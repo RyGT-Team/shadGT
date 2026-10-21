@@ -36,6 +36,7 @@
 #include "ryty_gpu/native/image_registry.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_rasterizer_native.h"
 #include "core/debug_state.h"
 #include "imgui.h"
 #ifdef ENABLE_DISCORD_RPC
@@ -64,7 +65,9 @@ void RunWindowThread() {
     auto* controllers = Common::Singleton<Input::GameControllers>::Instance();
     static Frontend::WindowSDL window(EmulatorSettings.GetWindowWidth(),
                                       EmulatorSettings.GetWindowHeight(), controllers,
-                                      "ryGT - Gran Turismo Sport");
+                                      Vulkan::NativeModeRequested()
+                                          ? "ryGT - Gran Turismo Sport (Native renderer)"
+                                          : "ryGT - Gran Turismo Sport (ShadGT renderer)");
     window.SetIcon({}); // shadGT's Gran Turismo Sport icon
     {
         std::scoped_lock lock{g_window_mutex};

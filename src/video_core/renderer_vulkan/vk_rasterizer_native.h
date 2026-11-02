@@ -532,7 +532,7 @@ private:
             const void* writes_data{}; size_t writes_size{}; const void* buffers_data{}; size_t buffers_size{}; const void* images_data{}; size_t images_size{};
             const void* vertex_identity{}; const void* vertex_buffers_data{}; size_t vertex_buffers_size{};
             bool descriptor_structure{},vertex_shape{},vertex_bindings{},vertex_pnext{};
-            bool image_sealed{}; u64 image_seal_epoch{}; const void* image_seal_owner{}; size_t image_seal_infos{};
+            bool image_sealed{}; u8 image_seal_reason{}; u64 image_seal_epoch{}; const void* image_seal_owner{}; size_t image_seal_infos{};
             std::array<const void*, Shader::Backend::MaxDescriptorSets> group_data{};
             std::array<size_t, Shader::Backend::MaxDescriptorSets> group_sizes{};
             size_t ordinary_writes{}, ordinary_buffers{}, ordinary_images{};

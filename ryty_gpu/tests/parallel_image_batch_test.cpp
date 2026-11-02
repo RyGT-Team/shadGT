@@ -10,6 +10,8 @@
 #include "ryty_gpu/native/prepared_sampled_view_proof.h"
 #include "ryty_gpu/native/prepared_proof_context.h"
 using u32=std::uint32_t;using u64=std::uint64_t;
+using u8=std::uint8_t;
+bool ParallelProofPhaseEnabled(){return true;}
 namespace vk {
 using ImageView=std::uintptr_t;using Sampler=std::uintptr_t;
 enum class ImageLayout { eGeneral,eOther };
@@ -31,7 +33,7 @@ struct Entries {
     const void* operator[](size_t i)const {if(change_epoch)++sampler_cache_epoch;return values[i];}
 };
 struct Origin {size_t slot{};vk::Sampler handle{};};
-struct Proof {bool descriptor_structure{},image_sealed{};u64 image_seal_epoch{};const void* image_seal_owner{};size_t image_seal_infos{};};
+struct Proof {bool descriptor_structure{},image_sealed{};u8 image_seal_reason{};u64 image_seal_epoch{};const void* image_seal_owner{};size_t image_seal_infos{};};
 struct Bindings {std::vector<vk::DescriptorImageInfo> images;std::vector<vk::Write> writes;Entries sampled;};
 struct Prepared {Proof cpu_proof;std::shared_ptr<Context> proof_context;bool sampler_origins_valid{true};u64 sampler_origins_epoch{1},proof_mode_state{1};Bindings bindings;std::vector<Origin> sampler_origins;std::vector<Native::Parallel::SampledViewProof<vk::ImageView>> sampled_view_proofs;};
 struct Parallel {std::shared_ptr<Context> prepared_proof_context;u64 image_batch_invalidations{},image_batch_draws{},image_batch_infos{};};
@@ -69,22 +71,25 @@ int main() {
     assert(Native::Parallel::AddSampledViewProof(p.sampled_view_proofs,0,0,vk::ImageView{41},&image,1,false));
     p.sampler_origins={{1,17}};Parallel parallel{p.proof_context};
     const auto reset=[&]{p.cpu_proof.image_sealed=false;};
-    owner.Seal(&p);assert(p.cpu_proof.image_sealed && p.cpu_proof.image_seal_infos==2);
+    owner.Seal(&p);assert(p.cpu_proof.image_sealed && p.cpu_proof.image_seal_infos==2 && p.cpu_proof.image_seal_reason==0);
     assert(owner.Start(&p,&parallel));u32 reason=0;assert(owner.End(&p,&parallel,true,true,reason));
     assert(!owner.Start(&p,&parallel,false));assert(!owner.Start(&p,&parallel,true,true));
     Owner different_owner;assert(!different_owner.Start(&p,&parallel));
     Parallel different_context{std::make_shared<Context>()};assert(!owner.Start(&p,&different_context));
-    p.sampler_origins[0].handle=18;reset();owner.Seal(&p);assert(!p.cpu_proof.image_sealed);p.sampler_origins[0].handle=17;
+    p.sampler_origins[0].handle=18;reset();owner.Seal(&p);assert(!p.cpu_proof.image_sealed && p.cpu_proof.image_seal_reason==5);p.sampler_origins[0].handle=17;
     p.sampler_origins[0].slot=0;reset();owner.Seal(&p);assert(!p.cpu_proof.image_sealed);p.sampler_origins[0].slot=1;
     p.sampler_origins_epoch=2;reset();owner.Seal(&p);assert(!p.cpu_proof.image_sealed);p.sampler_origins_epoch=1;
-    p.sampler_origins_valid=false;reset();owner.Seal(&p);assert(!p.cpu_proof.image_sealed);p.sampler_origins_valid=true;
+    p.sampler_origins_valid=false;reset();owner.Seal(&p);assert(!p.cpu_proof.image_sealed && p.cpu_proof.image_seal_reason==3);p.sampler_origins_valid=true;
+    p.cpu_proof.descriptor_structure=false;reset();owner.Seal(&p);assert(p.cpu_proof.image_seal_reason==1);p.cpu_proof.descriptor_structure=true;
+    {auto writes=std::move(p.bindings.writes);reset();owner.Seal(&p);assert(p.cpu_proof.image_sealed && p.cpu_proof.image_seal_reason==8);p.bindings.writes=std::move(writes);}
     p.bindings.images[1].sampler=0;reset();owner.Seal(&p);assert(!p.cpu_proof.image_sealed);p.bindings.images[1].sampler=17;
     p.bindings.images[1].imageView=1;reset();owner.Seal(&p);assert(!p.cpu_proof.image_sealed);p.bindings.images[1].imageView=0;
-    p.bindings.images[0].imageView=42;reset();owner.Seal(&p);assert(!p.cpu_proof.image_sealed);p.bindings.images[0].imageView=41;
-    p.bindings.images[0].imageView=0;reset();owner.Seal(&p);assert(!p.cpu_proof.image_sealed);p.bindings.images[0].imageView=41;
+    p.bindings.images[0].imageView=42;reset();owner.Seal(&p);assert(!p.cpu_proof.image_sealed && p.cpu_proof.image_seal_reason==7);p.bindings.images[0].imageView=41;
+    p.bindings.images[0].imageView=0;reset();owner.Seal(&p);assert(!p.cpu_proof.image_sealed && p.cpu_proof.image_seal_reason==6);p.bindings.images[0].imageView=41;
+    {auto saved=p.proof_context;p.proof_context.reset();reset();owner.Seal(&p);assert(p.cpu_proof.image_seal_reason==2);p.proof_context=std::move(saved);}
     p.bindings.writes[0].descriptorType=vk::DescriptorType::eStorageImage;reset();owner.Seal(&p);assert(!p.cpu_proof.image_sealed);p.bindings.writes[0].descriptorType=vk::DescriptorType::eSampledImage;
     p.bindings.writes[0].pImageInfo=p.bindings.images.data()+p.bindings.images.size();reset();owner.Seal(&p);assert(!p.cpu_proof.image_sealed);p.bindings.writes[0].pImageInfo=&p.bindings.images[0];
-    p.bindings.sampled.change_epoch=true;reset();owner.Seal(&p);assert(!p.cpu_proof.image_sealed);p.bindings.sampled.change_epoch=false;sampler_cache_epoch=1;
+    p.bindings.sampled.change_epoch=true;reset();owner.Seal(&p);assert(!p.cpu_proof.image_sealed && p.cpu_proof.image_seal_reason==9);p.bindings.sampled.change_epoch=false;sampler_cache_epoch=1;
     reset();owner.Seal(&p);assert(owner.Start(&p,&parallel));sampler_cache_epoch=2;reason=0;
     const bool snapshot_or_packet=owner.End(&p,&parallel,true,true,reason);
     assert(!snapshot_or_packet && reason==10);

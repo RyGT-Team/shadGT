@@ -287,6 +287,9 @@ struct ParallelRuntime {
     std::shared_ptr<const void> lease;
     u64 epoch{};
     std::array<u64,10> descriptor_fail_reasons{};u32 descriptor_samples{};u64 descriptor_readonly_attempts{},descriptor_readonly_regions{},descriptor_readonly_imports{},descriptor_readonly_uncontained{},descriptor_readonly_unmatched{},descriptor_clip_nulls{},readonly_range_hint_hits{},readonly_range_hint_misses{},readonly_region_hint_hits{},readonly_region_hint_misses{};
+    // Readonly attempt failures, not draw failures: another descriptor proof may succeed.
+    std::array<u64,7> readonly_guard_failures{};
+    std::array<u64,9> readonly_special_kinds{};
     std::array<ProofPhaseStats,9> proof_phases{};
     Native::Parallel::PositiveHandleCache<vk::Sampler> sampler_proof;
     u64 sampler_proof_hits{},sampler_proof_misses{},sampler_scan_steps{},sampler_scan_positives{};
@@ -5600,13 +5603,23 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                 const Shader::Info* matched=planned_stage();std::size_t local=matched?action->stage_local:0,start=0;
                                 if(!matched)for(std::size_t si=0;si<stage_count;++si){const auto* stage=stages[si];if(!stage)continue;const auto n=stage->buffers.size();
                                     if(index>=start && index-start<n){matched=stage;local=index-start;break;}start+=n;}
-                                if(!matched)return false;const auto& desc=matched->buffers[local];
-                                if(desc.IsSpecial() || desc.is_written)return false;
+                                if(!matched){++parallel->readonly_guard_failures[0];return false;}
+                                const auto& desc=matched->buffers[local];
+                                if(desc.IsSpecial()) {
+                                    ++parallel->readonly_guard_failures[1];
+                                    const auto kind=static_cast<std::size_t>(desc.buffer_type);
+                                    ++parallel->readonly_special_kinds[std::min(kind,parallel->readonly_special_kinds.size()-1)];
+                                    return false;
+                                }
+                                if(desc.is_written){++parallel->readonly_guard_failures[2];return false;}
                                 const auto sharp=desc.GetSharp(*matched);const u64 base=sharp.base_address,sharp_size=sharp.GetSize();
                                 // ClampRangeSize returns the original size below 1 GiB without a map lookup.
                                 // Larger ranges remain on the serial path; do not add a recorder map lock.
                                 constexpr u64 Limit=u64{1}<<40,NoClampLimit=u64{1}<<30;
-                                if(!base || !sharp_size || sharp_size>=NoClampLimit || base>=Limit || sharp_size>Limit-base)return false;
+                                if(!base){++parallel->readonly_guard_failures[3];return false;}
+                                if(!sharp_size){++parallel->readonly_guard_failures[4];return false;}
+                                if(sharp_size>=NoClampLimit){++parallel->readonly_guard_failures[5];return false;}
+                                if(base>=Limit || sharp_size>Limit-base){++parallel->readonly_guard_failures[6];return false;}
                                 const u64 bytes=sharp_size;
                                 const auto contains=[&](const auto& range) {
                                     const auto [begin,end]=range;
@@ -5666,7 +5679,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                             };
                             if(!recorded || !retained){++parallel->direct_slot_attempts;const bool direct_ok=TimedProofInvoke(parallel->proof_phases[6],phase_sample,direct_slot);if(!direct_ok && !TimedProofInvoke(parallel->proof_phases[7],phase_sample,readonly_slot) && !TimedProofInvoke(parallel->proof_phases[8],phase_sample,disabled_clip_null)){
                                 descriptor_fail_reason=3;
-                                if(ParallelGateDiagEnabled() && parallel->descriptor_samples<4) {
+                                if(sample_preflight && parallel->descriptor_samples<4) {
                                     ++parallel->descriptor_samples;u32 stage_id=~u32{0},kind=~u32{0},mode=~u32{0};bool stage_direct=false,eligible=false;
                                     std::size_t start=0;const auto stages=pipeline->GetStages();
                                     for(std::size_t si=0;si<std::min<std::size_t>(stages.size(),Shader::MaxStageTypes-1);++si) {
@@ -5852,7 +5865,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 ++parallel->preflight_cpu_samples;parallel->preflight_cpu_100ns+=preflight_cpu_end-preflight_cpu_begin;
             }
         }
-        if(cheap_eligible && !descriptor_safe){++parallel->descriptor_rejected;if(ParallelGateDiagEnabled())++parallel->descriptor_fail_reasons[descriptor_fail_reason];}
+        if(cheap_eligible && !descriptor_safe){++parallel->descriptor_rejected;++parallel->descriptor_fail_reasons[descriptor_fail_reason];}
         if(ParallelGateDiagEnabled()) {
             u64 mask=0;const auto fail=[&](u32 bit,bool bad){if(bad)mask|=u64{1}<<bit;};
             fail(0,!RytyGtsInRace());fail(1,EmulatorSettings.IsPatchShaders());
@@ -9785,11 +9798,18 @@ void NativeRenderer::Report() {
             const auto& p=groups.passes[reason];const auto& d=groups.draws[reason];
             LOG_INFO(Render_Vulkan,"PARALLEL-BATCH-GROUP reason={} passes1to8={},{},{},{},{},{},{},{} draws1to8plus={},{},{},{},{},{},{},{} lead_samples={} lead_ns={} lead_max_ns={}",reason,p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],d[1],d[2],d[3],d[4],d[5],d[6],d[7],d[8],groups.lead_samples,groups.lead_ns,groups.lead_max_ns);
         }
-        if(ParallelGateDiagEnabled()) {
+        {
             const auto& f=sidecar->descriptor_fail_reasons;
-            LOG_INFO(Render_Vulkan,"PARALLEL-DESCRIPTOR-FAIL write={} pnext={} buffer_slice={} buffer_unproved={} image_slice={} sampler_invalid={} sampler_unknown={} image_invalid={} image_unknown={} snapshot={} samples={}",
+            LOG_INFO(Render_Vulkan,"PARALLEL-DESCRIPTOR-FAIL preloop={} pnext={} buffer_slice={} buffer_unproved={} image_slice={} sampler_invalid={} sampler_unknown={} image_invalid={} image_unknown={} snapshot={} samples={}",
                 f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7],f[8],f[9],sidecar->descriptor_samples);
             sidecar->descriptor_fail_reasons={};sidecar->descriptor_samples=0;
+        }
+        {
+            const auto& f=sidecar->readonly_guard_failures;
+            const auto& k=sidecar->readonly_special_kinds;
+            LOG_INFO(Render_Vulkan,"PARALLEL-READONLY-GUARDS missing_stage={} special={} written={} zero_base={} zero_size={} size_ge_1g={} address_limit={} special_guest={} special_flatbuf={} special_pagetable={} special_fault={} special_gds={} special_shared={} special_clip={} special_direct_table={} special_other={}",
+                f[0],f[1],f[2],f[3],f[4],f[5],f[6],k[0],k[1],k[2],k[3],k[4],k[5],k[6],k[7],k[8]);
+            sidecar->readonly_guard_failures={};sidecar->readonly_special_kinds={};
         }
         LOG_INFO(Render_Vulkan,"PARALLEL-RECORD-DIAG absent_sampled_attempts={} absent_sampled_accepted={} absent_sampled_rejected={} sampled_null_view={} sampled_nonnull_sampler={} sampled_nongeneral={} sampled_canonical_null={} absent_mode0_attempts={} absent_mode0_accepted={} absent_mode0_rejected={} natural_preclosed={} natural_captured={} natural_serial_fallback={} natural_binding_skip={} sampler_entries={} sampler_proof_hits={} sampler_proof_misses={} sampler_scan_steps={} sampler_scan_positives={} proof_table_builds={} proof_table_hits={} extended_clear_rejected={} fast_rejected={} no_pass_room_rejected={} serial_scope_bypassed={} owner_slot_pressure={} eligible_in_serial_scope_examined={} eligible_in_active_scope={} eligible_at_boundary={} vertex_candidates={} vertex_preflight={} vertex_backing_pass={} vertex_bad_structure={} vertex_bad_binding={} vertex_bad_pnext={} vertex_unknown_backing={} vertex_direct_ranges={} vertex_direct_attempts={} vertex_direct_matches={} descriptor_readonly_attempts={} descriptor_readonly_regions={} descriptor_readonly_imports={} descriptor_readonly_uncontained={} descriptor_readonly_unmatched={} descriptor_clip_nulls={} direct_slot_attempts={} direct_slot_accepted={} considered={} eligible={} resource_key_unknown={} buffer_present={} alias_rejected={} descriptor_rejected={} missing_sets={} preflight_samples={} preflight_wall_ns={} preflight_cpu_samples={} preflight_cpu_100ns={} passes={} draws={} queued={} synchronous={} worker_jobs={} worker_wall_ns_sum={} worker_cpu_100ns={} worker_cpu_samples={} peak_workers={} worker_recorded_passes={} worker_recorded_draws={} small_groups_submitted={} small_groups_synchronous={} small_passes={} small_submitted_draws={} drain_wall_ns={} coordinator_cpu_100ns={} coordinator_cpu_samples={} pending={} inflight={}",
             sidecar->absent_sampled_attempts,sidecar->absent_sampled_accepted,sidecar->absent_sampled_rejected,sidecar->sampled_null_view,sidecar->sampled_nonnull_sampler,sidecar->sampled_nongeneral,sidecar->sampled_canonical_null,sidecar->absent_mode0_attempts,sidecar->absent_mode0_accepted,sidecar->absent_mode0_rejected,sidecar->natural_preclosed,sidecar->natural_captured,sidecar->natural_serial_fallback,sidecar->natural_binding_skip,sampler_entries,sidecar->sampler_proof_hits,sidecar->sampler_proof_misses,sidecar->sampler_scan_steps,sidecar->sampler_scan_positives,sidecar->proof_table_builds,sidecar->proof_table_hits,sidecar->extended_clear_rejected,sidecar->fast_rejected,sidecar->no_pass_room_rejected,sidecar->serial_scope_bypassed,sidecar->owner_slot_pressure,sidecar->eligible_in_serial_scope,sidecar->eligible_in_active_scope,sidecar->eligible_at_boundary,sidecar->vertex_candidates,sidecar->vertex_preflight_draws,sidecar->vertex_backing_pass,sidecar->vertex_bad_structure,sidecar->vertex_bad_binding,sidecar->vertex_bad_pnext,sidecar->vertex_unknown_backing,sidecar->vertex_direct_ranges,sidecar->vertex_direct_attempts,sidecar->vertex_direct_matches,sidecar->descriptor_readonly_attempts,sidecar->descriptor_readonly_regions,sidecar->descriptor_readonly_imports,sidecar->descriptor_readonly_uncontained,sidecar->descriptor_readonly_unmatched,sidecar->descriptor_clip_nulls,sidecar->direct_slot_attempts,sidecar->direct_slot_accepted,sidecar->considered,sidecar->eligible,sidecar->unknown_resource_key,sidecar->buffer_rejected,sidecar->alias_rejected,sidecar->descriptor_rejected,sidecar->missing_sets,sidecar->preflight_samples,sidecar->preflight_wall_ns,sidecar->preflight_cpu_samples,sidecar->preflight_cpu_100ns,sidecar->passes,sidecar->draws,sidecar->queued,sidecar->synchronous,workers.jobs,workers.wall_ns,workers.cpu_100ns,workers.cpu_samples,workers.peak,workers.recorded_passes,workers.recorded_draws,workers.small_groups_submitted,workers.small_groups_synchronous,workers.small_passes,workers.small_submitted_draws,sidecar->drain_ns,sidecar->coordinator_cpu_100ns,sidecar->coordinator_cpu_samples,

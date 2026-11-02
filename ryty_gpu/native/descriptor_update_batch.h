@@ -1,6 +1,10 @@
 #pragma once
 #include <cstddef>
 namespace Native {
+constexpr bool DescriptorCountsFit(std::size_t w,std::size_t b,std::size_t i,
+                                   std::size_t remaining_w,std::size_t remaining_b,std::size_t remaining_i) noexcept {
+    return w<=remaining_w && b<=remaining_b && i<=remaining_i;
+}
 // The write records are copied, and their binding-owned info arrays remain alive
 // until this draw returns. No destination is ever left in the original records.
 template<class Writes,class Set,class Updates>

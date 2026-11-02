@@ -16,7 +16,7 @@ static bool fail_new=false;void* operator new(size_t n){if(fail_new){fail_new=fa
 namespace vk{enum class DescriptorType{eUniformBuffer,eStorageBuffer,eSampledImage,eSampler};struct DescriptorBufferInfo{int x;};struct DescriptorImageInfo{int x;};struct WriteDescriptorSet{DescriptorType descriptorType{};u32 descriptorCount{};const void*pNext{},*pTexelBufferView{};const DescriptorBufferInfo*pBufferInfo{};const DescriptorImageInfo*pImageInfo{};};}
 struct DescriptorSnapshot{template<class T>static bool Valid(const T*p,size_t n,std::span<const T>x){return n&&p==x.data()&&n<=x.size();}static bool BufferSliceValid(const vk::DescriptorBufferInfo*p,size_t n,std::span<const vk::DescriptorBufferInfo>x){return Valid(p,n,x);}static bool ImageSliceValid(const vk::DescriptorImageInfo*p,size_t n,std::span<const vk::DescriptorImageInfo>x){return Valid(p,n,x);}static std::optional<DescriptorSnapshot> Make(auto,auto,auto,size_t){return DescriptorSnapshot{};}};
 struct Bind{u32 binding;const void*pNext;};struct Vertex{std::vector<int> buffers,offsets,sizes,strides;std::vector<Bind> input_bindings,attributes;};
-struct Proof{struct StageSchema{u64 identity{};size_t count{},table_local{SIZE_MAX},table_upload{SIZE_MAX};};std::array<StageSchema,5> stages{};const void*prepared_identity{},*pipeline_identity{},*writes_data{},*buffers_data{},*images_data{},*vertex_identity{},*vertex_buffers_data{},*push_data{};size_t writes_size{},buffers_size{},images_size{},vertex_buffers_size{},push_size{},push_buffer_first{},push_buffer_count{};int pipeline_layout{};bool descriptor_structure{},vertex_shape{},vertex_bindings{},vertex_pnext{};u32 push_index{};std::shared_ptr<void> push_snapshot;};
+struct Proof{struct StageSchema{u64 identity{};size_t count{},table_local{SIZE_MAX},table_upload{SIZE_MAX};};std::array<StageSchema,5> stages{};const void*prepared_identity{},*pipeline_identity{},*writes_data{},*buffers_data{},*images_data{},*vertex_identity{},*vertex_buffers_data{},*push_data{};size_t writes_size{},buffers_size{},images_size{},vertex_buffers_size{},push_size{},push_buffer_first{},push_buffer_count{};int pipeline_layout{};bool descriptor_structure{},vertex_shape{},vertex_bindings{},vertex_pnext{};std::array<const void*,5>group_data{};std::array<size_t,5>group_sizes{};size_t ordinary_writes{},ordinary_buffers{},ordinary_images{};u32 counts_push{};bool counts_valid{};u32 push_index{};std::shared_ptr<void> push_snapshot;};
 struct B{std::vector<vk::WriteDescriptorSet>writes;std::vector<vk::DescriptorBufferInfo>buffers;std::vector<vk::DescriptorImageInfo>images;std::array<std::vector<vk::WriteDescriptorSet>,1>grouped_writes;};struct PreparedDraw{struct DescriptorAction{size_t buffer_first{},stage_local{};u8 range_hint{255},region_hint{255};u32 stage_index{~u32{0}},upload_size{};u8 upload_match{2};bool is_buffer{};};struct Upload{u32 info{},size{};};Proof cpu_proof;B bindings;std::vector<DescriptorAction> descriptor_actions;std::vector<Upload> uploads;std::vector<std::pair<u64,u64>>buffer_ranges;struct Region{u64 address,size;};std::vector<Region>regions;bool has_vertices{};std::unique_ptr<Vertex>vertex_index;};using P=PreparedDraw;struct Pipeline{int GetLayout()const{return 4;}u32 PushSet()const{return 0;}};bool ParallelRecordingRequested(){return true;}
 void run(P*p,Pipeline&pipeline){std::array<const Shader::Info*,5> stages{};if(ParallelRecordingRequested())try{
         auto* candidate=&p->cpu_proof;candidate->prepared_identity=p;candidate->pipeline_identity=&pipeline;
@@ -104,6 +104,17 @@ void run(P*p,Pipeline&pipeline){std::array<const Shader::Info*,5> stages{};if(Pa
                 for(size_t i=0;i<n;++i)if(v.input_bindings[i].binding!=i || v.attributes[i].binding!=i)candidate->vertex_bindings=false;
                 for(const auto& x:v.input_bindings)if(x.pNext)candidate->vertex_pnext=false;
                 for(const auto& x:v.attributes)if(x.pNext)candidate->vertex_pnext=false;
+            }
+        }
+        candidate->counts_valid=candidate->descriptor_structure;
+        candidate->counts_push=pipeline.PushSet();
+        for(size_t set=0;candidate->counts_valid && set<b.grouped_writes.size();++set) {
+            const auto group=b.grouped_writes[set];candidate->group_data[set]=group.data();candidate->group_sizes[set]=group.size();
+            if(set==candidate->counts_push)continue;
+            for(const auto& row:group) {
+                auto& count=row.pBufferInfo ? candidate->ordinary_buffers : candidate->ordinary_images;
+                if(candidate->ordinary_writes==SIZE_MAX || row.descriptorCount>SIZE_MAX-count) {candidate->counts_valid=false;break;}
+                ++candidate->ordinary_writes;count+=row.descriptorCount;
             }
         }
         const u32 push=pipeline.PushSet();

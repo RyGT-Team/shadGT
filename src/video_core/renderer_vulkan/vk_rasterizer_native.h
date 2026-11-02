@@ -532,6 +532,10 @@ private:
             const void* writes_data{}; size_t writes_size{}; const void* buffers_data{}; size_t buffers_size{}; const void* images_data{}; size_t images_size{};
             const void* vertex_identity{}; const void* vertex_buffers_data{}; size_t vertex_buffers_size{};
             bool descriptor_structure{},vertex_shape{},vertex_bindings{},vertex_pnext{};
+            std::array<const void*, Shader::Backend::MaxDescriptorSets> group_data{};
+            std::array<size_t, Shader::Backend::MaxDescriptorSets> group_sizes{};
+            size_t ordinary_writes{}, ordinary_buffers{}, ordinary_images{};
+            u32 counts_push{}; bool counts_valid{};
             u32 push_index{}; const void* push_data{}; size_t push_size{}, push_buffer_first{}, push_buffer_count{};
             std::shared_ptr<void> push_snapshot;
         } cpu_proof;

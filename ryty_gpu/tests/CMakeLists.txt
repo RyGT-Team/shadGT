@@ -74,3 +74,7 @@ add_test(NAME parallel_snapshot_source_fragments
             "${CMAKE_CURRENT_SOURCE_DIR}/parallel_mixed_snapshot_test.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/parallel_producer_oom_test.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/parallel_descriptor_actions_test.cpp")
+
+add_test(NAME ahead_capture_safety
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/verify_ahead_capture_safety.py"
+            "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp")

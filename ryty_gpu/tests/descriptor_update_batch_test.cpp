@@ -10,6 +10,15 @@ struct Write {
     bool operator==(const Write&)const=default;
 };
 int main(){
+    for(std::size_t w=0;w<8;++w) for(std::size_t b=0;b<8;++b) for(std::size_t i=0;i<8;++i)
+        for(std::size_t rw=0;rw<8;++rw) for(std::size_t rb=0;rb<8;++rb) for(std::size_t ri=0;ri<8;++ri) {
+            bool scan=true;std::size_t x=0,y=0,z=0;
+            while(x<w && scan){if(x==rw)scan=false;else ++x;}
+            while(y<b && scan){if(y==rb)scan=false;else ++y;}
+            while(z<i && scan){if(z==ri)scan=false;else ++z;}
+            assert(Native::DescriptorCountsFit(w,b,i,rw,rb,ri)==scan);
+        }
+
     unsigned cases=0;
     for(unsigned code=0;code<256;++code)for(unsigned push=0;push<5;++push)for(unsigned n=1;n<=8;++n){
         std::array<std::vector<Write>,4> groups;

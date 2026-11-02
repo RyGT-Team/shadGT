@@ -150,7 +150,7 @@ void SetAheadMode(AheadContext& c,bool enabled) noexcept {
 }
 std::mutex ahead_context_mutex;
 std::unordered_map<const NativeRenderer*,std::shared_ptr<AheadContext>> ahead_contexts;
-bool AheadRequested() noexcept {static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_PRODUCER_DESCRIPTORS");return p && p[0]=='1' && !p[1];}();return enabled;}
+bool AheadRequested() noexcept {static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_PRODUCER_DESCRIPTORS");return !p || (p[0]=='1' && !p[1]);}();return enabled;}
 
 std::shared_ptr<AheadContext> FindAheadBlocking(const NativeRenderer* renderer) {
     if(!AheadRequested())return {};std::scoped_lock lock{ahead_context_mutex};const auto it=ahead_contexts.find(renderer);
@@ -179,7 +179,8 @@ namespace {
 // consume immutable pass packets and RHI device/instance handles.
 struct ParallelBindingCapture {
     std::array<vk::DescriptorSet,Shader::Backend::MaxDescriptorSets> sets{};
-    AheadLease* ahead{};bool ahead_used{},write_structure_proven{};
+    AheadLease* ahead{};bool ahead_used{},write_structure_proven{},counts_proven{};
+    std::size_t ordinary_writes{},ordinary_buffers{},ordinary_images{};
 };
 thread_local ParallelBindingCapture* parallel_binding_capture=nullptr;
 struct ScopedParallelBindingCapture {
@@ -240,6 +241,9 @@ struct PendingDescriptorUpdates {
             if(w==writes.size())return Admission::Capacity;++w;
         }
         return Admission::Yes;
+    }
+    Admission CheckCounts(std::size_t w,std::size_t b,std::size_t i) const noexcept {
+        return Native::DescriptorCountsFit(w,b,i,writes.size()-nw,buffers.size()-nb,images.size()-ni) ? Admission::Yes : Admission::Capacity;
     }
     template<class Rows> void Stage(const Rows& rows,vk::DescriptorSet set) noexcept {
         for(const auto& source:rows) {
@@ -1208,7 +1212,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
 #endif
         });
     if(AheadRequested() && ParallelRecordingRequested() && !r.instance.IsIntel()) {
-        try {auto context=std::make_shared<AheadContext>(r.instance.GetDevice());std::scoped_lock guard{ahead_context_mutex};ahead_contexts.emplace(this,context);SetAheadMode(*context,true);}
+        try {auto context=std::make_shared<AheadContext>(r.instance.GetDevice());std::scoped_lock guard{ahead_context_mutex};ahead_contexts.emplace(this,context);}
         catch(...) {LOG_WARNING(Render_Vulkan,"PARALLEL-PRODUCER-DESC setup failed; using original descriptors");}
     }
     LOG_INFO(Render_Vulkan, "NAT-100: native mode: draws, dispatches and copies are recorded with "
@@ -3870,6 +3874,8 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         const auto check=[&] {
             const auto buffers=std::span<const vk::DescriptorBufferInfo>{b.buffers.data(),b.buffers.size()};
             const auto images=std::span<const vk::DescriptorImageInfo>{b.images.data(),b.images.size()};
+            if(parallel_binding_capture->counts_proven)
+                return pending->CheckCounts(parallel_binding_capture->ordinary_writes,parallel_binding_capture->ordinary_buffers,parallel_binding_capture->ordinary_images);
             return parallel_binding_capture->write_structure_proven
                 ? pending->Check<true>(by_set,pipeline.PushSet(),buffers,images)
                 : pending->Check(by_set,pipeline.PushSet(),buffers,images);
@@ -3928,15 +3934,17 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         }
         trace.Next(4);
         const u64 layout_key = u64(VkDescriptorSetLayout(layout));
-        vk::DescriptorSet set = s.descriptor_reserve.Take(layout_key);
-        const bool reserve_hit=bool(set);
-        if (reserve_hit) ++stats.descriptor_reserve_hits;
-        if(!set && parallel_binding_capture && parallel_binding_capture->ahead) {
+        vk::DescriptorSet set{};
+        if(parallel_binding_capture && parallel_binding_capture->ahead) {
             auto* ahead=parallel_binding_capture->ahead;
             if(ahead->pipeline_layout==pipeline.GetLayout() && ahead->layouts[index]==layout && ahead->sets[index]) {
                 set=ahead->sets[index];++ahead->used_sets;ahead->context->used_sets.fetch_add(1,std::memory_order_relaxed);parallel_binding_capture->ahead_used=true;
             }
         }
+        const bool ahead_hit=bool(set);
+        if(!set)set=s.descriptor_reserve.Take(layout_key);
+        const bool reserve_hit=bool(set) && !ahead_hit;
+        if(reserve_hit)++stats.descriptor_reserve_hits;
         if (alloc_diag) { if (reserve_hit) ++descriptor_alloc_metrics.reserve_hits[alloc_kind]; else if(!set) ++alloc_misses; }
         if(!set) {
         std::array<vk::DescriptorSetLayout, 32> layouts;
@@ -4668,6 +4676,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             std::lock_guard sidecar_lock(parallel_sidecars_mutex);
             auto [where,inserted]=parallel_sidecars.emplace(this,std::move(sidecar));
             if(inserted && where->second->prepared_proof_context)where->second->prepared_proof_context->SetMode(true);
+            if(inserted && where->second->ahead_context) {
+                std::scoped_lock ahead_lock{ahead_context_mutex};
+                if(!where->second->ahead_context->closing.load(std::memory_order_acquire))
+                    SetAheadMode(*where->second->ahead_context,true);
+            }
             parallel_sidecars_generation.fetch_add(1,std::memory_order_release);
         } catch(const std::exception&) {parallel_sidecar_init_failed.store(true,std::memory_order_relaxed);LOG_WARNING(Render_Vulkan,"PARALLEL-RECORD: initialization failed, using serial recorder");}
     }
@@ -5135,6 +5148,19 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         worker_result->writes_data==b.writes.data() && worker_result->writes_size==b.writes.size() &&
         worker_result->buffers_data==b.buffers.data() && worker_result->buffers_size==b.buffers.size() &&
         worker_result->images_data==b.images.data() && worker_result->images_size==b.images.size();
+    // Producer totals cover every ordinary row, including descriptor-cache hits.
+    // Match each bounded group span before using them with the live structure proof.
+    // Like known_structure, this relies on published row metadata remaining immutable.
+    const auto set_count_proof=[&] {
+        if(!worker_identity || !worker_result->descriptor_structure || !worker_result->counts_valid ||
+           !b.groups_ready || worker_result->counts_push!=pipeline->PushSet())return;
+        for(size_t i=0;i<b.grouped_writes.size();++i)
+            if(worker_result->group_data[i]!=b.grouped_writes[i].data() || worker_result->group_sizes[i]!=b.grouped_writes[i].size())return;
+        parallel_bindings.counts_proven=true;
+        parallel_bindings.ordinary_writes=worker_result->ordinary_writes;
+        parallel_bindings.ordinary_buffers=worker_result->ordinary_buffers;
+        parallel_bindings.ordinary_images=worker_result->ordinary_images;
+    };
     if(parallel && !parallel->closing && parallel->applied_mode.Enabled()) {
         static const bool whole_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_WHOLE_PREFLIGHT");return p && p[0]=='1' && p[1]=='\0';}();
         const bool whole_sample=whole_enabled && ((++parallel->whole_seq & 127u)==0);
@@ -5845,6 +5871,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                         const auto* prebind_list=s.list;
                         const auto prebind_cmd=s.cmd;
                         parallel_bindings.write_structure_proven=true;
+                        set_count_proof();
                         {ScopedParallelBindingCapture capture{parallel_bindings};PushBindings(*pipeline,vk::PipelineBindPoint::eGraphics,b);}
                         if(!b.writes.empty())for(u32 i=0;i<b.grouped_writes.size();++i) {
                             if(i==pipeline->PushSet() || b.grouped_writes[i].empty())continue;
@@ -5974,14 +6001,22 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                     else ahead->context->capacity.fetch_add(1,std::memory_order_relaxed);
                 }
             }
+            // Retain before PushBindings: an exception after caching an ahead set must
+            // not allow its pool to reset while that cache entry is still reachable.
+            if(ahead && ahead_slot<parallel->ahead_flights.size()) {
+                parallel->ahead_flights[ahead_slot].lease=ahead;parallel->ahead_flights[ahead_slot].release=std::move(ahead_release);parallel->ahead_flights[ahead_slot].tick=0;++parallel->ahead_live;
+            }
             if(!serial_split_prebound) {
                 parallel_bindings.write_structure_proven=true; // descriptor_safe validated every source row
+                set_count_proof();
                 {ScopedParallelBindingCapture capture{parallel_bindings};PushBindings(*pipeline,vk::PipelineBindPoint::eGraphics,b);}
             }
             if(parallel_bindings.ahead_used) {
                 ASSERT_MSG(ahead && ahead_slot<parallel->ahead_flights.size(),"ahead descriptor lease missing");
                 ahead->used=true;ahead->context->used.fetch_add(1,std::memory_order_relaxed);
-                parallel->ahead_flights[ahead_slot].lease=std::move(ahead);parallel->ahead_flights[ahead_slot].release=std::move(ahead_release);parallel->ahead_flights[ahead_slot].tick=0;++parallel->ahead_live;
+            } else if(ahead && ahead_slot<parallel->ahead_flights.size()) {
+                // No ahead set reached the cache or command stream.
+                auto& flight=parallel->ahead_flights[ahead_slot];flight.lease.reset();flight.release={};--parallel->ahead_live;
             }
             static_assert(Shader::Backend::MaxDescriptorSets<=32);
             bool missing=false;
@@ -6513,6 +6548,17 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
                 for(size_t i=0;i<n;++i)if(v.input_bindings[i].binding!=i || v.attributes[i].binding!=i)candidate->vertex_bindings=false;
                 for(const auto& x:v.input_bindings)if(x.pNext)candidate->vertex_pnext=false;
                 for(const auto& x:v.attributes)if(x.pNext)candidate->vertex_pnext=false;
+            }
+        }
+        candidate->counts_valid=candidate->descriptor_structure;
+        candidate->counts_push=pipeline.PushSet();
+        for(size_t set=0;candidate->counts_valid && set<b.grouped_writes.size();++set) {
+            const auto group=b.grouped_writes[set];candidate->group_data[set]=group.data();candidate->group_sizes[set]=group.size();
+            if(set==candidate->counts_push)continue;
+            for(const auto& row:group) {
+                auto& count=row.pBufferInfo ? candidate->ordinary_buffers : candidate->ordinary_images;
+                if(candidate->ordinary_writes==SIZE_MAX || row.descriptorCount>SIZE_MAX-count) {candidate->counts_valid=false;break;}
+                ++candidate->ordinary_writes;count+=row.descriptorCount;
             }
         }
         const u32 push=pipeline.PushSet();
@@ -8908,10 +8954,17 @@ void NativeRenderer::Splice() {
     if(auto* sidecar=FindParallelRuntime(this);sidecar && sidecar->mode_controller && !sidecar->closing) {
         const u64 signal=boundary_signal;
         const auto request=sidecar->mode_controller->Requested();
-        if(sidecar->ahead_context && !request.enabled)SetAheadMode(*sidecar->ahead_context,false);
+        if(sidecar->ahead_context && !request.enabled) {
+            std::scoped_lock ahead_lock{ahead_context_mutex};
+            SetAheadMode(*sidecar->ahead_context,false);
+        }
         if(sidecar->prepared_proof_context && !request.enabled)sidecar->prepared_proof_context->SetMode(false);
         const auto changed=sidecar->applied_mode.Apply(request,true);
-        if(sidecar->ahead_context && sidecar->applied_mode.Enabled())SetAheadMode(*sidecar->ahead_context,true);
+        if(sidecar->ahead_context && sidecar->applied_mode.Enabled()) {
+            std::scoped_lock ahead_lock{ahead_context_mutex};
+            if(!sidecar->ahead_context->closing.load(std::memory_order_acquire))
+                SetAheadMode(*sidecar->ahead_context,true);
+        }
         if(sidecar->prepared_proof_context && sidecar->applied_mode.Enabled())sidecar->prepared_proof_context->SetMode(true);
         if((changed || !sidecar->mode_initial_logged) && sidecar->prepared_proof_context) {
             const auto state=sidecar->prepared_proof_context->state.load(std::memory_order_seq_cst);

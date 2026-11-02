@@ -57,7 +57,7 @@ struct Regs {struct {bool user_clip_plane_enable{};} clipper_control;};
 bool ParallelReadonlyDescriptorEnabled(){return true;}
 struct TestBuffer {bool mapped{true};std::uintptr_t native{77};u64 bytes{4096};bool Mapped()const{return mapped;}std::uintptr_t NativeHandle()const{return native;}u64 Size()const{return bytes;}};
 struct Stream {struct Chunk{TestBuffer* buffer{};};std::vector<Chunk> chunks;};
-struct Parallel {std::shared_ptr<Context> prepared_proof_context;u64 buffer_prefix_attempts{},buffer_prefix_accepts{},buffer_prefix_fallbacks{},buffer_prefix_coherence_misses{},buffer_prefix_invalidations{},image_batch_invalidations{},image_batch_draws{},image_batch_infos{};};
+struct Parallel {std::shared_ptr<Context> prepared_proof_context;u64 buffer_prefix_attempts{},buffer_prefix_accepts{},buffer_prefix_fallbacks{},buffer_prefix_coherence_misses{},buffer_prefix_invalidations{},image_tail_skips{},image_tail_rows{},image_batch_invalidations{},image_batch_draws{},image_batch_infos{};};
 struct Owner {
     struct {struct {VideoCore::DirectMemory* direct{};VideoCore::DirectMemory* GetDirectMemory()const{return direct;}} buffer_cache;
             struct {bool enabled{true};bool GetDevice()const{return enabled;}} instance;} r;
@@ -73,15 +73,16 @@ struct Owner {
 #include "buffer-prefix-recorder.inc"
         return buffer_prefix;
     }
-    bool Final(Prepared* prepared,Parallel* parallel,bool buffer_prefix,bool descriptor_safe,u32& descriptor_fail_reason) {
-        size_t image_batch_infos=0;auto* worker_result=&prepared->cpu_proof;bool buffer_freshness_certified=true;u64 buffer_freshness_seq=0;
+    bool Final(Prepared* prepared,Parallel* parallel,bool buffer_prefix,bool descriptor_safe,u32& descriptor_fail_reason,size_t image_batch_infos=0) {
+        auto* worker_result=&prepared->cpu_proof;bool buffer_freshness_certified=true;u64 buffer_freshness_seq=0;
 #include "buffer-prefix-end.inc"
         return descriptor_safe;
     }
-    std::pair<size_t,size_t> Loop(Prepared* prepared,bool buffer_prefix) {
-        const auto& b=prepared->bindings;const bool known_actions=true,image_batch=true;auto* worker_result=&prepared->cpu_proof;
-        size_t image_batch_infos=0,unsealed=0;
+    std::pair<size_t,size_t> Loop(Prepared* prepared,bool buffer_prefix, Parallel* counters=nullptr,bool image_batch=true,size_t* visited=nullptr) {
+        const auto& b=prepared->bindings;const bool known_actions=true;auto* worker_result=&prepared->cpu_proof;
+        size_t image_batch_infos=0,unsealed=0; Parallel local; auto* parallel=counters?counters:&local;
 #include "buffer-prefix-loop.inc"
+            if(visited)++*visited;
             (void)action;
             if(write.descriptorType==vk::DescriptorType::eStorageBuffer)continue;
 #include "buffer-prefix-image-skip.inc"
@@ -124,6 +125,32 @@ int main() {
     {p.bindings.writes.push_back({vk::DescriptorType::eSampledImage,1,nullptr});p.bindings.writes.push_back({vk::DescriptorType::eSampledImage,1,nullptr});p.descriptor_actions.resize(6);
      p.cpu_proof.image_seal_mask[0]=u64{1}<<4;assert((owner.Loop(&p,true)==std::pair<size_t,size_t>{1,1}));
      p.bindings.writes.resize(4);p.descriptor_actions.resize(4);p.cpu_proof.image_seal_mask={};}
+    { // Exercise production-extracted tail proof against the original row behavior.
+     for(size_t prefix: {size_t{0},size_t{1},size_t{63},size_t{64},size_t{127},size_t{128}})
+      for(size_t end: {size_t{0},size_t{1},size_t{63},size_t{64},size_t{127},size_t{128},size_t{129}}) {
+       if(prefix>end)continue;
+       p.bindings.buffers.resize(prefix);p.bindings.writes.assign(end,{vk::DescriptorType::eSampledImage,2,nullptr});
+       p.descriptor_actions.resize(end);p.cpu_proof.image_seal_mask={~u64{0},~u64{0}};
+       for(size_t i=0;i<prefix;++i)p.bindings.writes[i].descriptorType=vk::DescriptorType::eStorageBuffer;
+       assert((owner.Loop(&p,true)==std::pair<size_t,size_t>{2*(std::min(end,size_t{128})-prefix),end-std::min(end,size_t{128})}));
+       if(prefix<end && prefix<128) {
+        p.cpu_proof.image_seal_mask[prefix/64]&=~(u64{1}<<(prefix%64));
+        assert((owner.Loop(&p,true)==std::pair<size_t,size_t>{2*(std::min(end,size_t{128})-prefix-1),end-std::min(end,size_t{128})+1}));
+       }
+       for(size_t i=prefix;i<end;++i)p.bindings.writes[i].descriptorCount=0;
+       p.cpu_proof.image_seal_mask={~u64{0},~u64{0}};
+       assert(owner.Loop(&p,true).first==0);
+      }
+     p.bindings.buffers.resize(1);p.bindings.writes.assign(2,{vk::DescriptorType::eSampledImage,1,nullptr});p.descriptor_actions.resize(2);
+     p.bindings.writes[0].descriptorType=vk::DescriptorType::eStorageBuffer;p.cpu_proof.image_seal_mask={2,0};
+     Parallel counts;size_t visited=0;auto fast=owner.Loop(&p,true,&counts,true,&visited);assert(counts.image_tail_skips==1 && counts.image_tail_rows==1 && visited==0);
+     p.cpu_proof.image_seal_epoch=owner.sampler_cache_epoch.load();reason=0;assert(owner.Final(&p,&parallel,true,true,reason,fast.first));
+     ++owner.sampler_cache_epoch;reason=0;assert(!owner.Final(&p,&parallel,true,true,reason,fast.first) && reason==10);--owner.sampler_cache_epoch;
+     p.cpu_proof.image_seal_mask={0,0};visited=0;owner.Loop(&p,true,&counts,true,&visited);assert(counts.image_tail_skips==1 && visited==1);
+     p.cpu_proof.image_seal_mask={2,0};p.bindings.writes[1].descriptorCount=0;visited=0;owner.Loop(&p,true,&counts,true,&visited);assert(counts.image_tail_skips==1 && visited==1);
+     p.bindings.writes[1].descriptorCount=1;visited=0;owner.Loop(&p,false,&counts,true,&visited);assert(visited==2);visited=0;owner.Loop(&p,true,&counts,false,&visited);assert(counts.image_tail_skips==1 && visited==1);
+     p.bindings.buffers.resize(4);p.bindings.writes.resize(4);p.descriptor_actions.resize(4);p.cpu_proof.image_seal_mask={};
+    }
     regs.clipper_control.user_clip_plane_enable=true;assert(!owner.Recorder(&p,&parallel,regs,stream));regs.clipper_control.user_clip_plane_enable=false;
     direct.l1++;assert(!owner.Recorder(&p,&parallel,regs,stream));direct.l1--;
     backing.mapped=false;assert(!owner.Recorder(&p,&parallel,regs,stream));backing.mapped=true;

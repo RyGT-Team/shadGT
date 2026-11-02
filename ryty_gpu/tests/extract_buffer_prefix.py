@@ -12,7 +12,7 @@ end = source.index("                if(known_structure)++parallel->producer_stru
 start = source.index("                if(descriptor_safe && (image_batch_infos || buffer_prefix)) {")
 end = source.index("                parallel->producer_upload_lookup_hits", start)
 (out / "buffer-prefix-end.inc").write_text(source[start:end], encoding="utf-8")
-loop = source.index("std::size_t action_index=buffer_prefix?b.buffers.size():0")
+loop = source.index("                bool image_tail_sealed=false;")
 loop_end = source.index("                    if(!known_structure && (write.pNext", loop)
 (out / "buffer-prefix-loop.inc").write_text(source[loop:loop_end], encoding="utf-8")
 assert "std::span{b.writes.data(),b.writes.size()}.subspan(action_index)" in source[loop:end]

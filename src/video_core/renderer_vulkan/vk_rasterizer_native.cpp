@@ -288,6 +288,7 @@ struct ParallelRuntime {
     u64 epoch{};
     std::array<u64,11> descriptor_fail_reasons{};u32 descriptor_samples{};u64 descriptor_readonly_attempts{},descriptor_readonly_regions{},descriptor_readonly_imports{},descriptor_readonly_uncontained{},descriptor_readonly_unmatched{},descriptor_clip_nulls{},readonly_range_hint_hits{},readonly_range_hint_misses{},readonly_region_hint_hits{},readonly_region_hint_misses{};
     u64 image_batch_draws{},image_batch_infos{},image_batch_fallbacks{},image_batch_invalidations{};
+    u64 image_tail_skips{},image_tail_rows{};
     u64 buffer_prefix_attempts{},buffer_prefix_accepts{},buffer_prefix_fallbacks{},buffer_prefix_coherence_misses{},buffer_prefix_invalidations{};
     // Readonly attempt failures, not draw failures: another descriptor proof may succeed.
     std::array<u64,7> readonly_guard_failures{};
@@ -5507,7 +5508,25 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 if(known_stage_schema)++parallel->producer_stage_schema_hits;
                 struct DrawTableCache {const std::byte* data{};std::size_t size{};const void* owner{};u64 l1{},zero{};};
                 std::array<DrawTableCache,Shader::MaxStageTypes-1> table_cache{};
+                bool image_tail_sealed=false;
+                if(buffer_prefix && image_batch && b.writes.size()<=128 && b.buffers.size()<b.writes.size()) {
+                    const auto prefix=b.buffers.size(), end=b.writes.size();
+                    const auto low_mask=[](size_t n) {return n==64 ? ~u64{0} : (u64{1}<<n)-1;};
+                    image_tail_sealed=true;
+                    for(size_t word=prefix/64;word<=(end-1)/64;++word) {
+                        const auto first=word==prefix/64 ? prefix%64 : 0;
+                        const auto last=word==(end-1)/64 ? (end-1)%64+1 : 64;
+                        const u64 required=low_mask(last) & ~low_mask(first);
+                        if((worker_result->image_seal_mask[word]&required)!=required) {image_tail_sealed=false;break;}
+                    }
+                    if(image_tail_sealed) {
+                        for(size_t i=prefix;i<end;++i)image_batch_infos+=b.writes[i].descriptorCount;
+                        image_tail_sealed=image_batch_infos!=0;
+                        if(image_tail_sealed) {++parallel->image_tail_skips;parallel->image_tail_rows+=end-prefix;}
+                    }
+                }
                 std::size_t action_index=buffer_prefix?b.buffers.size():0, action_upload_lookups=0;
+                if(!image_tail_sealed)
                 for(const auto& write:std::span{b.writes.data(),b.writes.size()}.subspan(action_index)) {
                     const auto* action=known_actions ? &prepared->descriptor_actions[action_index] : nullptr;
                     ++action_index;
@@ -9992,6 +10011,8 @@ void NativeRenderer::Report() {
         }
         LOG_INFO(Render_Vulkan,"PARALLEL-BUFFER-PREFIX attempts={} accepted={} fallback={} coherence_miss={} invalidations={}",sidecar->buffer_prefix_attempts,sidecar->buffer_prefix_accepts,sidecar->buffer_prefix_fallbacks,sidecar->buffer_prefix_coherence_misses,sidecar->buffer_prefix_invalidations);
         sidecar->buffer_prefix_attempts=sidecar->buffer_prefix_accepts=sidecar->buffer_prefix_fallbacks=sidecar->buffer_prefix_coherence_misses=sidecar->buffer_prefix_invalidations=0;
+        if(sidecar->image_tail_skips)LOG_INFO(Render_Vulkan,"PARALLEL-IMAGE-TAIL skips={} rows={}",sidecar->image_tail_skips,sidecar->image_tail_rows);
+        sidecar->image_tail_skips=sidecar->image_tail_rows=0;
         LOG_INFO(Render_Vulkan,"PARALLEL-IMAGE-BATCH draws={} infos={} fallbacks={} invalidations={}",sidecar->image_batch_draws,sidecar->image_batch_infos,sidecar->image_batch_fallbacks,sidecar->image_batch_invalidations);
         sidecar->image_batch_draws=sidecar->image_batch_infos=sidecar->image_batch_fallbacks=sidecar->image_batch_invalidations=0;
         {

@@ -36,9 +36,10 @@ struct Entries {
 struct Origin {size_t slot{};vk::Sampler handle{};};
 struct Proof {bool descriptor_structure{};std::array<u64,2> image_seal_mask{};u64 image_seal_epoch{};const void* image_seal_owner{};};
 struct Bindings {std::vector<vk::DescriptorImageInfo> images;std::vector<vk::Write> writes;Entries sampled;};
-struct Prepared {Proof cpu_proof;std::shared_ptr<Context> proof_context;bool sampler_origins_valid{true};u64 sampler_origins_epoch{1},proof_mode_state{1};Bindings bindings;std::vector<Origin> sampler_origins;std::vector<Native::Parallel::SampledViewProof<vk::ImageView>> sampled_view_proofs;};
-struct Parallel {std::shared_ptr<Context> prepared_proof_context;u64 image_batch_invalidations{},image_batch_draws{},image_batch_infos{};};
+struct Prepared {Proof cpu_proof;std::shared_ptr<Context> proof_context;bool sampler_origins_valid{true};u64 sampler_origins_epoch{1},proof_mode_state{1},unmap_gen{};Bindings bindings;std::vector<Origin> sampler_origins;std::vector<Native::Parallel::SampledViewProof<vk::ImageView>> sampled_view_proofs;};
+struct Parallel {std::shared_ptr<Context> prepared_proof_context;u64 image_batch_invalidations{},image_batch_draws{},image_batch_infos{},buffer_prefix_invalidations{};};
 struct Owner {
+    std::atomic<u64> unmap_generation{};struct {u64 Seq()const{return 0;}} buffer_log;
     vk::Sampler next_sampler{17};bool change_during_factory{};
     vk::Sampler SamplerFor(int,int,bool) {if(change_during_factory)++sampler_cache_epoch;return next_sampler;}
     void Capture(Prepared& p) {
@@ -57,7 +58,7 @@ struct Owner {
         return image_batch;
     }
     bool End(Prepared* prepared,Parallel* parallel,size_t image_batch_infos,bool descriptor_safe,u32& descriptor_fail_reason) {
-        auto* worker_result=&prepared->cpu_proof;
+        auto* worker_result=&prepared->cpu_proof;bool buffer_prefix=false,buffer_freshness_certified=true;u64 buffer_freshness_seq=0;
 #include "image-batch-end.inc"
         return descriptor_safe;
     }

@@ -53,6 +53,7 @@ struct Info;
 
 namespace VideoCore {
 class Sampler;
+class DirectMemory;
 }
 
 namespace Native {
@@ -552,6 +553,11 @@ private:
         };
         static_assert(sizeof(DescriptorAction)==16);
         std::vector<DescriptorAction> descriptor_actions;
+        // Factory-proven buffer prefix; any failed guard retains the original loop.
+        bool buffer_prefix_sealed{}, buffer_prefix_clip{};
+        const VideoCore::DirectMemory* buffer_prefix_direct{};
+        u64 buffer_prefix_l1{}, buffer_prefix_zero{};
+        boost::container::small_vector<std::pair<VAddr,VAddr>,4> buffer_prefix_ranges;
 
         std::array<u64, Shader::MaxStageTypes> stage_hashes{};
         u64 image_generation = 0;

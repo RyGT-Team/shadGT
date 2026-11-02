@@ -36,7 +36,7 @@ foreach(name IN ITEMS parallel_initial_mode parallel_readonly_hint parallel_desc
     add_test(NAME ${name} COMMAND ${name}_test)
 endforeach()
 
-foreach(name IN ITEMS parallel_sampled_proof_compact parallel_descriptor_action_layout)
+foreach(name IN ITEMS parallel_sampled_proof_compact parallel_descriptor_action_layout parallel_direct_covers_all)
     add_executable(${name}_test ${name}_test.cpp)
     target_compile_features(${name}_test PRIVATE cxx_std_23)
     target_include_directories(${name}_test PRIVATE
@@ -93,6 +93,20 @@ add_custom_command(
     DEPENDS extract_image_batch.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" "${SHADGT_ROOT}/ryty_gpu/native/descriptor_snapshot.h" VERBATIM)
 target_sources(parallel_image_batch_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/image-batch-producer.inc" "${CMAKE_CURRENT_BINARY_DIR}/image-batch-start.inc" "${CMAKE_CURRENT_BINARY_DIR}/image-batch-end.inc" "${CMAKE_CURRENT_BINARY_DIR}/image-batch-skip.inc" "${CMAKE_CURRENT_BINARY_DIR}/image-batch-inside.inc" "${CMAKE_CURRENT_BINARY_DIR}/image-batch-factory.inc")
 add_test(NAME parallel_image_batch COMMAND parallel_image_batch_test)
+add_executable(parallel_buffer_prefix_test parallel_buffer_prefix_test.cpp)
+target_compile_features(parallel_buffer_prefix_test PRIVATE cxx_std_23)
+target_include_directories(parallel_buffer_prefix_test PRIVATE "${SHADGT_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(parallel_buffer_prefix_test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(parallel_buffer_prefix_test PRIVATE -UNDEBUG)
+endif()
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-producer.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-recorder.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-end.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-loop.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-image-skip.inc"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_buffer_prefix.py" "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" "${CMAKE_CURRENT_BINARY_DIR}"
+    DEPENDS extract_buffer_prefix.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" VERBATIM)
+target_sources(parallel_buffer_prefix_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-producer.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-recorder.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-end.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-loop.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-image-skip.inc")
+add_test(NAME parallel_buffer_prefix COMMAND parallel_buffer_prefix_test)
 add_executable(parallel_freshness_certificate_test parallel_freshness_certificate_test.cpp)
 target_compile_features(parallel_freshness_certificate_test PRIVATE cxx_std_23)
 target_include_directories(parallel_freshness_certificate_test PRIVATE "${SHADGT_ROOT}/src" "${CMAKE_CURRENT_BINARY_DIR}")

@@ -2,6 +2,8 @@
 #include <array>
 #include <cstdint>
 #include <mutex>
+#include <span>
+#include <utility>
 
 namespace Native::Parallel {
 // Opt-in observation only; import selection and teardown remain unchanged.
@@ -70,9 +72,10 @@ public:
     void Remove(const void* key,std::uint64_t begin,std::uint64_t end) noexcept {
         std::scoped_lock l(mutex_);for(auto& v:views_)if(v.owner==key && v.begin<end && begin<v.end)v={};Compact();
     }
-    bool Covers(const void* key,std::uint64_t begin,std::uint64_t size) const noexcept {
+private:
+    bool CoversLocked(const void* key,std::uint64_t begin,std::uint64_t size) const noexcept {
         if(!size || begin>UINT64_MAX-size)return false;
-        std::unique_lock l(mutex_,std::try_to_lock);if(!l.owns_lock())return false;const Owner* o=nullptr;for(const auto& x:owners_)if(x.key==key){o=&x;break;}
+        const Owner* o=nullptr;for(const auto& x:owners_)if(x.key==key){o=&x;break;}
         if(!o || !o->tables || o->poisoned)return false;
         const auto end=begin+size;auto cursor=begin;const auto owner=Key(key);
         while(cursor<end){
@@ -83,6 +86,18 @@ public:
             if(v.owner!=key || prefix_end_[pos]<=cursor)return false;
             cursor=prefix_end_[pos];
         }
+        return true;
+    }
+public:
+    bool Covers(const void* key,std::uint64_t begin,std::uint64_t size) const noexcept {
+        if(!size || begin>UINT64_MAX-size)return false;
+        std::unique_lock l(mutex_,std::try_to_lock);return l.owns_lock() && CoversLocked(key,begin,size);
+    }
+    // Empty input is the conjunction of zero checks; nonempty input takes one try-lock.
+    bool CoversAll(const void* key,std::span<const std::pair<std::uint64_t,std::uint64_t>> ranges) const noexcept {
+        if(ranges.empty())return true;
+        std::unique_lock l(mutex_,std::try_to_lock);if(!l.owns_lock())return false;
+        for(const auto& [begin,end]:ranges)if(end<=begin || !CoversLocked(key,begin,end-begin))return false;
         return true;
     }
 };

@@ -288,6 +288,7 @@ struct ParallelRuntime {
     u64 epoch{};
     std::array<u64,11> descriptor_fail_reasons{};u32 descriptor_samples{};u64 descriptor_readonly_attempts{},descriptor_readonly_regions{},descriptor_readonly_imports{},descriptor_readonly_uncontained{},descriptor_readonly_unmatched{},descriptor_clip_nulls{},readonly_range_hint_hits{},readonly_range_hint_misses{},readonly_region_hint_hits{},readonly_region_hint_misses{};
     u64 image_batch_draws{},image_batch_infos{},image_batch_fallbacks{},image_batch_invalidations{};
+    u64 buffer_prefix_attempts{},buffer_prefix_accepts{},buffer_prefix_fallbacks{},buffer_prefix_coherence_misses{},buffer_prefix_invalidations{};
     // Readonly attempt failures, not draw failures: another descriptor proof may succeed.
     std::array<u64,7> readonly_guard_failures{};
     std::array<u64,9> readonly_special_kinds{};
@@ -5468,13 +5469,46 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                     if((stage && !stage->identity) || (stage ? stage->identity : 0)!=schema.identity ||
                        (stage ? stage->buffers.size() : 0)!=schema.count){known_stage_schema=false;break;}
                 }
+                bool buffer_prefix=false;
+                if(prepared && from_prepared) {
+                    ++parallel->buffer_prefix_attempts;
+                    if(prepared->buffer_prefix_sealed) {
+                        const auto prefix=b.buffers.size();
+                        buffer_prefix=trusted && known_structure && known_actions && known_stage_schema && prefix<=128 && prefix<=b.writes.size() &&
+                            prepared->proof_context && prepared->proof_context==parallel->prepared_proof_context &&
+                            prepared->proof_context->Valid(prepared->proof_mode_state) &&
+                            prepared->unmap_gen==unmap_generation.load(std::memory_order_acquire) &&
+                            buffer_freshness_certified && buffer_log.Seq()==buffer_freshness_seq &&
+                            (!prepared->buffer_prefix_clip || (ParallelReadonlyDescriptorEnabled() && !regs.clipper_control.user_clip_plane_enable));
+                        if(buffer_prefix && prepared->buffer_prefix_direct) {
+                            const auto* direct=r.buffer_cache.GetDirectMemory();
+                            buffer_prefix=direct==prepared->buffer_prefix_direct && direct && r.instance.GetDevice() &&
+                                direct->L1Address()==prepared->buffer_prefix_l1 && direct->ZeroPageAddress()==prepared->buffer_prefix_zero;
+                            if(buffer_prefix && !prepared->buffer_prefix_ranges.empty() &&
+                               !VideoCore::ParallelDirectViewsCoherent(direct,std::span{prepared->buffer_prefix_ranges.data(),prepared->buffer_prefix_ranges.size()})) {
+                                ++parallel->buffer_prefix_coherence_misses;buffer_prefix=false;
+                            }
+                        }
+                        if(buffer_prefix)for(const auto& upload:prepared->uploads) {
+                            if(upload.info>=prefix) {buffer_prefix=false;break;}
+                            const auto& info=b.buffers[upload.info];
+                            if(info.range!=upload.size || !info.range || info.range==VK_WHOLE_SIZE ||
+                               !std::ranges::any_of(s.chunks,[&](const auto& chunk) {
+                                   if(!chunk.buffer || !chunk.buffer->Mapped() ||
+                                      vk::Buffer{Handle<VkBuffer_T>(chunk.buffer->NativeHandle())}!=info.buffer)return false;
+                                   const u64 size=chunk.buffer->Size();return info.offset<=size && info.range<=size-info.offset;
+                               })) {buffer_prefix=false;break;}
+                        }
+                    }
+                    if(buffer_prefix)++parallel->buffer_prefix_accepts;else ++parallel->buffer_prefix_fallbacks;
+                }
                 if(known_structure)++parallel->producer_structure_hits;
                 if(known_actions)++parallel->producer_action_hits;
                 if(known_stage_schema)++parallel->producer_stage_schema_hits;
                 struct DrawTableCache {const std::byte* data{};std::size_t size{};const void* owner{};u64 l1{},zero{};};
                 std::array<DrawTableCache,Shader::MaxStageTypes-1> table_cache{};
-                std::size_t action_index=0, action_upload_lookups=0;
-                for(const auto& write:b.writes) {
+                std::size_t action_index=buffer_prefix?b.buffers.size():0, action_upload_lookups=0;
+                for(const auto& write:std::span{b.writes.data(),b.writes.size()}.subspan(action_index)) {
                     const auto* action=known_actions ? &prepared->descriptor_actions[action_index] : nullptr;
                     ++action_index;
                     if(!known_structure && (write.pNext || write.pTexelBufferView)){descriptor_fail_reason=1;descriptor_safe=false;break;}
@@ -5840,11 +5874,17 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                     }
                     if(!descriptor_safe)break;
                 }
-                if(descriptor_safe && image_batch_infos) {
-                    if(!prepared->proof_context->Valid(prepared->proof_mode_state) ||
-                       sampler_cache_epoch.load(std::memory_order_acquire)!=worker_result->image_seal_epoch) {
-                        descriptor_fail_reason=10;descriptor_safe=false;++parallel->image_batch_invalidations;
-                    } else {++parallel->image_batch_draws;parallel->image_batch_infos+=image_batch_infos;}
+                if(descriptor_safe && (image_batch_infos || buffer_prefix)) {
+                    const bool context_valid=prepared->proof_context->Valid(prepared->proof_mode_state);
+                    const bool image_valid=!image_batch_infos || sampler_cache_epoch.load(std::memory_order_acquire)==worker_result->image_seal_epoch;
+                    const bool buffer_valid=!buffer_prefix ||
+                        (prepared->unmap_gen==unmap_generation.load(std::memory_order_acquire) &&
+                         buffer_freshness_certified && buffer_log.Seq()==buffer_freshness_seq);
+                    if(!context_valid || !image_valid || !buffer_valid) {
+                        descriptor_fail_reason=10;descriptor_safe=false;
+                        if(image_batch_infos && (!context_valid || !image_valid))++parallel->image_batch_invalidations;
+                        if(buffer_prefix && (!context_valid || !buffer_valid))++parallel->buffer_prefix_invalidations;
+                    } else if(image_batch_infos) {++parallel->image_batch_draws;parallel->image_batch_infos+=image_batch_infos;}
                 }
                 parallel->producer_upload_lookup_hits+=action_upload_lookups;
                 if(sample_view) {
@@ -6329,6 +6369,8 @@ void NativeRenderer::PreparedDraw::Reset() {
     if(AheadRequested())ahead_descriptor_lease.store({},std::memory_order_release);
     cpu_proof = {};
     descriptor_actions.clear(); // retain capacity for the next prepared draw
+    buffer_prefix_sealed=false;buffer_prefix_clip=false;buffer_prefix_direct=nullptr;
+    buffer_prefix_l1=buffer_prefix_zero=0;buffer_prefix_ranges.clear();
     sampled_view_proofs.clear();
     sampler_origins.clear();sampler_origins_epoch=0;sampler_origins_valid=true;
     proof_context.reset();proof_mode_state=0;
@@ -6726,6 +6768,76 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
             } else context->capacity.fetch_add(1,std::memory_order_relaxed);
         } catch(...) {context->failures.fetch_add(1,std::memory_order_relaxed);}
     }
+    // Seal only a complete factory-built buffer prefix. Dynamic ownership is
+    // rechecked by the recorder; unsupported or ambiguous rows retain the old loop.
+    if(p->cpu_proof.descriptor_structure && p->proof_context &&
+       p->proof_context->Valid(p->proof_mode_state) &&
+       p->bindings.buffers.size()<=128 && p->bindings.buffers.size()<=p->bindings.writes.size() &&
+       p->descriptor_actions.size()==p->bindings.writes.size()) try {
+        const auto& b=p->bindings;const auto prefix=b.buffers.size();bool safe=prefix!=0;
+        // Buffer metadata is published with the canonical stage identity; the
+        // recorder still evaluates its live stage eligibility independently.
+        const auto& canonical=pipeline.CanonicalStages();
+        for(size_t si=0;safe && si<p->cpu_proof.stages.size();++si) {
+            const auto* stage=si<stages.size()?stages[si]:nullptr;
+            const auto* original=si<canonical.size()?canonical[si]:nullptr;
+            if(bool(stage)!=bool(original) || (stage && (!stage->identity || stage->identity!=original->identity ||
+               stage->buffers.size()!=original->buffers.size())))safe=false;
+        }
+        bool clip=false;const VideoCore::DirectMemory* owner=nullptr;u64 l1=0,zero=0;
+        std::array<bool,128> uploads{};
+        for(const auto& upload:p->uploads) {
+            if(upload.info>=prefix || uploads[upload.info]) {safe=false;break;}
+            uploads[upload.info]=true;
+        }
+        static const bool absent_enabled=[] {const char* q=std::getenv("RYGT_PARALLEL_ABSENT_GUEST");return q && q[0]=='1' && !q[1];}();
+        for(size_t i=0;safe && i<prefix;++i) {
+            const auto& w=b.writes[i];const auto& a=p->descriptor_actions[i];const auto& info=b.buffers[i];
+            if(w.descriptorType!=vk::DescriptorType::eStorageBuffer || w.descriptorCount!=1 ||
+               w.pBufferInfo!=&info || !a.is_buffer || a.buffer_first!=i || a.upload_match==2) {safe=false;break;}
+            if(a.upload_match==1) {
+                if(!uploads[i] || a.upload_size!=info.range || !info.range || info.range==VK_WHOLE_SIZE) safe=false;
+                continue;
+            }
+            if(uploads[i] || a.stage_index>=stages.size() || !stages[a.stage_index] ||
+               a.stage_local>=stages[a.stage_index]->buffers.size()) {safe=false;break;}
+            const auto& stage=*stages[a.stage_index];const auto& desc=stage.buffers[a.stage_local];
+            if(ParallelReadonlyDescriptorEnabled() && !info.buffer && !info.offset && info.range==VK_WHOLE_SIZE &&
+               !regs.clipper_control.user_clip_plane_enable && desc.buffer_type==Shader::BufferType::ClipPlanes && !desc.is_written) {
+                clip=true;continue;
+            }
+            if(info.buffer || info.offset || info.range!=VK_WHOLE_SIZE || !stage.identity || !stage.uses_direct ||
+               !desc.IsDirectEligible()) {safe=false;break;}
+            auto* direct=r.buffer_cache.GetDirectMemory();const auto& schema=p->cpu_proof.stages[a.stage_index];
+            if(!direct || (owner && owner!=direct) || schema.table_local>=stage.buffers.size() ||
+               schema.table_upload>=p->uploads.size() || stage.buffers[schema.table_local].buffer_type!=Shader::BufferType::DirectTable ||
+               i<a.stage_local || i-a.stage_local>SIZE_MAX-schema.table_local ||
+               p->uploads[schema.table_upload].info!=i-a.stage_local+schema.table_local ||
+               stage.buffers.size()>(SIZE_MAX-16)/16) {safe=false;break;}
+            const auto expected=16+stage.buffers.size()*16;const auto& upload=p->uploads[schema.table_upload];
+            if(upload.flat_stage>=0 || upload.size!=expected || upload.offset>p->upload_bytes.size() ||
+               expected>p->upload_bytes.size()-upload.offset) {safe=false;break;}
+            const auto* data=reinterpret_cast<const std::byte*>(p->upload_bytes.data()+upload.offset);
+            u32 header[4]{},words[4]{};std::memcpy(header,data,sizeof(header));std::memcpy(words,data+16+size_t(a.stage_local)*16,sizeof(words));
+            const u64 dl1=direct->L1Address(),dzero=direct->ZeroPageAddress();
+            if((u64(header[0])|(u64(header[1])<<32))!=dl1 || (u64(header[2])|(u64(header[3])<<32))!=dzero ||
+               (owner && (l1!=dl1 || zero!=dzero))) {safe=false;break;}
+            owner=direct;l1=dl1;zero=dzero;const auto bytes=std::span<const std::byte>{data,expected};
+            if(words[3]==0) {
+                const auto sharp=desc.GetSharp(stage);
+                if(!absent_enabled || !Native::Parallel::IsPreparedAbsentDirectSlot(bytes,stage.buffers.size(),a.stage_local,
+                    desc.IsDirectEligible(),bool(r.instance.GetDevice()),true,info.offset,info.range,sharp.base_address,sharp.GetSize()))safe=false;
+            } else if(Native::Parallel::IsPreparedDirectSlot(bytes,stage.buffers.size(),a.stage_local,true,true,info.offset,info.range)) {
+                const u64 begin=u64(words[0])|(u64(words[1])<<32);
+                if(words[2]>UINT64_MAX-begin || p->buffer_prefix_ranges.size()>=128) {safe=false;break;}
+                p->buffer_prefix_ranges.emplace_back(begin,begin+words[2]);
+            } else safe=false;
+        }
+        if(safe && p->proof_context->Valid(p->proof_mode_state)) {
+            p->buffer_prefix_sealed=true;p->buffer_prefix_clip=clip;p->buffer_prefix_direct=owner;
+            p->buffer_prefix_l1=l1;p->buffer_prefix_zero=zero;
+        } else p->buffer_prefix_ranges.clear();
+    } catch(const std::bad_alloc&) {p->buffer_prefix_ranges.clear();}
     // Seal each complete image/sampler row independently. Unproved rows keep
     // the original recorder path, including canonical null image proofs.
     if(p->cpu_proof.descriptor_structure && p->proof_context && p->sampler_origins_valid &&
@@ -9878,6 +9990,8 @@ void NativeRenderer::Report() {
                 f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7],f[8],f[9],f[10],sidecar->descriptor_samples);
             sidecar->descriptor_fail_reasons={};sidecar->descriptor_samples=0;
         }
+        LOG_INFO(Render_Vulkan,"PARALLEL-BUFFER-PREFIX attempts={} accepted={} fallback={} coherence_miss={} invalidations={}",sidecar->buffer_prefix_attempts,sidecar->buffer_prefix_accepts,sidecar->buffer_prefix_fallbacks,sidecar->buffer_prefix_coherence_misses,sidecar->buffer_prefix_invalidations);
+        sidecar->buffer_prefix_attempts=sidecar->buffer_prefix_accepts=sidecar->buffer_prefix_fallbacks=sidecar->buffer_prefix_coherence_misses=sidecar->buffer_prefix_invalidations=0;
         LOG_INFO(Render_Vulkan,"PARALLEL-IMAGE-BATCH draws={} infos={} fallbacks={} invalidations={}",sidecar->image_batch_draws,sidecar->image_batch_infos,sidecar->image_batch_fallbacks,sidecar->image_batch_invalidations);
         sidecar->image_batch_draws=sidecar->image_batch_infos=sidecar->image_batch_fallbacks=sidecar->image_batch_invalidations=0;
         {

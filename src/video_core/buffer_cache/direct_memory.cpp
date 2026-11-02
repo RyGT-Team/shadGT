@@ -78,6 +78,10 @@ struct PendingRelease {
 
 } // namespace
 
+bool ParallelDirectViewsCoherent(const DirectMemory* owner, std::span<const std::pair<std::uint64_t,std::uint64_t>> ranges) noexcept {
+    return ranges.empty() || (TrackParallelDirect() && direct_coherence.CoversAll(owner,ranges));
+}
+
 bool ParallelDirectViewCoherent(const DirectMemory* owner, std::uint64_t base, std::uint64_t size) noexcept {
     return TrackParallelDirect() && direct_coherence.Covers(owner,base,size);
 }

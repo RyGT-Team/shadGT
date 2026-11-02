@@ -5302,9 +5302,6 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             const Region* vertex_region_hint=nullptr;
             const Mirror* vertex_mirror_hint=nullptr;
             vk::Buffer vertex_handle_hint{};
-            // Indices are draw-local hints into the current prepared owner vectors.
-            // Every lookup repeats the live handle and capacity checks.
-            size_t vertex_region_index=SIZE_MAX,vertex_mirror_index=SIZE_MAX;
             // Direct vertex ranges are appended in binding order by PrepareVertices.
             // This is only a scan hint; every candidate still gets a live proof.
             std::size_t vertex_direct_hint=0;
@@ -5320,15 +5317,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                     owned=matches(vertex_region_hint) || matches(vertex_mirror_hint);
                 if(!owned) {
                     vertex_region_hint=nullptr;vertex_mirror_hint=nullptr;vertex_handle_hint=vk::Buffer{};
-                    if(vertex_region_index<prepared->regions.size() && matches(prepared->regions[vertex_region_index].region)) {
-                        owned=true;vertex_region_hint=prepared->regions[vertex_region_index].region;
-                    } else if(vertex_mirror_index<prepared->mirrors.size() && matches(prepared->mirrors[vertex_mirror_index])) {
-                        owned=true;vertex_mirror_hint=prepared->mirrors[vertex_mirror_index];
-                    }
-                    if(!owned) {
-                        for(size_t n=0;n<prepared->regions.size();++n)if(matches(prepared->regions[n].region)) {owned=true;vertex_region_index=n;vertex_region_hint=prepared->regions[n].region;break;}
-                        if(!owned)for(size_t n=0;n<prepared->mirrors.size();++n)if(matches(prepared->mirrors[n])) {owned=true;vertex_mirror_index=n;vertex_mirror_hint=prepared->mirrors[n];break;}
-                    }
+                    for(const auto& region:prepared->regions) if(matches(region.region)){owned=true;vertex_region_hint=region.region;break;}
+                    if(!owned)for(const auto* mirror:prepared->mirrors)if(matches(mirror)){owned=true;vertex_mirror_hint=mirror;break;}
                     if(owned)vertex_handle_hint=handle;
                 }
                 if(!owned && handle && size && ParallelDirectVertexEnabled() && ParallelD2Enabled() &&
@@ -5370,21 +5360,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             if(vertex_safe)++parallel->vertex_backing_pass;
         }
         whole_phases.Next(2);
-        const auto current_stages=pipeline->GetStages();
-        const bool known_structure=worker_identity && worker_result->descriptor_structure;
-        const bool known_actions=known_structure && prepared->descriptor_actions.size()==b.writes.size();
-        bool known_stage_schema=known_actions;
         bool stages_safe=true,resource_key_known=true;
-        // The same live stages determine eligibility and the producer schema.
-        // No safety flag is cached across draws.
-        for(size_t si=0;si<current_stages.size();++si) {
-            const auto* stage=current_stages[si];
-            if(known_stage_schema && si<worker_result->stages.size()) {
-                const auto& schema=worker_result->stages[si];
-                if((stage && !stage->identity) || (stage ? stage->identity : 0)!=schema.identity ||
-                   (stage ? stage->buffers.size() : 0)!=schema.count)known_stage_schema=false;
-            }
-            if(!stage)continue;
+        for(const auto* stage:pipeline->GetStages()) if(stage) {
             if(!stage->resource_usage_known) resource_key_known=false;
             if(!stage->fmasks.empty() || !stage->attribute_flags_known || !stage->resource_usage_known || stage->translation_failed ||
              (stage->sw_stage!=Shader::SwStage::Vertex && stage->sw_stage!=Shader::SwStage::Fragment) ||
@@ -5392,12 +5369,6 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
              (stage->uses_direct && !ParallelD2Enabled()) ||
              stage->has_storage_images || stage->uses_shader_clock ||
              std::ranges::any_of(stage->buffers,[](const auto& buffer){return buffer.is_written;})) stages_safe=false;
-        }
-        if(known_stage_schema && current_stages.size()<worker_result->stages.size()) {
-            for(size_t si=current_stages.size();si<worker_result->stages.size();++si) {
-                const auto& schema=worker_result->stages[si];
-                if(schema.identity || schema.count){known_stage_schema=false;break;}
-            }
         }
         if(!resource_key_known) ++parallel->unknown_resource_key;
         // Submission-window N protects only views actually tracked by the native
@@ -5499,6 +5470,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 Native::Parallel::ViewProofStats local_view_stats{};const bool gate_view=ParallelGateDiagEnabled();
                 Native::Parallel::PerDrawViewProof<vk::ImageView> view_proof{sample_view?&local_view_stats:(gate_view?&parallel->view_proof_stats:nullptr),wanted_view_filter};
                 const auto note_view_cardinality=[&](std::size_t n) {if(sample_view)++parallel->view_sample.cardinality[n==0?0:n==1?1:n==2?2:n<=4?3:n<=8?4:n<=16?5:n<=32?6:n<=64?7:n<=128?8:9];};
+                const bool known_structure=worker_identity && worker_result->descriptor_structure;
                 const bool image_batch=known_structure && (worker_result->image_seal_mask[0] || worker_result->image_seal_mask[1]) &&
                     worker_result->image_seal_owner==this && feedback.empty() && prepared->proof_context &&
                     prepared->proof_context==parallel->prepared_proof_context &&
@@ -5506,6 +5478,15 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                     sampler_cache_epoch.load(std::memory_order_acquire)==worker_result->image_seal_epoch;
                 if(!image_batch)++parallel->image_batch_fallbacks;
                 size_t image_batch_infos=0;
+                const bool known_actions=known_structure && prepared->descriptor_actions.size()==b.writes.size();
+                const auto current_stages=pipeline->GetStages();
+                bool known_stage_schema=known_actions;
+                if(known_stage_schema)for(size_t si=0;si<worker_result->stages.size();++si) {
+                    const auto* stage=si<current_stages.size()?current_stages[si]:nullptr;
+                    const auto& schema=worker_result->stages[si];
+                    if((stage && !stage->identity) || (stage ? stage->identity : 0)!=schema.identity ||
+                       (stage ? stage->buffers.size() : 0)!=schema.count){known_stage_schema=false;break;}
+                }
                 bool buffer_prefix=false;
                 if(prepared && from_prepared) {
                     ++parallel->buffer_prefix_attempts;
@@ -5526,25 +5507,15 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                 ++parallel->buffer_prefix_coherence_misses;buffer_prefix=false;
                             }
                         }
-                        // A draw-local index is only a hint. Every use rechecks the current
-                        // chunk's handle, mapping and capacity; misses retain the full scan.
-                        size_t upload_owner_hint=SIZE_MAX;
                         if(buffer_prefix)for(const auto& upload:prepared->uploads) {
                             if(upload.info>=prefix) {buffer_prefix=false;break;}
                             const auto& info=b.buffers[upload.info];
-                            if(info.range!=upload.size || !info.range || info.range==VK_WHOLE_SIZE) {buffer_prefix=false;break;}
-                            const auto matches_chunk=[&](const auto& chunk) {
-                                if(!chunk.buffer || !chunk.buffer->Mapped() ||
-                                   vk::Buffer{Handle<VkBuffer_T>(chunk.buffer->NativeHandle())}!=info.buffer)return false;
-                                const u64 size=chunk.buffer->Size();return info.offset<=size && info.range<=size-info.offset;
-                            };
-                            bool found=upload_owner_hint<s.chunks.size() && matches_chunk(s.chunks[upload_owner_hint]);
-                            if(!found) {
-                                const auto it=std::ranges::find_if(s.chunks,matches_chunk);
-                                found=it!=s.chunks.end();
-                                upload_owner_hint=found?static_cast<size_t>(it-s.chunks.begin()):SIZE_MAX;
-                            }
-                            if(!found) {buffer_prefix=false;break;}
+                            if(info.range!=upload.size || !info.range || info.range==VK_WHOLE_SIZE ||
+                               !std::ranges::any_of(s.chunks,[&](const auto& chunk) {
+                                   if(!chunk.buffer || !chunk.buffer->Mapped() ||
+                                      vk::Buffer{Handle<VkBuffer_T>(chunk.buffer->NativeHandle())}!=info.buffer)return false;
+                                   const u64 size=chunk.buffer->Size();return info.offset<=size && info.range<=size-info.offset;
+                               })) {buffer_prefix=false;break;}
                         }
                     }
                     if(buffer_prefix)++parallel->buffer_prefix_accepts;else ++parallel->buffer_prefix_fallbacks;

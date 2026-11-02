@@ -136,22 +136,6 @@ int main() {
     owner.Produce(&p,pipeline,stages,regs);assert(p.buffer_prefix_sealed && p.buffer_prefix_clip && p.buffer_prefix_ranges.size()==1);
     p.bindings.buffers[3]={Handle<VkBuffer_T>(77),0,80};
     assert(owner.Recorder(&p,&parallel,regs,stream));u32 reason=0;assert(owner.Final(&p,&parallel,true,true,reason));
-    { // Upload owner hints revalidate live chunks and preserve the old any_of result.
-     Prepared q=p;q.buffer_prefix_clip=false;q.buffer_prefix_direct=nullptr;q.buffer_prefix_ranges.clear();
-     q.uploads={{0,0,8,-1},{1,0,8,-1}};q.bindings.buffers[0]={Handle<VkBuffer_T>(77),0,8};q.bindings.buffers[1]={Handle<VkBuffer_T>(77),16,8};
-     TestBuffer small{true,77,16},large{true,77,32},other{true,88,32};Stream choices{{{&small},{&large},{&other}}};
-     const auto old=[&] {for(const auto& upload:q.uploads) {
-      if(upload.info>=q.bindings.buffers.size())return false;const auto& info=q.bindings.buffers[upload.info];
-      if(info.range!=upload.size || !info.range || info.range==VK_WHOLE_SIZE || !std::ranges::any_of(choices.chunks,[&](const auto& chunk) {
-       if(!chunk.buffer || !chunk.buffer->Mapped() || Handle<VkBuffer_T>(chunk.buffer->NativeHandle())!=info.buffer)return false;
-       const u64 size=chunk.buffer->Size();return info.offset<=size && info.range<=size-info.offset;
-      }))return false;
-     }return true;};
-     const auto check=[&]{assert(owner.Recorder(&q,&parallel,regs,choices)==old());};
-     check();small.mapped=false;check();large.bytes=20;check();large.bytes=32;std::swap(choices.chunks[0],choices.chunks[2]);check();
-     q.bindings.buffers[1].offset=UINT64_MAX;check();q.bindings.buffers[1].offset=16;q.bindings.buffers[1].buffer=Handle<VkBuffer_T>(88);check();
-     q.bindings.buffers[0].range=0;check();q.bindings.buffers[0].range=8;choices.chunks.clear();check();
-    }
     const auto table=std::span<const std::byte>{reinterpret_cast<const std::byte*>(p.upload_bytes.data()),p.upload_bytes.size()};
     const auto absent=stage.buffers[1].GetSharp(stage);
     assert(Native::Parallel::IsPreparedDirectSlot(table,4,0,true,true,0,VK_WHOLE_SIZE));

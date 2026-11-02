@@ -231,20 +231,3 @@ else()
 endif()
 add_test(NAME frame_queue_trace_disabled COMMAND frame_queue_trace_runtime_test disabled)
 add_test(NAME frame_queue_trace_runtime COMMAND frame_queue_trace_runtime_test)
-
-add_executable(parallel_stage_schema_gate_test parallel_stage_schema_gate_test.cpp)
-target_compile_features(parallel_stage_schema_gate_test PRIVATE cxx_std_23)
-target_include_directories(parallel_stage_schema_gate_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
-if(MSVC)
-    target_compile_options(parallel_stage_schema_gate_test PRIVATE /UNDEBUG)
-else()
-    target_compile_options(parallel_stage_schema_gate_test PRIVATE -UNDEBUG)
-endif()
-add_custom_command(
-    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/stage-schema-gate-under-test.inc"
-    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_stage_schema_gate.py"
-        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
-        "${CMAKE_CURRENT_BINARY_DIR}/stage-schema-gate-under-test.inc"
-    DEPENDS extract_stage_schema_gate.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" VERBATIM)
-target_sources(parallel_stage_schema_gate_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/stage-schema-gate-under-test.inc")
-add_test(NAME parallel_stage_schema_gate COMMAND parallel_stage_schema_gate_test)

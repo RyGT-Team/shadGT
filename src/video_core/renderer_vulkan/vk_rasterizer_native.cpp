@@ -286,7 +286,8 @@ struct ParallelRuntime {
     std::vector<Native::Parallel::Draw> scratch_draws;
     std::shared_ptr<const void> lease;
     u64 epoch{};
-    std::array<u64,10> descriptor_fail_reasons{};u32 descriptor_samples{};u64 descriptor_readonly_attempts{},descriptor_readonly_regions{},descriptor_readonly_imports{},descriptor_readonly_uncontained{},descriptor_readonly_unmatched{},descriptor_clip_nulls{},readonly_range_hint_hits{},readonly_range_hint_misses{},readonly_region_hint_hits{},readonly_region_hint_misses{};
+    std::array<u64,11> descriptor_fail_reasons{};u32 descriptor_samples{};u64 descriptor_readonly_attempts{},descriptor_readonly_regions{},descriptor_readonly_imports{},descriptor_readonly_uncontained{},descriptor_readonly_unmatched{},descriptor_clip_nulls{},readonly_range_hint_hits{},readonly_range_hint_misses{},readonly_region_hint_hits{},readonly_region_hint_misses{};
+    u64 image_batch_draws{},image_batch_infos{},image_batch_fallbacks{},image_batch_invalidations{};
     // Readonly attempt failures, not draw failures: another descriptor proof may succeed.
     std::array<u64,7> readonly_guard_failures{};
     std::array<u64,9> readonly_special_kinds{};
@@ -5451,6 +5452,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 Native::Parallel::PerDrawViewProof<vk::ImageView> view_proof{sample_view?&local_view_stats:(gate_view?&parallel->view_proof_stats:nullptr),wanted_view_filter};
                 const auto note_view_cardinality=[&](std::size_t n) {if(sample_view)++parallel->view_sample.cardinality[n==0?0:n==1?1:n==2?2:n<=4?3:n<=8?4:n<=16?5:n<=32?6:n<=64?7:n<=128?8:9];};
                 const bool known_structure=worker_identity && worker_result->descriptor_structure;
+                const bool image_batch=known_structure && worker_result->image_sealed && worker_result->image_seal_infos &&
+                    worker_result->image_seal_owner==this && feedback.empty() && prepared->proof_context &&
+                    prepared->proof_context==parallel->prepared_proof_context &&
+                    prepared->proof_context->Valid(prepared->proof_mode_state) &&
+                    sampler_cache_epoch.load(std::memory_order_acquire)==worker_result->image_seal_epoch;
+                if(!image_batch)++parallel->image_batch_fallbacks;
                 const bool known_actions=known_structure && prepared->descriptor_actions.size()==b.writes.size();
                 const auto current_stages=pipeline->GetStages();
                 bool known_stage_schema=known_actions;
@@ -5718,6 +5725,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                         if(!descriptor_safe)break;
                         continue;
                     }
+                    if(image_batch)continue;
                     if(!known_structure && (write.pBufferInfo || !DescriptorSnapshot::ImageSliceValid(write.pImageInfo,write.descriptorCount,image_infos) ||
                        (write.descriptorType!=vk::DescriptorType::eSampledImage && write.descriptorType!=vk::DescriptorType::eSampler))) {descriptor_fail_reason=4;descriptor_safe=false;break;}
                     for(u32 j=0;j<write.descriptorCount;++j) {
@@ -5828,6 +5836,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                         }
                     }
                     if(!descriptor_safe)break;
+                }
+                if(descriptor_safe && image_batch) {
+                    if(!prepared->proof_context->Valid(prepared->proof_mode_state) ||
+                       sampler_cache_epoch.load(std::memory_order_acquire)!=worker_result->image_seal_epoch) {
+                        descriptor_fail_reason=10;descriptor_safe=false;++parallel->image_batch_invalidations;
+                    } else {++parallel->image_batch_draws;parallel->image_batch_infos+=worker_result->image_seal_infos;}
                 }
                 parallel->producer_upload_lookup_hits+=action_upload_lookups;
                 if(sample_view) {
@@ -6313,6 +6327,7 @@ void NativeRenderer::PreparedDraw::Reset() {
     cpu_proof = {};
     descriptor_actions.clear(); // retain capacity for the next prepared draw
     sampled_view_proofs.clear();
+    sampler_origins.clear();sampler_origins_epoch=0;sampler_origins_valid=true;
     proof_context.reset();proof_mode_state=0;
     pipeline_keepalive.reset();
     stage_hashes = {};
@@ -6707,6 +6722,40 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
                 else if(reason!=AheadPools::Failure::Disabled)context->failures.fetch_add(1,std::memory_order_relaxed);
             } else context->capacity.fetch_add(1,std::memory_order_relaxed);
         } catch(...) {context->failures.fetch_add(1,std::memory_order_relaxed);}
+    }
+    // Seal only complete image/sampler rows built by this preparation. The
+    // recorder still checks the context and owner epoch before and after use.
+    if(p->cpu_proof.descriptor_structure && p->proof_context && p->sampler_origins_valid &&
+       p->proof_context->Valid(p->proof_mode_state)) {
+        const auto seal_epoch=sampler_cache_epoch.load(std::memory_order_acquire);
+        const auto& b=p->bindings;
+        const auto images=std::span<const vk::DescriptorImageInfo>{b.images.data(),b.images.size()};
+        bool sealed=true;size_t infos=0;
+        for(const auto& w:b.writes) {
+            if(w.descriptorType==vk::DescriptorType::eUniformBuffer || w.descriptorType==vk::DescriptorType::eStorageBuffer)continue;
+            if((w.descriptorType!=vk::DescriptorType::eSampledImage && w.descriptorType!=vk::DescriptorType::eSampler) ||
+               w.pNext || w.pTexelBufferView || w.pBufferInfo ||
+               !DescriptorSnapshot::ImageSliceValid(w.pImageInfo,w.descriptorCount,images) ||
+               w.descriptorCount>SIZE_MAX-infos){sealed=false;break;}
+            for(u32 j=0;j<w.descriptorCount;++j) {
+                const auto& info=w.pImageInfo[j];const auto slot=static_cast<size_t>(&info-b.images.data());
+                if(w.descriptorType==vk::DescriptorType::eSampler) {
+                    if(!info.sampler || info.imageView || p->sampler_origins_epoch!=seal_epoch || !std::ranges::any_of(p->sampler_origins,[&](const auto& origin) {
+                        return origin.slot==slot && origin.handle==info.sampler;
+                    })) {sealed=false;break;}
+                } else if(!info.imageView || info.sampler || info.imageLayout!=vk::ImageLayout::eGeneral ||
+                          !Native::Parallel::MatchSampledViewProof(p->sampled_view_proofs,slot,info.imageView,seal_epoch,b.sampled)) {
+                    sealed=false;break;
+                }
+            }
+            if(!sealed)break;
+            infos+=w.descriptorCount;
+        }
+        if(sealed && p->proof_context->Valid(p->proof_mode_state) &&
+           sampler_cache_epoch.load(std::memory_order_acquire)==seal_epoch) {
+            p->cpu_proof.image_sealed=true;p->cpu_proof.image_seal_epoch=seal_epoch;
+            p->cpu_proof.image_seal_owner=this;p->cpu_proof.image_seal_infos=infos;
+        }
     }
     // An off/on transition invalidates all tokens from the old mode generation.
     // A transition racing this check is also rejected by the recorder's Valid check.
@@ -7166,8 +7215,15 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
                                 regs.ta_bc_base.Address() == 0)) {
             ssharp = AmdGpu::Sampler{};
         }
-        b.images.push_back({SamplerFor(ssharp, regs.ta_bc_base, sampler.is_depth), VK_NULL_HANDLE,
-                            vk::ImageLayout::eGeneral});
+        const auto origin_epoch=p.proof_context ? sampler_cache_epoch.load(std::memory_order_acquire) : 0;
+        const auto sampler_handle=SamplerFor(ssharp, regs.ta_bc_base, sampler.is_depth);
+        if(p.proof_context) {
+            if(!sampler_handle || p.sampler_origins.size()==p.sampler_origins.capacity() ||
+               (!p.sampler_origins.empty() && p.sampler_origins_epoch!=origin_epoch) ||
+               sampler_cache_epoch.load(std::memory_order_acquire)!=origin_epoch) p.sampler_origins_valid=false;
+            else {p.sampler_origins_epoch=origin_epoch;p.sampler_origins.push_back({b.images.size(),sampler_handle});}
+        }
+        b.images.push_back({sampler_handle, VK_NULL_HANDLE, vk::ImageLayout::eGeneral});
         b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
         b.writes.push_back(vk::WriteDescriptorSet{
             .dstSet = VK_NULL_HANDLE,
@@ -9814,10 +9870,12 @@ void NativeRenderer::Report() {
         }
         {
             const auto& f=sidecar->descriptor_fail_reasons;
-            LOG_INFO(Render_Vulkan,"PARALLEL-DESCRIPTOR-FAIL preloop={} pnext={} buffer_slice={} buffer_unproved={} image_slice={} sampler_invalid={} sampler_unknown={} image_invalid={} image_unknown={} snapshot={} samples={}",
-                f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7],f[8],f[9],sidecar->descriptor_samples);
+            LOG_INFO(Render_Vulkan,"PARALLEL-DESCRIPTOR-FAIL preloop={} pnext={} buffer_slice={} buffer_unproved={} image_slice={} sampler_invalid={} sampler_unknown={} image_invalid={} image_unknown={} snapshot={} batch_invalidated={} samples={}",
+                f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7],f[8],f[9],f[10],sidecar->descriptor_samples);
             sidecar->descriptor_fail_reasons={};sidecar->descriptor_samples=0;
         }
+        LOG_INFO(Render_Vulkan,"PARALLEL-IMAGE-BATCH draws={} infos={} fallbacks={} invalidations={}",sidecar->image_batch_draws,sidecar->image_batch_infos,sidecar->image_batch_fallbacks,sidecar->image_batch_invalidations);
+        sidecar->image_batch_draws=sidecar->image_batch_infos=sidecar->image_batch_fallbacks=sidecar->image_batch_invalidations=0;
         {
             const auto& f=sidecar->readonly_guard_failures;
             const auto& k=sidecar->readonly_special_kinds;

@@ -532,6 +532,7 @@ private:
             const void* writes_data{}; size_t writes_size{}; const void* buffers_data{}; size_t buffers_size{}; const void* images_data{}; size_t images_size{};
             const void* vertex_identity{}; const void* vertex_buffers_data{}; size_t vertex_buffers_size{};
             bool descriptor_structure{},vertex_shape{},vertex_bindings{},vertex_pnext{};
+            bool image_sealed{}; u64 image_seal_epoch{}; const void* image_seal_owner{}; size_t image_seal_infos{};
             std::array<const void*, Shader::Backend::MaxDescriptorSets> group_data{};
             std::array<size_t, Shader::Backend::MaxDescriptorSets> group_sizes{};
             size_t ordinary_writes{}, ordinary_buffers{}, ordinary_images{};
@@ -604,6 +605,10 @@ private:
             std::vector<u32> flattened;
         };
         std::array<StageCopy, Shader::MaxStageTypes> stage_copies;
+        struct SamplerOrigin { size_t slot{}; vk::Sampler handle{}; };
+        boost::container::static_vector<SamplerOrigin,Shader::NUM_SAMPLERS*(Shader::MaxStageTypes-1)> sampler_origins;
+        u64 sampler_origins_epoch{};
+        bool sampler_origins_valid{true};
         void Reset();
     };
     /// OPT-010: the guest ranges whose region or mirror was made or dropped, by sequence number

@@ -29,6 +29,21 @@ static std::vector<bool> checked(Prepared* prepared, Vertex* vi) {
     return results;
 }
 
+static std::vector<bool> Reference(Prepared* prepared,Vertex* vi) {
+    std::vector<bool> results;
+    for(size_t i=0;i<vi->buffers.size();++i) {
+        const auto handle=vi->buffers[i];const auto offset=vi->offsets[i],size=vi->sizes[i];
+        const auto matches=[&](const auto* value) {
+            if(!value || !value->buffer || !handle || !size)return false;
+            if(Handle<VkBuffer_T>(value->buffer->NativeHandle())!=handle)return false;
+            const u64 capacity=value->buffer->Size();return offset<=capacity && size<=capacity-offset;
+        };
+        bool found=false;for(const auto& region:prepared->regions)if(matches(region.region)){found=true;break;}
+        if(!found)for(const auto* mirror:prepared->mirrors)if(matches(mirror)){found=true;break;}
+        results.push_back(found);
+    }
+    return results;
+}
 int main() {
     Region first{std::make_unique<Buffer>(Buffer{1, 16})};
     Region second{std::make_unique<Buffer>(Buffer{1, 32})};
@@ -44,6 +59,10 @@ int main() {
     first.buffer.reset();
     vi.buffers.resize(2); vi.offsets.resize(2); vi.sizes.resize(2);
     assert((checked(&prepared, &vi) == std::vector<bool>{true, true}));
+    assert(checked(&prepared,&vi)==Reference(&prepared,&vi));
+    std::swap(prepared.regions[1],prepared.regions[2]);assert(checked(&prepared,&vi)==Reference(&prepared,&vi));
+    prepared.regions.erase(prepared.regions.begin()+1);assert(checked(&prepared,&vi)==Reference(&prepared,&vi));
+    prepared.regions.insert(prepared.regions.begin()+1,{&second});
     second.buffer.reset();
     assert((checked(&prepared, &vi) == std::vector<bool>{false, false}));
 
@@ -53,6 +72,7 @@ int main() {
            Handle<VkBuffer_T>(1), Handle<VkBuffer_T>(1), Handle<VkBuffer_T>(2),
            Handle<VkBuffer_T>(1)},
           {0, 16, 17, max, 1, 0, 0}, {1, 0, 1, 1, max, 1, 1}};
+    assert(checked(&prepared,&vi)==Reference(&prepared,&vi));
     // Every binding is rechecked, including subtraction boundaries. Switching
     // handles must find the mirror and then return to the region.
     assert((checked(&prepared, &vi) ==

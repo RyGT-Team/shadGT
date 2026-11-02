@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <atomic>
 #include <cassert>
 #include <cstdint>
@@ -46,7 +47,7 @@ using Context=Native::Parallel::ProofProducerContext;
 struct Action{bool is_buffer{true};size_t buffer_first{},stage_index{},stage_local{};u32 upload_match{},upload_size{};};
 struct Upload{size_t info{},offset{},size{};int flat_stage{-1};};
 struct StageSchema{u64 identity{1};size_t count{},table_local{3},table_upload{};};
-struct Proof{bool descriptor_structure{true};std::array<StageSchema,1> stages{};std::array<u64,2> image_seal_mask{};u64 image_seal_epoch{};};
+struct Proof{bool descriptor_structure{true};std::array<StageSchema,1> stages{};std::array<u64,2> image_seal_mask{};u64 image_seal_infos{},image_seal_rows{},image_seal_epoch{};};
 struct Bindings{std::vector<vk::DescriptorBufferInfo> buffers;std::vector<vk::Write> writes;};
 struct Prepared {Proof cpu_proof;std::shared_ptr<Context> proof_context;u64 proof_mode_state{},unmap_gen{};Bindings bindings;
     std::vector<Action> descriptor_actions;std::vector<Upload> uploads;std::vector<unsigned char> upload_bytes;
@@ -57,7 +58,7 @@ struct Regs {struct {bool user_clip_plane_enable{};} clipper_control;};
 bool ParallelReadonlyDescriptorEnabled(){return true;}
 struct TestBuffer {bool mapped{true};std::uintptr_t native{77};u64 bytes{4096};bool Mapped()const{return mapped;}std::uintptr_t NativeHandle()const{return native;}u64 Size()const{return bytes;}};
 struct Stream {struct Chunk{TestBuffer* buffer{};};std::vector<Chunk> chunks;};
-struct Parallel {std::shared_ptr<Context> prepared_proof_context;u64 buffer_prefix_attempts{},buffer_prefix_accepts{},buffer_prefix_fallbacks{},buffer_prefix_coherence_misses{},buffer_prefix_invalidations{},image_tail_skips{},image_tail_rows{},image_sealed_rows{},image_batch_invalidations{},image_batch_draws{},image_batch_infos{};};
+struct Parallel {std::shared_ptr<Context> prepared_proof_context;u64 buffer_prefix_attempts{},buffer_prefix_accepts{},buffer_prefix_fallbacks{},buffer_prefix_coherence_misses{},buffer_prefix_invalidations{},image_bitmap_draws{},image_bitmap_rows{},image_batch_invalidations{},image_batch_draws{},image_batch_infos{};};
 struct Owner {
     struct {struct {VideoCore::DirectMemory* direct{};VideoCore::DirectMemory* GetDirectMemory()const{return direct;}} buffer_cache;
             struct {bool enabled{true};bool GetDevice()const{return enabled;}} instance;} r;
@@ -78,11 +79,17 @@ struct Owner {
 #include "buffer-prefix-end.inc"
         return descriptor_safe;
     }
-    std::pair<size_t,size_t> Loop(Prepared* prepared,bool buffer_prefix, Parallel* counters=nullptr,bool image_batch=true,size_t* visited=nullptr,bool known_actions=true) {
+    std::pair<size_t,size_t> Loop(Prepared* prepared,bool buffer_prefix, Parallel* counters=nullptr,bool image_batch=true,size_t* visited=nullptr,bool known_actions=true,std::vector<size_t>* order=nullptr,size_t fail_row=SIZE_MAX) {
         const auto& b=prepared->bindings;auto* worker_result=&prepared->cpu_proof;
         size_t image_batch_infos=0,unsealed=0; Parallel local; auto* parallel=counters?counters:&local;
+        worker_result->image_seal_infos=0;worker_result->image_seal_rows=0;
+        for(size_t i=0;i<std::min(size_t{128},b.writes.size());++i)if(worker_result->image_seal_mask[i/64]&(u64{1}<<(i%64))) {
+            worker_result->image_seal_infos+=b.writes[i].descriptorCount;++worker_result->image_seal_rows;
+        }
 #include "buffer-prefix-loop.inc"
             if(visited)++*visited;
+            if(order)order->push_back(action_index-1);
+            if(action_index-1==fail_row)break;
             if(action ? action->is_buffer : write.descriptorType==vk::DescriptorType::eStorageBuffer)continue;
             ++unsealed;
         }
@@ -159,12 +166,14 @@ int main() {
       }
      p.bindings.buffers.resize(1);p.bindings.writes.assign(2,{vk::DescriptorType::eSampledImage,1,nullptr});p.descriptor_actions.resize(2);
      p.bindings.writes[0].descriptorType=vk::DescriptorType::eStorageBuffer;p.descriptor_actions[0].is_buffer=true;p.descriptor_actions[1].is_buffer=false;p.cpu_proof.image_seal_mask={2,0};
-     Parallel counts;size_t visited=0;auto fast=owner.Loop(&p,true,&counts,true,&visited);assert(counts.image_tail_skips==1 && counts.image_tail_rows==1 && visited==0);
+     Parallel counts;size_t visited=0;auto fast=owner.Loop(&p,true,&counts,true,&visited);assert(counts.image_bitmap_draws==1 && counts.image_bitmap_rows==1 && visited==0);
      p.cpu_proof.image_seal_epoch=owner.sampler_cache_epoch.load();reason=0;assert(owner.Final(&p,&parallel,true,true,reason,fast.first));
      ++owner.sampler_cache_epoch;reason=0;assert(!owner.Final(&p,&parallel,true,true,reason,fast.first) && reason==10);--owner.sampler_cache_epoch;
-     p.cpu_proof.image_seal_mask={0,0};visited=0;owner.Loop(&p,true,&counts,true,&visited);assert(counts.image_tail_skips==1 && visited==1);
-     p.cpu_proof.image_seal_mask={2,0};p.bindings.writes[1].descriptorCount=0;visited=0;owner.Loop(&p,true,&counts,true,&visited);assert(counts.image_tail_skips==1 && visited==0);
-     p.bindings.writes[1].descriptorCount=1;visited=0;owner.Loop(&p,false,&counts,true,&visited);assert(visited==1);visited=0;owner.Loop(&p,true,&counts,false,&visited);assert(counts.image_tail_skips==1 && visited==1);
+     // Synthetic zero-mask case exercises iterator fallback (production image_batch rejects zero masks).
+     p.cpu_proof.image_seal_mask={0,0};visited=0;owner.Loop(&p,true,&counts,true,&visited);assert(counts.image_bitmap_draws==1 && visited==1);
+     // A valid seal with zero total uses the original per-row path.
+     p.cpu_proof.image_seal_mask={2,0};p.bindings.writes[1].descriptorCount=0;visited=0;owner.Loop(&p,true,&counts,true,&visited);assert(counts.image_bitmap_draws==1 && visited==0);
+     p.bindings.writes[1].descriptorCount=1;visited=0;owner.Loop(&p,false,&counts,true,&visited);assert(visited==1);visited=0;owner.Loop(&p,true,&counts,false,&visited);assert(counts.image_bitmap_draws==2 && visited==1);
      p.bindings.buffers.resize(4);p.bindings.writes.resize(4);p.descriptor_actions.resize(4);p.cpu_proof.image_seal_mask={};
     }
     { // Compare the extracted production fast path to the 084 row order.
@@ -183,6 +192,38 @@ int main() {
         assert(owner.Loop(&p,prefix_proven,nullptr,image_proven,nullptr,actions)==owner.OldLoop(&p,prefix_proven,image_proven,actions));
        }
       }
+     p.bindings.buffers.resize(4);p.bindings.writes.resize(4);p.descriptor_actions.resize(4);p.cpu_proof.image_seal_mask={};
+    }
+    { // Exhaust all eight-row masks; visit only unsealed indices, in order.
+     p.bindings.buffers.clear();p.bindings.writes.assign(8,{vk::DescriptorType::eSampledImage,1,nullptr});p.descriptor_actions.resize(8);
+     for(auto& action:p.descriptor_actions)action.is_buffer=false;
+     for(u64 mask=0;mask<256;++mask) {
+      p.cpu_proof.image_seal_mask={mask,0};std::vector<size_t> actual,expected;
+      for(size_t i=0;i<8;++i)if(!(mask&(u64{1}<<i)))expected.push_back(i);
+      auto result=owner.Loop(&p,false,nullptr,true,nullptr,true,&actual);
+      assert(actual==expected && result.first==std::popcount(mask) && result.second==expected.size());
+      if(!expected.empty()) {
+       std::vector<size_t> stopped;owner.Loop(&p,false,nullptr,true,nullptr,true,&stopped,expected.front());
+       assert(stopped.size()==1 && stopped[0]==expected.front());
+      }
+     }
+     p.bindings.buffers.resize(4);p.bindings.writes.resize(4);p.descriptor_actions.resize(4);p.cpu_proof.image_seal_mask={};
+    }
+    { // Prefix intersection forces the original per-row fallback and excludes prefix totals.
+     p.bindings.buffers.resize(1);p.bindings.writes.assign(3,{vk::DescriptorType::eSampledImage,1,nullptr});p.descriptor_actions.resize(3);
+     p.bindings.writes[0].descriptorType=vk::DescriptorType::eStorageBuffer;p.descriptor_actions[0].is_buffer=true;p.descriptor_actions[1].is_buffer=p.descriptor_actions[2].is_buffer=false;
+     p.cpu_proof.image_seal_mask={3,0};Parallel counts;std::vector<size_t> order;
+     auto result=owner.Loop(&p,true,&counts,true,nullptr,true,&order);assert(counts.image_bitmap_draws==0 && result.first==1 && order==std::vector<size_t>{2});
+    }
+    { // Mixed boundary rows retain order; a failure never reaches final acceptance.
+     p.bindings.buffers.clear();p.bindings.writes.assign(128,{vk::DescriptorType::eSampledImage,1,nullptr});p.descriptor_actions.resize(128);
+     for(auto& action:p.descriptor_actions)action.is_buffer=false;
+     p.cpu_proof.image_seal_mask={~u64{0},~u64{0}};
+     for(size_t i: {size_t{0},size_t{63},size_t{64},size_t{127}})p.cpu_proof.image_seal_mask[i/64]&=~(u64{1}<<(i%64));
+     std::vector<size_t> order;Parallel counts;auto result=owner.Loop(&p,false,&counts,true,nullptr,true,&order);
+     assert((order==std::vector<size_t>{0,63,64,127}) && result.first==124 && counts.image_bitmap_rows==124);
+     order.clear();result=owner.Loop(&p,false,&counts,true,nullptr,true,&order,63);assert((order==std::vector<size_t>{0,63}));
+     u32 failure=7;const auto accepted=parallel.image_batch_draws;assert(!owner.Final(&p,&parallel,false,false,failure,result.first) && failure==7 && parallel.image_batch_draws==accepted);
      p.bindings.buffers.resize(4);p.bindings.writes.resize(4);p.descriptor_actions.resize(4);p.cpu_proof.image_seal_mask={};
     }
     regs.clipper_control.user_clip_plane_enable=true;assert(!owner.Recorder(&p,&parallel,regs,stream));regs.clipper_control.user_clip_plane_enable=false;

@@ -288,7 +288,7 @@ struct ParallelRuntime {
     u64 epoch{};
     std::array<u64,11> descriptor_fail_reasons{};u32 descriptor_samples{};u64 descriptor_readonly_attempts{},descriptor_readonly_regions{},descriptor_readonly_imports{},descriptor_readonly_uncontained{},descriptor_readonly_unmatched{},descriptor_clip_nulls{},readonly_range_hint_hits{},readonly_range_hint_misses{},readonly_region_hint_hits{},readonly_region_hint_misses{};
     u64 image_batch_draws{},image_batch_infos{},image_batch_fallbacks{},image_batch_invalidations{};
-    u64 image_tail_skips{},image_tail_rows{},image_sealed_rows{};
+    u64 image_bitmap_draws{},image_bitmap_rows{};
     u64 buffer_prefix_attempts{},buffer_prefix_accepts{},buffer_prefix_fallbacks{},buffer_prefix_coherence_misses{},buffer_prefix_invalidations{};
     // Readonly attempt failures, not draw failures: another descriptor proof may succeed.
     std::array<u64,7> readonly_guard_failures{};
@@ -5526,29 +5526,36 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 struct DrawTableCache {const std::byte* data{};std::size_t size{};const void* owner{};u64 l1{},zero{};};
                 std::array<DrawTableCache,Shader::MaxStageTypes-1> table_cache{};
                 whole_phases.Next(5);
-                bool image_tail_sealed=false;
-                if(buffer_prefix && image_batch && b.writes.size()<=128 && b.buffers.size()<b.writes.size()) {
-                    const auto prefix=b.buffers.size(), end=b.writes.size();
-                    const auto low_mask=[](size_t n) {return n==64 ? ~u64{0} : (u64{1}<<n)-1;};
-                    image_tail_sealed=true;
-                    for(size_t word=prefix/64;word<=(end-1)/64;++word) {
-                        const auto first=word==prefix/64 ? prefix%64 : 0;
-                        const auto last=word==(end-1)/64 ? (end-1)%64+1 : 64;
-                        const u64 required=low_mask(last) & ~low_mask(first);
-                        if((worker_result->image_seal_mask[word]&required)!=required) {image_tail_sealed=false;break;}
-                    }
-                    if(image_tail_sealed) {
-                        for(size_t i=prefix;i<end;++i)image_batch_infos+=b.writes[i].descriptorCount;
-                        image_tail_sealed=image_batch_infos!=0;
-                        if(image_tail_sealed) {++parallel->image_tail_skips;parallel->image_tail_rows+=end-prefix;}
+                std::size_t action_index=buffer_prefix?b.buffers.size():0, action_upload_lookups=0;
+                const auto low_mask=[](size_t n) {return n==64 ? ~u64{0} : (u64{1}<<n)-1;};
+                bool image_bitmap=image_batch && worker_result->image_seal_infos && worker_result->image_seal_infos<=SIZE_MAX &&
+                    b.writes.size()<=128 && action_index<=b.writes.size();
+                std::array<u64,2> pending{};
+                if(image_bitmap) {
+                    for(size_t word=0;word<2;++word) {
+                        const size_t base=word*64;
+                        const size_t before=action_index<=base?0:std::min<size_t>(64,action_index-base);
+                        const size_t used=b.writes.size()<=base?0:std::min<size_t>(64,b.writes.size()-base);
+                        if(worker_result->image_seal_mask[word] & low_mask(before))image_bitmap=false;
+                        pending[word]=~worker_result->image_seal_mask[word] & low_mask(used) & ~low_mask(before);
                     }
                 }
-                std::size_t action_index=buffer_prefix?b.buffers.size():0, action_upload_lookups=0;
-                if(!image_tail_sealed)
-                for(const auto& write:std::span{b.writes.data(),b.writes.size()}.subspan(action_index)) {
-                    ++action_index;
-                    if(image_batch && action_index<=128 && (worker_result->image_seal_mask[(action_index-1)/64] & (u64{1}<<((action_index-1)%64)))) {
-                        ++parallel->image_sealed_rows;image_batch_infos+=write.descriptorCount;continue;
+                if(image_bitmap) {
+                    image_batch_infos=worker_result->image_seal_infos;
+                    ++parallel->image_bitmap_draws;parallel->image_bitmap_rows+=worker_result->image_seal_rows;
+                }
+                size_t linear_row=action_index, word=0;
+                const auto next_row=[&]() -> size_t {
+                    if(!image_bitmap)return linear_row<b.writes.size()?linear_row++:b.writes.size();
+                    while(word<2 && !pending[word])++word;
+                    if(word==2)return b.writes.size();
+                    const size_t row=word*64+std::countr_zero(pending[word]);
+                    pending[word]&=pending[word]-1;return row;
+                };
+                for(size_t row=next_row();row<b.writes.size();row=next_row()) {
+                    const auto& write=b.writes[row];action_index=row+1;
+                    if(!image_bitmap && image_batch && action_index<=128 && (worker_result->image_seal_mask[(action_index-1)/64] & (u64{1}<<((action_index-1)%64)))) {
+                        image_batch_infos+=write.descriptorCount;continue;
                     }
                     const auto* action=known_actions ? &prepared->descriptor_actions[action_index-1] : nullptr;
                     if(!known_structure && (write.pNext || write.pTexelBufferView)){descriptor_fail_reason=1;descriptor_safe=false;break;}
@@ -6886,7 +6893,7 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
         const auto seal_epoch=sampler_cache_epoch.load(std::memory_order_acquire);
         const auto& b=p->bindings;
         const auto images=std::span<const vk::DescriptorImageInfo>{b.images.data(),b.images.size()};
-        std::array<u64,2> sealed_rows{};
+        std::array<u64,2> sealed_rows{};u64 sealed_infos=0,sealed_count=0;
         for(size_t row=0;row<b.writes.size();++row) {
             const auto& w=b.writes[row];
             if(w.descriptorType==vk::DescriptorType::eUniformBuffer || w.descriptorType==vk::DescriptorType::eStorageBuffer)continue;
@@ -6906,11 +6913,11 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
                     sealed=false;break;
                 }
             }
-            if(sealed)sealed_rows[row/64]|=u64{1}<<(row%64);
+            if(sealed) {sealed_rows[row/64]|=u64{1}<<(row%64);sealed_infos+=w.descriptorCount;++sealed_count;}
         }
         if((sealed_rows[0] || sealed_rows[1]) && p->proof_context->Valid(p->proof_mode_state) &&
            sampler_cache_epoch.load(std::memory_order_acquire)==seal_epoch) {
-            p->cpu_proof.image_seal_mask=sealed_rows;p->cpu_proof.image_seal_epoch=seal_epoch;
+            p->cpu_proof.image_seal_mask=sealed_rows;p->cpu_proof.image_seal_infos=sealed_infos;p->cpu_proof.image_seal_rows=sealed_count;p->cpu_proof.image_seal_epoch=seal_epoch;
             p->cpu_proof.image_seal_owner=this;
         }
     }
@@ -10041,10 +10048,8 @@ void NativeRenderer::Report() {
         }
         LOG_INFO(Render_Vulkan,"PARALLEL-BUFFER-PREFIX attempts={} accepted={} fallback={} coherence_miss={} invalidations={}",sidecar->buffer_prefix_attempts,sidecar->buffer_prefix_accepts,sidecar->buffer_prefix_fallbacks,sidecar->buffer_prefix_coherence_misses,sidecar->buffer_prefix_invalidations);
         sidecar->buffer_prefix_attempts=sidecar->buffer_prefix_accepts=sidecar->buffer_prefix_fallbacks=sidecar->buffer_prefix_coherence_misses=sidecar->buffer_prefix_invalidations=0;
-        if(sidecar->image_sealed_rows)LOG_INFO(Render_Vulkan,"PARALLEL-IMAGE-ROW early_sealed_rows={} (before final validation)",sidecar->image_sealed_rows);
-        sidecar->image_sealed_rows=0;
-        if(sidecar->image_tail_skips)LOG_INFO(Render_Vulkan,"PARALLEL-IMAGE-TAIL skips={} rows={}",sidecar->image_tail_skips,sidecar->image_tail_rows);
-        sidecar->image_tail_skips=sidecar->image_tail_rows=0;
+        if(sidecar->image_bitmap_draws)LOG_INFO(Render_Vulkan,"PARALLEL-IMAGE-BITMAP draws={} sealed_rows={} (proof available before final validation)",sidecar->image_bitmap_draws,sidecar->image_bitmap_rows);
+        sidecar->image_bitmap_draws=sidecar->image_bitmap_rows=0;
         LOG_INFO(Render_Vulkan,"PARALLEL-IMAGE-BATCH draws={} infos={} fallbacks={} invalidations={}",sidecar->image_batch_draws,sidecar->image_batch_infos,sidecar->image_batch_fallbacks,sidecar->image_batch_invalidations);
         sidecar->image_batch_draws=sidecar->image_batch_infos=sidecar->image_batch_fallbacks=sidecar->image_batch_invalidations=0;
         {

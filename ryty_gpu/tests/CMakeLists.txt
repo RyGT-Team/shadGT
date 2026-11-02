@@ -102,10 +102,10 @@ else()
     target_compile_options(parallel_buffer_prefix_test PRIVATE -UNDEBUG)
 endif()
 add_custom_command(
-    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-producer.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-recorder.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-end.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-loop.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-image-skip.inc"
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-producer.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-recorder.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-end.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-loop.inc"
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_buffer_prefix.py" "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" "${CMAKE_CURRENT_BINARY_DIR}"
     DEPENDS extract_buffer_prefix.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" VERBATIM)
-target_sources(parallel_buffer_prefix_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-producer.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-recorder.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-end.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-loop.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-image-skip.inc")
+target_sources(parallel_buffer_prefix_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-producer.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-recorder.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-end.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-loop.inc")
 add_test(NAME parallel_buffer_prefix COMMAND parallel_buffer_prefix_test)
 add_executable(parallel_freshness_certificate_test parallel_freshness_certificate_test.cpp)
 target_compile_features(parallel_freshness_certificate_test PRIVATE cxx_std_23)

@@ -288,8 +288,6 @@ struct ParallelRuntime {
     u64 epoch{};
     std::array<u64,11> descriptor_fail_reasons{};u32 descriptor_samples{};u64 descriptor_readonly_attempts{},descriptor_readonly_regions{},descriptor_readonly_imports{},descriptor_readonly_uncontained{},descriptor_readonly_unmatched{},descriptor_clip_nulls{},readonly_range_hint_hits{},readonly_range_hint_misses{},readonly_region_hint_hits{},readonly_region_hint_misses{};
     u64 image_batch_draws{},image_batch_infos{},image_batch_fallbacks{},image_batch_invalidations{};
-    std::array<u64,8> image_batch_start_reasons{};
-    std::array<u64,10> image_seal_reasons{};
     // Readonly attempt failures, not draw failures: another descriptor proof may succeed.
     std::array<u64,7> readonly_guard_failures{};
     std::array<u64,9> readonly_special_kinds{};
@@ -5454,28 +5452,13 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 Native::Parallel::PerDrawViewProof<vk::ImageView> view_proof{sample_view?&local_view_stats:(gate_view?&parallel->view_proof_stats:nullptr),wanted_view_filter};
                 const auto note_view_cardinality=[&](std::size_t n) {if(sample_view)++parallel->view_sample.cardinality[n==0?0:n==1?1:n==2?2:n<=4?3:n<=8?4:n<=16?5:n<=32?6:n<=64?7:n<=128?8:9];};
                 const bool known_structure=worker_identity && worker_result->descriptor_structure;
-                const bool image_batch=known_structure && worker_result->image_sealed && worker_result->image_seal_infos &&
+                const bool image_batch=known_structure && (worker_result->image_seal_mask[0] || worker_result->image_seal_mask[1]) &&
                     worker_result->image_seal_owner==this && feedback.empty() && prepared->proof_context &&
                     prepared->proof_context==parallel->prepared_proof_context &&
                     prepared->proof_context->Valid(prepared->proof_mode_state) &&
                     sampler_cache_epoch.load(std::memory_order_acquire)==worker_result->image_seal_epoch;
-                if(!image_batch) {
-                    ++parallel->image_batch_fallbacks;
-                    if(ParallelProofPhaseEnabled()) {
-                        u32 reason=7; // A concurrent transition can make a recheck pass.
-                        if(!known_structure)reason=0;
-                        else if(!worker_result->image_sealed) {
-                            reason=1;
-                            ++parallel->image_seal_reasons[worker_result->image_seal_reason];
-                        }
-                        else if(!worker_result->image_seal_infos)reason=2;
-                        else if(worker_result->image_seal_owner!=this || !feedback.empty())reason=3;
-                        else if(!prepared->proof_context || prepared->proof_context!=parallel->prepared_proof_context)reason=4;
-                        else if(!prepared->proof_context->Valid(prepared->proof_mode_state))reason=5;
-                        else if(sampler_cache_epoch.load(std::memory_order_acquire)!=worker_result->image_seal_epoch)reason=6;
-                        ++parallel->image_batch_start_reasons[reason];
-                    }
-                }
+                if(!image_batch)++parallel->image_batch_fallbacks;
+                size_t image_batch_infos=0;
                 const bool known_actions=known_structure && prepared->descriptor_actions.size()==b.writes.size();
                 const auto current_stages=pipeline->GetStages();
                 bool known_stage_schema=known_actions;
@@ -5743,7 +5726,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                         if(!descriptor_safe)break;
                         continue;
                     }
-                    if(image_batch)continue;
+                    if(image_batch && action_index<=128 && (worker_result->image_seal_mask[(action_index-1)/64] & (u64{1}<<((action_index-1)%64)))) {
+                        image_batch_infos+=write.descriptorCount;continue;
+                    }
                     if(!known_structure && (write.pBufferInfo || !DescriptorSnapshot::ImageSliceValid(write.pImageInfo,write.descriptorCount,image_infos) ||
                        (write.descriptorType!=vk::DescriptorType::eSampledImage && write.descriptorType!=vk::DescriptorType::eSampler))) {descriptor_fail_reason=4;descriptor_safe=false;break;}
                     for(u32 j=0;j<write.descriptorCount;++j) {
@@ -5855,11 +5840,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                     }
                     if(!descriptor_safe)break;
                 }
-                if(descriptor_safe && image_batch) {
+                if(descriptor_safe && image_batch_infos) {
                     if(!prepared->proof_context->Valid(prepared->proof_mode_state) ||
                        sampler_cache_epoch.load(std::memory_order_acquire)!=worker_result->image_seal_epoch) {
                         descriptor_fail_reason=10;descriptor_safe=false;++parallel->image_batch_invalidations;
-                    } else {++parallel->image_batch_draws;parallel->image_batch_infos+=worker_result->image_seal_infos;}
+                    } else {++parallel->image_batch_draws;parallel->image_batch_infos+=image_batch_infos;}
                 }
                 parallel->producer_upload_lookup_hits+=action_upload_lookups;
                 if(sample_view) {
@@ -6741,48 +6726,41 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
             } else context->capacity.fetch_add(1,std::memory_order_relaxed);
         } catch(...) {context->failures.fetch_add(1,std::memory_order_relaxed);}
     }
-    // Seal only complete image/sampler rows built by this preparation. The
-    // recorder still checks the context and owner epoch before and after use.
-    u32 image_seal_reason=9; // Concurrent state change on a diagnostic recheck.
+    // Seal each complete image/sampler row independently. Unproved rows keep
+    // the original recorder path, including canonical null image proofs.
     if(p->cpu_proof.descriptor_structure && p->proof_context && p->sampler_origins_valid &&
-       p->proof_context->Valid(p->proof_mode_state)) {
+       p->bindings.writes.size()<=128 && p->proof_context->Valid(p->proof_mode_state)) {
         const auto seal_epoch=sampler_cache_epoch.load(std::memory_order_acquire);
         const auto& b=p->bindings;
         const auto images=std::span<const vk::DescriptorImageInfo>{b.images.data(),b.images.size()};
-        bool sealed=true;size_t infos=0;image_seal_reason=0;
-        for(const auto& w:b.writes) {
+        std::array<u64,2> sealed_rows{};
+        for(size_t row=0;row<b.writes.size();++row) {
+            const auto& w=b.writes[row];
             if(w.descriptorType==vk::DescriptorType::eUniformBuffer || w.descriptorType==vk::DescriptorType::eStorageBuffer)continue;
             if((w.descriptorType!=vk::DescriptorType::eSampledImage && w.descriptorType!=vk::DescriptorType::eSampler) ||
                w.pNext || w.pTexelBufferView || w.pBufferInfo ||
-               !DescriptorSnapshot::ImageSliceValid(w.pImageInfo,w.descriptorCount,images) ||
-               w.descriptorCount>SIZE_MAX-infos){sealed=false;image_seal_reason=4;break;}
+               !DescriptorSnapshot::ImageSliceValid(w.pImageInfo,w.descriptorCount,images))continue;
+            bool sealed=true;
             for(u32 j=0;j<w.descriptorCount;++j) {
                 const auto& info=w.pImageInfo[j];const auto slot=static_cast<size_t>(&info-b.images.data());
                 if(w.descriptorType==vk::DescriptorType::eSampler) {
                     if(!info.sampler || info.imageView || p->sampler_origins_epoch!=seal_epoch || !std::ranges::any_of(p->sampler_origins,[&](const auto& origin) {
                         return origin.slot==slot && origin.handle==info.sampler;
-                    })) {sealed=false;image_seal_reason=5;break;}
+                    })) {sealed=false;break;}
                 } else if(!info.imageView || info.sampler || info.imageLayout!=vk::ImageLayout::eGeneral) {
-                    sealed=false;image_seal_reason=!info.imageView && !info.sampler && info.imageLayout==vk::ImageLayout::eGeneral ? 6 : 4;break;
+                    sealed=false;break;
                 } else if(!Native::Parallel::MatchSampledViewProof(p->sampled_view_proofs,slot,info.imageView,seal_epoch,b.sampled)) {
-                    sealed=false;image_seal_reason=7;break;
+                    sealed=false;break;
                 }
             }
-            if(!sealed)break;
-            infos+=w.descriptorCount;
+            if(sealed)sealed_rows[row/64]|=u64{1}<<(row%64);
         }
-        if(sealed && p->proof_context->Valid(p->proof_mode_state) &&
+        if((sealed_rows[0] || sealed_rows[1]) && p->proof_context->Valid(p->proof_mode_state) &&
            sampler_cache_epoch.load(std::memory_order_acquire)==seal_epoch) {
-            p->cpu_proof.image_sealed=true;p->cpu_proof.image_seal_epoch=seal_epoch;
-            p->cpu_proof.image_seal_owner=this;p->cpu_proof.image_seal_infos=infos;
-            if(!infos)image_seal_reason=8;
-        } else if(sealed) {
-            image_seal_reason=9;
+            p->cpu_proof.image_seal_mask=sealed_rows;p->cpu_proof.image_seal_epoch=seal_epoch;
+            p->cpu_proof.image_seal_owner=this;
         }
-    } else if(!p->cpu_proof.descriptor_structure)image_seal_reason=1;
-    else if(!p->proof_context)image_seal_reason=2;
-    else if(!p->sampler_origins_valid)image_seal_reason=3;
-    if(ParallelProofPhaseEnabled())p->cpu_proof.image_seal_reason=static_cast<u8>(image_seal_reason);
+    }
     // An off/on transition invalidates all tokens from the old mode generation.
     // A transition racing this check is also rejected by the recorder's Valid check.
     if(p->proof_context && !p->proof_context->Valid(p->proof_mode_state)) {
@@ -9902,12 +9880,6 @@ void NativeRenderer::Report() {
         }
         LOG_INFO(Render_Vulkan,"PARALLEL-IMAGE-BATCH draws={} infos={} fallbacks={} invalidations={}",sidecar->image_batch_draws,sidecar->image_batch_infos,sidecar->image_batch_fallbacks,sidecar->image_batch_invalidations);
         sidecar->image_batch_draws=sidecar->image_batch_infos=sidecar->image_batch_fallbacks=sidecar->image_batch_invalidations=0;
-        if(ParallelProofPhaseEnabled()) {
-            const auto& s=sidecar->image_batch_start_reasons;const auto& p=sidecar->image_seal_reasons;
-            LOG_INFO(Render_Vulkan,"PARALLEL-IMAGE-BATCH-START identity_or_structure={} unsealed={} no_infos={} owner_or_feedback={} context_identity={} context_invalid={} epoch={} changed_on_recheck={}",s[0],s[1],s[2],s[3],s[4],s[5],s[6],s[7]);
-            LOG_INFO(Render_Vulkan,"PARALLEL-IMAGE-SEAL-REASON population=recorder_unsealed success={} structure={} no_context={} origin_invalid={} bad_row_or_shape={} sampler_origin={} canonical_null={} sampled_proof={} no_infos={} state_changed={}",p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],p[9]);
-        }
-        sidecar->image_batch_start_reasons={};sidecar->image_seal_reasons={};
         {
             const auto& f=sidecar->readonly_guard_failures;
             const auto& k=sidecar->readonly_special_kinds;

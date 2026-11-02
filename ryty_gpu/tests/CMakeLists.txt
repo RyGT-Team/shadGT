@@ -88,10 +88,10 @@ else()
     target_compile_options(parallel_image_batch_test PRIVATE -UNDEBUG)
 endif()
 add_custom_command(
-    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/image-batch-producer.inc" "${CMAKE_CURRENT_BINARY_DIR}/image-batch-start.inc" "${CMAKE_CURRENT_BINARY_DIR}/image-batch-end.inc" "${CMAKE_CURRENT_BINARY_DIR}/image-batch-inside.inc" "${CMAKE_CURRENT_BINARY_DIR}/image-batch-factory.inc"
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/image-batch-producer.inc" "${CMAKE_CURRENT_BINARY_DIR}/image-batch-start.inc" "${CMAKE_CURRENT_BINARY_DIR}/image-batch-end.inc" "${CMAKE_CURRENT_BINARY_DIR}/image-batch-skip.inc" "${CMAKE_CURRENT_BINARY_DIR}/image-batch-inside.inc" "${CMAKE_CURRENT_BINARY_DIR}/image-batch-factory.inc"
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_image_batch.py" "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" "${CMAKE_CURRENT_BINARY_DIR}" "${SHADGT_ROOT}/ryty_gpu/native/descriptor_snapshot.h"
     DEPENDS extract_image_batch.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" "${SHADGT_ROOT}/ryty_gpu/native/descriptor_snapshot.h" VERBATIM)
-target_sources(parallel_image_batch_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/image-batch-producer.inc" "${CMAKE_CURRENT_BINARY_DIR}/image-batch-start.inc" "${CMAKE_CURRENT_BINARY_DIR}/image-batch-end.inc" "${CMAKE_CURRENT_BINARY_DIR}/image-batch-inside.inc" "${CMAKE_CURRENT_BINARY_DIR}/image-batch-factory.inc")
+target_sources(parallel_image_batch_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/image-batch-producer.inc" "${CMAKE_CURRENT_BINARY_DIR}/image-batch-start.inc" "${CMAKE_CURRENT_BINARY_DIR}/image-batch-end.inc" "${CMAKE_CURRENT_BINARY_DIR}/image-batch-skip.inc" "${CMAKE_CURRENT_BINARY_DIR}/image-batch-inside.inc" "${CMAKE_CURRENT_BINARY_DIR}/image-batch-factory.inc")
 add_test(NAME parallel_image_batch COMMAND parallel_image_batch_test)
 add_executable(parallel_freshness_certificate_test parallel_freshness_certificate_test.cpp)
 target_compile_features(parallel_freshness_certificate_test PRIVATE cxx_std_23)

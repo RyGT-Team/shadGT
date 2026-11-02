@@ -102,10 +102,10 @@ else()
     target_compile_options(parallel_buffer_prefix_test PRIVATE -UNDEBUG)
 endif()
 add_custom_command(
-    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-producer.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-recorder.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-end.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-loop.inc"
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-producer.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-recorder.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-end.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-loop.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-empty-final.inc" "${CMAKE_CURRENT_BINARY_DIR}/native-vi-admission.inc"
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_buffer_prefix.py" "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" "${CMAKE_CURRENT_BINARY_DIR}"
     DEPENDS extract_buffer_prefix.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" VERBATIM)
-target_sources(parallel_buffer_prefix_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-producer.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-recorder.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-end.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-loop.inc")
+target_sources(parallel_buffer_prefix_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-producer.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-recorder.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-end.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-loop.inc" "${CMAKE_CURRENT_BINARY_DIR}/buffer-prefix-empty-final.inc" "${CMAKE_CURRENT_BINARY_DIR}/native-vi-admission.inc")
 add_test(NAME parallel_buffer_prefix COMMAND parallel_buffer_prefix_test)
 add_executable(parallel_freshness_certificate_test parallel_freshness_certificate_test.cpp)
 target_compile_features(parallel_freshness_certificate_test PRIVATE cxx_std_23)
@@ -128,20 +128,20 @@ target_sources(parallel_freshness_certificate_test PRIVATE "${CMAKE_CURRENT_BINA
 add_test(NAME parallel_freshness_certificate COMMAND parallel_freshness_certificate_test)
 add_executable(parallel_vertex_owner_hint_test parallel_vertex_owner_hint_test.cpp)
 target_compile_features(parallel_vertex_owner_hint_test PRIVATE cxx_std_23)
-target_include_directories(parallel_vertex_owner_hint_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_include_directories(parallel_vertex_owner_hint_test PRIVATE "${SHADGT_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}")
 if(MSVC)
     target_compile_options(parallel_vertex_owner_hint_test PRIVATE /UNDEBUG)
 else()
     target_compile_options(parallel_vertex_owner_hint_test PRIVATE -UNDEBUG)
 endif()
 add_custom_command(
-    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/vertex-owner-hint-under-test.inc"
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/vertex-owner-hint-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/vertex-native-receipt-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/vertex-receipt-select.inc" "${CMAKE_CURRENT_BINARY_DIR}/index-receipt-select.inc"
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_vertex_owner_hint.py"
         "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
-        "${CMAKE_CURRENT_BINARY_DIR}/vertex-owner-hint-under-test.inc"
+        "${CMAKE_CURRENT_BINARY_DIR}/vertex-owner-hint-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/vertex-native-receipt-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/vertex-receipt-select.inc" "${CMAKE_CURRENT_BINARY_DIR}/index-receipt-select.inc"
     DEPENDS extract_vertex_owner_hint.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
     VERBATIM)
-target_sources(parallel_vertex_owner_hint_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/vertex-owner-hint-under-test.inc")
+target_sources(parallel_vertex_owner_hint_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/vertex-owner-hint-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/vertex-native-receipt-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/vertex-receipt-select.inc" "${CMAKE_CURRENT_BINARY_DIR}/index-receipt-select.inc")
 add_test(NAME parallel_vertex_owner_hint COMMAND parallel_vertex_owner_hint_test)
 add_custom_command(
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/gc-function-under-test.inc"
@@ -231,3 +231,29 @@ else()
 endif()
 add_test(NAME frame_queue_trace_disabled COMMAND frame_queue_trace_runtime_test disabled)
 add_test(NAME frame_queue_trace_runtime COMMAND frame_queue_trace_runtime_test)
+
+add_executable(parallel_upload_memo_receipt_test parallel_upload_memo_receipt_test.cpp)
+target_compile_features(parallel_upload_memo_receipt_test PRIVATE cxx_std_23)
+target_include_directories(parallel_upload_memo_receipt_test PRIVATE "${SHADGT_ROOT}/src")
+if(MSVC)
+    target_compile_options(parallel_upload_memo_receipt_test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(parallel_upload_memo_receipt_test PRIVATE -UNDEBUG)
+endif()
+add_test(NAME parallel_upload_memo_receipt COMMAND parallel_upload_memo_receipt_test)
+
+add_executable(parallel_upload_receipt_test parallel_upload_receipt_test.cpp)
+target_compile_features(parallel_upload_receipt_test PRIVATE cxx_std_23)
+target_include_directories(parallel_upload_receipt_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(parallel_upload_receipt_test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(parallel_upload_receipt_test PRIVATE -UNDEBUG)
+endif()
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/upload-backing-proof.inc" "${CMAKE_CURRENT_BINARY_DIR}/upload-incarnation-bump.inc" "${CMAKE_CURRENT_BINARY_DIR}/upload-commit-proof.inc"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_upload_receipt.py"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" "${CMAKE_CURRENT_BINARY_DIR}"
+    DEPENDS extract_upload_receipt.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" VERBATIM)
+target_sources(parallel_upload_receipt_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/upload-backing-proof.inc" "${CMAKE_CURRENT_BINARY_DIR}/upload-incarnation-bump.inc" "${CMAKE_CURRENT_BINARY_DIR}/upload-commit-proof.inc")
+add_test(NAME parallel_upload_receipt COMMAND parallel_upload_receipt_test)

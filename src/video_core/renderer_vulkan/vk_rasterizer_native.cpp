@@ -289,6 +289,8 @@ struct ParallelRuntime {
     std::array<u64,11> descriptor_fail_reasons{};u32 descriptor_samples{};u64 descriptor_readonly_attempts{},descriptor_readonly_regions{},descriptor_readonly_imports{},descriptor_readonly_uncontained{},descriptor_readonly_unmatched{},descriptor_clip_nulls{},readonly_range_hint_hits{},readonly_range_hint_misses{},readonly_region_hint_hits{},readonly_region_hint_misses{};
     u64 image_batch_draws{},image_batch_infos{},image_batch_fallbacks{},image_batch_invalidations{};
     u64 image_bitmap_draws{},image_bitmap_rows{};
+    u64 native_vi_attempts{},native_vi_accepts{},native_vi_fallbacks{},native_vi_skipped{};
+    u64 native_upload_attempts{},native_upload_accepts{},native_upload_fallbacks{},native_upload_skipped{};
     u64 buffer_prefix_attempts{},buffer_prefix_accepts{},buffer_prefix_fallbacks{},buffer_prefix_coherence_misses{},buffer_prefix_invalidations{};
     // Readonly attempt failures, not draw failures: another descriptor proof may succeed.
     std::array<u64,7> readonly_guard_failures{};
@@ -1511,6 +1513,8 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     if (s.list) {
         return s;
     }
+    // Zero permanently disables receipts after incarnation overflow.
+    s.upload_incarnation=s.upload_incarnation && s.upload_incarnation!=UINT64_MAX ? s.upload_incarnation+1 : 0;
     UploadMemoFor(this).Clear(); // new list: old upload-buffer bindings cannot be reused
     if (r.instance.IsIntel()) {
         // FIX-188: Intel Arc (#65) records into the scheduler's own command buffer.
@@ -1837,7 +1841,7 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     return chunk;
 }
 
-std::tuple<vk::Buffer, u64, u8*> NativeRenderer::Allocate(u64 size, u64 align) {
+std::tuple<vk::Buffer, u64, u8*> NativeRenderer::Allocate(u64 size, u64 align, bool* backing_proven) {
     Stream& s = stream;
     align = std::max<u64>(align, 16);
     if (s.chunks.empty() ||
@@ -1848,7 +1852,10 @@ std::tuple<vk::Buffer, u64, u8*> NativeRenderer::Allocate(u64 size, u64 align) {
     const auto& buffer = *s.chunks.back().buffer;
     const u64 offset = Common::AlignUp(s.chunk_used, align);
     s.chunk_used = offset + size;
-    return {vk::Buffer{Handle<VkBuffer_T>(buffer.NativeHandle())}, offset, buffer.Mapped() + offset};
+    const vk::Buffer handle{Handle<VkBuffer_T>(buffer.NativeHandle())};
+    if(backing_proven) *backing_proven=bool(handle) && buffer.Mapped() && size &&
+        offset<=buffer.Size() && size<=buffer.Size()-offset;
+    return {handle, offset, buffer.Mapped() + offset};
 }
 
 static bool FlatUploadReuseEnabled() {
@@ -1860,7 +1867,7 @@ static bool FlatUploadReuseEnabled() {
     return reuse_enabled;
 }
 
-vk::DescriptorBufferInfo NativeRenderer::UploadFlatData(u32 stage, const u8* source, u32 size) {
+vk::DescriptorBufferInfo NativeRenderer::UploadFlatData(u32 stage, const u8* source, u32 size, bool* backing_proven) {
     Native::SlowCallTrace<5> trace{t_timed, "upload-flat-data",
         {"compare", "allocate", "copy-upload", "copy-reference", "finish"}};
     trace.Next(0, reinterpret_cast<u64>(source), size);
@@ -1874,6 +1881,7 @@ vk::DescriptorBufferInfo NativeRenderer::UploadFlatData(u32 stage, const u8* sou
             return Native::Parallel::AdaptiveXXH3(data, length);
         });
         if (lookup.binding) {
+            if(backing_proven)*backing_proven=lookup.backing_proven;
             ++stats.flat_upload_hits;
             stats.flat_upload_bytes_saved += size;
             return *lookup.binding;
@@ -1882,14 +1890,16 @@ vk::DescriptorBufferInfo NativeRenderer::UploadFlatData(u32 stage, const u8* sou
     // This is also the uploaded count in the existing report: include bypasses.
     ++stats.flat_upload_misses;
     trace.Next(1);
-    const auto [buffer, offset, data] = Allocate(size, r.instance.StorageMinAlignment());
+    bool allocated_backing=false;
+    const auto [buffer, offset, data] = Allocate(size, r.instance.StorageMinAlignment(), backing_proven?&allocated_backing:nullptr);
+    if(backing_proven)*backing_proven=allocated_backing;
     trace.Next(2);
     std::memcpy(data, source, size);
     stats.flat_upload_bytes_uploaded += size;
     const vk::DescriptorBufferInfo binding{buffer, offset, size};
     trace.Next(3);
     if (reuse_enabled) {
-        memo.Store(lookup, stage, bytes, binding);
+        memo.Store(lookup, stage, bytes, binding, allocated_backing);
         if (lookup.slot < 128) stats.flat_upload_reference_bytes += size;
     }
     trace.Next(4);
@@ -5282,6 +5292,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         const bool has_vertex_input=!vi->buffers.empty() || !vi->input_bindings.empty() || !vi->attributes.empty();
         bool vertex_safe=!has_vertex_input && vi->offsets.empty() && vi->sizes.empty() && vi->strides.empty() && (extended || !vi->index_buffer);
         bool vertex_shape_ok=false,vertex_binding_ok=true,vertex_pnext_ok=true,vertex_owner_missing=false;
+        bool native_vi_receipt_used=false,native_vi_attempted=false,native_upload_receipt_used=false,native_upload_attempted=false;size_t native_vertex_skipped=0;
+        const bool native_receipt_valid=trusted && from_prepared && prepared && worker_identity &&
+            prepared->proof_context && prepared->proof_context==parallel->prepared_proof_context &&
+            prepared->proof_context->Valid(prepared->proof_mode_state) &&
+            prepared->unmap_gen==unmap_generation.load(std::memory_order_acquire) &&
+            buffer_freshness_certified && buffer_log.Seq()==buffer_freshness_seq;
         if(vertex_requested && has_vertex_input && vertex_preflight &&
            prepared->has_vertices && prepared->vertex_index.get()==vi &&
            vi->buffers.size()<=32 && vi->input_bindings.size()<=32 && vi->attributes.size()<=32 &&
@@ -5299,6 +5315,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 for(const auto& x:vi->attributes) if(x.pNext)vertex_pnext_ok=false;
             }
             vertex_safe=vertex_binding_ok && vertex_pnext_ok;
+            const bool native_vertex=vertex_safe && known_shape && native_receipt_valid && prepared->native_vertex_receipt;
+            if(native_vertex) {native_vi_receipt_used=true;native_vertex_skipped=vi->buffers.size();}
+            if(!native_vertex) {
             const Region* vertex_region_hint=nullptr;
             const Mirror* vertex_mirror_hint=nullptr;
             vk::Buffer vertex_handle_hint{};
@@ -5346,8 +5365,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 }
                 if(!owned){vertex_owner_missing=true;vertex_safe=false;}
             }
+            }
         }
         if(vertex_requested && has_vertex_input) {
+            if(vertex_preflight) {native_vi_attempted=true;++parallel->native_vi_attempts;}
             ++parallel->vertex_candidates;
             if(vertex_preflight) {
                 ++parallel->vertex_preflight_draws;
@@ -5420,12 +5441,16 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             const u64 base=regs.index_base_address.Address<VAddr>();
             const u64 address=prepared->index_address;
             if(Native::Parallel::PreparedIndexRange(base,index_offset,regs.num_indices,element,address,vi->index_offset,checked_index_bytes)) {
+                if(!native_vi_attempted){native_vi_attempted=true;++parallel->native_vi_attempts;}
                 const auto matches=[&](const auto* value){
                     if(!value || !value->buffer || vk::Buffer{Handle<VkBuffer_T>(value->buffer->NativeHandle())}!=vi->index_buffer)return false;
                     return Native::Parallel::PreparedIndexBacking(address,checked_index_bytes,value->begin,value->end,vi->index_offset,value->buffer->Size());
                 };
-                for(const auto& use:prepared->regions)if(matches(use.region)){index_safe=true;break;}
-                if(!index_safe)for(const auto* mirror:prepared->mirrors)if(matches(mirror)){index_safe=true;break;}
+                if(native_receipt_valid && prepared->native_index_receipt) {index_safe=true;native_vi_receipt_used=true;}
+                else {
+                    for(const auto& use:prepared->regions)if(matches(use.region)){index_safe=true;break;}
+                    if(!index_safe)for(const auto* mirror:prepared->mirrors)if(matches(mirror)){index_safe=true;break;}
+                }
                 if(!index_safe && ParallelDirectVertexEnabled() && ParallelD2Enabled()) {
                     auto* direct=r.buffer_cache.GetDirectMemory();
                     if(direct && std::ranges::any_of(prepared->in_place,[&](const auto& part){return part.first==address && part.second==checked_index_bytes;})) {
@@ -5507,16 +5532,24 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                 ++parallel->buffer_prefix_coherence_misses;buffer_prefix=false;
                             }
                         }
+                        // CommitPrepared is the sole writer of these buffer infos after
+                        // publication; a new list or Splice invalidates this receipt.
+                        if(buffer_prefix && !prepared->uploads.empty()) {
+                            native_upload_attempted=true;++parallel->native_upload_attempts;
+                            native_upload_receipt_used=prepared->upload_receipt_incarnation &&
+                                prepared->upload_receipt_incarnation==s.upload_incarnation;
+                        }
                         if(buffer_prefix)for(const auto& upload:prepared->uploads) {
                             if(upload.info>=prefix) {buffer_prefix=false;break;}
                             const auto& info=b.buffers[upload.info];
                             if(info.range!=upload.size || !info.range || info.range==VK_WHOLE_SIZE ||
-                               !std::ranges::any_of(s.chunks,[&](const auto& chunk) {
+                               (!native_upload_receipt_used && !std::ranges::any_of(s.chunks,[&](const auto& chunk) {
                                    if(!chunk.buffer || !chunk.buffer->Mapped() ||
                                       vk::Buffer{Handle<VkBuffer_T>(chunk.buffer->NativeHandle())}!=info.buffer)return false;
                                    const u64 size=chunk.buffer->Size();return info.offset<=size && info.range<=size-info.offset;
-                               })) {buffer_prefix=false;break;}
+                               }))) {buffer_prefix=false;break;}
                         }
+                        if(!buffer_prefix)native_upload_receipt_used=false;
                     }
                     if(buffer_prefix)++parallel->buffer_prefix_accepts;else ++parallel->buffer_prefix_fallbacks;
                 }
@@ -5918,12 +5951,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                     }
                     if(!descriptor_safe)break;
                 }
-                if(descriptor_safe && (image_batch_infos || buffer_prefix)) {
+                if(descriptor_safe && (image_batch_infos || buffer_prefix || native_vi_receipt_used)) {
                     const bool context_valid=prepared->proof_context->Valid(prepared->proof_mode_state);
                     const bool image_valid=!image_batch_infos || sampler_cache_epoch.load(std::memory_order_acquire)==worker_result->image_seal_epoch;
-                    const bool buffer_valid=!buffer_prefix ||
+                    const bool buffer_valid=(!buffer_prefix && !native_vi_receipt_used) ||
                         (prepared->unmap_gen==unmap_generation.load(std::memory_order_acquire) &&
-                         buffer_freshness_certified && buffer_log.Seq()==buffer_freshness_seq);
+                         buffer_freshness_certified && buffer_log.Seq()==buffer_freshness_seq &&
+                         (!native_upload_receipt_used || (prepared->upload_receipt_incarnation &&
+                          prepared->upload_receipt_incarnation==s.upload_incarnation)));
                     if(!context_valid || !image_valid || !buffer_valid) {
                         descriptor_fail_reason=10;descriptor_safe=false;
                         if(image_batch_infos && (!context_valid || !image_valid))++parallel->image_batch_invalidations;
@@ -5972,6 +6007,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 }
             } catch(const std::bad_alloc&) {descriptor_fail_reason=9;descriptor_safe=false;parallel_push_writes.reset();}
         }
+        if(descriptor_safe && b.writes.empty() && native_vi_receipt_used &&
+           (!prepared->proof_context->Valid(prepared->proof_mode_state) ||
+            prepared->unmap_gen!=unmap_generation.load(std::memory_order_acquire) ||
+            !buffer_freshness_certified || buffer_log.Seq()!=buffer_freshness_seq)) {
+            descriptor_fail_reason=10;descriptor_safe=false;
+        }
         whole_phases.Next(7);
         if(sample_preflight) {
             ++parallel->preflight_samples;
@@ -5979,6 +6020,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             if(preflight_cpu_started && DescriptorThreadCpu100ns(preflight_cpu_end) && preflight_cpu_end>=preflight_cpu_begin) {
                 ++parallel->preflight_cpu_samples;parallel->preflight_cpu_100ns+=preflight_cpu_end-preflight_cpu_begin;
             }
+        }
+        if(native_vi_attempted) {
+            if(descriptor_safe && native_vi_receipt_used) {++parallel->native_vi_accepts;parallel->native_vi_skipped+=native_vertex_skipped;}
+            else ++parallel->native_vi_fallbacks;
+        }
+        if(native_upload_attempted) {
+            if(descriptor_safe && native_upload_receipt_used) {++parallel->native_upload_accepts;parallel->native_upload_skipped+=prepared->uploads.size();}
+            else ++parallel->native_upload_fallbacks;
         }
         if(cheap_eligible && !descriptor_safe){++parallel->descriptor_rejected;++parallel->descriptor_fail_reasons[descriptor_fail_reason];}
         if(ParallelGateDiagEnabled()) {
@@ -6430,7 +6479,9 @@ void NativeRenderer::PreparedDraw::Reset() {
     buffer_ranges.clear();
     upload_bytes.clear();
     uploads.clear();
+    upload_receipt_incarnation = 0;
     null_images = 0;
+    native_vertex_receipt = native_index_receipt = false;
     has_vertices = false;
     vertex_hash = 0;
     indexed = false;
@@ -7423,16 +7474,25 @@ u64 NativeRenderer::VertexHash(const GraphicsPipeline& pipeline, const Shader::I
 
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobVertexBuffer(VAddr address, u64 size,
                                                                           PreparedDraw& p,
-                                                                          Mirror** mirror_out) {
+                                                                          Mirror** mirror_out,
+                                                                          bool* native_receipt) {
     // As GuestBufferLookup for vertices and indices (a region, else a mirror, else in place).
     // The caller holds buffer_map_mutex shared.
     *mirror_out = nullptr;
+    if(native_receipt)*native_receipt = false;
+    const auto valid_native = [&](const auto& owner) {
+        if(!owner.buffer || !size || address<owner.begin || address>owner.end || size>owner.end-address)return false;
+        const u64 offset=address-owner.begin,capacity=owner.buffer->Size();
+        return bool(vk::Buffer{Handle<VkBuffer_T>(owner.buffer->NativeHandle())}) &&
+            offset<=capacity && size<=capacity-offset;
+    };
     {
         if (Region* region = RegionOver(address, size)) {
             if (address < region->begin || address + size > region->end) {
                 return std::nullopt;
             }
             p.regions.push_back({region, address, size});
+            if(native_receipt)*native_receipt=valid_native(*region);
             return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
                              u64{address - region->begin}};
         }
@@ -7446,6 +7506,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobVertexBuffer(VAddr 
                     p.mirrors.push_back(mirror);
                 }
                 *mirror_out = mirror;
+                if(native_receipt)*native_receipt=valid_native(*mirror);
                 return std::pair{vk::Buffer{Handle<VkBuffer_T>(mirror->buffer->NativeHandle())},
                                  u64{address - mirror->begin}};
             }
@@ -7481,7 +7542,10 @@ bool NativeRenderer::PrepareVertices(PreparedDraw& p, const AmdGpu::Regs& regs,
     // Regions and mirrors stay put while this thread reads them.
     std::shared_lock map_lock{buffer_map_mutex};
     Mirror* near = nullptr;
+    const bool receipt_requested=p.proof_context && p.proof_context->Valid(p.proof_mode_state);
+    bool all_native=receipt_requested && !guest_buffers.empty();
     for (const auto& guest : guest_buffers) {
+        bool native_receipt=false;
         std::optional<std::pair<vk::Buffer, u64>> found;
         u64 size = 0;
         const VAddr base = guest.base_address;
@@ -7491,13 +7555,19 @@ bool NativeRenderer::PrepareVertices(PreparedDraw& p, const AmdGpu::Regs& regs,
             size = sharp_size; // OPT-004 on this thread
             found = std::pair{vk::Buffer{Handle<VkBuffer_T>(near->buffer->NativeHandle())},
                               u64{base - near->begin}};
+            if(receipt_requested && near->buffer) {
+                const u64 off=base-near->begin,capacity=near->buffer->Size();
+                native_receipt=bool(found->first) && base<=near->end && size<=near->end-base &&
+                    off<=capacity && size<=capacity-off;
+            }
         } else if (base != 0 && sharp_size > 0 && r.memory->MappedAreaEnd(base, base + 1) != 0) {
             size = r.memory->ClampRangeSize(base, sharp_size);
-            found = JobVertexBuffer(base, size, p, &near);
+            found = JobVertexBuffer(base, size, p, &near, receipt_requested?&native_receipt:nullptr);
             if (!found) {
                 return false;
             }
         }
+        all_native=all_native && native_receipt;
         if (size != 0) {
             p.buffer_ranges.emplace_back(base, base + size);
         }
@@ -7520,7 +7590,8 @@ bool NativeRenderer::PrepareVertices(PreparedDraw& p, const AmdGpu::Regs& regs,
             return false;
         }
         Mirror* unused = nullptr;
-        const auto found = JobVertexBuffer(address, bytes, p, &unused);
+        bool native_receipt=false;
+        const auto found = JobVertexBuffer(address, bytes, p, &unused, receipt_requested?&native_receipt:nullptr);
         if (!found) {
             return false;
         }
@@ -7528,7 +7599,9 @@ bool NativeRenderer::PrepareVertices(PreparedDraw& p, const AmdGpu::Regs& regs,
         p.index_address = address;
         v.index_buffer = found->first;
         v.index_offset = found->second;
+        p.native_index_receipt=native_receipt;
     }
+    p.native_vertex_receipt=all_native;
     return true;
 }
 
@@ -7627,7 +7700,12 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     }
     const u64 alignment = r.instance.StorageMinAlignment();
     trace.Next(5);
+    p.upload_receipt_incarnation=0;
+    const u64 upload_incarnation=stream.upload_incarnation;
+    const bool receipt_requested=trusted && p.proof_context && p.proof_context->Valid(p.proof_mode_state);
+    bool uploads_proven=receipt_requested && upload_incarnation && !p.uploads.empty();
     for (const auto& upload : p.uploads) {
+        bool backing_proven=false;
         const u8* source = p.upload_bytes.data() + upload.offset;
         u32 size = upload.size;
         if (upload.flat_stage >= 0) {
@@ -7635,13 +7713,16 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         }
         if (upload.flat_stage >= 0) {
             p.bindings.buffers[upload.info] =
-                UploadFlatData(static_cast<u32>(upload.flat_stage), source, size);
+                UploadFlatData(static_cast<u32>(upload.flat_stage), source, size, receipt_requested?&backing_proven:nullptr);
         } else {
-            const auto [buffer, offset, data] = Allocate(size, alignment);
+            const auto [buffer, offset, data] = Allocate(size, alignment, receipt_requested?&backing_proven:nullptr);
             std::memcpy(data, source, size);
             p.bindings.buffers[upload.info] = vk::DescriptorBufferInfo{buffer, offset, size};
         }
+        uploads_proven=uploads_proven && backing_proven;
     }
+    if(uploads_proven && stream.upload_incarnation==upload_incarnation)
+        p.upload_receipt_incarnation=upload_incarnation;
     trace.Next(6);
     for (const auto* stored : p.bindings.stored) {
         auto& entry = *const_cast<Native::ImageEntry*>(stored);
@@ -9148,6 +9229,7 @@ void NativeRenderer::Splice() {
     if (!s.list) {
         return;
     }
+    s.upload_incarnation=s.upload_incarnation && s.upload_incarnation!=UINT64_MAX ? s.upload_incarnation+1 : 0;
     const u64 boundary_signal=ActiveSubmitSignal()?ActiveSubmitSignal():r.scheduler.CurrentTick();
     EndRendering();
     if (!writebacks.empty()) {
@@ -10048,6 +10130,10 @@ void NativeRenderer::Report() {
         }
         LOG_INFO(Render_Vulkan,"PARALLEL-BUFFER-PREFIX attempts={} accepted={} fallback={} coherence_miss={} invalidations={}",sidecar->buffer_prefix_attempts,sidecar->buffer_prefix_accepts,sidecar->buffer_prefix_fallbacks,sidecar->buffer_prefix_coherence_misses,sidecar->buffer_prefix_invalidations);
         sidecar->buffer_prefix_attempts=sidecar->buffer_prefix_accepts=sidecar->buffer_prefix_fallbacks=sidecar->buffer_prefix_coherence_misses=sidecar->buffer_prefix_invalidations=0;
+        if(sidecar->native_upload_attempts)LOG_INFO(Render_Vulkan,"PARALLEL-NATIVE-UPLOAD attempts={} accepted={} fallback={} uploads_skipped={} (proof accepted after final validation, not queue admission)",sidecar->native_upload_attempts,sidecar->native_upload_accepts,sidecar->native_upload_fallbacks,sidecar->native_upload_skipped);
+        sidecar->native_upload_attempts=sidecar->native_upload_accepts=sidecar->native_upload_fallbacks=sidecar->native_upload_skipped=0;
+        if(sidecar->native_vi_attempts)LOG_INFO(Render_Vulkan,"PARALLEL-NATIVE-VI attempts={} accepted={} fallback={} vertex_bindings_skipped={} (proof accepted after final validation, not queue admission)",sidecar->native_vi_attempts,sidecar->native_vi_accepts,sidecar->native_vi_fallbacks,sidecar->native_vi_skipped);
+        sidecar->native_vi_attempts=sidecar->native_vi_accepts=sidecar->native_vi_fallbacks=sidecar->native_vi_skipped=0;
         if(sidecar->image_bitmap_draws)LOG_INFO(Render_Vulkan,"PARALLEL-IMAGE-BITMAP draws={} sealed_rows={} (proof available before final validation)",sidecar->image_bitmap_draws,sidecar->image_bitmap_rows);
         sidecar->image_bitmap_draws=sidecar->image_bitmap_rows=0;
         LOG_INFO(Render_Vulkan,"PARALLEL-IMAGE-BATCH draws={} infos={} fallbacks={} invalidations={}",sidecar->image_batch_draws,sidecar->image_batch_infos,sidecar->image_batch_fallbacks,sidecar->image_batch_invalidations);

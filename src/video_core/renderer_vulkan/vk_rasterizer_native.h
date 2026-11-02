@@ -213,6 +213,7 @@ private:
         std::vector<const Native::ImageEntry*> read;
         std::vector<Chunk> chunks;
         u64 chunk_used = 0;
+        u64 upload_incarnation = 1;
         // Flattened user data is read-only. Keep the last immutable upload for each
         // stage until this command list retires; compare bytes, never just addresses.
         struct FlatUpload {
@@ -253,9 +254,9 @@ private:
     void ChunkFlushCheck();
 
     /// Upload memory of the stream's list: (buffer, offset, CPU pointer).
-    std::tuple<vk::Buffer, u64, u8*> Allocate(u64 size, u64 align);
+    std::tuple<vk::Buffer, u64, u8*> Allocate(u64 size, u64 align, bool* backing_proven = nullptr);
     Chunk TakeChunk(u64 size);
-    vk::DescriptorBufferInfo UploadFlatData(u32 stage, const u8* source, u32 size);
+    vk::DescriptorBufferInfo UploadFlatData(u32 stage, const u8* source, u32 size, bool* backing_proven = nullptr);
     vk::DescriptorPool TakeDescriptorPool();
 
     /// NAT-114: a range shaders write that no single imported view holds lives in a buffer of
@@ -587,11 +588,13 @@ private:
         };
         std::vector<u8> upload_bytes;
         boost::container::small_vector<Upload, 4> uploads;
+        u64 upload_receipt_incarnation = 0;
         u32 null_images = 0;
         /// OPT-011: vertex inputs and buffers and the index buffer (not for quad lists), as
         /// ResolveVertexBuffers and ResolveIndices work them out; the V#s they came from (a
         /// hash), the mirrors bound (copied in at commit) and the ranges read in place (mirror
         /// candidates, noted at commit).
+        bool native_vertex_receipt = false, native_index_receipt = false;
         bool has_vertices = false;
         std::unique_ptr<VertexIndexState> vertex_index;
         u64 vertex_hash = 0;
@@ -668,7 +671,8 @@ private:
     /// when it would need ordered work).
     std::optional<std::pair<vk::Buffer, u64>> JobVertexBuffer(VAddr address, u64 size,
                                                               PreparedDraw& p,
-                                                              Mirror** mirror_out);
+                                                              Mirror** mirror_out,
+                                                              bool* native_receipt);
     bool CommitPreparedVertices(PreparedDraw& p, const GraphicsPipeline& pipeline,
                                 const AmdGpu::Regs& regs, bool is_indexed, u32 index_offset,
                                 bool quad_triangles, bool trusted);

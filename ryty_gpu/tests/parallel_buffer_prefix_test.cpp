@@ -52,13 +52,13 @@ struct Bindings{std::vector<vk::DescriptorBufferInfo> buffers;std::vector<vk::Wr
 struct Prepared {Proof cpu_proof;std::shared_ptr<Context> proof_context;u64 proof_mode_state{},unmap_gen{};Bindings bindings;
     std::vector<Action> descriptor_actions;std::vector<Upload> uploads;std::vector<unsigned char> upload_bytes;
     bool buffer_prefix_sealed{},buffer_prefix_clip{};const VideoCore::DirectMemory* buffer_prefix_direct{};u64 buffer_prefix_l1{},buffer_prefix_zero{};
-    std::vector<std::pair<VAddr,VAddr>> buffer_prefix_ranges;};
+    std::vector<std::pair<VAddr,VAddr>> buffer_prefix_ranges;u64 upload_receipt_incarnation{};};
 struct Pipeline {std::array<const Shader::Info*,1> canonical{};const auto& CanonicalStages()const{return canonical;}};
 struct Regs {struct {bool user_clip_plane_enable{};} clipper_control;};
 bool ParallelReadonlyDescriptorEnabled(){return true;}
 struct TestBuffer {bool mapped{true};std::uintptr_t native{77};u64 bytes{4096};bool Mapped()const{return mapped;}std::uintptr_t NativeHandle()const{return native;}u64 Size()const{return bytes;}};
-struct Stream {struct Chunk{TestBuffer* buffer{};};std::vector<Chunk> chunks;};
-struct Parallel {std::shared_ptr<Context> prepared_proof_context;u64 buffer_prefix_attempts{},buffer_prefix_accepts{},buffer_prefix_fallbacks{},buffer_prefix_coherence_misses{},buffer_prefix_invalidations{},image_bitmap_draws{},image_bitmap_rows{},image_batch_invalidations{},image_batch_draws{},image_batch_infos{};};
+struct Stream {struct Chunk{TestBuffer* buffer{};};std::vector<Chunk> chunks;u64 upload_incarnation{1};};
+struct Parallel {std::shared_ptr<Context> prepared_proof_context;u64 buffer_prefix_attempts{},buffer_prefix_accepts{},buffer_prefix_fallbacks{},buffer_prefix_coherence_misses{},buffer_prefix_invalidations{},native_upload_attempts{},image_bitmap_draws{},image_bitmap_rows{},image_batch_invalidations{},image_batch_draws{},image_batch_infos{};};
 struct Owner {
     struct {struct {VideoCore::DirectMemory* direct{};VideoCore::DirectMemory* GetDirectMemory()const{return direct;}} buffer_cache;
             struct {bool enabled{true};bool GetDevice()const{return enabled;}} instance;} r;
@@ -70,13 +70,24 @@ struct Owner {
     bool Recorder(Prepared* prepared,Parallel* parallel,const Regs& regs,const Stream& s,
                   bool known_structure=true,bool known_actions=true,bool known_stage_schema=true,
                   bool from_prepared=true,bool buffer_freshness_certified=true,u64 buffer_freshness_seq=0,bool trusted=true) {
-        const auto& b=prepared->bindings;
+        const auto& b=prepared->bindings;bool native_upload_receipt_used=false,native_upload_attempted=false;
 #include "buffer-prefix-recorder.inc"
         return buffer_prefix;
     }
-    bool Final(Prepared* prepared,Parallel* parallel,bool buffer_prefix,bool descriptor_safe,u32& descriptor_fail_reason,size_t image_batch_infos=0) {
+    bool Final(Prepared* prepared,Parallel* parallel,bool buffer_prefix,bool descriptor_safe,u32& descriptor_fail_reason,size_t image_batch_infos=0,bool vi_receipt=false,bool upload_receipt=false,u64 incarnation=1) {
         auto* worker_result=&prepared->cpu_proof;bool buffer_freshness_certified=true;u64 buffer_freshness_seq=0;
+        bool native_vi_receipt_used=vi_receipt,native_upload_receipt_used=upload_receipt;Stream s;s.upload_incarnation=incarnation;
 #include "buffer-prefix-end.inc"
+        return descriptor_safe;
+    }
+    bool ViGuard(Prepared* prepared,Parallel* parallel,bool trusted,bool from_prepared,bool worker_identity,bool buffer_freshness_certified,u64 buffer_freshness_seq) {
+#include "native-vi-admission.inc"
+        return native_receipt_valid;
+    }
+    bool FinalEmpty(Prepared* prepared,u32& descriptor_fail_reason) {
+        auto& b=prepared->bindings;bool descriptor_safe=true,native_vi_receipt_used=true;
+        bool buffer_freshness_certified=true;u64 buffer_freshness_seq=0;
+#include "buffer-prefix-empty-final.inc"
         return descriptor_safe;
     }
     std::pair<size_t,size_t> Loop(Prepared* prepared,bool buffer_prefix, Parallel* counters=nullptr,bool image_batch=true,size_t* visited=nullptr,bool known_actions=true,std::vector<size_t>* order=nullptr,size_t fail_row=SIZE_MAX) {
@@ -136,6 +147,16 @@ int main() {
     owner.Produce(&p,pipeline,stages,regs);assert(p.buffer_prefix_sealed && p.buffer_prefix_clip && p.buffer_prefix_ranges.size()==1);
     p.bindings.buffers[3]={Handle<VkBuffer_T>(77),0,80};
     assert(owner.Recorder(&p,&parallel,regs,stream));u32 reason=0;assert(owner.Final(&p,&parallel,true,true,reason));
+    { // Incarnation receipt skips chunk search but retains every upload semantic guard.
+     Prepared q=p;q.buffer_prefix_clip=false;q.buffer_prefix_direct=nullptr;q.buffer_prefix_ranges.clear();
+     q.uploads={{0,0,8,-1}};q.bindings.buffers[0]={Handle<VkBuffer_T>(77),0,8};q.upload_receipt_incarnation=stream.upload_incarnation;
+     Stream empty;assert(owner.Recorder(&q,&parallel,regs,empty));
+     q.uploads[0].info=q.bindings.buffers.size();assert(!owner.Recorder(&q,&parallel,regs,empty));q.uploads[0].info=0;
+     q.bindings.buffers[0].range=0;assert(!owner.Recorder(&q,&parallel,regs,empty));
+     q.bindings.buffers[0].range=VK_WHOLE_SIZE;assert(!owner.Recorder(&q,&parallel,regs,empty));
+     q.bindings.buffers[0].range=9;assert(!owner.Recorder(&q,&parallel,regs,empty));
+     q.bindings.buffers[0].range=8;++empty.upload_incarnation;assert(!owner.Recorder(&q,&parallel,regs,empty));
+    }
     const auto table=std::span<const std::byte>{reinterpret_cast<const std::byte*>(p.upload_bytes.data()),p.upload_bytes.size()};
     const auto absent=stage.buffers[1].GetSharp(stage);
     assert(Native::Parallel::IsPreparedDirectSlot(table,4,0,true,true,0,VK_WHOLE_SIZE));
@@ -233,6 +254,22 @@ int main() {
     ++owner.unmap_generation;assert(!owner.Recorder(&p,&parallel,regs,stream));--owner.unmap_generation;
     ++owner.buffer_log.seq;assert(!owner.Recorder(&p,&parallel,regs,stream));reason=0;assert(!owner.Final(&p,&parallel,true,true,reason) && reason==10);--owner.buffer_log.seq;
     ++owner.unmap_generation;reason=0;assert(!owner.Final(&p,&parallel,true,true,reason) && reason==10);--owner.unmap_generation;
+    assert(owner.ViGuard(&p,&parallel,true,true,true,true,0));
+    assert(!owner.ViGuard(&p,&parallel,false,true,true,true,0));assert(!owner.ViGuard(&p,&parallel,true,false,true,true,0));
+    assert(!owner.ViGuard(&p,&parallel,true,true,false,true,0));assert(!owner.ViGuard(&p,&parallel,true,true,true,false,0));
+    ++owner.unmap_generation;assert(!owner.ViGuard(&p,&parallel,true,true,true,true,0));--owner.unmap_generation;
+    ++owner.buffer_log.seq;assert(!owner.ViGuard(&p,&parallel,true,true,true,true,0));--owner.buffer_log.seq;
+    // VI-only receipt must recheck context, unmap and log sequence even without image infos/prefix.
+    reason=0;assert(owner.Final(&p,&parallel,false,true,reason,0,true));
+    ++owner.unmap_generation;reason=0;assert(!owner.Final(&p,&parallel,false,true,reason,0,true) && reason==10);--owner.unmap_generation;
+    ++owner.buffer_log.seq;reason=0;assert(!owner.Final(&p,&parallel,false,true,reason,0,true) && reason==10);--owner.buffer_log.seq;
+    p.proof_context->SetMode(false);reason=0;assert(!owner.Final(&p,&parallel,false,true,reason,0,true) && reason==10);p.proof_context->SetMode(true);p.proof_mode_state=p.proof_context->state.load();
+    p.upload_receipt_incarnation=1;reason=0;assert(owner.Final(&p,&parallel,true,true,reason,0,false,true,1));
+    reason=0;assert(!owner.Final(&p,&parallel,true,true,reason,0,false,true,2) && reason==10);p.upload_receipt_incarnation=0;
+    {auto saved=p.bindings.writes;p.bindings.writes.clear();reason=0;assert(owner.FinalEmpty(&p,reason));
+     ++owner.buffer_log.seq;reason=0;assert(!owner.FinalEmpty(&p,reason) && reason==10);--owner.buffer_log.seq;
+     ++owner.unmap_generation;reason=0;assert(!owner.FinalEmpty(&p,reason) && reason==10);--owner.unmap_generation;
+     p.proof_context->SetMode(false);reason=0;assert(!owner.FinalEmpty(&p,reason) && reason==10);p.proof_context->SetMode(true);p.proof_mode_state=p.proof_context->state.load();p.bindings.writes=std::move(saved);}
     reason=3;assert(!owner.Final(&p,&parallel,true,false,reason) && reason==3);
     p.proof_context->SetMode(false);reason=0;assert(!owner.Final(&p,&parallel,true,true,reason));
     p.proof_context->SetMode(true);p.proof_mode_state=p.proof_context->state.load();

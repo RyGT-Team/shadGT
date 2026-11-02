@@ -16,7 +16,7 @@ class ImmutableUploadMemo {
     static_assert(Slots >= Ways && Slots % Ways == 0);
     static constexpr std::size_t MaxBytes = 64 * 1024;
     struct Entry {
-        bool valid{};
+        bool valid{},backing_proven{};
         std::uint32_t stage{};
         std::uint64_t hash{};
         std::vector<std::uint8_t> bytes;
@@ -30,6 +30,7 @@ public:
         std::optional<Binding> binding;
         std::size_t slot = Slots;
         std::uint64_t hash{};
+        bool backing_proven{};
     };
     ImmutableUploadMemo() { last.fill(Slots); }
 
@@ -42,7 +43,7 @@ public:
         };
         if (last[stage] < Slots && equal(entries[last[stage]])) {
             const auto& entry = entries[last[stage]];
-            return {entry.binding, last[stage], entry.hash};
+            return {entry.binding, last[stage], entry.hash, entry.backing_proven};
         }
         const std::uint64_t hash = hash_bytes(bytes.data(), bytes.size());
         const auto bucket = (hash ^ (std::uint64_t(stage) * 0x9e3779b97f4a7c15ull)) % Buckets;
@@ -52,7 +53,7 @@ public:
             if (!entries[i].valid) vacant = i;
             if (entries[i].hash == hash && equal(entries[i])) {
                 last[stage] = i;
-                return {entries[i].binding, i, hash};
+                return {entries[i].binding, i, hash, entries[i].backing_proven};
             }
         }
         const auto slot = vacant != Slots ? vacant : begin + replacement[bucket]++ % Ways;
@@ -60,7 +61,7 @@ public:
     }
 
     void Store(const Lookup& lookup, std::uint32_t stage,
-               std::span<const std::uint8_t> bytes, Binding binding) {
+               std::span<const std::uint8_t> bytes, Binding binding, bool backing_proven = false) {
         if (lookup.slot >= Slots || stage >= Stages || bytes.empty() || bytes.size() > MaxBytes)
             return;
         auto& entry = entries[lookup.slot];
@@ -71,7 +72,7 @@ public:
         } else {
             entry.bytes.assign(bytes.begin(), bytes.end());
         }
-        entry.stage = stage; entry.hash = lookup.hash; entry.binding = binding;
+        entry.stage = stage; entry.hash = lookup.hash; entry.binding = binding; entry.backing_proven = backing_proven;
         entry.valid = true; last[stage] = lookup.slot;
     }
 

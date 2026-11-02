@@ -7,6 +7,7 @@
 #include "ryty_gpu/native/sync_owner_pins.h"
 #include "ryty_gpu/native/rhi/completed_owner_release.h"
 #include "ryty_gpu/native/prepared_direct_slot.h"
+#include "ryty_gpu/native/readonly_hint.h"
 #include "ryty_gpu/native/parallel_direct_capability.h"
 #include "ryty_gpu/native/parallel_gate_histogram.h"
 #include "core/emulator_settings.h"
@@ -281,7 +282,7 @@ struct ParallelRuntime {
     std::vector<Native::Parallel::Draw> scratch_draws;
     std::shared_ptr<const void> lease;
     u64 epoch{};
-    std::array<u64,10> descriptor_fail_reasons{};u32 descriptor_samples{};u64 descriptor_readonly_attempts{},descriptor_readonly_regions{},descriptor_readonly_imports{},descriptor_readonly_uncontained{},descriptor_readonly_unmatched{},descriptor_clip_nulls{};
+    std::array<u64,10> descriptor_fail_reasons{};u32 descriptor_samples{};u64 descriptor_readonly_attempts{},descriptor_readonly_regions{},descriptor_readonly_imports{},descriptor_readonly_uncontained{},descriptor_readonly_unmatched{},descriptor_clip_nulls{},readonly_range_hint_hits{},readonly_range_hint_misses{},readonly_region_hint_hits{},readonly_region_hint_misses{};
     std::array<ProofPhaseStats,9> proof_phases{};
     Native::Parallel::PositiveHandleCache<vk::Sampler> sampler_proof;
     u64 sampler_proof_hits{},sampler_proof_misses{},sampler_scan_steps{},sampler_scan_positives{};
@@ -295,7 +296,7 @@ struct ParallelRuntime {
     struct ViewSample {u64 sequence{},draws{},queried_draws{},image_infos{},sampled_entries{};std::array<u64,10> cardinality{};Native::Parallel::ViewProofStats proof{};} view_sample;
     struct AheadFlight {std::shared_ptr<AheadLease> lease;std::function<void()> release;u64 tick{};};
     std::array<AheadFlight,2048> ahead_flights{};std::size_t ahead_cursor{},ahead_live{};std::shared_ptr<AheadContext> ahead_context;
-    u64 proof_table_builds{},proof_table_hits{},extended_clear_rejected{},fast_rejected{},serial_scope_bypassed{},owner_slot_pressure{},eligible_in_serial_scope{},eligible_in_active_scope{},eligible_at_boundary{},vertex_candidates{},vertex_preflight_draws{},vertex_backing_pass{},vertex_bad_structure{},vertex_bad_binding{},vertex_bad_pnext{},vertex_unknown_backing{},vertex_direct_ranges{},vertex_direct_attempts{},vertex_direct_matches{},direct_slot_attempts{},direct_slot_accepted{},passes{},draws{},queued{},synchronous{},considered{},eligible{},unknown_resource_key{},buffer_rejected{},alias_rejected{},descriptor_rejected{},missing_sets{},preflight_seq{},preflight_samples{},preflight_wall_ns{},preflight_cpu_100ns{},preflight_cpu_samples{},drain_ns{},coordinator_cpu_100ns{},coordinator_cpu_samples{};
+    u64 proof_table_builds{},proof_table_hits{},extended_clear_rejected{},fast_rejected{},no_pass_room_rejected{},serial_scope_bypassed{},owner_slot_pressure{},eligible_in_serial_scope{},eligible_in_active_scope{},eligible_at_boundary{},vertex_candidates{},vertex_preflight_draws{},vertex_backing_pass{},vertex_bad_structure{},vertex_bad_binding{},vertex_bad_pnext{},vertex_unknown_backing{},vertex_direct_ranges{},vertex_direct_attempts{},vertex_direct_matches{},direct_slot_attempts{},direct_slot_accepted{},passes{},draws{},queued{},synchronous{},considered{},eligible{},unknown_resource_key{},buffer_rejected{},alias_rejected{},descriptor_rejected{},missing_sets{},preflight_seq{},preflight_samples{},preflight_wall_ns{},preflight_cpu_100ns{},preflight_cpu_samples{},drain_ns{},coordinator_cpu_100ns{},coordinator_cpu_samples{};
     u64 serial_eligible_run{},serial_eligible_run_max{};std::array<u64,4> serial_eligible_runs{};
     void FinishSerialEligibleRun() noexcept {
         if(!serial_eligible_run)return;
@@ -5159,7 +5160,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         const bool same_serial_scope=s.rendering && !parallel->active && s.render==targets.state;
         const bool split_candidate=same_serial_scope && !split_clear;
         const bool serial_scope_bypass=!serial_audit && s.rendering && !parallel->active && !split_candidate;
-        bool fast_reject=serial_scope_bypass || !fast_race || fast_patch || fast_trace || quad_list || quad_triangles ||
+        // Do not build a captured pass when even its prefix and pass nodes
+        // cannot fit. Recheck on later serial draws as retired nodes may free.
+        const bool no_pass_room=!parallel->active && !parallel->coordinator->HasRoomForPass();
+        bool fast_reject=no_pass_room || serial_scope_bypass || !fast_race || fast_patch || fast_trace || quad_list || quad_triangles ||
             (!extended && is_indexed) || scale_composition || native_fsr_composition ||
             (!extended && targets.state.num_color_attachments!=1) || targets.state.num_color_attachments>8 || prohibited_clear ||
             (!extended && (fast_depth.has_depth || fast_depth.has_stencil || bool(vi->index_buffer))) ||
@@ -5171,11 +5175,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         if(!fast_reject && (prepared->unmap_gen!=unmap_generation.load(std::memory_order_acquire) ||
            !buffer_log.Untouched(prepared->buffer_seq,prepared->buffer_ranges))) fast_reject=true;
         if(fast_reject) {
-            ++parallel->fast_rejected;if(extended && any_clear)++parallel->extended_clear_rejected;if(serial_scope_bypass)++parallel->serial_scope_bypassed;
+            ++parallel->fast_rejected;if(no_pass_room)++parallel->no_pass_room_rejected;if(extended && any_clear)++parallel->extended_clear_rejected;if(serial_scope_bypass)++parallel->serial_scope_bypassed;
             if(ParallelGateDiagEnabled()) {
                 // Bit 25 means deeper stage/view/alias/descriptor checks were not examined.
                 u64 mask=u64{1}<<25;if(serial_scope_bypass)mask|=u64{1}<<26;const auto fail=[&](u32 bit,bool bad){if(bad)mask|=u64{1}<<bit;};
-                fail(0,!fast_race);fail(1,fast_patch);fail(2,fast_trace);fail(4,!feedback.empty());
+                fail(27,no_pass_room);fail(0,!fast_race);fail(1,fast_patch);fail(2,fast_trace);fail(4,!feedback.empty());
                 fail(5,!extended && targets.state.num_color_attachments!=1);fail(6,prohibited_clear);
                 fail(7,!extended && (fast_depth.has_depth || fast_depth.has_stencil));fail(8,quad_list || quad_triangles || (!extended && is_indexed));
                 fail(9,scale_composition || native_fsr_composition);fail(12,!extended && bool(vi->index_buffer));
@@ -5533,23 +5537,31 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                 constexpr u64 Limit=u64{1}<<40,NoClampLimit=u64{1}<<30;
                                 if(!base || !sharp_size || sharp_size>=NoClampLimit || base>=Limit || sharp_size>Limit-base)return false;
                                 const u64 bytes=sharp_size;
-                                bool contained=false;
-                                for(const auto& [begin,end]:prepared->buffer_ranges)
-                                    if(begin<=base && end>=base && bytes<=end-base){contained=true;break;}
+                                const auto contains=[&](const auto& range) {
+                                    const auto [begin,end]=range;
+                                    return begin<=base && end>=base && bytes<=end-base;
+                                };
+                                bool range_hit=false;
+                                const bool contained=Native::Parallel::ReadonlyHintOrScan(prepared->buffer_ranges,
+                                    action ? action->range_hint : SIZE_MAX,contains,range_hit);
+                                if(range_hit)++parallel->readonly_range_hint_hits;else ++parallel->readonly_range_hint_misses;
                                 if(!contained){++parallel->descriptor_readonly_uncontained;return false;}
                                 const u64 alignment=r.instance.StorageMinAlignment();if(!alignment)return false;
                                 const auto normalized=[&](u64 source_offset,u64 count) {
                                     const u64 aligned=Common::AlignDown(source_offset,alignment),adjust=source_offset-aligned;
                                     return count<=UINT64_MAX-adjust && info->offset==aligned && info->range==count+adjust;
                                 };
-                                for(const auto& use:prepared->regions) {
-                                    if(use.address!=base || use.size!=bytes || !use.region || !use.region->buffer || base<use.region->begin)continue;
+                                const auto matches_region=[&](const auto& use) {
+                                    if(use.address!=base || use.size!=bytes || !use.region || !use.region->buffer || base<use.region->begin)return false;
                                     const auto& buffer=*use.region->buffer;const u64 source_offset=base-use.region->begin;
-                                    if(vk::Buffer{Handle<VkBuffer_T>(buffer.NativeHandle())}==info->buffer &&
-                                       source_offset<=buffer.Size() && bytes<=buffer.Size()-source_offset && normalized(source_offset,bytes)){
-                                        ++parallel->descriptor_readonly_regions;return true;
-                                    }
-                                }
+                                    return vk::Buffer{Handle<VkBuffer_T>(buffer.NativeHandle())}==info->buffer &&
+                                       source_offset<=buffer.Size() && bytes<=buffer.Size()-source_offset && normalized(source_offset,bytes);
+                                };
+                                bool region_hit=false;
+                                const bool region_match=Native::Parallel::ReadonlyHintOrScan(prepared->regions,
+                                    action ? action->region_hint : SIZE_MAX,matches_region,region_hit);
+                                if(region_hit)++parallel->readonly_region_hint_hits;else ++parallel->readonly_region_hint_misses;
+                                if(region_match){++parallel->descriptor_readonly_regions;return true;}
                                 auto* direct=r.buffer_cache.GetDirectMemory();
                                 if(direct){u32 parts=0;bool exact=false;
                                     const bool covered=direct->TryForEachPart(base,bytes,
@@ -5658,7 +5670,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                         [](const Shader::Info& stage) -> u64 {
                                             const auto start=Shader::Backend::StageStart(u32(stage.sw_stage));
                                             if(stage.buffers.size()>u64(UINT32_MAX)-start.unified)return UINT64_MAX;
-                                            return PlanStageResourceBindings(stage,start).textures.unified;
+                                            // Only the texture base is needed; avoid planning unused later bindings.
+                                            return u64(start.unified)+stage.buffers.size();
                                         });
                                 }
                                 if(absent_sampled) {if(ParallelGateDiagEnabled())++parallel->absent_sampled_accepted;continue;}
@@ -6462,6 +6475,24 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
                                 action.stage_index=static_cast<u32>(si);action.stage_local=action.buffer_first-base;break;
                             }
                             base+=n;
+                        }
+                        // Indices are hints only; the recorder rechecks every predicate and scans on a miss.
+                        if(action.stage_index<stages.size() && stages[action.stage_index] &&
+                           action.stage_local<stages[action.stage_index]->buffers.size() &&
+                           p->buffer_ranges.size()<=64 && p->regions.size()<=64) {
+                            const auto& stage=*stages[action.stage_index];
+                            const auto& desc=stage.buffers[action.stage_local];
+                            if(!desc.IsSpecial() && !desc.is_written) {
+                                const auto sharp=desc.GetSharp(stage);const u64 base=sharp.base_address,bytes=sharp.GetSize();
+                                for(size_t i=0;i<p->buffer_ranges.size();++i) {
+                                    const auto [begin,end]=p->buffer_ranges[i];
+                                    if(begin<=base && end>=base && bytes<=end-base){action.range_hint=static_cast<u8>(i);break;}
+                                }
+                                for(size_t i=0;i<p->regions.size();++i) {
+                                    const auto& use=p->regions[i];
+                                    if(use.address==base && use.size==bytes){action.region_hint=static_cast<u8>(i);break;}
+                                }
+                            }
                         }
                         action.upload_match=0;
                         for(const auto& upload:p->uploads) if(upload.info==action.buffer_first) {
@@ -9658,10 +9689,13 @@ void NativeRenderer::Report() {
                 f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7],f[8],f[9],sidecar->descriptor_samples);
             sidecar->descriptor_fail_reasons={};sidecar->descriptor_samples=0;
         }
-        LOG_INFO(Render_Vulkan,"PARALLEL-RECORD-DIAG absent_sampled_attempts={} absent_sampled_accepted={} absent_sampled_rejected={} sampled_null_view={} sampled_nonnull_sampler={} sampled_nongeneral={} sampled_canonical_null={} absent_mode0_attempts={} absent_mode0_accepted={} absent_mode0_rejected={} natural_preclosed={} natural_captured={} natural_serial_fallback={} natural_binding_skip={} sampler_entries={} sampler_proof_hits={} sampler_proof_misses={} sampler_scan_steps={} sampler_scan_positives={} proof_table_builds={} proof_table_hits={} extended_clear_rejected={} fast_rejected={} serial_scope_bypassed={} owner_slot_pressure={} eligible_in_serial_scope_examined={} eligible_in_active_scope={} eligible_at_boundary={} vertex_candidates={} vertex_preflight={} vertex_backing_pass={} vertex_bad_structure={} vertex_bad_binding={} vertex_bad_pnext={} vertex_unknown_backing={} vertex_direct_ranges={} vertex_direct_attempts={} vertex_direct_matches={} descriptor_readonly_attempts={} descriptor_readonly_regions={} descriptor_readonly_imports={} descriptor_readonly_uncontained={} descriptor_readonly_unmatched={} descriptor_clip_nulls={} direct_slot_attempts={} direct_slot_accepted={} considered={} eligible={} resource_key_unknown={} buffer_present={} alias_rejected={} descriptor_rejected={} missing_sets={} preflight_samples={} preflight_wall_ns={} preflight_cpu_samples={} preflight_cpu_100ns={} passes={} draws={} queued={} synchronous={} worker_jobs={} worker_wall_ns_sum={} worker_cpu_100ns={} worker_cpu_samples={} peak_workers={} worker_recorded_passes={} worker_recorded_draws={} small_groups_submitted={} small_groups_synchronous={} small_passes={} small_submitted_draws={} drain_wall_ns={} coordinator_cpu_100ns={} coordinator_cpu_samples={} pending={} inflight={}",
-            sidecar->absent_sampled_attempts,sidecar->absent_sampled_accepted,sidecar->absent_sampled_rejected,sidecar->sampled_null_view,sidecar->sampled_nonnull_sampler,sidecar->sampled_nongeneral,sidecar->sampled_canonical_null,sidecar->absent_mode0_attempts,sidecar->absent_mode0_accepted,sidecar->absent_mode0_rejected,sidecar->natural_preclosed,sidecar->natural_captured,sidecar->natural_serial_fallback,sidecar->natural_binding_skip,sampler_entries,sidecar->sampler_proof_hits,sidecar->sampler_proof_misses,sidecar->sampler_scan_steps,sidecar->sampler_scan_positives,sidecar->proof_table_builds,sidecar->proof_table_hits,sidecar->extended_clear_rejected,sidecar->fast_rejected,sidecar->serial_scope_bypassed,sidecar->owner_slot_pressure,sidecar->eligible_in_serial_scope,sidecar->eligible_in_active_scope,sidecar->eligible_at_boundary,sidecar->vertex_candidates,sidecar->vertex_preflight_draws,sidecar->vertex_backing_pass,sidecar->vertex_bad_structure,sidecar->vertex_bad_binding,sidecar->vertex_bad_pnext,sidecar->vertex_unknown_backing,sidecar->vertex_direct_ranges,sidecar->vertex_direct_attempts,sidecar->vertex_direct_matches,sidecar->descriptor_readonly_attempts,sidecar->descriptor_readonly_regions,sidecar->descriptor_readonly_imports,sidecar->descriptor_readonly_uncontained,sidecar->descriptor_readonly_unmatched,sidecar->descriptor_clip_nulls,sidecar->direct_slot_attempts,sidecar->direct_slot_accepted,sidecar->considered,sidecar->eligible,sidecar->unknown_resource_key,sidecar->buffer_rejected,sidecar->alias_rejected,sidecar->descriptor_rejected,sidecar->missing_sets,sidecar->preflight_samples,sidecar->preflight_wall_ns,sidecar->preflight_cpu_samples,sidecar->preflight_cpu_100ns,sidecar->passes,sidecar->draws,sidecar->queued,sidecar->synchronous,workers.jobs,workers.wall_ns,workers.cpu_100ns,workers.cpu_samples,workers.peak,workers.recorded_passes,workers.recorded_draws,workers.small_groups_submitted,workers.small_groups_synchronous,workers.small_passes,workers.small_submitted_draws,sidecar->drain_ns,sidecar->coordinator_cpu_100ns,sidecar->coordinator_cpu_samples,
+        LOG_INFO(Render_Vulkan,"PARALLEL-RECORD-DIAG absent_sampled_attempts={} absent_sampled_accepted={} absent_sampled_rejected={} sampled_null_view={} sampled_nonnull_sampler={} sampled_nongeneral={} sampled_canonical_null={} absent_mode0_attempts={} absent_mode0_accepted={} absent_mode0_rejected={} natural_preclosed={} natural_captured={} natural_serial_fallback={} natural_binding_skip={} sampler_entries={} sampler_proof_hits={} sampler_proof_misses={} sampler_scan_steps={} sampler_scan_positives={} proof_table_builds={} proof_table_hits={} extended_clear_rejected={} fast_rejected={} no_pass_room_rejected={} serial_scope_bypassed={} owner_slot_pressure={} eligible_in_serial_scope_examined={} eligible_in_active_scope={} eligible_at_boundary={} vertex_candidates={} vertex_preflight={} vertex_backing_pass={} vertex_bad_structure={} vertex_bad_binding={} vertex_bad_pnext={} vertex_unknown_backing={} vertex_direct_ranges={} vertex_direct_attempts={} vertex_direct_matches={} descriptor_readonly_attempts={} descriptor_readonly_regions={} descriptor_readonly_imports={} descriptor_readonly_uncontained={} descriptor_readonly_unmatched={} descriptor_clip_nulls={} direct_slot_attempts={} direct_slot_accepted={} considered={} eligible={} resource_key_unknown={} buffer_present={} alias_rejected={} descriptor_rejected={} missing_sets={} preflight_samples={} preflight_wall_ns={} preflight_cpu_samples={} preflight_cpu_100ns={} passes={} draws={} queued={} synchronous={} worker_jobs={} worker_wall_ns_sum={} worker_cpu_100ns={} worker_cpu_samples={} peak_workers={} worker_recorded_passes={} worker_recorded_draws={} small_groups_submitted={} small_groups_synchronous={} small_passes={} small_submitted_draws={} drain_wall_ns={} coordinator_cpu_100ns={} coordinator_cpu_samples={} pending={} inflight={}",
+            sidecar->absent_sampled_attempts,sidecar->absent_sampled_accepted,sidecar->absent_sampled_rejected,sidecar->sampled_null_view,sidecar->sampled_nonnull_sampler,sidecar->sampled_nongeneral,sidecar->sampled_canonical_null,sidecar->absent_mode0_attempts,sidecar->absent_mode0_accepted,sidecar->absent_mode0_rejected,sidecar->natural_preclosed,sidecar->natural_captured,sidecar->natural_serial_fallback,sidecar->natural_binding_skip,sampler_entries,sidecar->sampler_proof_hits,sidecar->sampler_proof_misses,sidecar->sampler_scan_steps,sidecar->sampler_scan_positives,sidecar->proof_table_builds,sidecar->proof_table_hits,sidecar->extended_clear_rejected,sidecar->fast_rejected,sidecar->no_pass_room_rejected,sidecar->serial_scope_bypassed,sidecar->owner_slot_pressure,sidecar->eligible_in_serial_scope,sidecar->eligible_in_active_scope,sidecar->eligible_at_boundary,sidecar->vertex_candidates,sidecar->vertex_preflight_draws,sidecar->vertex_backing_pass,sidecar->vertex_bad_structure,sidecar->vertex_bad_binding,sidecar->vertex_bad_pnext,sidecar->vertex_unknown_backing,sidecar->vertex_direct_ranges,sidecar->vertex_direct_attempts,sidecar->vertex_direct_matches,sidecar->descriptor_readonly_attempts,sidecar->descriptor_readonly_regions,sidecar->descriptor_readonly_imports,sidecar->descriptor_readonly_uncontained,sidecar->descriptor_readonly_unmatched,sidecar->descriptor_clip_nulls,sidecar->direct_slot_attempts,sidecar->direct_slot_accepted,sidecar->considered,sidecar->eligible,sidecar->unknown_resource_key,sidecar->buffer_rejected,sidecar->alias_rejected,sidecar->descriptor_rejected,sidecar->missing_sets,sidecar->preflight_samples,sidecar->preflight_wall_ns,sidecar->preflight_cpu_samples,sidecar->preflight_cpu_100ns,sidecar->passes,sidecar->draws,sidecar->queued,sidecar->synchronous,workers.jobs,workers.wall_ns,workers.cpu_100ns,workers.cpu_samples,workers.peak,workers.recorded_passes,workers.recorded_draws,workers.small_groups_submitted,workers.small_groups_synchronous,workers.small_passes,workers.small_submitted_draws,sidecar->drain_ns,sidecar->coordinator_cpu_100ns,sidecar->coordinator_cpu_samples,
             sidecar->coordinator->PendingNodes(),sidecar->coordinator->InFlightNodes());
-        sidecar->absent_sampled_attempts=sidecar->absent_sampled_accepted=sidecar->absent_sampled_rejected=sidecar->sampled_null_view=sidecar->sampled_nonnull_sampler=sidecar->sampled_nongeneral=sidecar->sampled_canonical_null=sidecar->absent_mode0_attempts=sidecar->absent_mode0_accepted=sidecar->absent_mode0_rejected=sidecar->natural_preclosed=sidecar->natural_captured=sidecar->natural_serial_fallback=sidecar->natural_binding_skip=sidecar->sampler_proof_hits=sidecar->sampler_proof_misses=sidecar->sampler_scan_steps=sidecar->sampler_scan_positives=sidecar->proof_table_builds=sidecar->proof_table_hits=sidecar->extended_clear_rejected=sidecar->fast_rejected=sidecar->serial_scope_bypassed=sidecar->owner_slot_pressure=sidecar->eligible_in_serial_scope=sidecar->eligible_in_active_scope=sidecar->eligible_at_boundary=sidecar->vertex_candidates=sidecar->vertex_preflight_draws=sidecar->vertex_backing_pass=sidecar->vertex_bad_structure=sidecar->vertex_bad_binding=sidecar->vertex_bad_pnext=sidecar->vertex_unknown_backing=sidecar->vertex_direct_ranges=sidecar->vertex_direct_attempts=sidecar->vertex_direct_matches=sidecar->descriptor_readonly_attempts=sidecar->descriptor_readonly_regions=sidecar->descriptor_readonly_imports=sidecar->descriptor_readonly_uncontained=sidecar->descriptor_readonly_unmatched=sidecar->descriptor_clip_nulls=sidecar->direct_slot_attempts=sidecar->direct_slot_accepted=sidecar->passes=sidecar->draws=sidecar->queued=sidecar->synchronous=sidecar->considered=sidecar->eligible=sidecar->unknown_resource_key=sidecar->buffer_rejected=sidecar->alias_rejected=sidecar->descriptor_rejected=sidecar->missing_sets=sidecar->preflight_samples=sidecar->preflight_wall_ns=sidecar->preflight_cpu_100ns=sidecar->preflight_cpu_samples=sidecar->drain_ns=sidecar->coordinator_cpu_100ns=sidecar->coordinator_cpu_samples=0;
+        LOG_INFO(Render_Vulkan,"PARALLEL-READONLY-HINT range_hits={} range_misses={} region_hits={} region_misses={}",
+            sidecar->readonly_range_hint_hits,sidecar->readonly_range_hint_misses,sidecar->readonly_region_hint_hits,sidecar->readonly_region_hint_misses);
+        sidecar->readonly_range_hint_hits=sidecar->readonly_range_hint_misses=sidecar->readonly_region_hint_hits=sidecar->readonly_region_hint_misses=0;
+        sidecar->absent_sampled_attempts=sidecar->absent_sampled_accepted=sidecar->absent_sampled_rejected=sidecar->sampled_null_view=sidecar->sampled_nonnull_sampler=sidecar->sampled_nongeneral=sidecar->sampled_canonical_null=sidecar->absent_mode0_attempts=sidecar->absent_mode0_accepted=sidecar->absent_mode0_rejected=sidecar->natural_preclosed=sidecar->natural_captured=sidecar->natural_serial_fallback=sidecar->natural_binding_skip=sidecar->sampler_proof_hits=sidecar->sampler_proof_misses=sidecar->sampler_scan_steps=sidecar->sampler_scan_positives=sidecar->proof_table_builds=sidecar->proof_table_hits=sidecar->extended_clear_rejected=sidecar->fast_rejected=sidecar->no_pass_room_rejected=sidecar->serial_scope_bypassed=sidecar->owner_slot_pressure=sidecar->eligible_in_serial_scope=sidecar->eligible_in_active_scope=sidecar->eligible_at_boundary=sidecar->vertex_candidates=sidecar->vertex_preflight_draws=sidecar->vertex_backing_pass=sidecar->vertex_bad_structure=sidecar->vertex_bad_binding=sidecar->vertex_bad_pnext=sidecar->vertex_unknown_backing=sidecar->vertex_direct_ranges=sidecar->vertex_direct_attempts=sidecar->vertex_direct_matches=sidecar->descriptor_readonly_attempts=sidecar->descriptor_readonly_regions=sidecar->descriptor_readonly_imports=sidecar->descriptor_readonly_uncontained=sidecar->descriptor_readonly_unmatched=sidecar->descriptor_clip_nulls=sidecar->direct_slot_attempts=sidecar->direct_slot_accepted=sidecar->passes=sidecar->draws=sidecar->queued=sidecar->synchronous=sidecar->considered=sidecar->eligible=sidecar->unknown_resource_key=sidecar->buffer_rejected=sidecar->alias_rejected=sidecar->descriptor_rejected=sidecar->missing_sets=sidecar->preflight_samples=sidecar->preflight_wall_ns=sidecar->preflight_cpu_100ns=sidecar->preflight_cpu_samples=sidecar->drain_ns=sidecar->coordinator_cpu_100ns=sidecar->coordinator_cpu_samples=0;
     }
     LOG_INFO(Render_Vulkan, "NAT: descriptor allocation calls={} reserve hits={} unused={}",
              stats.descriptor_allocate_calls, stats.descriptor_reserve_hits, stream.descriptor_reserve.SpareCount());

@@ -128,5 +128,11 @@ public:
     GroupStats TakeGroupStats() noexcept {auto result=group_stats_;group_stats_={};return result;}
     std::size_t PendingNodes() const noexcept {return nodes_.size();}
     std::size_t InFlightNodes() const noexcept {return in_flight_count_;}
+    // A queued pass needs both a prefix node and a pass node. This is only
+    // a snapshot: capacity may return before the current scope ends.
+    bool HasRoomForPass() const noexcept {
+        const auto used=nodes_.size()+in_flight_count_;
+        return used<=node_cap_ && node_cap_-used>=2;
+    }
 };
 }

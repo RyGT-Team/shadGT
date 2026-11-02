@@ -12,8 +12,8 @@
 using u8=uint8_t;using u32=uint32_t;using u64=uint64_t;
 static bool fail_alloc=false;void* operator new(size_t n){if(fail_alloc){fail_alloc=false;throw std::bad_alloc();}if(auto*p=malloc(n))return p;throw std::bad_alloc();}void operator delete(void*p) noexcept{free(p);}void operator delete(void*p,size_t) noexcept{free(p);}
 struct Upload{u32 info{},size{};};struct Bindings{std::vector<vk::WriteDescriptorSet>writes;std::vector<vk::DescriptorBufferInfo>buffers;std::vector<vk::DescriptorImageInfo>images;};
-namespace Shader {enum class BufferType { Other, DirectTable }; struct Buffer { BufferType buffer_type{}; }; struct Info { u64 identity{}; std::vector<Buffer> buffers; };}
-struct PreparedDraw{struct DescriptorAction{std::size_t buffer_first{},stage_local{};u32 stage_index{~u32{0}},upload_size{};u8 upload_match{2};bool is_buffer{};};struct Proof{struct StageSchema{u64 identity{};size_t count{},table_local{SIZE_MAX},table_upload{SIZE_MAX};};std::array<StageSchema,5> stages{};bool descriptor_structure{};}cpu_proof;Bindings bindings;std::vector<DescriptorAction>descriptor_actions;std::vector<Upload>uploads;};
+namespace Shader {enum class BufferType { Other, DirectTable }; struct Buffer { BufferType buffer_type{}; bool is_written{}; bool IsSpecial()const{return false;} struct Sharp {u64 base_address{};u64 GetSize()const{return 0;}}; Sharp GetSharp(const auto&)const{return {};} }; struct Info { u64 identity{}; std::vector<Buffer> buffers; };}
+struct PreparedDraw{struct DescriptorAction{std::size_t buffer_first{},stage_local{};u8 range_hint{255},region_hint{255};u32 stage_index{~u32{0}},upload_size{};u8 upload_match{2};bool is_buffer{};};struct Proof{struct StageSchema{u64 identity{};size_t count{},table_local{SIZE_MAX},table_upload{SIZE_MAX};};std::array<StageSchema,5> stages{};bool descriptor_structure{};}cpu_proof;Bindings bindings;std::vector<DescriptorAction>descriptor_actions;std::vector<Upload>uploads;std::vector<std::pair<u64,u64>>buffer_ranges;struct Region{u64 address,size;};std::vector<Region>regions;};
 void produce(PreparedDraw* p){try{std::array<const Shader::Info*,5> stages{};auto*candidate=&p->cpu_proof;const auto& b=p->bindings;const auto buffers=std::span<const vk::DescriptorBufferInfo>{b.buffers.data(),b.buffers.size()};const auto images=std::span<const vk::DescriptorImageInfo>{b.images.data(),b.images.size()};candidate->descriptor_structure=true;
         size_t stage_base=0;
         for(size_t si=0;si<candidate->stages.size();++si) {
@@ -55,6 +55,24 @@ void produce(PreparedDraw* p){try{std::array<const Shader::Info*,5> stages{};aut
                                 action.stage_index=static_cast<u32>(si);action.stage_local=action.buffer_first-base;break;
                             }
                             base+=n;
+                        }
+                        // Indices are hints only; the recorder rechecks every predicate and scans on a miss.
+                        if(action.stage_index<stages.size() && stages[action.stage_index] &&
+                           action.stage_local<stages[action.stage_index]->buffers.size() &&
+                           p->buffer_ranges.size()<=64 && p->regions.size()<=64) {
+                            const auto& stage=*stages[action.stage_index];
+                            const auto& desc=stage.buffers[action.stage_local];
+                            if(!desc.IsSpecial() && !desc.is_written) {
+                                const auto sharp=desc.GetSharp(stage);const u64 base=sharp.base_address,bytes=sharp.GetSize();
+                                for(size_t i=0;i<p->buffer_ranges.size();++i) {
+                                    const auto [begin,end]=p->buffer_ranges[i];
+                                    if(begin<=base && end>=base && bytes<=end-base){action.range_hint=static_cast<u8>(i);break;}
+                                }
+                                for(size_t i=0;i<p->regions.size();++i) {
+                                    const auto& use=p->regions[i];
+                                    if(use.address==base && use.size==bytes){action.region_hint=static_cast<u8>(i);break;}
+                                }
+                            }
                         }
                         action.upload_match=0;
                         for(const auto& upload:p->uploads) if(upload.info==action.buffer_first) {

@@ -539,6 +539,7 @@ private:
         struct DescriptorAction {
             std::size_t buffer_first{};
             std::size_t stage_local{};
+            u8 range_hint{255}, region_hint{255};
             u32 stage_index{~u32{0}};
             u32 upload_size{};
             // 0: no matching upload, 1: unique matching upload, 2: use the original scan.

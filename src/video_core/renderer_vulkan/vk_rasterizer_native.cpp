@@ -294,6 +294,7 @@ struct ParallelRuntime {
     std::array<u64,7> readonly_guard_failures{};
     std::array<u64,9> readonly_special_kinds{};
     std::array<ProofPhaseStats,9> proof_phases{};
+    std::array<ProofPhaseStats,8> whole_phases{};
     Native::Parallel::PositiveHandleCache<vk::Sampler> sampler_proof;
     u64 sampler_proof_hits{},sampler_proof_misses{},sampler_scan_steps{},sampler_scan_positives{};
     u64 natural_preclosed{},natural_captured{},natural_serial_fallback{},natural_binding_skip{};
@@ -377,6 +378,17 @@ struct SampledProofTimer {
     SampledProofTimer(ProofPhaseStats& s,bool sampled) noexcept {if(sampled){stats=&s;start=std::chrono::steady_clock::now();}}
     ~SampledProofTimer() {if(!stats)return;const auto raw=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();const u64 wall=raw>0?u64(raw):0;
         ++stats->count;stats->wall_ns+=wall;stats->wall_max=std::max(stats->wall_max,wall);}
+};
+// Sequential slices of the existing whole-preflight sample. Counts differ when
+// guards skip sections; intervals include instrumentation overhead.
+struct WholePhaseTimer {
+    std::array<ProofPhaseStats,8>* phases{};std::chrono::steady_clock::time_point start{};size_t current{};
+    WholePhaseTimer(std::array<ProofPhaseStats,8>& p,bool sampled) noexcept {if(sampled){phases=&p;start=std::chrono::steady_clock::now();}}
+    void Stop() noexcept {if(!phases)return;const auto now=std::chrono::steady_clock::now();
+        const auto raw=std::chrono::duration_cast<std::chrono::nanoseconds>(now-start).count();const u64 wall=raw>0?u64(raw):0;
+        auto& s=(*phases)[current];++s.count;s.wall_ns+=wall;s.wall_max=std::max(s.wall_max,wall);start=now;}
+    void Next(size_t phase) noexcept {if(!phases)return;Stop();current=phase;}
+    ~WholePhaseTimer() {Stop();}
 };
 template<class F> auto TimedProofInvoke(ProofPhaseStats& stats,bool sampled,F&& fn) {
     if(!sampled)return std::forward<F>(fn)();
@@ -5205,6 +5217,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         u64 whole_cpu_begin=0,whole_cpu_end=0;
         const bool whole_cpu_started=whole_sample && DescriptorThreadCpu100ns(whole_cpu_begin);
         const auto whole_begin=whole_sample?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+        WholePhaseTimer whole_phases{parallel->whole_phases,whole_sample};
         ++parallel->considered;
         const auto& fast_depth=targets.state.depth_stencil_attachment;
         const bool extended=ParallelExtendedEnabled();
@@ -5256,6 +5269,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             parallel->FinishSerialEligibleRun();
             if(parallel->active){EndRendering();PassBarrier();}
         } else {
+        whole_phases.Next(1);
         const auto& db=targets.state.depth_stencil_attachment;
         // These draw-local requirements are mandatory in cheap_eligible below.
         // Avoid region/mirror scans for draws that can never be admitted.
@@ -5345,6 +5359,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             }
             if(vertex_safe)++parallel->vertex_backing_pass;
         }
+        whole_phases.Next(2);
         bool stages_safe=true,resource_key_known=true;
         for(const auto* stage:pipeline->GetStages()) if(stage) {
             if(!stage->resource_usage_known) resource_key_known=false;
@@ -5358,6 +5373,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         if(!resource_key_known) ++parallel->unknown_resource_key;
         // Submission-window N protects only views actually tracked by the native
         // registry; the epoch token itself is not an owning image reference.
+        whole_phases.Next(3);
         bool native_attachment=true;
         {
             std::scoped_lock views_lock{views_mutex};
@@ -5437,6 +5453,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         u64 preflight_cpu_begin=0,preflight_cpu_end=0;
         const bool preflight_cpu_started=sample_preflight && DescriptorThreadCpu100ns(preflight_cpu_begin);
         const auto preflight_begin=sample_preflight?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+        whole_phases.Next(4);
         if(descriptor_safe && !b.writes.empty()) {
             try {
                 constexpr std::size_t MaxSnapshotBytes=64*1024;
@@ -5508,6 +5525,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 if(known_stage_schema)++parallel->producer_stage_schema_hits;
                 struct DrawTableCache {const std::byte* data{};std::size_t size{};const void* owner{};u64 l1{},zero{};};
                 std::array<DrawTableCache,Shader::MaxStageTypes-1> table_cache{};
+                whole_phases.Next(5);
                 bool image_tail_sealed=false;
                 if(buffer_prefix && image_batch && b.writes.size()<=128 && b.buffers.size()<b.writes.size()) {
                     const auto prefix=b.buffers.size(), end=b.writes.size();
@@ -5913,6 +5931,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                     add(v.proof,local_view_stats);if(gate_view)add(parallel->view_proof_stats,local_view_stats);
                 }
                 if(stage_proof && ParallelGateDiagEnabled()){parallel->proof_table_builds+=stage_proof->Builds();parallel->proof_table_hits+=stage_proof->Hits();}
+                whole_phases.Next(6);
                 if(descriptor_safe) {
                     if(!b.groups_ready)b.PrepareWriteGroups();
                     const u32 push=pipeline->PushSet();
@@ -5946,6 +5965,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 }
             } catch(const std::bad_alloc&) {descriptor_fail_reason=9;descriptor_safe=false;parallel_push_writes.reset();}
         }
+        whole_phases.Next(7);
         if(sample_preflight) {
             ++parallel->preflight_samples;
             parallel->preflight_wall_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-preflight_begin).count();
@@ -6045,6 +6065,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         parallel_draw=parallel->active && s.rendering && s.render==targets.state && eligible;
         if(parallel_draw){parallel_index_safe=index_safe;parallel_index_bytes=checked_index_bytes;}
         }
+        whole_phases.Stop();
+        whole_phases.phases=nullptr;
         if(whole_sample) {
             const u64 elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-whole_begin).count();
             ++parallel->whole_samples;parallel->whole_wall_ns+=elapsed;parallel->whole_max_ns=std::max(parallel->whole_max_ns,elapsed);
@@ -9975,6 +9997,11 @@ void NativeRenderer::Report() {
                 v.cardinality[0],v.cardinality[1],v.cardinality[2],v.cardinality[3],v.cardinality[4],v.cardinality[5],v.cardinality[6],v.cardinality[7],v.cardinality[8],v.cardinality[9]);
             const auto sequence=v.sequence;v={};v.sequence=sequence;
         }
+        static constexpr std::array whole_phase_names{"fast-screen","vertex","stage","attachments-alias-index","descriptor-schema-prefix","descriptor-row-final","push-snapshot","transition"};
+        for(u32 i=0;i<sidecar->whole_phases.size();++i) {const auto& t=sidecar->whole_phases[i];
+            if(t.count)LOG_INFO(Render_Vulkan,"PARALLEL-WHOLE-PHASE phase={} samples={} wall_ns={} wall_max_ns={} (1/128 considered; sequential slices nested in whole preflight, timer overhead included)",whole_phase_names[i],t.count,t.wall_ns,t.wall_max);
+        }
+        sidecar->whole_phases={};
         if(ParallelProofPhaseEnabled()) {
             LOG_INFO(Render_Vulkan,"PARALLEL-PROOF-PHASE-LEGEND 0=buffer-write-group 1=sampler-descriptor 2=sampled-view-descriptor 3=push-snapshot 4=upload-lookup 5=chunk-scan 6=direct-slot 7=readonly-slot 8=clip-slot; each subphase count is per invocation (including early clip probes), wall overlaps outer phases and includes timer overhead");
             for(u32 i=0;i<sidecar->proof_phases.size();++i) {const auto& t=sidecar->proof_phases[i];

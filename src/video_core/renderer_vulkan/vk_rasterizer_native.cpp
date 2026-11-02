@@ -5529,7 +5529,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                        stage->buffers[schema.table_local].buffer_type==Shader::BufferType::DirectTable &&
                                        index>=action->stage_local && index-action->stage_local<=SIZE_MAX-schema.table_local &&
                                        prepared->uploads[schema.table_upload].info==index-action->stage_local+schema.table_local) {
-                                        const auto local=action->stage_local,n=stage->buffers.size();
+                                        const auto local=action->stage_local;
+                                        const auto n=stage->buffers.size();
                                         if(!stage->uses_direct || !stage->buffers[local].IsDirectEligible() || n>(SIZE_MAX-16)/16)return false;
                                         const auto expected=16+n*16;const auto& upload=prepared->uploads[schema.table_upload];
                                         auto& cached=table_cache[action->stage_index];const u64 l1=direct->L1Address(),zero=direct->ZeroPageAddress();

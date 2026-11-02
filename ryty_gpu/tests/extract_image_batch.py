@@ -17,7 +17,7 @@ start = source.index("                if(descriptor_safe && (image_batch_infos |
 end = source.index("                parallel->producer_upload_lookup_hits", start)
 (out / "image-batch-end.inc").write_text(source[start:end], encoding="utf-8")
 skip_start = source.index("                    if(image_batch && action_index<=128")
-skip_end = source.index("                    if(!known_structure && (write.pBufferInfo", skip_start)
+skip_end = source.index("                    const auto* action=", skip_start)
 (out / "image-batch-skip.inc").write_text(source[skip_start:skip_end], encoding="utf-8")
 assert skip_end < source.index("Native::Parallel::AbsentSampledImage<Shader::Info>(", skip_end) < start
 assert start < source.index("                    if(!b.groups_ready)b.PrepareWriteGroups();", start)

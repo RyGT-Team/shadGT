@@ -288,7 +288,7 @@ struct ParallelRuntime {
     u64 epoch{};
     std::array<u64,11> descriptor_fail_reasons{};u32 descriptor_samples{};u64 descriptor_readonly_attempts{},descriptor_readonly_regions{},descriptor_readonly_imports{},descriptor_readonly_uncontained{},descriptor_readonly_unmatched{},descriptor_clip_nulls{},readonly_range_hint_hits{},readonly_range_hint_misses{},readonly_region_hint_hits{},readonly_region_hint_misses{};
     u64 image_batch_draws{},image_batch_infos{},image_batch_fallbacks{},image_batch_invalidations{};
-    u64 image_tail_skips{},image_tail_rows{};
+    u64 image_tail_skips{},image_tail_rows{},image_sealed_rows{};
     u64 buffer_prefix_attempts{},buffer_prefix_accepts{},buffer_prefix_fallbacks{},buffer_prefix_coherence_misses{},buffer_prefix_invalidations{};
     // Readonly attempt failures, not draw failures: another descriptor proof may succeed.
     std::array<u64,7> readonly_guard_failures{};
@@ -5546,8 +5546,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 std::size_t action_index=buffer_prefix?b.buffers.size():0, action_upload_lookups=0;
                 if(!image_tail_sealed)
                 for(const auto& write:std::span{b.writes.data(),b.writes.size()}.subspan(action_index)) {
-                    const auto* action=known_actions ? &prepared->descriptor_actions[action_index] : nullptr;
                     ++action_index;
+                    if(image_batch && action_index<=128 && (worker_result->image_seal_mask[(action_index-1)/64] & (u64{1}<<((action_index-1)%64)))) {
+                        ++parallel->image_sealed_rows;image_batch_infos+=write.descriptorCount;continue;
+                    }
+                    const auto* action=known_actions ? &prepared->descriptor_actions[action_index-1] : nullptr;
                     if(!known_structure && (write.pNext || write.pTexelBufferView)){descriptor_fail_reason=1;descriptor_safe=false;break;}
                     const bool buffer_type=action ? action->is_buffer :
                         (write.descriptorType==vk::DescriptorType::eUniformBuffer || write.descriptorType==vk::DescriptorType::eStorageBuffer);
@@ -5796,9 +5799,6 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                         }
                         if(!descriptor_safe)break;
                         continue;
-                    }
-                    if(image_batch && action_index<=128 && (worker_result->image_seal_mask[(action_index-1)/64] & (u64{1}<<((action_index-1)%64)))) {
-                        image_batch_infos+=write.descriptorCount;continue;
                     }
                     if(!known_structure && (write.pBufferInfo || !DescriptorSnapshot::ImageSliceValid(write.pImageInfo,write.descriptorCount,image_infos) ||
                        (write.descriptorType!=vk::DescriptorType::eSampledImage && write.descriptorType!=vk::DescriptorType::eSampler))) {descriptor_fail_reason=4;descriptor_safe=false;break;}
@@ -7606,6 +7606,9 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     trace.Next(2);
     SortRegionWrites(); // CPU writes since (may drop mirrors)
     trace.Next(3);
+    // A successful first scan certifies history through this earlier checkpoint;
+    // the second scan must still check every later change. Sampling after the scan is unsafe.
+    const u64 recheck_from = buffer_log.Seq();
     if (!buffer_log.Untouched(p.buffer_seq, p.buffer_ranges)) {
         return reject(4);
     }
@@ -7652,7 +7655,7 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     // dereferencing its vertex mirrors if any prepared range changed.
     Begin();
     if (p.unmap_gen != unmap_generation.load(std::memory_order_acquire)) return reject(2);
-    if (!buffer_log.Untouched(p.buffer_seq, p.buffer_ranges)) return reject(4);
+    if (!buffer_log.Untouched(recheck_from, p.buffer_ranges)) return reject(4);
     // The viewport transform the shaders get, from the registers as recorded.
     trace.Next(7);
     const Shader::PushData fresh = UserData(regs);
@@ -10038,6 +10041,8 @@ void NativeRenderer::Report() {
         }
         LOG_INFO(Render_Vulkan,"PARALLEL-BUFFER-PREFIX attempts={} accepted={} fallback={} coherence_miss={} invalidations={}",sidecar->buffer_prefix_attempts,sidecar->buffer_prefix_accepts,sidecar->buffer_prefix_fallbacks,sidecar->buffer_prefix_coherence_misses,sidecar->buffer_prefix_invalidations);
         sidecar->buffer_prefix_attempts=sidecar->buffer_prefix_accepts=sidecar->buffer_prefix_fallbacks=sidecar->buffer_prefix_coherence_misses=sidecar->buffer_prefix_invalidations=0;
+        if(sidecar->image_sealed_rows)LOG_INFO(Render_Vulkan,"PARALLEL-IMAGE-ROW early_sealed_rows={} (before final validation)",sidecar->image_sealed_rows);
+        sidecar->image_sealed_rows=0;
         if(sidecar->image_tail_skips)LOG_INFO(Render_Vulkan,"PARALLEL-IMAGE-TAIL skips={} rows={}",sidecar->image_tail_skips,sidecar->image_tail_rows);
         sidecar->image_tail_skips=sidecar->image_tail_rows=0;
         LOG_INFO(Render_Vulkan,"PARALLEL-IMAGE-BATCH draws={} infos={} fallbacks={} invalidations={}",sidecar->image_batch_draws,sidecar->image_batch_infos,sidecar->image_batch_fallbacks,sidecar->image_batch_invalidations);

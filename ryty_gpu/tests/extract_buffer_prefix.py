@@ -18,6 +18,6 @@ loop_end = source.index("                    if(!known_structure && (write.pNext
 assert "std::span{b.writes.data(),b.writes.size()}.subspan(action_index)" in source[loop:end]
 skip = source.index("                    if(image_batch && action_index<=128", loop)
 assert loop < skip < start
-skip_end = source.index("                    if(!known_structure && (write.pBufferInfo", skip)
+skip_end = source.index("                    const auto* action=", skip)
 (out / "buffer-prefix-image-skip.inc").write_text(source[skip:skip_end], encoding="utf-8")
 assert "Splice(" not in source[loop:start]

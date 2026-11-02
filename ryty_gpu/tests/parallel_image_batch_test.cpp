@@ -37,7 +37,7 @@ struct Origin {size_t slot{};vk::Sampler handle{};};
 struct Proof {bool descriptor_structure{};std::array<u64,2> image_seal_mask{};u64 image_seal_epoch{};const void* image_seal_owner{};};
 struct Bindings {std::vector<vk::DescriptorImageInfo> images;std::vector<vk::Write> writes;Entries sampled;};
 struct Prepared {Proof cpu_proof;std::shared_ptr<Context> proof_context;bool sampler_origins_valid{true};u64 sampler_origins_epoch{1},proof_mode_state{1},unmap_gen{};Bindings bindings;std::vector<Origin> sampler_origins;std::vector<Native::Parallel::SampledViewProof<vk::ImageView>> sampled_view_proofs;};
-struct Parallel {std::shared_ptr<Context> prepared_proof_context;u64 image_batch_invalidations{},image_batch_draws{},image_batch_infos{},buffer_prefix_invalidations{};};
+struct Parallel {std::shared_ptr<Context> prepared_proof_context;u64 image_sealed_rows{},image_batch_invalidations{},image_batch_draws{},image_batch_infos{},buffer_prefix_invalidations{};};
 struct Owner {
     std::atomic<u64> unmap_generation{};struct {u64 Seq()const{return 0;}} buffer_log;
     vk::Sampler next_sampler{17};bool change_during_factory{};
@@ -69,12 +69,12 @@ struct NullStage {
 };
 struct RowResult {size_t skipped{},fallback{},null_proofs{};};
 RowResult CheckRows(Prepared* prepared,bool image_batch) {
-    auto* worker_result=&prepared->cpu_proof;size_t action_index=0,image_batch_infos=0;RowResult result;
+    auto* worker_result=&prepared->cpu_proof;size_t action_index=0,image_batch_infos=0;RowResult result;Parallel counters;auto* parallel=&counters;
     const NullStage stage{};const std::array<const NullStage*,1> stages{&stage};
     for(const auto& write:prepared->bindings.writes) {
         ++action_index;
-        if(write.descriptorType==vk::DescriptorType::eUniformBuffer || write.descriptorType==vk::DescriptorType::eStorageBuffer)continue;
 #include "image-batch-skip.inc"
+        if(write.descriptorType==vk::DescriptorType::eUniformBuffer || write.descriptorType==vk::DescriptorType::eStorageBuffer)continue;
         ++result.fallback;
         if(write.descriptorType==vk::DescriptorType::eSampledImage && !write.pImageInfo->imageView) {
             assert(Native::Parallel::AbsentSampledImage<NullStage>(stages,0,0,0,1,

@@ -116,7 +116,7 @@ else()
     target_compile_options(parallel_freshness_certificate_test PRIVATE -UNDEBUG)
 endif()
 add_custom_command(
-    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/freshness-log-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/freshness-admission-under-test.inc"
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/freshness-log-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/freshness-admission-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/freshness-first-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/freshness-recheck-under-test.inc"
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_freshness_certificate.py"
         "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.h"
         "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
@@ -124,7 +124,7 @@ add_custom_command(
     DEPENDS extract_freshness_certificate.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.h"
         "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
     VERBATIM)
-target_sources(parallel_freshness_certificate_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/freshness-log-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/freshness-admission-under-test.inc")
+target_sources(parallel_freshness_certificate_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/freshness-log-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/freshness-admission-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/freshness-first-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/freshness-recheck-under-test.inc")
 add_test(NAME parallel_freshness_certificate COMMAND parallel_freshness_certificate_test)
 add_executable(parallel_vertex_owner_hint_test parallel_vertex_owner_hint_test.cpp)
 target_compile_features(parallel_vertex_owner_hint_test PRIVATE cxx_std_23)

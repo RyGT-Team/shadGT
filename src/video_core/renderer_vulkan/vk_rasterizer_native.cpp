@@ -1833,28 +1833,47 @@ std::tuple<vk::Buffer, u64, u8*> NativeRenderer::Allocate(u64 size, u64 align) {
     return {vk::Buffer{Handle<VkBuffer_T>(buffer.NativeHandle())}, offset, buffer.Mapped() + offset};
 }
 
+static bool FlatUploadReuseEnabled() {
+    // Diagnostic A/B control, sampled once at startup; reuse remains on by default.
+    static const bool reuse_enabled = [] {
+        const char* value = std::getenv("RYGT_FLAT_UPLOAD_REUSE");
+        return !value || value[0] != '0' || value[1] != '\0';
+    }();
+    return reuse_enabled;
+}
+
 vk::DescriptorBufferInfo NativeRenderer::UploadFlatData(u32 stage, const u8* source, u32 size) {
     Native::SlowCallTrace<5> trace{t_timed, "upload-flat-data",
         {"compare", "allocate", "copy-upload", "copy-reference", "finish"}};
     trace.Next(0, reinterpret_cast<u64>(source), size);
+    const bool reuse_enabled = FlatUploadReuseEnabled();
     auto& memo = UploadMemoFor(this);
     const std::span<const u8> bytes{source, size};
-    const auto lookup = memo.Find(stage, bytes, [](const void* data, size_t length) {
-        return Native::Parallel::AdaptiveXXH3(data, length);
-    });
-    if (lookup.binding) {
-        ++stats.flat_upload_hits;
-        stats.flat_upload_bytes_saved += size;
-        return *lookup.binding;
+    FlatUploadMemo::Lookup lookup;
+    if (reuse_enabled) {
+        lookup = memo.Find(stage, bytes, [this](const void* data, size_t length) {
+            stats.flat_upload_bytes_hashed += length;
+            return Native::Parallel::AdaptiveXXH3(data, length);
+        });
+        if (lookup.binding) {
+            ++stats.flat_upload_hits;
+            stats.flat_upload_bytes_saved += size;
+            return *lookup.binding;
+        }
     }
+    // This is also the uploaded count in the existing report: include bypasses.
     ++stats.flat_upload_misses;
     trace.Next(1);
     const auto [buffer, offset, data] = Allocate(size, r.instance.StorageMinAlignment());
     trace.Next(2);
     std::memcpy(data, source, size);
+    stats.flat_upload_bytes_uploaded += size;
     const vk::DescriptorBufferInfo binding{buffer, offset, size};
     trace.Next(3);
-    memo.Store(lookup, stage, bytes, binding);
+    if (reuse_enabled) {
+        memo.Store(lookup, stage, bytes, binding);
+        if (lookup.slot < 128) stats.flat_upload_reference_bytes += size;
+    }
     trace.Next(4);
     return binding;
 }
@@ -5248,6 +5267,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 for(const auto& x:vi->attributes) if(x.pNext)vertex_pnext_ok=false;
             }
             vertex_safe=vertex_binding_ok && vertex_pnext_ok;
+            const Region* vertex_region_hint=nullptr;
+            const Mirror* vertex_mirror_hint=nullptr;
+            vk::Buffer vertex_handle_hint{};
             for(std::size_t i=0;i<vi->buffers.size() && vertex_safe;++i) {
                 const auto handle=vi->buffers[i];const auto offset=vi->offsets[i],size=vi->sizes[i];
                 bool owned=false;
@@ -5256,8 +5278,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                     if(vk::Buffer{Handle<VkBuffer_T>(value->buffer->NativeHandle())}!=handle)return false;
                     const u64 capacity=value->buffer->Size();return offset<=capacity && size<=capacity-offset;
                 };
-                for(const auto& region:prepared->regions) if(matches(region.region)){owned=true;break;}
-                if(!owned)for(const auto* mirror:prepared->mirrors)if(matches(mirror)){owned=true;break;}
+                if(handle==vertex_handle_hint)
+                    owned=matches(vertex_region_hint) || matches(vertex_mirror_hint);
+                if(!owned) {
+                    vertex_region_hint=nullptr;vertex_mirror_hint=nullptr;vertex_handle_hint=vk::Buffer{};
+                    for(const auto& region:prepared->regions) if(matches(region.region)){owned=true;vertex_region_hint=region.region;break;}
+                    if(!owned)for(const auto* mirror:prepared->mirrors)if(matches(mirror)){owned=true;vertex_mirror_hint=mirror;break;}
+                    if(owned)vertex_handle_hint=handle;
+                }
                 if(!owned && handle && size && ParallelDirectVertexEnabled() && ParallelD2Enabled() &&
                    prepared->in_place.size()<=32) {
                     auto* direct=r.buffer_cache.GetDirectMemory();
@@ -5289,15 +5317,16 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             if(vertex_safe)++parallel->vertex_backing_pass;
         }
         bool stages_safe=true,resource_key_known=true;
-        for(const auto* stage:pipeline->GetStages()) if(stage && !stage->resource_usage_known) resource_key_known=false;
-        if(!resource_key_known) ++parallel->unknown_resource_key;
-        for(const auto* stage:pipeline->GetStages()) if(stage &&
-            (!stage->fmasks.empty() || !stage->attribute_flags_known || !stage->resource_usage_known || stage->translation_failed ||
+        for(const auto* stage:pipeline->GetStages()) if(stage) {
+            if(!stage->resource_usage_known) resource_key_known=false;
+            if(!stage->fmasks.empty() || !stage->attribute_flags_known || !stage->resource_usage_known || stage->translation_failed ||
              (stage->sw_stage!=Shader::SwStage::Vertex && stage->sw_stage!=Shader::SwStage::Fragment) ||
              (stage->has_fetch_shader && !(vertex_requested && has_vertex_input && vertex_safe && stage->sw_stage==Shader::SwStage::Vertex)) || stage->uses_patches || stage->uses_dma ||
              (stage->uses_direct && !ParallelD2Enabled()) ||
              stage->has_storage_images || stage->uses_shader_clock ||
-             std::ranges::any_of(stage->buffers,[](const auto& buffer){return buffer.is_written;}))) stages_safe=false;
+             std::ranges::any_of(stage->buffers,[](const auto& buffer){return buffer.is_written;})) stages_safe=false;
+        }
+        if(!resource_key_known) ++parallel->unknown_resource_key;
         // Submission-window N protects only views actually tracked by the native
         // registry; the epoch token itself is not an owning image reference.
         bool native_attachment=true;
@@ -6585,7 +6614,6 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
     if(auto context=ahead_guard.context;context && p->pipeline_keepalive && context->mode.load(std::memory_order_acquire)) {
         context->attempts.fetch_add(1,std::memory_order_relaxed);
         try {
-            auto candidate=std::make_shared<AheadLease>();candidate->context=context;candidate->pipeline_owner=p->pipeline_keepalive;candidate->pipeline_layout=pipeline.GetLayout();
             std::array<vk::DescriptorSetLayout,Shader::Backend::MaxDescriptorSets> layouts{};
             std::array<u32,Shader::Backend::MaxDescriptorSets> indices{};std::array<std::size_t,4> counts{};std::size_t n=0;bool supported=true;
             const auto& groups=p->bindings.grouped_writes;
@@ -6622,7 +6650,7 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
             for(u32 i=0;supported && i<groups.size();++i) {
                 if(groups[i].empty() || i==pipeline.PushSet())continue;
                 auto layout=pipeline.SetLayout(i);if(!layout || n==layouts.size()){supported=false;break;}
-                layouts[n]=layout;indices[n++]=i;candidate->layouts[i]=layout;
+                layouts[n]=layout;indices[n++]=i;
                 for(const auto& w:groups[i]) {
                     std::size_t type=0;
                     switch(w.descriptorType){case vk::DescriptorType::eStorageBuffer:type=0;break;case vk::DescriptorType::eSampledImage:type=1;break;case vk::DescriptorType::eStorageImage:type=2;break;case vk::DescriptorType::eSampler:type=3;break;default:supported=false;continue;}
@@ -6631,6 +6659,8 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
                 }
             }
             if(supported && n) {
+                auto candidate=std::make_shared<AheadLease>();candidate->context=context;candidate->pipeline_owner=p->pipeline_keepalive;candidate->pipeline_layout=pipeline.GetLayout();
+                for(std::size_t k=0;k<n;++k)candidate->layouts[indices[k]]=layouts[k];
                 AheadPools::Failure reason{};
                 auto lease=context->pools.TryPrepare(std::span<const vk::DescriptorSetLayout>{layouts.data(),n},counts,p->pipeline_keepalive,r.scheduler.GetWorkSemaphore()->KnownGpuTick(),&reason);
                 if(lease) {for(std::size_t k=0;k<n;++k)candidate->sets[indices[k]]=lease->sets[k];candidate->prepared_sets=n;candidate->lease=std::move(lease);p->ahead_descriptor_lease.store(std::move(candidate),std::memory_order_release);context->ready.fetch_add(1,std::memory_order_relaxed);}
@@ -9649,9 +9679,12 @@ void NativeRenderer::Report() {
                  stream.chunks.size(), free_chunks.size(), retiring_chunks.size(),
                  registry->Count(), registry_stats.evicted.load(), retired_views.size(), upload_free_bytes);
     }
-    LOG_INFO(Render_Vulkan, "NAT: flat uploads reused={} uploaded={} bytes_saved={}",
-             stats.flat_upload_hits, stats.flat_upload_misses, stats.flat_upload_bytes_saved);
+    LOG_INFO(Render_Vulkan, "NAT: flat uploads reused={} uploaded={} bytes_saved={} bytes_hashed={} reference_bytes_copied={} upload_bytes={} reuse_enabled={} retained_reference_bytes={}",
+             stats.flat_upload_hits, stats.flat_upload_misses, stats.flat_upload_bytes_saved,
+             stats.flat_upload_bytes_hashed, stats.flat_upload_reference_bytes, stats.flat_upload_bytes_uploaded,
+             FlatUploadReuseEnabled(), UploadMemoFor(this).RetainedBytes());
     stats.flat_upload_hits = stats.flat_upload_misses = stats.flat_upload_bytes_saved = 0;
+    stats.flat_upload_bytes_hashed = stats.flat_upload_reference_bytes = stats.flat_upload_bytes_uploaded = 0;
     if (ParallelEligibilityEnabled() && parallel_eligibility_owner==this) {
         auto& probe=parallel_eligibility_stats; probe.Flush();
         LOG_INFO(Render_Vulkan, "PARALLEL-ELIGIBILITY-DIAG observed={} upper_bound={} run_counts_1_2_4_8_16_32_64plus={}/{}/{}/{}/{}/{}/{} draws_per_bucket={}/{}/{}/{}/{}/{}/{}; not proof of safe worker recording",

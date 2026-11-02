@@ -40,6 +40,23 @@ target_sources(tiling_specialization_test PRIVATE "${SHADGT_ROOT}/src/video_core
 target_compile_definitions(tiling_specialization_test PRIVATE FMT_HEADER_ONLY)
 
 add_test(NAME ghost_smoothing_disabled COMMAND ghost_smoothing_test disabled)
+add_executable(parallel_vertex_owner_hint_test parallel_vertex_owner_hint_test.cpp)
+target_compile_features(parallel_vertex_owner_hint_test PRIVATE cxx_std_23)
+target_include_directories(parallel_vertex_owner_hint_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(parallel_vertex_owner_hint_test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(parallel_vertex_owner_hint_test PRIVATE -UNDEBUG)
+endif()
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/vertex-owner-hint-under-test.inc"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_vertex_owner_hint.py"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
+        "${CMAKE_CURRENT_BINARY_DIR}/vertex-owner-hint-under-test.inc"
+    DEPENDS extract_vertex_owner_hint.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
+    VERBATIM)
+target_sources(parallel_vertex_owner_hint_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/vertex-owner-hint-under-test.inc")
+add_test(NAME parallel_vertex_owner_hint COMMAND parallel_vertex_owner_hint_test)
 add_custom_command(
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/gc-function-under-test.inc"
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_gc.py"

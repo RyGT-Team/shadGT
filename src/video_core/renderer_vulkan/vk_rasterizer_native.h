@@ -770,6 +770,7 @@ private:
         /// OPT-010: draws bound from a prepared draw, without one, and prepared draws not used:
         /// another pipeline, other user data, memory unmapped, pictures or buffers changed.
         u64 flat_upload_hits = 0, flat_upload_bytes_saved = 0, flat_upload_misses = 0;
+        u64 flat_upload_bytes_hashed = 0, flat_upload_reference_bytes = 0, flat_upload_bytes_uploaded = 0;
         u64 descriptor_allocate_calls = 0, descriptor_reserve_hits = 0;
         u64 prepared_used = 0, prepared_missing = 0;
         std::array<u64, 5> prepared_rejected{};

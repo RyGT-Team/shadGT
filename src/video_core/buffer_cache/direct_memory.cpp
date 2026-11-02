@@ -396,6 +396,11 @@ bool DirectMemory::TryForEachPart(
         if (it == views.begin()) return false;
         const View& view = std::prev(it)->second;
         if (cursor < view.begin || cursor >= view.end || !view.wrapper) return false;
+        if (cursor == address && end <= view.end) {
+            if (!ready()) return false;
+            fn(*view.wrapper, address - view.begin, 0, size);
+            return true;
+        }
         cursor = std::min(end, view.end);
     }
     if (!ready()) return false;

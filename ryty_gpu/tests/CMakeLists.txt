@@ -181,3 +181,31 @@ add_test(NAME parallel_snapshot_source_fragments
 add_test(NAME ahead_capture_safety
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/verify_ahead_capture_safety.py"
             "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp")
+
+add_executable(parallel_direct_try_parts_test parallel_direct_try_parts_test.cpp)
+target_compile_features(parallel_direct_try_parts_test PRIVATE cxx_std_23)
+target_include_directories(parallel_direct_try_parts_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(parallel_direct_try_parts_test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(parallel_direct_try_parts_test PRIVATE -UNDEBUG)
+endif()
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/direct-try-parts-under-test.inc"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_direct_try_parts.py"
+        "${SHADGT_ROOT}/src/video_core/buffer_cache/direct_memory.cpp"
+        "${CMAKE_CURRENT_BINARY_DIR}/direct-try-parts-under-test.inc"
+    DEPENDS extract_direct_try_parts.py "${SHADGT_ROOT}/src/video_core/buffer_cache/direct_memory.cpp"
+    VERBATIM)
+target_sources(parallel_direct_try_parts_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/direct-try-parts-under-test.inc")
+add_test(NAME parallel_direct_try_parts COMMAND parallel_direct_try_parts_test)
+
+add_executable(sync_owner_pins_test sync_owner_pins_test.cpp)
+target_compile_features(sync_owner_pins_test PRIVATE cxx_std_23)
+target_include_directories(sync_owner_pins_test PRIVATE "${SHADGT_ROOT}")
+if(MSVC)
+    target_compile_options(sync_owner_pins_test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(sync_owner_pins_test PRIVATE -UNDEBUG)
+endif()
+add_test(NAME sync_owner_pins COMMAND sync_owner_pins_test)

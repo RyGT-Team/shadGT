@@ -546,11 +546,9 @@ private:
             u8 range_hint{255}, region_hint{255};
             u32 stage_index{~u32{0}};
             u32 upload_size{};
-            u32 absent_sharp_offset{};
             // 0: no matching upload, 1: unique matching upload, 2: use the original scan.
             u8 upload_match{2};
             bool is_buffer{};
-            bool absent_sharp{};
         };
         std::vector<DescriptorAction> descriptor_actions;
 

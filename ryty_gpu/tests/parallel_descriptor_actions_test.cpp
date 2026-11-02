@@ -12,8 +12,8 @@
 using u8=uint8_t;using u32=uint32_t;using u64=uint64_t;
 static bool fail_alloc=false;void* operator new(size_t n){if(fail_alloc){fail_alloc=false;throw std::bad_alloc();}if(auto*p=malloc(n))return p;throw std::bad_alloc();}void operator delete(void*p) noexcept{free(p);}void operator delete(void*p,size_t) noexcept{free(p);}
 struct Upload{u32 info{},size{};};struct Bindings{std::vector<vk::WriteDescriptorSet>writes;std::vector<vk::DescriptorBufferInfo>buffers;std::vector<vk::DescriptorImageInfo>images;};
-namespace Shader {enum class BufferType { Other, DirectTable }; enum class SharpFetchPostOp { None }; struct Fetch {enum class Summary { SingleLoad };Summary summary{};std::array<u32,1> offsets{};bool FitsIn(size_t)const{return true;}};struct Buffer { BufferType buffer_type{}; bool is_written{}; Fetch sharp_fetch{};SharpFetchPostOp post_op{};bool IsDirectEligible()const{return true;} bool IsSpecial()const{return false;} struct Sharp {u64 base_address{};u64 GetSize()const{return 0;}}; Sharp GetSharp(const auto&)const{return {};} }; struct Info { u64 identity{}; std::vector<Buffer> buffers; };}
-struct PreparedDraw{struct DescriptorAction{std::size_t buffer_first{},stage_local{};u8 range_hint{255},region_hint{255};u32 stage_index{~u32{0}},upload_size{},absent_sharp_offset{};u8 upload_match{2};bool is_buffer{},absent_sharp{};};struct Copy{bool present{};std::vector<u32> flattened;u64 pgm_base{};};std::array<Copy,5>stage_copies{};struct Proof{struct StageSchema{u64 identity{};size_t count{},table_local{SIZE_MAX},table_upload{SIZE_MAX};};std::array<StageSchema,5> stages{};bool descriptor_structure{};}cpu_proof;Bindings bindings;std::vector<DescriptorAction>descriptor_actions;std::vector<Upload>uploads;std::vector<std::pair<u64,u64>>buffer_ranges;struct Region{u64 address,size;};std::vector<Region>regions;};
+namespace Shader {enum class BufferType { Other, DirectTable }; struct Buffer { BufferType buffer_type{}; bool is_written{}; bool IsSpecial()const{return false;} struct Sharp {u64 base_address{};u64 GetSize()const{return 0;}}; Sharp GetSharp(const auto&)const{return {};} }; struct Info { u64 identity{}; std::vector<Buffer> buffers; };}
+struct PreparedDraw{struct DescriptorAction{std::size_t buffer_first{},stage_local{};u8 range_hint{255},region_hint{255};u32 stage_index{~u32{0}},upload_size{};u8 upload_match{2};bool is_buffer{};};struct Proof{struct StageSchema{u64 identity{};size_t count{},table_local{SIZE_MAX},table_upload{SIZE_MAX};};std::array<StageSchema,5> stages{};bool descriptor_structure{};}cpu_proof;Bindings bindings;std::vector<DescriptorAction>descriptor_actions;std::vector<Upload>uploads;std::vector<std::pair<u64,u64>>buffer_ranges;struct Region{u64 address,size;};std::vector<Region>regions;};
 void produce(PreparedDraw* p){try{std::array<const Shader::Info*,5> stages{};auto*candidate=&p->cpu_proof;const auto& b=p->bindings;const auto buffers=std::span<const vk::DescriptorBufferInfo>{b.buffers.data(),b.buffers.size()};const auto images=std::span<const vk::DescriptorImageInfo>{b.images.data(),b.images.size()};candidate->descriptor_structure=true;
         size_t stage_base=0;
         for(size_t si=0;si<candidate->stages.size();++si) {
@@ -55,20 +55,6 @@ void produce(PreparedDraw* p){try{std::array<const Shader::Info*,5> stages{};aut
                                 action.stage_index=static_cast<u32>(si);action.stage_local=action.buffer_first-base;break;
                             }
                             base+=n;
-                        }
-                        if(action.stage_index<stages.size() && stages[action.stage_index] &&
-                           action.stage_local<stages[action.stage_index]->buffers.size()) {
-                            const auto& desc=stages[action.stage_index]->buffers[action.stage_local];
-                            const auto& copy=p->stage_copies[action.stage_index];
-                            if(copy.present && desc.IsDirectEligible() &&
-                               desc.sharp_fetch.summary==decltype(desc.sharp_fetch)::Summary::SingleLoad &&
-                               desc.post_op==Shader::SharpFetchPostOp::None &&
-                               desc.sharp_fetch.FitsIn(copy.flattened.size())) {
-                                struct Snapshot { std::span<const u32> flattened_ud_buf; u64 pgm_base; };
-                                const auto sharp=desc.GetSharp(Snapshot{copy.flattened,copy.pgm_base});
-                                action.absent_sharp=!sharp.base_address || !sharp.GetSize();
-                                action.absent_sharp_offset=desc.sharp_fetch.offsets[0];
-                            }
                         }
                         // Indices are hints only; the recorder rechecks every predicate and scans on a miss.
                         if(action.stage_index<stages.size() && stages[action.stage_index] &&

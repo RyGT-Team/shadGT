@@ -809,6 +809,8 @@ set(COMMON src/common/logging/classes.cpp
            src/common/read_capture.cpp
            src/common/read_capture.h
            src/common/sampling_profiler.h
+           src/common/frame_queue_trace.cpp
+           src/common/frame_queue_trace.h
            src/common/perf_monitor.cpp
            src/common/perf_monitor.h
            src/common/thread.cpp

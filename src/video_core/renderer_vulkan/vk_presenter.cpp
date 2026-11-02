@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/debug.h"
+#include "common/frame_queue_trace.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -1334,6 +1335,18 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread, Frame* frame) {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+    auto* trace = Common::FrameQueueTrace::current;
+    struct TracePresentScope {
+        Common::FrameQueueTrace::Row* row;
+        explicit TracePresentScope(Common::FrameQueueTrace::Row* r) : row(r) {
+            if (row)
+                row->present_begin = Common::FrameQueueTrace::Now(row->ticket);
+        }
+        ~TracePresentScope() {
+            if (row)
+                row->present_end = Common::FrameQueueTrace::Now(row->ticket);
+        }
+    } trace_scope{trace};
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
@@ -1604,7 +1617,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // PERF-084: the work the frame waits for is on the same queue, so it must be submitted
     // first (a command thread submits it after the flush that recorded it).
     if (frame->ready_scheduler) {
+        if (trace)
+            trace->wait_begin = Common::FrameQueueTrace::Now(trace->ticket);
         frame->ready_scheduler->WaitSubmitted(frame->ready_tick);
+        if (trace)
+            trace->wait_end = Common::FrameQueueTrace::Now(trace->ticket);
     }
     SubmitInfo info{};
     info.AddWait(swapchain.GetImageAcquiredSemaphore());
@@ -1616,8 +1633,17 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // Present to swapchain.
     {
         RYDIAG_SCOPE(Present);
+        if (trace)
+            trace->lock_attempt = Common::FrameQueueTrace::Now(trace->ticket);
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        if (!swapchain.Present()) {
+        if (trace)
+            trace->lock_acquired = Common::FrameQueueTrace::Now(trace->ticket);
+        const bool presented = swapchain.Present();
+        if (trace) {
+            trace->swapchain_return = Common::FrameQueueTrace::Now(trace->ticket);
+            trace->present_outcome = presented ? 1 : 2;
+        }
+        if (!presented) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
     }

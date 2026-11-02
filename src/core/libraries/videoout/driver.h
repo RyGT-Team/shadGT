@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "common/frame_queue_trace.h"
 #include "common/debug.h"
 #include "common/polyfill_thread.h"
 #include "core/libraries/videoout/video_out.h"
@@ -105,6 +106,7 @@ private:
         s64 flip_arg;
         s32 index;
         bool eop;
+        Common::FrameQueueTrace::Ticket trace{};
         std::chrono::steady_clock::time_point submitted{}; // PERF-DIAG-002
 
         operator bool() const noexcept {
@@ -115,7 +117,8 @@ private:
     void Flip(const Request& req);
     void DrawBlankFrame(); // Video port out not open
     bool DrawLastFrame();  // Used when there is no flip request
-    void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
+    void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
+                            Common::FrameQueueTrace::Ticket trace);
     void PresentThread(std::stop_token token);
 
     std::mutex mutex;

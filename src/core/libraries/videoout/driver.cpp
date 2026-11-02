@@ -5,6 +5,7 @@
 #include "common/debug.h"
 #include "common/guest_clock.h"
 #include "common/thread.h"
+#include "common/perf_monitor.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
@@ -48,6 +49,7 @@ constexpr u32 PixelFormatBpp(PixelFormat pixel_format) {
 }
 
 VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
+    Common::FrameQueueTrace::Initialize();
     main_port.resolution.full_width = width;
     main_port.resolution.full_height = height;
     main_port.resolution.pane_width = width;
@@ -274,6 +276,16 @@ void ReportFlipStats() {
 } // namespace
 
 void VideoOutDriver::Flip(const Request& req) {
+    Common::FrameQueueTrace::Row trace{};
+    trace.ticket = req.trace;
+    if (trace.ticket.generation) {
+        trace.flip_begin = Common::FrameQueueTrace::Now(trace.ticket);
+        trace.ready_semaphore =
+            reinterpret_cast<std::uintptr_t>(static_cast<VkSemaphore>(req.frame->ready_semaphore));
+        trace.ready_tick = req.frame->ready_tick;
+        trace.frame_id = req.frame->id;
+    }
+    Common::FrameQueueTrace::Scope trace_scope{trace.ticket.generation ? &trace : nullptr};
     // Update HDR status before presenting.
     presenter->SetHDR(req.port->is_hdr);
 
@@ -299,6 +311,18 @@ void VideoOutDriver::Flip(const Request& req) {
         st.max_latency_ms = std::max(st.max_latency_ms, latency_ms);
     }
 
+    if (trace.ticket.generation) {
+        auto& work = Common::GetWorkCounters();
+        trace.draws = work.draws.load(std::memory_order_relaxed);
+        trace.dispatches = work.dispatches.load(std::memory_order_relaxed);
+        trace.shaders = work.shaders_compiled.load(std::memory_order_relaxed);
+        trace.pipelines = work.pipelines_compiled.load(std::memory_order_relaxed);
+        trace.uploads = work.uploads.load(std::memory_order_relaxed);
+        trace.upload_bytes = work.upload_bytes.load(std::memory_order_relaxed);
+        trace.protects = work.protects.load(std::memory_order_relaxed);
+        trace.protect_bytes = work.protect_bytes.load(std::memory_order_relaxed);
+        Common::FrameQueueTrace::Complete(trace);
+    }
     // Update flip status.
     auto* port = req.port;
     {
@@ -356,6 +380,7 @@ void VideoOutDriver::AntiLagInput() {
 
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
                                 bool is_eop /*= false*/) {
+    auto trace = Common::FrameQueueTrace::Start();
     RyDiag::Mark(RyDiag::Zone::GameFlip, u64(index));
     if (!is_eop) {
         presenter->AntiLagInput(); // PERF-210: on the game's thread, never the command thread
@@ -376,15 +401,19 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 
     if (!is_eop) {
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
-        liverpool->SendCommand([=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
+        liverpool->SendCommand(
+            [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop, trace); });
     } else {
-        SubmitFlipInternal(port, index, flip_arg, is_eop);
+        SubmitFlipInternal(port, index, flip_arg, is_eop, trace);
     }
 
     return true;
 }
 
-void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
+void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
+                                        Common::FrameQueueTrace::Ticket trace) {
+    if (trace.generation)
+        Common::FrameQueueTrace::Prepare(trace);
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
@@ -396,12 +425,15 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
     }
 
     std::scoped_lock lock{mutex};
+    if (trace.generation)
+        Common::FrameQueueTrace::Enqueue(trace);
     requests.push({
         .frame = frame,
         .port = port,
         .flip_arg = flip_arg,
         .index = index,
         .eop = is_eop,
+        .trace = trace,
         .submitted = std::chrono::steady_clock::now(),
     });
 }
@@ -439,8 +471,10 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
         if (!requests.empty()) {
-            const auto request = requests.front();
+            auto request = requests.front();
             requests.pop();
+            if (request.trace.generation)
+                Common::FrameQueueTrace::Dequeue(request.trace);
             return request;
         }
         return {};

@@ -520,6 +520,8 @@ private:
     bool InstallDrawStages(const Pipeline* pipeline,
                            std::array<SelectedStage, Shader::MaxStageTypes>& stages,
                            bool validate);
+    // Recorder-thread generation; UINT64_MAX permanently disables certificates.
+    u64 draw_stage_install_serial{};
     ShadowInfo& ShadowOf(const Shader::Info* canonical, const Shader::Info* seed);
     /// The user data of the infos the pipeline cache just selected (under its lock).
     /// PERF-055: the compute stage of the pipeline just looked up, in its pipeline slot.

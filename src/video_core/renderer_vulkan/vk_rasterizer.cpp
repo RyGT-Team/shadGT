@@ -1045,6 +1045,7 @@ Rasterizer::ShadowInfo& Rasterizer::ShadowOf(const Shader::Info* canonical,
 bool Rasterizer::InstallDrawStages(const Pipeline* pipeline,
                                    std::array<SelectedStage, Shader::MaxStageTypes>& stages,
                                    bool validate) {
+    if (draw_stage_install_serial != UINT64_MAX) ++draw_stage_install_serial;
     const auto& canonical = pipeline->CanonicalStages();
     std::array<const Shader::Info*, Shader::MaxStageTypes> draw_stages{};
     for (u32 stage = 0; stage < Shader::MaxStageTypes; ++stage) {

@@ -295,6 +295,7 @@ struct ParallelRuntime {
     u64 sampler_proof_hits{},sampler_proof_misses{},sampler_scan_steps{},sampler_scan_positives{};
     u64 natural_preclosed{},natural_captured{},natural_serial_fallback{},natural_binding_skip{};
     u64 absent_mode0_attempts{},absent_mode0_accepted{},absent_mode0_rejected{};
+    u64 absent_sharp_cert_hits{},absent_sharp_live_fallbacks{};
     u64 sampled_null_view{},sampled_nonnull_sampler{},sampled_nongeneral{},sampled_canonical_null{};
     u64 absent_sampled_attempts{},absent_sampled_accepted{},absent_sampled_rejected{};
     u64 prepared_view_attempts{},prepared_view_accepted{},prepared_view_fallbacks{};
@@ -4840,11 +4841,13 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     // OPT-012: when the command thread didn't select (it saw the prepared draw), the job
     // thread's selection is installed and trusted.
     bool trusted = false;
+    u64 trusted_install_serial = UINT64_MAX;
     const GraphicsPipeline* pipeline = [&]() -> const GraphicsPipeline* {
         PhaseClock clock{stats.phase_ns[0]};
         if (prepared && !quad_list && r.selected_pipeline == nullptr && prepared->pipeline) {
             if (const GraphicsPipeline* installed = InstallPrepared(*prepared)) {
                 trusted = true;
+                trusted_install_serial = r.draw_stage_install_serial;
                 return installed;
             }
         }
@@ -5510,7 +5513,16 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                 u32 words[4]{};std::memcpy(words,bytes.data()+16+local*16,sizeof(words));
                                 if(words[3]!=0)return false;
                                 ++parallel->absent_mode0_attempts;
-                                const auto& desc=stage.buffers[local];const auto sharp=desc.GetSharp(stage);
+                                const auto& desc=stage.buffers[local];
+                                const bool certified_absent=trusted && from_prepared && worker_identity &&
+                                    known_stage_schema && action && planned_stage()==&stage &&
+                                    action->stage_local==local && action->absent_sharp &&
+                                    trusted_install_serial!=UINT64_MAX && r.draw_stage_install_serial==trusted_install_serial &&
+                                    desc.IsDirectEligible() && desc.sharp_fetch.summary==decltype(desc.sharp_fetch)::Summary::SingleLoad &&
+                                    desc.post_op==Shader::SharpFetchPostOp::None && desc.sharp_fetch.offsets[0]==action->absent_sharp_offset;
+                                if(certified_absent)++parallel->absent_sharp_cert_hits;
+                                else ++parallel->absent_sharp_live_fallbacks;
+                                const auto sharp=certified_absent ? AmdGpu::Buffer::Null() : desc.GetSharp(stage);
                                 // The linked Instance requires and enables nullDescriptor before
                                 // exposing its logical device; see vk_instance.cpp 394-400, 687.
                                 const bool null_enabled=bool(r.instance.GetDevice());
@@ -6579,6 +6591,20 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
                                 action.stage_index=static_cast<u32>(si);action.stage_local=action.buffer_first-base;break;
                             }
                             base+=n;
+                        }
+                        if(action.stage_index<stages.size() && stages[action.stage_index] &&
+                           action.stage_local<stages[action.stage_index]->buffers.size()) {
+                            const auto& desc=stages[action.stage_index]->buffers[action.stage_local];
+                            const auto& copy=p->stage_copies[action.stage_index];
+                            if(copy.present && desc.IsDirectEligible() &&
+                               desc.sharp_fetch.summary==decltype(desc.sharp_fetch)::Summary::SingleLoad &&
+                               desc.post_op==Shader::SharpFetchPostOp::None &&
+                               desc.sharp_fetch.FitsIn(copy.flattened.size())) {
+                                struct Snapshot { std::span<const u32> flattened_ud_buf; u64 pgm_base; };
+                                const auto sharp=desc.GetSharp(Snapshot{copy.flattened,copy.pgm_base});
+                                action.absent_sharp=!sharp.base_address || !sharp.GetSize();
+                                action.absent_sharp_offset=desc.sharp_fetch.offsets[0];
+                            }
                         }
                         // Indices are hints only; the recorder rechecks every predicate and scans on a miss.
                         if(action.stage_index<stages.size() && stages[action.stage_index] &&
@@ -9799,6 +9825,9 @@ void NativeRenderer::Report() {
         const auto& rotation=sidecar->rotation_diag;const auto& sizes=sidecar->pass_size_hist;
         LOG_INFO(Render_Vulkan,"PARALLEL-ROTATION attempts={} success={} invalid={} preflight={} acquire={} command={} prefix={} exception={} pass_sizes_0_1_2_3_4_5_6_7_8plus={},{},{},{},{},{},{},{},{}",rotation.attempts,rotation.success,rotation.invalid,rotation.preflight,rotation.acquire,rotation.command,rotation.prefix,rotation.exception,sizes[0],sizes[1],sizes[2],sizes[3],sizes[4],sizes[5],sizes[6],sizes[7],sizes[8]);
         sidecar->rotation_diag={};sidecar->pass_size_hist={};sidecar->small_admission_exceptions=sidecar->large_admission_exceptions=0;
+        LOG_INFO(Render_Vulkan,"PARALLEL-ABSENT-SHARP cert_hits={} live_fallbacks={}",
+            sidecar->absent_sharp_cert_hits,sidecar->absent_sharp_live_fallbacks);
+        sidecar->absent_sharp_cert_hits=sidecar->absent_sharp_live_fallbacks=0;
         const auto workers=sidecar->coordinator->TakeStats();
         if(sidecar->coordinator->TransferEnabled()) {const auto transfer=sidecar->coordinator->TakeTransferStats();
             LOG_INFO(Render_Vulkan,"PARALLEL-TRANSFER-PASSES attempts={} success={} fallback={}",transfer.success+transfer.fallback,transfer.success,transfer.fallback);}

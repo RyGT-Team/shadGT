@@ -11,13 +11,13 @@
 #include <optional>
 #include <cstdio>
 using u8=uint8_t;using u32=uint32_t;using u64=uint64_t;using std::size_t;
-namespace Shader {enum class BufferType { Other, DirectTable };struct Buffer {BufferType buffer_type{}; bool is_written{}; bool IsSpecial()const{return false;} struct Sharp {u64 base_address{};u64 GetSize()const{return 0;}}; Sharp GetSharp(const auto&)const{return {};} };struct Info {u64 identity{};std::vector<Buffer> buffers;};}
+namespace Shader {enum class BufferType { Other, DirectTable }; enum class SharpFetchPostOp { None }; struct Fetch {enum class Summary { SingleLoad };Summary summary{};std::array<u32,1> offsets{};bool FitsIn(size_t)const{return true;}};struct Buffer {BufferType buffer_type{}; bool is_written{}; Fetch sharp_fetch{}; SharpFetchPostOp post_op{}; bool IsDirectEligible()const{return true;} bool IsSpecial()const{return false;} struct Sharp {u64 base_address{};u64 GetSize()const{return 0;}}; Sharp GetSharp(const auto&)const{return {};} };struct Info {u64 identity{};std::vector<Buffer> buffers;};}
 static bool fail_new=false;void* operator new(size_t n){if(fail_new){fail_new=false;throw std::bad_alloc();}if(auto p=malloc(n))return p;throw std::bad_alloc();}void operator delete(void*p) noexcept{free(p);}void operator delete(void*p,size_t) noexcept{free(p);}
 namespace vk{enum class DescriptorType{eUniformBuffer,eStorageBuffer,eSampledImage,eSampler};struct DescriptorBufferInfo{int x;};struct DescriptorImageInfo{int x;};struct WriteDescriptorSet{DescriptorType descriptorType{};u32 descriptorCount{};const void*pNext{},*pTexelBufferView{};const DescriptorBufferInfo*pBufferInfo{};const DescriptorImageInfo*pImageInfo{};};}
 struct DescriptorSnapshot{template<class T>static bool Valid(const T*p,size_t n,std::span<const T>x){return n&&p==x.data()&&n<=x.size();}static bool BufferSliceValid(const vk::DescriptorBufferInfo*p,size_t n,std::span<const vk::DescriptorBufferInfo>x){return Valid(p,n,x);}static bool ImageSliceValid(const vk::DescriptorImageInfo*p,size_t n,std::span<const vk::DescriptorImageInfo>x){return Valid(p,n,x);}static std::optional<DescriptorSnapshot> Make(auto,auto,auto,size_t){return DescriptorSnapshot{};}};
 struct Bind{u32 binding;const void*pNext;};struct Vertex{std::vector<int> buffers,offsets,sizes,strides;std::vector<Bind> input_bindings,attributes;};
 struct Proof{struct StageSchema{u64 identity{};size_t count{},table_local{SIZE_MAX},table_upload{SIZE_MAX};};std::array<StageSchema,5> stages{};const void*prepared_identity{},*pipeline_identity{},*writes_data{},*buffers_data{},*images_data{},*vertex_identity{},*vertex_buffers_data{},*push_data{};size_t writes_size{},buffers_size{},images_size{},vertex_buffers_size{},push_size{},push_buffer_first{},push_buffer_count{};int pipeline_layout{};bool descriptor_structure{},vertex_shape{},vertex_bindings{},vertex_pnext{};std::array<const void*,5>group_data{};std::array<size_t,5>group_sizes{};size_t ordinary_writes{},ordinary_buffers{},ordinary_images{};u32 counts_push{};bool counts_valid{};u32 push_index{};std::shared_ptr<void> push_snapshot;};
-struct B{std::vector<vk::WriteDescriptorSet>writes;std::vector<vk::DescriptorBufferInfo>buffers;std::vector<vk::DescriptorImageInfo>images;std::array<std::vector<vk::WriteDescriptorSet>,1>grouped_writes;};struct PreparedDraw{struct DescriptorAction{size_t buffer_first{},stage_local{};u8 range_hint{255},region_hint{255};u32 stage_index{~u32{0}},upload_size{};u8 upload_match{2};bool is_buffer{};};struct Upload{u32 info{},size{};};Proof cpu_proof;B bindings;std::vector<DescriptorAction> descriptor_actions;std::vector<Upload> uploads;std::vector<std::pair<u64,u64>>buffer_ranges;struct Region{u64 address,size;};std::vector<Region>regions;bool has_vertices{};std::unique_ptr<Vertex>vertex_index;};using P=PreparedDraw;struct Pipeline{int GetLayout()const{return 4;}u32 PushSet()const{return 0;}};bool ParallelRecordingRequested(){return true;}
+struct B{std::vector<vk::WriteDescriptorSet>writes;std::vector<vk::DescriptorBufferInfo>buffers;std::vector<vk::DescriptorImageInfo>images;std::array<std::vector<vk::WriteDescriptorSet>,1>grouped_writes;};struct PreparedDraw{struct DescriptorAction{size_t buffer_first{},stage_local{};u8 range_hint{255},region_hint{255};u32 stage_index{~u32{0}},upload_size{},absent_sharp_offset{};u8 upload_match{2};bool is_buffer{},absent_sharp{};};struct Copy{bool present{};std::vector<u32> flattened;u64 pgm_base{};};std::array<Copy,5>stage_copies{};struct Upload{u32 info{},size{};};Proof cpu_proof;B bindings;std::vector<DescriptorAction> descriptor_actions;std::vector<Upload> uploads;std::vector<std::pair<u64,u64>>buffer_ranges;struct Region{u64 address,size;};std::vector<Region>regions;bool has_vertices{};std::unique_ptr<Vertex>vertex_index;};using P=PreparedDraw;struct Pipeline{int GetLayout()const{return 4;}u32 PushSet()const{return 0;}};bool ParallelRecordingRequested(){return true;}
 void run(P*p,Pipeline&pipeline){std::array<const Shader::Info*,5> stages{};if(ParallelRecordingRequested())try{
         auto* candidate=&p->cpu_proof;candidate->prepared_identity=p;candidate->pipeline_identity=&pipeline;
         candidate->pipeline_layout=pipeline.GetLayout();
@@ -66,6 +66,20 @@ void run(P*p,Pipeline&pipeline){std::array<const Shader::Info*,5> stages{};if(Pa
                                 action.stage_index=static_cast<u32>(si);action.stage_local=action.buffer_first-base;break;
                             }
                             base+=n;
+                        }
+                        if(action.stage_index<stages.size() && stages[action.stage_index] &&
+                           action.stage_local<stages[action.stage_index]->buffers.size()) {
+                            const auto& desc=stages[action.stage_index]->buffers[action.stage_local];
+                            const auto& copy=p->stage_copies[action.stage_index];
+                            if(copy.present && desc.IsDirectEligible() &&
+                               desc.sharp_fetch.summary==decltype(desc.sharp_fetch)::Summary::SingleLoad &&
+                               desc.post_op==Shader::SharpFetchPostOp::None &&
+                               desc.sharp_fetch.FitsIn(copy.flattened.size())) {
+                                struct Snapshot { std::span<const u32> flattened_ud_buf; u64 pgm_base; };
+                                const auto sharp=desc.GetSharp(Snapshot{copy.flattened,copy.pgm_base});
+                                action.absent_sharp=!sharp.base_address || !sharp.GetSize();
+                                action.absent_sharp_offset=desc.sharp_fetch.offsets[0];
+                            }
                         }
                         // Indices are hints only; the recorder rechecks every predicate and scans on a miss.
                         if(action.stage_index<stages.size() && stages[action.stage_index] &&

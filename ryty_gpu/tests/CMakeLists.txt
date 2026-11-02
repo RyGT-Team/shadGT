@@ -76,6 +76,23 @@ add_custom_command(
     VERBATIM)
 target_sources(parallel_freshness_certificate_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/freshness-log-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/freshness-admission-under-test.inc")
 add_test(NAME parallel_freshness_certificate COMMAND parallel_freshness_certificate_test)
+add_executable(parallel_absent_sharp_test parallel_absent_sharp_test.cpp)
+target_compile_features(parallel_absent_sharp_test PRIVATE cxx_std_23)
+target_include_directories(parallel_absent_sharp_test PRIVATE "${SHADGT_ROOT}" "${SHADGT_ROOT}/src" "${SHADGT_ROOT}/externals/ext-boost" "${SHADGT_FMT_INCLUDE}" "${SHADGT_MAGIC_ENUM_INCLUDE}" "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(parallel_absent_sharp_test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(parallel_absent_sharp_test PRIVATE -UNDEBUG)
+endif()
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/absent-producer.inc" "${CMAKE_CURRENT_BINARY_DIR}/absent-recorder.inc" "${CMAKE_CURRENT_BINARY_DIR}/absent-install.inc"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_absent_sharp.py"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer.cpp" "${CMAKE_CURRENT_BINARY_DIR}"
+    DEPENDS extract_absent_sharp.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer.cpp"
+    VERBATIM)
+target_sources(parallel_absent_sharp_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/absent-producer.inc" "${CMAKE_CURRENT_BINARY_DIR}/absent-recorder.inc" "${CMAKE_CURRENT_BINARY_DIR}/absent-install.inc")
+add_test(NAME parallel_absent_sharp COMMAND parallel_absent_sharp_test)
 add_executable(parallel_vertex_owner_hint_test parallel_vertex_owner_hint_test.cpp)
 target_compile_features(parallel_vertex_owner_hint_test PRIVATE cxx_std_23)
 target_include_directories(parallel_vertex_owner_hint_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")

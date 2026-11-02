@@ -16,6 +16,9 @@ inline std::optional<bool> ParseMode(const std::string& s) noexcept {
     if(s.size()!=1 || (s[0]!='0' && s[0]!='1')) return std::nullopt;
     return s[0]=='1';
 }
+inline bool InitialMode(const char* mode_file,const char* initial) noexcept {
+    return !(mode_file && *mode_file && initial && initial[0]=='0' && !initial[1]);
+}
 struct ModeRequest {std::uint64_t generation;bool enabled;};
 class ModeController {
     std::filesystem::path path_;std::atomic<std::uint64_t> request_;

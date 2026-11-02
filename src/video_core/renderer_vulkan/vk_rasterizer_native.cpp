@@ -4666,8 +4666,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             if(PreparedSampledProofRequested()) {
                 sidecar->prepared_proof_context=prepared_proof_contexts.FindBlocking(this);
             }
-            if(const char* path=std::getenv("RYGT_PARALLEL_MODE_FILE");path && *path)
-                sidecar->mode_controller=std::make_unique<Native::Parallel::ModeController>(std::filesystem::path(path),true);
+            if(const char* path=std::getenv("RYGT_PARALLEL_MODE_FILE");path && *path) {
+                const char* initial=std::getenv("RYGT_PARALLEL_INITIAL_MODE");
+                const bool enabled=Native::Parallel::InitialMode(path,initial);
+                sidecar->applied_mode=Native::Parallel::AppliedMode(enabled);
+                sidecar->mode_controller=std::make_unique<Native::Parallel::ModeController>(std::filesystem::path(path),enabled);
+            }
             if(const char* path=std::getenv("RYGT_PARALLEL_VIEW_MODE_FILE");path && *path)
                 sidecar->view_mode_controller=std::make_unique<Native::Parallel::ModeController>(std::filesystem::path(path),sidecar->view_applied_mode.Enabled());
             sidecar->coordinator=std::make_unique<Native::Parallel::PassCoordinator>(*device,r.instance,*timeline,2,32,64*1024*1024,64);
@@ -4675,11 +4679,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 sidecar->transfer_mode_controller=std::make_unique<Native::Parallel::ModeController>(std::filesystem::path(path),sidecar->transfer_applied_mode.Enabled());
             std::lock_guard sidecar_lock(parallel_sidecars_mutex);
             auto [where,inserted]=parallel_sidecars.emplace(this,std::move(sidecar));
-            if(inserted && where->second->prepared_proof_context)where->second->prepared_proof_context->SetMode(true);
+            if(inserted && where->second->prepared_proof_context)where->second->prepared_proof_context->SetMode(where->second->applied_mode.Enabled());
             if(inserted && where->second->ahead_context) {
                 std::scoped_lock ahead_lock{ahead_context_mutex};
                 if(!where->second->ahead_context->closing.load(std::memory_order_acquire))
-                    SetAheadMode(*where->second->ahead_context,true);
+                    SetAheadMode(*where->second->ahead_context,where->second->applied_mode.Enabled());
             }
             parallel_sidecars_generation.fetch_add(1,std::memory_order_release);
         } catch(const std::exception&) {parallel_sidecar_init_failed.store(true,std::memory_order_relaxed);LOG_WARNING(Render_Vulkan,"PARALLEL-RECORD: initialization failed, using serial recorder");}

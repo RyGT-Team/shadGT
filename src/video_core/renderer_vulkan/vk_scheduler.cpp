@@ -18,8 +18,13 @@
 #include "common/nvtx.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "ryty_gpu/ryty_diag.h"
+#include "parallel_submit_context.h"
 
 namespace Vulkan {
+namespace { thread_local u64 active_submit_signal=0; }
+u64 ActiveSubmitSignal() noexcept {return active_submit_signal;}
+ScopedSubmitSignal::ScopedSubmitSignal(u64 signal) noexcept : previous_(active_submit_signal) {active_submit_signal=signal;}
+ScopedSubmitSignal::~ScopedSubmitSignal() {active_submit_signal=previous_;}
 
 std::mutex Scheduler::submit_mutex;
 
@@ -503,6 +508,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     // PERF-084: the queue lock is taken only around queue calls (the submit callback's sparse
     // binds take it themselves), so the command thread can submit while the recorder works.
     const u64 signal_value = work_semaphore.NextTick();
+    const ScopedSubmitSignal submit_signal_scope{signal_value};
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();

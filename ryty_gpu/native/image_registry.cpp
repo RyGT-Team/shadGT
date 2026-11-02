@@ -861,7 +861,9 @@ void ImageRegistry::Invalidate(VAddr address, u64 size, Stale why) {
             MarkStale(entry, why);
         } else {
             entry.guest_modified.store(true, std::memory_order_seq_cst);
-            if (entry.kept.load(std::memory_order_seq_cst)) {
+            // Unmapping ends the allocation's lifetime, even before it was kept.
+            // Retire it from lookup without destroying resources still in flight.
+            if (why == Stale::Unmap || entry.kept.load(std::memory_order_seq_cst)) {
                 MarkReused(entry); // FIX-157
             }
         }
@@ -952,13 +954,17 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
                     entry.info.size.width >= 2048 && (prior <= 3 || prior % 16 == 0)) {
                     static std::atomic<u32> logged{};
                     if (logged.fetch_add(1,std::memory_order_relaxed) < 4096) {
-                        const u64 sequence = GpuCheckpoints::sequence.load(std::memory_order_acquire);
-                        const auto& slot = GpuCheckpoints::slots[sequence % GpuCheckpoints::slots.size()];
-                        const u64 before = slot.stamp.load(std::memory_order_acquire);
-                        const u64 kind = slot.kind.load(std::memory_order_relaxed);
-                        const u64 program = slot.program.load(std::memory_order_relaxed);
-                        const bool stable = before == sequence && sequence != 0 &&
-                            slot.stamp.load(std::memory_order_acquire) == before;
+                        u64 sequence = 0, kind = 0, program = 0;
+                        bool stable = false;
+                        if (GpuCheckpoints::supported.load(std::memory_order_relaxed)) {
+                            sequence = GpuCheckpoints::sequence.load(std::memory_order_acquire);
+                            const auto& slot = GpuCheckpoints::Slots()[sequence % GpuCheckpoints::SlotCount];
+                            const u64 before = slot.stamp.load(std::memory_order_acquire);
+                            kind = slot.kind.load(std::memory_order_relaxed);
+                            program = slot.program.load(std::memory_order_relaxed);
+                            stable = before == sequence && sequence != 0 &&
+                                slot.stamp.load(std::memory_order_acquire) == before;
+                        }
                         LOG_WARNING(Render_Vulkan,
                             "UPLOAD-CAUSE: gpu-write image={:#x} guest={:#x} prior={} write={:#x}+{:#x} exact={} fill={} clock={} preceding-checkpoint={} preceding-kind={} preceding-program={:#x} stable={}",
                             entry.image->NativeHandle(),entry.info.guest_address,prior,address,size,

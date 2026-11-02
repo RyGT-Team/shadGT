@@ -125,6 +125,9 @@ ryty_add_library(ryty_gpu libSceVideoOut
         ryty_gpu/native/entry_hook.cpp
         ryty_gpu/native/gts_hooks.cpp
         ryty_gpu/native/job_walker.cpp
+        ryty_gpu/native/parallel_pass_recording.cpp
+        ryty_gpu/native/parallel_pass_coordinator.cpp
+        ryty_gpu/native/native_xxh512.c
         ryty_gpu/native/shadow.cpp
         # NAT-010/011: the native renderer's backend interface and its Vulkan backend.
         ryty_gpu/native/rhi/rhi_vulkan.cpp
@@ -138,9 +141,14 @@ ryty_add_library(ryty_gpu libSceVideoOut
         src/core/loader/dwarf.cpp
 )
 
+# Keep the dispatch/feature-test translation unit baseline-safe; xxHash selects
+# its AVX-512 implementation only after checking CPU and OS vector state.
+if (CMAKE_C_COMPILER_ID MATCHES "Clang|GNU" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i.86)$")
+    set_source_files_properties(ryty_gpu/native/native_xxh512.c PROPERTIES COMPILE_OPTIONS "-march=x86-64")
+endif()
 target_compile_definitions(ryty_gpu PRIVATE RYTY_HAS_CPU_PATCHES=1 RYTY_DIAG=1)
 
-# shadGT's Discord Rich Presence, in the renderer library only ("Running on ryGT").
+# Discord Rich Presence is linked into the renderer library only.
 if (ENABLE_DISCORD_RPC)
     target_sources(ryty_gpu PRIVATE src/common/discord_rpc_handler.cpp)
     target_compile_definitions(ryty_gpu PRIVATE ENABLE_DISCORD_RPC)

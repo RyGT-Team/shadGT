@@ -3,6 +3,8 @@
 
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
+#include "video_core/renderer_vulkan/descriptor_write_groups.h"
+#include "ryty_gpu/native/descriptor_update_batch.h"
 
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -35,28 +37,30 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const WriteSets& writ
     }
 
     // SHD-002: each stage's writes go to its own set.
-    std::array<boost::container::small_vector<vk::WriteDescriptorSet, 32>,
+    static thread_local std::array<boost::container::small_vector<vk::WriteDescriptorSet, 32>,
                Shader::Backend::MaxDescriptorSets>
-        by_set;
-    for (size_t i = 0; i < set_writes.size(); ++i) {
-        by_set[i < write_sets.size() ? write_sets[i] : 0].push_back(set_writes[i]);
-    }
+        scratch;
+    const auto by_set = GroupDescriptorWrites<vk::WriteDescriptorSet>(
+        {set_writes.data(),set_writes.size()},{write_sets.data(),write_sets.size()},scratch);
+    static thread_local boost::container::small_vector<vk::WriteDescriptorSet,64> updates;
+    updates.clear();
+    std::array<vk::DescriptorSet,Shader::Backend::MaxDescriptorSets> sets{};
     for (u32 set = 0; set < by_set.size(); ++set) {
         auto& writes = by_set[set];
         if (writes.empty()) {
             continue;
         }
         if (set == push_set) {
-            cmdbuf.pushDescriptorSetKHR(bind_point, *pipeline_layout, set, writes);
             continue;
         }
         const auto desc_set = desc_heap.Commit(set_layouts[set]);
-        for (auto& set_write : writes) {
-            set_write.dstSet = desc_set;
-        }
-        instance.GetDevice().updateDescriptorSets(writes, {});
-        cmdbuf.bindDescriptorSets(bind_point, *pipeline_layout, set, desc_set, {});
+        sets[set] = desc_set;
+        Native::AppendDescriptorUpdates(writes,desc_set,updates);
     }
+    Native::CommitDescriptorBatch(updates,sets,push_set,by_set,
+        [&](const auto& all){instance.GetDevice().updateDescriptorSets(all,{});},
+        [&](u32 set,const auto& writes){cmdbuf.pushDescriptorSetKHR(bind_point,*pipeline_layout,set,writes);},
+        [&](u32 set,vk::DescriptorSet value){cmdbuf.bindDescriptorSets(bind_point,*pipeline_layout,set,value,{});});
 }
 
 std::string Pipeline::GetDebugString() const {

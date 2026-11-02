@@ -51,6 +51,9 @@
 #endif
 
 namespace Vulkan {
+#ifdef RYTY_GPU
+bool RytyGtsInRace();
+#endif
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -203,6 +206,11 @@ bool Rasterizer::FilterDraw() {
 }
 
 bool Rasterizer::SelectsPipelinesAhead() const {
+#ifdef RYTY_GPU
+    // Thumbnail dependencies must stop the recorder at the actual draw, with
+    // its guest-clock hold, rather than compile ahead of its queued resources.
+    if (!RytyGtsInRace()) return false;
+#endif
     // PERF-047: -DisablePerf 59 selects every pipeline on the recorder thread as before.
     static const bool enabled = Common::PerfFeatureEnabled(59);
     return enabled && liverpool->Pipelined();
@@ -425,10 +433,11 @@ const ComputePipeline* Rasterizer::AcquireComputePipeline() {
             ++select_stats.mismatched;
         }
     }
-    // Copies are installed only when dispatches may have installed some before (PERF-055 on);
-    // otherwise the pipeline keeps using the cache's infos, as before.
+    // Earlier race dispatches may have installed a shadow on this cached pipeline.
+    // Refresh its recorder-owned stage even when ahead selection is now disabled
+    // by the race-to-menu transition.
     static const bool copies = Common::PerfFeatureEnabled(66);
-    const bool install = copies && SelectsPipelinesAhead();
+    const bool install = copies;
     std::array<SelectedStage, Shader::MaxStageTypes> stages{};
     const ComputePipeline* pipeline;
     {
@@ -1076,8 +1085,18 @@ bool Rasterizer::InstallDrawStages(const Pipeline* pipeline,
 const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectParams& params,
                                                             bool selected_allowed) {
     if (!SelectsPipelinesAhead()) {
-        std::scoped_lock lk{pipeline_cache.LookupMutex()};
-        return pipeline_cache.GetGraphicsPipeline(params);
+        // A cached pipeline may still point at a per-race shadow. Reinstall a
+        // recorder-owned stage from the current lookup after leaving race mode.
+        std::array<SelectedStage, Shader::MaxStageTypes> stages{};
+        const GraphicsPipeline* pipeline;
+        {
+            std::scoped_lock lk{pipeline_cache.LookupMutex()};
+            pipeline = pipeline_cache.GetGraphicsPipeline(params);
+            if (!pipeline) return nullptr;
+            CopySelectedStages(stages);
+        }
+        if (!InstallDrawStages(pipeline, stages, false)) return nullptr;
+        return pipeline;
     }
     auto& stats = select_stats;
     const auto now = std::chrono::steady_clock::now();

@@ -9,6 +9,7 @@
 #include <windows.h>
 
 #include "ryty_gpu/native/job_walker.h"
+#include "ryty_gpu/native/memory_range_runs.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/amdgpu/regs.h"
 
@@ -142,11 +143,13 @@ void ForgetReadable(u64 address, u64 size) {
         return;
     }
     readable_generation.fetch_add(1, std::memory_order_acq_rel);
-    for (u64 granule = address >> GranuleBits;
-         granule <= (address + size - 1) >> GranuleBits && granule < Granules; ++granule) {
-        readable_bits[granule / 64].fetch_and(~(u64{1} << (granule % 64)),
-                                               std::memory_order_relaxed);
-    }
+    constexpr u64 AddressLimit = Granules << GranuleBits;
+    if (address >= AddressLimit) return;
+    const u64 end = size >= AddressLimit - address ? Granules
+        : ((address + size - 1) >> GranuleBits) + 1;
+    VisitBitWords(address >> GranuleBits, end, [](u64 word, u64 mask) {
+        readable_bits[word].fetch_and(~mask, std::memory_order_relaxed);
+    });
 }
 
 u64 ReadablePrefix(const void* address, u64 size) {

@@ -625,6 +625,7 @@ bool Instance::CreateDevice() {
     if (Native::GpuCheckpoints::Requested()) {
         const bool enabled = add_extension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
         Native::GpuCheckpoints::supported.store(enabled, std::memory_order_relaxed);
+        if (enabled) (void)Native::GpuCheckpoints::Slots(); // Allocate diagnostics before recording begins.
         LOG_INFO(Render_Vulkan, "GPU-CHECKPOINT: diagnostic requested, supported={}", enabled);
     }
 #endif

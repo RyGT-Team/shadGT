@@ -8,7 +8,7 @@ int main() {
     std::uint64_t cases = 0;
     for (std::uint64_t mib = 0; mib <= 32768; ++mib) {
         const auto budget = mib << 20;
-        const auto threshold = budget > GiB ? budget - GiB : 0;
+        const auto threshold = budget > 2 * GiB ? budget - 2 * GiB : 0;
         assert(!PipelineRetentionUnderPressure(0, budget));
         assert(!PipelineRetentionUnderPressure(threshold, budget));
         assert(PipelineRetentionUnderPressure(threshold + 1, budget) == (budget != 0));
@@ -17,6 +17,6 @@ int main() {
     }
     assert(!PipelineRetentionUnderPressure(UINT64_MAX, 0));
     assert(PipelineRetentionUnderPressure(UINT64_MAX, UINT64_MAX));
-    assert(!PipelineRetentionUnderPressure(UINT64_MAX - GiB, UINT64_MAX));
+    assert(!PipelineRetentionUnderPressure(UINT64_MAX - 2 * GiB, UINT64_MAX));
     printf("PASS %llu pipeline budget boundary cases\n", (unsigned long long)(cases + 3));
 }

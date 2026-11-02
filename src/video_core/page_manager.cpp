@@ -23,6 +23,8 @@
 #include "video_core/buffer_cache/proto_import.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
+#include "video_core/guest_page_domain.h"
+
 #ifndef _WIN64
 #include <sys/mman.h>
 #include "common/adaptive_mutex.h"
@@ -709,6 +711,10 @@ struct SignalImpl : public PageManager::Impl {
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
+        // Host/driver faults must continue to their own handlers. Besides
+        // needless GPU drains, indexing the 40-bit guest table with a host
+        // address can fault recursively and hide the original exception.
+        if (!IsTrackedGuestAddress(addr)) return false;
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
         // PERF-031: the draw pipe's recorder thread is a GPU thread too; a fault on the command
         // thread lets the recorder finish first, since the handling uses the caches.
@@ -790,12 +796,12 @@ void PageManager::Unguard(VAddr address, u64 size) {
 }
 
 bool PageManager::IsGuarded(VAddr page) const {
-    const auto* state = impl->cached_pages.find(page >> PM_PAGE_BITS);
+    const auto* state = FindTrackedGuestPage(impl->cached_pages,page,PM_PAGE_BITS);
     return state && state->num_guards != 0;
 }
 
 bool PageManager::IsUnwatched(VAddr page) const {
-    const auto* state = impl->cached_pages.find(page >> PM_PAGE_BITS);
+    const auto* state = FindTrackedGuestPage(impl->cached_pages,page,PM_PAGE_BITS);
     return !state || (state->num_write_watchers == 0 && state->num_read_watchers == 0 &&
                       state->num_guards == 0);
 }

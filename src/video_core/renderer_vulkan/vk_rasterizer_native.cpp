@@ -1,3 +1,27 @@
+#include "ryty_gpu/native/ahead_descriptor_pools.h"
+#include "ryty_gpu/native/per_draw_view_proof.h"
+#include "ryty_gpu/native/adaptive_xxh3.h"
+#include "ryty_gpu/native/batch_view_walk.h"
+#include "parallel_absent_sampled_image.h"
+#include "ryty_gpu/native/parallel_mode_control.h"
+#include "ryty_gpu/native/sync_owner_pins.h"
+#include "ryty_gpu/native/rhi/completed_owner_release.h"
+#include "ryty_gpu/native/prepared_direct_slot.h"
+#include "ryty_gpu/native/parallel_direct_capability.h"
+#include "ryty_gpu/native/parallel_gate_histogram.h"
+#include "core/emulator_settings.h"
+#include "ryty_gpu/native/parallel_rotate_segment.h"
+#include "ryty_gpu/native/natural_scope_boundary.h"
+#include "ryty_gpu/native/attachment_alias.h"
+#include "ryty_gpu/native/prepared_index_bounds.h"
+#include "ryty_gpu/native/prepared_direct_absent.h"
+#include "ryty_gpu/native/per_draw_stage_proof.h"
+#include "ryty_gpu/native/positive_handle_cache.h"
+#include "parallel_submit_context.h"
+#include "ryty_gpu/native/descriptor_alloc_metrics.h"
+#include "a82_capture_gate.h"
+#include "ryty_gpu/native/descriptor_pool_reuse.h"
+#include "ryty_gpu/native/epoch_lookup_memo.h"
 #include "ryty_gpu/native/descriptor_update_batch.h"
 #include "ryty_gpu/native/upload_phase_trace.h"
 #include "ryty_gpu/native/region_init_gaps.h"
@@ -79,15 +103,292 @@ namespace VideoCore {
 vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type);
 }
 
+#include "video_core/renderer_vulkan/scene_capture_trace.h"
+#include "video_core/renderer_vulkan/trace_mip_layout.h"
+#include "video_core/renderer_vulkan/trace_residency.h"
+#include "video_core/renderer_vulkan/resident_prt_view.h"
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace Vulkan {
+namespace {
+struct AheadVulkanBackend {
+    using Pool=vk::DescriptorPool;using Layout=vk::DescriptorSetLayout;using Set=vk::DescriptorSet;
+    static constexpr std::size_t MaxSetsPerPool=256;
+    static constexpr std::array<std::size_t,4> MaxDescriptorsPerPool{4096,4096,512,2048};
+    vk::Device device;
+    Pool Create() noexcept {try {
+        const std::array<vk::DescriptorPoolSize,4> sizes{{{vk::DescriptorType::eStorageBuffer,4096},{vk::DescriptorType::eSampledImage,4096},{vk::DescriptorType::eStorageImage,512},{vk::DescriptorType::eSampler,2048}}};
+        const auto [result,pool]=device.createDescriptorPool(vk::DescriptorPoolCreateInfo{.maxSets=u32(MaxSetsPerPool),.poolSizeCount=u32(sizes.size()),.pPoolSizes=sizes.data()});
+        return result==vk::Result::eSuccess?pool:Pool{};
+    } catch(...) {return {};}}
+    bool Reset(Pool pool) noexcept {try{return device.resetDescriptorPool(pool)==vk::Result::eSuccess;}catch(...){return false;}}
+    bool Allocate(Pool pool,std::span<const Layout> layouts,std::span<Set> sets) noexcept {try {
+        const vk::DescriptorSetAllocateInfo a{.descriptorPool=pool,.descriptorSetCount=u32(layouts.size()),.pSetLayouts=layouts.data()};
+        return device.allocateDescriptorSets(&a,sets.data())==vk::Result::eSuccess;
+    } catch(...) {return false;}}
+    void Destroy(Pool pool) noexcept {device.destroyDescriptorPool(pool);}
+};
+using AheadPools=Native::Parallel::AheadDescriptorPools<AheadVulkanBackend,4,Shader::Backend::MaxDescriptorSets>;
+struct AheadContext {
+    AheadPools pools;std::atomic<bool> closing{},mode{};std::atomic<u64> active{},attempts{},ready{},used{},unused{},used_sets{},unused_sets{},failures{},capacity{};
+    explicit AheadContext(vk::Device device):pools(AheadVulkanBackend{device}){}
+};
+struct AheadLease {
+    std::shared_ptr<AheadContext> context;AheadPools::LeasePtr lease;
+    std::array<vk::DescriptorSet,Shader::Backend::MaxDescriptorSets> sets{};
+    std::array<vk::DescriptorSetLayout,Shader::Backend::MaxDescriptorSets> layouts{};
+    vk::PipelineLayout pipeline_layout{};std::shared_ptr<const void> pipeline_owner;std::size_t prepared_sets{},used_sets{};bool used{};
+    ~AheadLease(){if(context && lease){if(!used)context->unused.fetch_add(1,std::memory_order_relaxed);context->unused_sets.fetch_add(prepared_sets-used_sets,std::memory_order_relaxed);}}
+};
+std::atomic<u32> ahead_enabled_contexts{};
+void SetAheadMode(AheadContext& c,bool enabled) noexcept {
+    const bool old=c.mode.exchange(enabled,std::memory_order_acq_rel);if(old==enabled)return;
+    c.pools.SetEnabled(enabled);if(enabled)ahead_enabled_contexts.fetch_add(1,std::memory_order_release);else ahead_enabled_contexts.fetch_sub(1,std::memory_order_release);
+}
+std::mutex ahead_context_mutex;
+std::unordered_map<const NativeRenderer*,std::shared_ptr<AheadContext>> ahead_contexts;
+bool AheadRequested() noexcept {static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_PRODUCER_DESCRIPTORS");return p && p[0]=='1' && !p[1];}();return enabled;}
+
+std::shared_ptr<AheadContext> FindAheadBlocking(const NativeRenderer* renderer) {
+    if(!AheadRequested())return {};std::scoped_lock lock{ahead_context_mutex};const auto it=ahead_contexts.find(renderer);
+    return it==ahead_contexts.end()?std::shared_ptr<AheadContext>{}:it->second;
+}
+std::shared_ptr<AheadContext> FindAhead(const NativeRenderer* renderer) noexcept {
+    if(!ahead_enabled_contexts.load(std::memory_order_acquire))return {};
+    std::unique_lock lock{ahead_context_mutex,std::try_to_lock};if(!lock)return {};
+    const auto it=ahead_contexts.find(renderer);if(it==ahead_contexts.end())return {};
+    auto c=it->second;if(!c->mode.load(std::memory_order_acquire) || c->closing.load(std::memory_order_acquire))return {};
+    c->active.fetch_add(1,std::memory_order_acq_rel);return c;
+}
+std::shared_ptr<AheadContext> BeginAheadShutdown(const NativeRenderer* renderer) {
+    if(!AheadRequested())return {};std::scoped_lock lock{ahead_context_mutex};const auto it=ahead_contexts.find(renderer);
+    if(it==ahead_contexts.end())return {};auto c=it->second;c->closing.store(true,std::memory_order_release);SetAheadMode(*c,false);c->pools.BeginClose();ahead_contexts.erase(it);return c;
+}
+struct AheadPrepareGuard {
+    std::shared_ptr<AheadContext> context;
+    explicit AheadPrepareGuard(std::shared_ptr<AheadContext> c):context(std::move(c)) {}
+    ~AheadPrepareGuard(){if(context)context->active.fetch_sub(1,std::memory_order_release);}
+};
+}
+namespace {
+// Experimental sidecar: enabled only by RYGT_PARALLEL_RECORDING=1. The
+// renderer's recursive mutex serializes access to each sidecar; workers only
+// consume immutable pass packets and RHI device/instance handles.
+struct ParallelBindingCapture {
+    std::array<vk::DescriptorSet,Shader::Backend::MaxDescriptorSets> sets{};
+    AheadLease* ahead{};bool ahead_used{},write_structure_proven{};
+};
+thread_local ParallelBindingCapture* parallel_binding_capture=nullptr;
+struct ScopedParallelBindingCapture {
+    ParallelBindingCapture* previous;
+    explicit ScopedParallelBindingCapture(ParallelBindingCapture& capture):previous(parallel_binding_capture) {parallel_binding_capture=&capture;}
+    ~ScopedParallelBindingCapture(){parallel_binding_capture=previous;}
+};
+struct ProofPhaseStats {u64 count{},wall_ns{},wall_max{};};
+bool BatchViewWalkRequested() noexcept {
+    static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_BATCH_VIEW_WALK");return p && p[0]=='1' && !p[1];}();
+    return enabled;
+}
+bool TransferPassesRequested() noexcept {
+    static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_TRANSFER_PASSES");return p && p[0]=='1' && !p[1];}();
+    return enabled;
+}
+bool PreparedSampledProofRequested() noexcept {
+    static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_PREPARED_VIEW_PROOF");return p && p[0]=='1' && !p[1];}();
+    return enabled;
+}
+Native::Parallel::ProofProducerRegistry prepared_proof_contexts;
+// Recorder-owned host update batch. Storage never moves while any write points into it.
+struct PendingDescriptorUpdates {
+    PendingDescriptorUpdates()=default;
+    PendingDescriptorUpdates(const PendingDescriptorUpdates&)=delete;
+    PendingDescriptorUpdates& operator=(const PendingDescriptorUpdates&)=delete;
+    PendingDescriptorUpdates(PendingDescriptorUpdates&&)=delete;
+    PendingDescriptorUpdates& operator=(PendingDescriptorUpdates&&)=delete;
+    static_assert(256*sizeof(vk::WriteDescriptorSet)+1024*sizeof(vk::DescriptorBufferInfo)+
+                  1024*sizeof(vk::DescriptorImageInfo)<=64*1024);
+    enum Reason : u32 { EndPass, Serial, Abandoned, Capacity, Unsupported, Exception, ReasonCount };
+    enum class Admission { Yes, Capacity, Unsupported };
+    std::array<vk::WriteDescriptorSet,256> writes{};
+    std::array<vk::DescriptorBufferInfo,1024> buffers{};
+    std::array<vk::DescriptorImageInfo,1024> images{};
+    std::size_t nw{},nb{},ni{};
+    u64 logical_draws{},actual_calls{},staged_rows{},immediate_draws{},overflow_draws{},unsupported_draws{},high_rows{};
+    std::array<u64,ReasonCount> flushes{};
+    template<bool Proven=false,class Groups>
+    Admission Check(const Groups& groups,u32 push,std::span<const vk::DescriptorBufferInfo> source_buffers,
+                    std::span<const vk::DescriptorImageInfo> source_images) const noexcept {
+        std::size_t w=nw,b=nb,i=ni;
+        for(u32 set=0;set<groups.size();++set) if(set!=push) for(const auto& row:groups[set]) {
+            if constexpr(Proven) {
+                if(row.pBufferInfo) {if(row.descriptorCount>buffers.size()-b)return Admission::Capacity;b+=row.descriptorCount;}
+                else {if(row.descriptorCount>images.size()-i)return Admission::Capacity;i+=row.descriptorCount;}
+            } else {
+                if(row.pNext || row.pTexelBufferView || !row.descriptorCount)return Admission::Unsupported;
+                const bool buffer=row.descriptorType==vk::DescriptorType::eUniformBuffer || row.descriptorType==vk::DescriptorType::eStorageBuffer;
+                const bool image=row.descriptorType==vk::DescriptorType::eSampler || row.descriptorType==vk::DescriptorType::eSampledImage;
+                if(buffer) {if(row.pImageInfo || !DescriptorSnapshot::BufferSliceValid(row.pBufferInfo,row.descriptorCount,source_buffers))return Admission::Unsupported;
+                    if(row.descriptorCount>buffers.size()-b)return Admission::Capacity;b+=row.descriptorCount;}
+                else if(image) {if(row.pBufferInfo || !DescriptorSnapshot::ImageSliceValid(row.pImageInfo,row.descriptorCount,source_images))return Admission::Unsupported;
+                    if(row.descriptorCount>images.size()-i)return Admission::Capacity;i+=row.descriptorCount;}
+                else return Admission::Unsupported;
+            }
+            if(w==writes.size())return Admission::Capacity;++w;
+        }
+        return Admission::Yes;
+    }
+    template<class Rows> void Stage(const Rows& rows,vk::DescriptorSet set) noexcept {
+        for(const auto& source:rows) {
+            auto row=source;row.dstSet=set;
+            if(row.pBufferInfo) {std::copy_n(row.pBufferInfo,row.descriptorCount,buffers.data()+nb);row.pBufferInfo=buffers.data()+nb;nb+=row.descriptorCount;}
+            else {std::copy_n(row.pImageInfo,row.descriptorCount,images.data()+ni);row.pImageInfo=images.data()+ni;ni+=row.descriptorCount;}
+            writes[nw++]=row;++staged_rows;
+        }
+        high_rows=std::max<u64>(high_rows,nw);
+    }
+    void Flush(vk::Device device,Reason reason) noexcept {
+        if(!nw)return;
+        device.updateDescriptorSets(vk::ArrayProxy<const vk::WriteDescriptorSet>{static_cast<u32>(nw),writes.data()},{});
+        ++actual_calls;++flushes[reason];nw=nb=ni=0;
+    }
+};
+struct ParallelRuntime {
+    PendingDescriptorUpdates descriptor_updates;
+    u64 producer_structure_hits{},producer_vertex_hits{},producer_snapshot_hits{};
+    std::unique_ptr<Native::Parallel::PassCoordinator> coordinator;
+    std::unique_ptr<Native::Parallel::ModeController> mode_controller;
+    Native::Parallel::AppliedMode applied_mode{true};bool mode_initial_logged{};
+    std::shared_ptr<Native::Parallel::ProofProducerContext> prepared_proof_context;
+    std::unique_ptr<Native::Parallel::ModeController> transfer_mode_controller;
+    Native::Parallel::AppliedMode transfer_applied_mode{TransferPassesRequested()};bool transfer_mode_initial_logged{};
+    std::unique_ptr<Native::Parallel::ModeController> view_mode_controller;
+    Native::Parallel::AppliedMode view_applied_mode{BatchViewWalkRequested()};bool view_mode_initial_logged{};
+    u64 whole_seq{},whole_samples{},whole_wall_ns{},whole_cpu_samples{},whole_cpu_100ns{},whole_max_ns{};
+    ParallelGateHistogram gates;
+    std::optional<Native::Parallel::Pass> active;
+    Native::Parallel::SyncOwnerPins<> sync_pins;
+    std::size_t pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;
+    std::vector<Native::Parallel::Draw> scratch_draws;
+    std::shared_ptr<const void> lease;
+    u64 epoch{};
+    std::array<u64,10> descriptor_fail_reasons{};u32 descriptor_samples{};u64 descriptor_readonly_attempts{},descriptor_readonly_regions{},descriptor_readonly_imports{},descriptor_readonly_uncontained{},descriptor_readonly_unmatched{},descriptor_clip_nulls{};
+    std::array<ProofPhaseStats,9> proof_phases{};
+    Native::Parallel::PositiveHandleCache<vk::Sampler> sampler_proof;
+    u64 sampler_proof_hits{},sampler_proof_misses{},sampler_scan_steps{},sampler_scan_positives{};
+    u64 natural_preclosed{},natural_captured{},natural_serial_fallback{},natural_binding_skip{};
+    u64 absent_mode0_attempts{},absent_mode0_accepted{},absent_mode0_rejected{};
+    u64 sampled_null_view{},sampled_nonnull_sampler{},sampled_nongeneral{},sampled_canonical_null{};
+    u64 absent_sampled_attempts{},absent_sampled_accepted{},absent_sampled_rejected{};
+    u64 prepared_view_attempts{},prepared_view_accepted{},prepared_view_fallbacks{};
+    std::array<u64,7> captured_vertex_counts{};u64 captured_vertex_sum{};
+    Native::Parallel::ViewProofStats view_proof_stats{};
+    struct ViewSample {u64 sequence{},draws{},queried_draws{},image_infos{},sampled_entries{};std::array<u64,10> cardinality{};Native::Parallel::ViewProofStats proof{};} view_sample;
+    struct AheadFlight {std::shared_ptr<AheadLease> lease;std::function<void()> release;u64 tick{};};
+    std::array<AheadFlight,2048> ahead_flights{};std::size_t ahead_cursor{},ahead_live{};std::shared_ptr<AheadContext> ahead_context;
+    u64 proof_table_builds{},proof_table_hits{},extended_clear_rejected{},fast_rejected{},serial_scope_bypassed{},owner_slot_pressure{},eligible_in_serial_scope{},eligible_in_active_scope{},eligible_at_boundary{},vertex_candidates{},vertex_preflight_draws{},vertex_backing_pass{},vertex_bad_structure{},vertex_bad_binding{},vertex_bad_pnext{},vertex_unknown_backing{},vertex_direct_ranges{},vertex_direct_attempts{},vertex_direct_matches{},direct_slot_attempts{},direct_slot_accepted{},passes{},draws{},queued{},synchronous{},considered{},eligible{},unknown_resource_key{},buffer_rejected{},alias_rejected{},descriptor_rejected{},missing_sets{},preflight_seq{},preflight_samples{},preflight_wall_ns{},preflight_cpu_100ns{},preflight_cpu_samples{},drain_ns{},coordinator_cpu_100ns{},coordinator_cpu_samples{};
+    u64 serial_eligible_run{},serial_eligible_run_max{};std::array<u64,4> serial_eligible_runs{};
+    void FinishSerialEligibleRun() noexcept {
+        if(!serial_eligible_run)return;
+        const auto n=serial_eligible_run;++serial_eligible_runs[n==1?0:n<4?1:n<8?2:3];serial_eligible_run=0;
+    }
+    void NoteSerialEligible() noexcept {
+        if(serial_eligible_run!=UINT64_MAX)++serial_eligible_run;
+        serial_eligible_run_max=std::max(serial_eligible_run_max,serial_eligible_run);
+    }
+    bool closing{};
+};
+std::mutex parallel_sidecars_mutex;
+std::unordered_map<const NativeRenderer*,std::unique_ptr<ParallelRuntime>> parallel_sidecars;
+std::atomic<u64> parallel_sidecars_generation{1};
+std::atomic<bool> parallel_sidecar_init_failed{false};
+bool ParallelRecordingRequested();
+ParallelRuntime* FindParallelRuntime(const NativeRenderer* renderer) {
+    if(!ParallelRecordingRequested())return nullptr;
+    struct Cache {const NativeRenderer* owner{};ParallelRuntime* sidecar{};u64 generation{};};
+    static thread_local Cache cache;
+    const u64 generation=parallel_sidecars_generation.load(std::memory_order_acquire);
+    if(cache.owner==renderer && cache.generation==generation)return cache.sidecar;
+    std::lock_guard lock(parallel_sidecars_mutex);
+    const auto it=parallel_sidecars.find(renderer);
+    cache={renderer,it==parallel_sidecars.end()?nullptr:it->second.get(),parallel_sidecars_generation.load(std::memory_order_relaxed)};
+    return cache.sidecar;
+}
+bool ParallelRecordingRequested() {
+    static const bool requested=[] {const char* p=std::getenv("RYGT_PARALLEL_RECORDING");return p&&p[0]=='1'&&p[1]=='\0';}();return requested;
+}
+bool ParallelReadonlyDescriptorEnabled() {static const bool yes=[] {const char* p=std::getenv("RYGT_PARALLEL_READONLY_DESCRIPTOR");return p && p[0]=='1' && p[1]=='\0';}();return yes;}
+bool ParallelDirectVertexEnabled() { static const bool yes=[] {const char* p=std::getenv("RYGT_PARALLEL_DIRECT_VERTEX");return p && p[0]=='1' && p[1]=='\0';}();return yes; }
+bool ParallelVertexEnabled() { static const bool yes=[] {const char* p=std::getenv("RYGT_PARALLEL_VERTEX");return p && p[0]=='1' && p[1]=='\0';}();return yes; }
+bool ParallelSmallPassBatchEnabled() { static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_SMALLPASS_BATCH");return p && p[0]=='1' && p[1]=='\0';}();return enabled; }
+// Experimental indexed/MRT/depth packet. Clear admission remains separately gated.
+bool ParallelExtendedEnabled() {static const bool on=[] {const char* p=std::getenv("RYGT_PARALLEL_EXTENDED");return p && p[0]=='1' && !p[1];}();return on;}
+bool ParallelD2Enabled() { static const bool yes=[] {const char* p=std::getenv("RYGT_PARALLEL_D2"); return p && p[0]=='1' && p[1]=='\0';}();return yes; }
+bool ParallelProofPhaseEnabled() {static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_PROOF_PHASE_DIAG");return p && p[0]=='1' && !p[1];}();return enabled;}
+bool ParallelGateDiagEnabled() {
+    static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_GATE_DIAG");return p&&p[0]=='1'&&p[1]=='\0';}();return enabled;
+}
+struct ParallelEligibilityStats {
+    u64 observed{}, eligible{}, race{}, nonindexed{}, single_color{}, no_clear{}, no_depth{}, no_descriptors{}, no_storage{}, no_feedback{}, eligible_draws_in_runs[7]{}, runs[7]{}, current{};
+    void Flush() { if (!current) return; unsigned bucket=0; u64 value=current; while(value>1 && bucket<6){value>>=1;++bucket;} ++runs[bucket]; eligible_draws_in_runs[bucket]+=current;current=0; }
+};
+thread_local ParallelEligibilityStats parallel_eligibility_stats;
+thread_local const NativeRenderer* parallel_eligibility_owner=nullptr;
+bool ParallelEligibilityEnabled() { static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_ELIGIBILITY_DIAG");return p&&p[0]=='1';}();return enabled; }
+thread_local Native::DescriptorAllocMetrics descriptor_alloc_metrics;
+thread_local u64 descriptor_bind_sets[2]{}, descriptor_bind_runs[2]{}, descriptor_bind_multi[2]{};
+thread_local const NativeRenderer* descriptor_alloc_owner = nullptr;
+bool DescriptorAllocDiagEnabled() {
+    static const bool enabled = [] { const char* e=std::getenv("RYGT_DESC_ALLOC_DIAG"); return e && e[0]=='1'; }();
+    return enabled;
+}
+bool DescriptorThreadCpu100ns(u64& result) {
+#ifdef _WIN32
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) {
+        result=(u64(kernel.dwHighDateTime)<<32 | kernel.dwLowDateTime) + (u64(user.dwHighDateTime)<<32 | user.dwLowDateTime);
+        return true;
+    }
+#endif
+    result=0; return false;
+}
+struct SampledProofTimer {
+    ProofPhaseStats* stats{};std::chrono::steady_clock::time_point start{};
+    SampledProofTimer(ProofPhaseStats& s,bool sampled) noexcept {if(sampled){stats=&s;start=std::chrono::steady_clock::now();}}
+    ~SampledProofTimer() {if(!stats)return;const auto raw=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();const u64 wall=raw>0?u64(raw):0;
+        ++stats->count;stats->wall_ns+=wall;stats->wall_max=std::max(stats->wall_max,wall);}
+};
+template<class F> auto TimedProofInvoke(ProofPhaseStats& stats,bool sampled,F&& fn) {
+    SampledProofTimer timer{stats,sampled};return std::forward<F>(fn)();
+}
+}
+struct SceneIndirectArgs {u64 id,address,offset;};
+static std::unique_ptr<Native::Rhi::Buffer> scene_indirect_buffer;
+static std::vector<SceneIndirectArgs> scene_indirect_args;
+
 bool RytyGtsInRace();
 extern std::atomic<u64> g_prepared_frames;
 bool RytyGtsMenuSnapshotsAllowed();
 namespace {
+bool A82CaptureAfterRace() {
+    static const bool enabled=[] { const char* p=std::getenv("RYGT_A82_CAPTURE_AFTER_RACE"); return p && p[0]=='1'; }();
+    if (!enabled) return true;
+    static A82RaceGate gate;
+    static std::atomic<bool> logged_race{}, logged_armed{};
+    const auto state=gate.Observe(RytyGtsInRace());
+    if (state==A82RaceGate::SawRace && !logged_race.exchange(true))
+        LOG_WARNING(Render_Vulkan,"DIAG-A82 gate observed race; capture budget remains untouched");
+    if (state==A82RaceGate::Armed && !logged_armed.exchange(true))
+        LOG_WARNING(Render_Vulkan,"DIAG-A82 gate armed after race; capture enabled");
+    return state==A82RaceGate::Armed;
+}
 thread_local u64 descriptor_hash_reused = 0;
 thread_local u64 descriptor_hash_refreshed = 0;
 
 using FlatUploadMemo = ImmutableUploadMemo<vk::DescriptorBufferInfo, Shader::MaxStageTypes>;
+std::atomic<u64> sampler_cache_epoch{1};
+
 FlatUploadMemo& UploadMemoFor(const NativeRenderer* renderer) {
     struct Local { const NativeRenderer* owner{}; FlatUploadMemo memo; };
     static thread_local Local local;
@@ -408,9 +709,9 @@ void NativeRenderer::DrawBindings::PrepareDescriptorKeys(const Pipeline& pipelin
     if (!groups_ready) PrepareWriteGroups();
     for (u32 set = 0; set < grouped_writes.size(); ++set) {
         if (grouped_writes[set].empty() || set == pipeline.PushSet()) continue;
-        descriptor_keys[set].Build(pipeline.SetLayout(set), grouped_writes[set]);
+        descriptor_keys[set].Build<false>(pipeline.SetLayout(set), grouped_writes[set]);
         auto& key = descriptor_keys[set];
-        if (key.cacheable) key.hash = XXH3_64bits(key.words.data(), key.words.size() * sizeof(u64));
+        if (key.cacheable) key.hash = Native::Parallel::AdaptiveXXH3(key.words.data(), key.words.size() * sizeof(u64));
     }
     key_layout = pipeline.GetLayout();
 }
@@ -627,6 +928,8 @@ void NativeRenderer::FinishNativeFsr(const Targets& targets) {
 }
 
 NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
+    sampler_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
+    if(PreparedSampledProofRequested())try {prepared_proof_contexts.Register(this);} catch(...) {}
     device = Native::Rhi::CreateVulkanDevice(r.instance);
     ASSERT_MSG(device, "NAT-100: no native device");
     const VkSemaphore semaphore = r.scheduler.GetWorkSemaphore()->Handle();
@@ -873,13 +1176,47 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
             SetThreadPriorityBoost(GetCurrentThread(), TRUE);
 #endif
         });
+    if(AheadRequested() && ParallelRecordingRequested() && !r.instance.IsIntel()) {
+        try {auto context=std::make_shared<AheadContext>(r.instance.GetDevice());std::scoped_lock guard{ahead_context_mutex};ahead_contexts.emplace(this,context);SetAheadMode(*context,true);}
+        catch(...) {LOG_WARNING(Render_Vulkan,"PARALLEL-PRODUCER-DESC setup failed; using original descriptors");}
+    }
     LOG_INFO(Render_Vulkan, "NAT-100: native mode: draws, dispatches and copies are recorded with "
                             "native images and guest memory read in place");
 }
 
 NativeRenderer::~NativeRenderer() {
+    if(PreparedSampledProofRequested())prepared_proof_contexts.Close(this);
+    auto ahead_shutdown=BeginAheadShutdown(this);
+    if(ahead_shutdown)while(ahead_shutdown->active.load(std::memory_order_acquire) || !ahead_shutdown->pools.Quiescent())std::this_thread::yield();
+    scene_indirect_buffer.reset();scene_indirect_args.clear();
+    if(SceneTrace::state.pool){const auto pool=SceneTrace::state.pool;const auto device=r.instance.GetDevice();r.scheduler.DeferOperation([device,pool]{device.destroyQueryPool(pool);});SceneTrace::state={};}
     mirror_preparation.reset(); // Join before any device or direct-memory teardown.
+    sampler_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
     std::scoped_lock lock{mutex};
+    if (auto* sidecar=FindParallelRuntime(this)) {
+        sidecar->closing=true;
+        EndRendering();Splice();
+        const auto ahead_pending=[&] {return sidecar->ahead_live!=0;};
+        if(sidecar->coordinator->InFlightNodes() || sidecar->sync_pins.Waiting() || ahead_pending()) {
+            r.scheduler.Finish();
+            while(sidecar->coordinator->InFlightNodes() || sidecar->sync_pins.Waiting() || ahead_pending()) {
+                const u64 done=timeline->Completed();sidecar->coordinator->Collect(done);
+                sidecar->sync_pins.Collect(done,[&](auto& callback) noexcept {return Native::Rhi::TryEnqueueCompleted(*device,callback);});
+                for(auto& flight:sidecar->ahead_flights)if(flight.release && flight.tick && flight.tick<=done){
+                    flight.lease.reset();if(!Native::Rhi::TryEnqueueCompleted(*device,flight.release))continue;flight.tick=0;--sidecar->ahead_live;}
+                if(sidecar->coordinator->InFlightNodes() || sidecar->sync_pins.Waiting() || ahead_pending())std::this_thread::yield();
+            }
+        }
+        std::lock_guard sidecar_lock(parallel_sidecars_mutex);
+        parallel_sidecars_generation.fetch_add(1,std::memory_order_release);
+        parallel_sidecars.erase(this); // joins workers before device/view destruction
+    }
+    if(ahead_shutdown) {
+        {std::scoped_lock prepared_lock{prepared_pool_mutex};for(auto& prepared:prepared_all)if(prepared)prepared->ahead_descriptor_lease.store({},std::memory_order_release);}
+        r.scheduler.Finish();
+        while(!ahead_shutdown->pools.DestroyReady(timeline->Completed()))std::this_thread::yield();
+
+    }
     const vk::Device vk_device = r.instance.GetDevice();
     for (const auto pool : free_pools) {
         vk_device.destroyDescriptorPool(pool);
@@ -990,9 +1327,18 @@ Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bo
 vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
                                    const VideoCore::ImageViewInfo& requested, ViewUse use) {
     std::scoped_lock lock{views_mutex};
+    auto trace_view=[&](vk::ImageView handle,bool cached){
+        if(!SceneTrace::Id())return;
+        const auto& d=entry.image->Desc();const u32 mips=std::max(d.mips,1u),layers=d.dim==Native::Rhi::ImageDim::D3?1u:std::max(d.layers,1u);
+        const u32 first=std::min<u32>(requested.range.base.level,mips-1),count=std::clamp<u32>(requested.range.extent.levels,1,mips-first);
+        const u32 layer=std::min<u32>(requested.range.base.layer,layers-1),layer_count=std::clamp<u32>(requested.range.extent.layers,1,layers-layer);
+        const float min_lod=requested.min_lod && r.instance.IsImageViewMinLodSupported()?std::min(float(requested.min_lod)/256.f,float(first+count-1)):0.f;
+        r.FrameDumpEvent(fmt::format("scene-view id={} address={:#x} handle={:#x} use={} cached={} normalized_mip={}+{} normalized_layer={}+{} effective_min_lod={} min_lod_supported={} image_format={} requested_format={}",SceneTrace::Id(),entry.info.guest_address,reinterpret_cast<u64>(static_cast<VkImageView>(handle)),u32(use),cached,first,count,layer,layer_count,min_lod,r.instance.IsImageViewMinLodSupported(),u32(d.format),u32(requested.format)));
+    };
     auto& records = views[&entry];
     for (const auto& record : records) {
         if (record.use == use && record.info == requested) {
+            trace_view(*record.view,true);
             return *record.view;
         }
     }
@@ -1084,6 +1430,8 @@ vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
         return {};
     }
     const vk::ImageView handle = *view;
+    trace_view(handle,false);
+    if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-view-created id={} handle={:#x} format={} aspect={} type={}",SceneTrace::Id(),reinterpret_cast<u64>(static_cast<VkImageView>(handle)),u32(format),u32(aspect),u32(view_type)));
     records.push_back({requested, use, std::move(view)});
     return handle;
 }
@@ -1092,12 +1440,17 @@ vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& sharp,
                                        AmdGpu::BorderColorBuffer border, bool is_depth) {
     const u64 hash = XXH3_64bits(&sharp, sizeof(sharp)) ^
                      (is_depth ? 0x9E3779B97F4A7C15ULL : 0) ^ (u64(border.Address()) << 1);
+    static thread_local Native::EpochValueMemo<vk::Sampler> memo;
+    const auto epoch = sampler_cache_epoch.load(std::memory_order_acquire);
+    if (const auto found = memo.Find(this, epoch, hash)) return *found;
     std::scoped_lock lock{sampler_mutex};
     auto& slot = samplers[hash];
     if (!slot) {
         slot = std::make_unique<VideoCore::Sampler>(r.instance, sharp, border, is_depth);
     }
-    return slot->Handle();
+    const auto handle = slot->Handle();
+    memo.Store(this, epoch, hash, handle);
+    return handle;
 }
 
 NativeRenderer::Stream& NativeRenderer::Begin() {
@@ -1130,6 +1483,38 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
 }
 
 void NativeRenderer::EndRendering() {
+    auto* sidecar=FindParallelRuntime(this);
+    if(sidecar)sidecar->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::EndPass);
+    if(sidecar)sidecar->FinishSerialEligibleRun();
+    if (sidecar && sidecar->active) {
+        auto& pass=*sidecar->active;
+        u64 coordinator_start=0,coordinator_end=0;const bool cpu_started=ParallelGateDiagEnabled() && DescriptorThreadCpu100ns(coordinator_start);
+        stream.rendering=false; // the captured pass has not begun on stream.cmd
+        bool queued=false;
+        if((pass.draws.size()>=8 || ParallelSmallPassBatchEnabled()) && !sidecar->closing) {
+            const auto reset=[&]() noexcept {stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;};
+            if(Native::Parallel::RotateSegment(*sidecar->coordinator,*device,sidecar->epoch,
+                    stream.list,stream.cmd,sidecar->lease,64*1024,reset)) {
+                std::size_t bytes=sizeof(pass)+pass.draws.capacity()*sizeof(Native::Parallel::Draw);
+                for(const auto& draw:pass.draws) bytes+=draw.descriptor_bytes;
+                try {queued=pass.draws.size()>=8 ? (sidecar->transfer_applied_mode.Enabled() ? sidecar->coordinator->TryPassTransfer(sidecar->epoch,pass,bytes) : sidecar->coordinator->TryPass(sidecar->epoch,pass,bytes)) : sidecar->coordinator->TrySmallPass(sidecar->epoch,pass,bytes);}
+                catch(const std::bad_alloc&) {queued=false;}
+            }
+        }
+        if(queued) {++sidecar->queued;sidecar->sync_pins.Queued(sidecar->pin_slot);} else {
+            ++sidecar->synchronous;
+            ASSERT_MSG(Native::Parallel::RecordPass(stream.cmd,r.instance,pass),"parallel pass synchronous fallback failed");
+            ASSERT_MSG(sidecar->sync_pins.Tag(sidecar->pin_slot,sidecar->epoch),"parallel synchronous owner pin failed");
+            stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;
+        }
+        pass.draws.clear();sidecar->scratch_draws.swap(pass.draws);
+        sidecar->pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;
+        sidecar->active.reset();sidecar->lease.reset();
+        if(cpu_started && DescriptorThreadCpu100ns(coordinator_end) && coordinator_end>=coordinator_start) {
+            sidecar->coordinator_cpu_100ns+=coordinator_end-coordinator_start;++sidecar->coordinator_cpu_samples;
+        }
+        return;
+    }
     if (stream.rendering) {
         stream.cmd.endRendering();
         stream.rendering = false;
@@ -1418,7 +1803,7 @@ vk::DescriptorBufferInfo NativeRenderer::UploadFlatData(u32 stage, const u8* sou
     auto& memo = UploadMemoFor(this);
     const std::span<const u8> bytes{source, size};
     const auto lookup = memo.Find(stage, bytes, [](const void* data, size_t length) {
-        return XXH3_64bits(data, length);
+        return Native::Parallel::AdaptiveXXH3(data, length);
     });
     if (lookup.binding) {
         ++stats.flat_upload_hits;
@@ -1439,19 +1824,16 @@ vk::DescriptorBufferInfo NativeRenderer::UploadFlatData(u32 stage, const u8* sou
 
 vk::DescriptorPool NativeRenderer::TakeDescriptorPool() {
     const vk::Device vk_device = r.instance.GetDevice();
+    vk::DescriptorPool ready;
+    bool reset = false;
     {
         std::scoped_lock lock{chunk_mutex};
-        const u64 known = r.scheduler.GetWorkSemaphore()->KnownGpuTick();
-        while (!retiring_pools.empty() && retiring_pools.front().first <= known) {
-            std::ignore = vk_device.resetDescriptorPool(retiring_pools.front().second);
-            free_pools.push_back(retiring_pools.front().second);
-            retiring_pools.pop_front();
-        }
-        if (!free_pools.empty()) {
-            const auto pool = free_pools.back();
-            free_pools.pop_back();
-            return pool;
-        }
+        std::tie(ready, reset) = Native::TakeReadyDescriptorPool(free_pools, retiring_pools,
+            r.scheduler.GetWorkSemaphore()->KnownGpuTick());
+    }
+    if (ready) {
+        if (reset) std::ignore = vk_device.resetDescriptorPool(ready);
+        return ready;
     }
     static constexpr std::array<vk::DescriptorPoolSize, 4> sizes{{
         {vk::DescriptorType::eStorageBuffer, 8192},
@@ -2799,7 +3181,17 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
     const bool descriptor_postprocess = postprocess_descriptors &&
         stage.sw_stage == Shader::SwStage::Fragment &&
         (stage.pgm_hash == 0x184b619c || stage.pgm_hash == 0x7cd92fb8);
-    auto* direct = stage.uses_direct && !descriptor_composition
+    // Diagnostic A/B: retain shader compilation but use descriptor bindings.
+    static const bool descriptor_only_a82d2fe = [] {
+        const char* value = std::getenv("RYGT_A82D2FE_DESCRIPTOR_ONLY");
+        return value && value[0] == '1';
+    }();
+    const bool force_descriptor = descriptor_only_a82d2fe &&
+        stage.sw_stage == Shader::SwStage::Compute && stage.pgm_hash == 0xa82d2fe;
+    static std::atomic<bool> descriptor_diagnostic_logged{};
+    if (force_descriptor && !descriptor_diagnostic_logged.exchange(true))
+        LOG_WARNING(Render_Vulkan, "DIAG: 0xa82d2fe descriptor-only buffer binding active");
+    auto* direct = stage.uses_direct && !descriptor_composition && !force_descriptor
         ? r.buffer_cache.GetDirectMemory() : nullptr;
     // D3's table: page table L1 and zero page, then base, size and valid of each buffer read
     // through it.
@@ -3065,6 +3457,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                 }
             }
         }
+        if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-buffer id={} stage={} program={:#x} binding={} descriptor={} special={} written={} handle={:#x} offset={} range={} direct={}",SceneTrace::Id(),u32(stage.sw_stage),stage.pgm_hash,binding.unified,buffer_index,desc.IsSpecial(),desc.is_written,reinterpret_cast<u64>(static_cast<VkBuffer>(info.buffer)),info.offset,info.range,stage.uses_direct));
         b.buffers.push_back(info);
         b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
         b.writes.push_back(vk::WriteDescriptorSet{
@@ -3082,6 +3475,46 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
 
 void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs& regs,
                                   Shader::Backend::Bindings& binding, DrawBindings& b) {
+    if(SceneTrace::Id()) {
+        std::string constants;
+        for(size_t i=0;i<std::min<size_t>(stage.flattened_ud_buf.size(),128);++i)constants+=fmt::format(" {}:{:08x}",i,stage.flattened_ud_buf[i]);
+        r.FrameDumpEvent(fmt::format("scene-stage id={} stage={} program={:#x} image_count={} sampler_count={} scalar_words={} captured_words={} values{}",SceneTrace::Id(),u32(stage.sw_stage),stage.pgm_hash,stage.images.size(),stage.samplers.size(),stage.flattened_ud_buf.size(),std::min<size_t>(stage.flattened_ud_buf.size(),128),constants));
+    }
+    // Local, F8-only Autopolis cascade-consumer trace. Never changes bindings.
+    const bool trace_cascade = r.FrameDumpCollecting() &&
+        stage.sw_stage == Shader::SwStage::Fragment &&
+        std::ranges::any_of(stage.images, [&](const auto& image) {
+            const auto address = image.GetSharp(stage).Address();
+            return address == 0x100ca70000 || address == 0x2900000000 ||
+                   address == 0x2920000000;
+        });
+    if (trace_cascade) {
+        std::string values;
+        for (size_t i = 0; i < std::min<size_t>(stage.flattened_ud_buf.size(), 384); ++i) {
+            values += fmt::format(" {}:{:08x}@{:x}", i, stage.flattened_ud_buf[i],
+                i < stage.flattened_ud_src.size() ? stage.flattened_ud_src[i] : 0);
+        }
+        r.FrameDumpEvent(fmt::format("cascade-reader ps {:#x} indices {} instances {}:{}",
+            stage.pgm_hash, regs.num_indices, regs.num_instances.NumInstances(), values));
+        for (const auto& sampler : stage.samplers) {
+            const auto sharp = sampler.GetSharp(stage);
+            std::array<u32, sizeof(sharp) / sizeof(u32)> words{};
+            std::memcpy(words.data(), &sharp, sizeof(sharp));
+            std::string raw;
+            for (const auto word : words) raw += fmt::format(" {:08x}", word);
+            std::array<u32,4> color{};
+            const auto address = regs.ta_bc_base.Address() +
+                u64(sharp.border_color_ptr.Value()) * sizeof(color);
+            const bool custom = sharp.border_color_type.Value() == AmdGpu::BorderColor::Custom;
+            const bool readable = custom && Core::RytyMemory::GuardedCopy(
+                color.data(), reinterpret_cast<const void*>(address), sizeof(color));
+            r.FrameDumpEvent(fmt::format(
+                "cascade-sampler ps {:#x} compare {} lod {}..{} bias {} border {:#x} "
+                "custom {} readable {} rgba {:08x}/{:08x}/{:08x}/{:08x} raw{}",
+                stage.pgm_hash, sampler.is_depth, sharp.MinLod(), sharp.MaxLod(),
+                sharp.LodBias(), address, custom, readable, color[0],color[1],color[2],color[3],raw));
+        }
+    }
     // DIAG-207 (RYGT_NULL_TEXTURES=<hash>:<hex slot mask>): that program's chosen texture slots
     // are bound empty, to see which one carries a wrong colour. Recorder-side draws only.
     static const std::pair<u64, u64> null_textures = [] {
@@ -3119,6 +3552,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             binding.unified += num_bindings;
         };
         const auto bind_null = [&](u32 reason) {
+            if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-null-image id={} stage={} program={:#x} binding={} reason={} address={:#x}",SceneTrace::Id(),u32(stage.sw_stage),stage.pgm_hash,binding.unified,reason,tsharp.Address()));
             for (u32 i = 0; i < num_bindings; ++i) {
                 b.images.push_back({VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral});
             }
@@ -3191,11 +3625,58 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             bind_null(3);
             continue;
         }
-        const VideoCore::TextureCache::ImageDesc desc{tsharp, image_desc};
+        VideoCore::TextureCache::ImageDesc desc{tsharp, image_desc};
+        const bool original_backing=HasImageBacking(desc.info.guest_address,desc.info.guest_size);
+        const u64 original_address=desc.info.guest_address;
+        const u32 original_first_mip=desc.view_info.range.base.level;
+        const bool resident_view=!original_backing && !storage && !cube_sampling && num_bindings==1 &&
+            image_desc.mip_fallback_mode==Shader::MipStorageFallbackMode::None &&
+            RebaseResidentPrtView(desc,[&](u64 address,u64 bytes){return HasImageBacking(address,bytes);});
+        if (resident_view && SceneTrace::Id()) r.FrameDumpEvent(fmt::format(
+            "scene-prt-resident-view id={} program={:#x} original={:#x} first_mip={} resolved={:#x} bytes={} size={}x{} levels={}",
+            SceneTrace::Id(),stage.pgm_hash,original_address,original_first_mip,desc.info.guest_address,
+            desc.info.guest_size,desc.info.size.width,desc.info.size.height,desc.info.resources.levels));
+        const auto trace_rejected_backing = [&](const char* failure) {
+#ifdef _WIN32
+            if (!SceneTrace::Id()) return;
+            static thread_local u64 observed_frame=~u64{};
+            static thread_local std::vector<std::pair<u64,u64>> seen;
+            if (observed_frame!=frame) { observed_frame=frame; seen.clear(); }
+            const std::pair<u64,u64> key{desc.info.guest_address,desc.info.guest_size};
+            if (std::find(seen.begin(),seen.end(),key)!=seen.end() || seen.size()>=64) return;
+            seen.push_back(key);
+            const auto snapshot=SceneResidency::Observe(key.first,key.second,[](u64 address,SceneResidency::Region& region) {
+                MEMORY_BASIC_INFORMATION info{};
+                if (!VirtualQuery(reinterpret_cast<const void*>(address),&info,sizeof(info))) return false;
+                const auto begin=reinterpret_cast<u64>(info.BaseAddress);
+                if (info.RegionSize>std::numeric_limits<u64>::max()-begin) return false;
+                region={begin,begin+info.RegionSize,info.State,info.Protect,info.Type};
+                return true;
+            });
+            const auto total=SceneResidency::Cover(snapshot,key.first,key.second);
+            r.FrameDumpEvent(fmt::format("scene-rejected-backing id={} failure={} program={:#x} binding={} address={:#x} bytes={} tile={} prt={} size={}x{} levels={} layers={} view_base_mip={} view_last_mip={} min_lod={} cached_image={} observed={} committed={} complete={} query_failed={} invalid={} raw={:016x}/{:016x}/{:016x}/{:016x}",
+                SceneTrace::Id(),failure,stage.pgm_hash,binding.unified,key.first,key.second,
+                u32(desc.info.tile_mode),AmdGpu::IsPrt(desc.info.array_mode),desc.info.size.width,desc.info.size.height,
+                desc.info.resources.levels,desc.info.resources.layers,u32(tsharp.base_level),u32(tsharp.last_level),
+                float(tsharp.min_lod)/256.0f,registry->HasImageAt(key.first),total.observed,total.committed,snapshot.Complete(),
+                snapshot.query_failed,snapshot.invalid,raw_sharp[0],raw_sharp[1],raw_sharp[2],raw_sharp[3]));
+            for (const auto& region:snapshot.regions) {
+                r.FrameDumpEvent(fmt::format("scene-backing-region id={} address={:#x} begin={:#x} end={:#x} state={:#x} protect={:#x} type={:#x}",
+                    SceneTrace::Id(),key.first,region.begin,region.end,region.state,region.protect,region.type));
+            }
+            for (u32 mip=0;mip<std::min<u32>(desc.info.resources.levels,desc.info.mips_layout.size());++mip) {
+                const auto& layout=desc.info.mips_layout[mip];
+                const auto coverage=SceneResidency::Cover(snapshot,key.first+layout.offset,layout.size);
+                r.FrameDumpEvent(fmt::format("scene-backing-mip id={} address={:#x} mip={} offset={} bytes={} observed={} committed={} complete={}",
+                    SceneTrace::Id(),key.first,mip,layout.offset,layout.size,coverage.observed,coverage.committed,coverage.complete));
+            }
+#endif
+        };
         // A valid base address is not sufficient: stale optional descriptors can
         // span gigabytes beyond their allocation. Reject before image creation,
         // guest-memory import, staging allocation or a detiling dispatch.
-        if (!HasImageBacking(desc.info.guest_address, desc.info.guest_size)) {
+        if (!original_backing && !resident_view) {
+            trace_rejected_backing("span");
             static std::atomic<u32> logged{};
             if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
                 LOG_WARNING(Render_Vulkan,
@@ -3215,6 +3696,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         // shader reads garbage T#s from one slot when the texture is unused; from there only an
         // image the game already made is bound.
         if (!r.IsMappedStart(desc.info.guest_address)) {
+            trace_rejected_backing("start");
             bind_null(4);
             continue;
         }
@@ -3244,7 +3726,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                 const char* env = std::getenv("RYGT_FRAME_DUMP_ALL_TEXTURES");
                 return env && env[0] == '1';
             }();
-            if (dump_all || !entry->from_cpu) {
+            if (dump_all || !entry->from_cpu || SceneTrace::Id()) {
                 auto key = Rasterizer::FrameDumpTextureKey(desc.info); // NAT-123
                 if (std::ranges::find(dump_textures, key, &decltype(dump_textures)::value_type::first) ==
                     dump_textures.end()) {
@@ -3271,6 +3753,23 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                 View(*entry, view_info, storage ? ViewUse::Storage
                                                : cube_sampling ? ViewUse::CubeSampled
                                                            : ViewUse::Sampled);
+            if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-image id={} stage={} program={:#x} binding={} element={} storage={} comparison={} requested={:#x} actual={:#x} format={} size={}x{} levels={} layers={} view_mip={}+{} view_layer={}+{} min_lod={} fallback={} version={} dirty={} from_cpu={}",SceneTrace::Id(),u32(stage.sw_stage),stage.pgm_hash,binding.unified,i,storage,image_desc.is_depth,desc.info.guest_address,entry->info.guest_address,u32(entry->info.pixel_format),entry->info.size.width,entry->info.size.height,entry->info.resources.levels,entry->info.resources.layers,view_info.range.base.level,view_info.range.extent.levels,view_info.range.base.layer,view_info.range.extent.layers,view_info.min_lod,u32(fallback),entry->write_version.load(),entry->needs_upload.load(),entry->from_cpu));
+            if (trace_cascade) {
+                r.FrameDumpEvent(fmt::format(
+                    "cascade-view ps {:#x} requested {:#x} {}x{} mips {} layers {} "
+                    "actual {:#x} {}x{} mips {} layers {} from-cpu {} depth {} "
+                    "view mip {}+{} layer {}+{} min-lod {} comparison {} raw {:016x}/{:016x}/{:016x}/{:016x} "
+                    "version {} uploads {} dirty {} kept {} tracked {} guest-modified {}",
+                    stage.pgm_hash, desc.info.guest_address, desc.info.size.width, desc.info.size.height,
+                    desc.info.resources.levels, desc.info.resources.layers, entry->info.guest_address,
+                    entry->info.size.width, entry->info.size.height, entry->info.resources.levels,
+                    entry->info.resources.layers, entry->from_cpu, bool(entry->info.props.is_depth),
+                    view_info.range.base.level, view_info.range.extent.levels,
+                    view_info.range.base.layer, view_info.range.extent.layers, view_info.min_lod,
+                    image_desc.is_depth, raw_sharp[0],raw_sharp[1],raw_sharp[2],raw_sharp[3],
+                    entry->write_version.load(),entry->total_uploads.load(),entry->needs_upload.load(),
+                    entry->kept.load(),entry->guest_writes_tracked,entry->guest_modified.load()));
+            }
             b.images.push_back({VK_NULL_HANDLE, view, vk::ImageLayout::eGeneral});
         }
         if (memo) {
@@ -3292,6 +3791,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                                 regs.ta_bc_base.Address() == 0)) {
             ssharp = AmdGpu::Sampler{};
         }
+        if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-sampler id={} stage={} program={:#x} binding={} comparison={} compare_op={} min_lod={} max_lod={} original_bias={} sanitized_bias={} effective_bias={} effective_max_lod={} mip_filter={} min_filter={} mag_filter={} anisotropy={} clamp={}/{}/{} border={}",SceneTrace::Id(),u32(stage.sw_stage),stage.pgm_hash,binding.unified,sampler.is_depth,u32(ssharp.depth_compare_func.Value()),ssharp.MinLod(),ssharp.MaxLod(),sampler.GetSharp(stage).LodBias(),ssharp.LodBias(),std::min(ssharp.LodBias(),r.instance.MaxSamplerLodBias()),std::max(ssharp.MinLod(),ssharp.MaxLod()),u32(ssharp.mip_filter.Value()),u32(ssharp.xy_min_filter.Value()),u32(ssharp.xy_mag_filter.Value()),ssharp.MaxAniso(),u32(ssharp.clamp_x.Value()),u32(ssharp.clamp_y.Value()),u32(ssharp.clamp_z.Value()),u32(ssharp.border_color_type.Value())));
         b.images.push_back({SamplerFor(ssharp, regs.ta_bc_base, sampler.is_depth), VK_NULL_HANDLE,
                             vk::ImageLayout::eGeneral});
         b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
@@ -3308,6 +3808,9 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
 
 void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoint bind_point,
                                   DrawBindings& b) {
+    auto* pending_owner=FindParallelRuntime(this);
+    if(!parallel_binding_capture && pending_owner)
+        pending_owner->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::Serial);
     Native::SlowCallTrace<9> trace{t_timed, "descriptor-bindings",
         {"push-constants", "groups-keys", "push-descriptor", "hash-lookup", "allocate",
          "copy-writes", "update-descriptors", "store-key", "bind-set"}};
@@ -3315,7 +3818,7 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     const CmdBuf cmdbuf{s.cmd};
     const auto stage_flags =
         pipeline.IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
-    cmdbuf.pushConstants(pipeline.GetLayout(), stage_flags, 0u, sizeof(b.push), &b.push);
+    if(!parallel_binding_capture) cmdbuf.pushConstants(pipeline.GetLayout(), stage_flags, 0u, sizeof(b.push), &b.push);
     if (b.writes.empty()) {
         return;
     }
@@ -3328,7 +3831,35 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     static thread_local boost::container::small_vector<vk::WriteDescriptorSet, 64> updates;
     updates.clear();
     std::array<vk::DescriptorSet, Shader::Backend::MaxDescriptorSets> sets{};
-    for (u32 index = 0; index < by_set.size(); ++index) {
+    PendingDescriptorUpdates* pending=parallel_binding_capture && pending_owner ? &pending_owner->descriptor_updates : nullptr;
+    bool deferred=false;u64 staged_before=0;
+    if(pending) {
+        const auto check=[&] {
+            const auto buffers=std::span<const vk::DescriptorBufferInfo>{b.buffers.data(),b.buffers.size()};
+            const auto images=std::span<const vk::DescriptorImageInfo>{b.images.data(),b.images.size()};
+            return parallel_binding_capture->write_structure_proven
+                ? pending->Check<true>(by_set,pipeline.PushSet(),buffers,images)
+                : pending->Check(by_set,pipeline.PushSet(),buffers,images);
+        };
+        auto admission=check();
+        if(admission==PendingDescriptorUpdates::Admission::Capacity) {
+            ++pending->overflow_draws;
+            pending->Flush(vk_device,PendingDescriptorUpdates::Capacity);
+            admission=check(); // revalidate all rows; capacity may have stopped the first scan
+        }
+        deferred=admission==PendingDescriptorUpdates::Admission::Yes;
+        if(!deferred) {
+            const bool overflow=admission==PendingDescriptorUpdates::Admission::Capacity;
+            if(!overflow)++pending->unsupported_draws;
+            pending->Flush(vk_device,overflow?PendingDescriptorUpdates::Capacity:PendingDescriptorUpdates::Unsupported);
+        }
+        staged_before=pending->staged_rows;
+    }
+    const bool alloc_diag = DescriptorAllocDiagEnabled();
+    const unsigned alloc_kind = pipeline.IsCompute() ? 1 : 0;
+    u32 alloc_misses = 0;
+    if (alloc_diag && descriptor_alloc_owner != this) { descriptor_alloc_metrics = {}; std::fill_n(descriptor_bind_sets, 2, 0); std::fill_n(descriptor_bind_runs, 2, 0); std::fill_n(descriptor_bind_multi, 2, 0); descriptor_alloc_owner = this; }
+    try { for (u32 index = 0; index < by_set.size(); ++index) {
         auto& writes = by_set[index];
         if (writes.empty()) {
             continue;
@@ -3348,7 +3879,7 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         const bool cacheable = prepared_key.cacheable;
         const std::span<const u64> descriptor_key{key.data(), key.size()};
         if (cacheable && key_changed) {
-            prepared_key.hash = XXH3_64bits(key.data(), key.size() * sizeof(u64));
+            prepared_key.hash = Native::Parallel::AdaptiveXXH3(key.data(), key.size() * sizeof(u64));
             ++descriptor_hash_refreshed;
         } else if (cacheable) {
             ++descriptor_hash_reused;
@@ -3358,19 +3889,32 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             if (const auto reused = s.descriptor_sets.Find(key_hash, descriptor_key)) {
                 sets[index] = reused;
                 ++stats.descriptor_reuses;
+                if (alloc_diag) ++descriptor_alloc_metrics.cache_hits[alloc_kind];
                 continue;
             }
         }
         trace.Next(4);
         const u64 layout_key = u64(VkDescriptorSetLayout(layout));
         vk::DescriptorSet set = s.descriptor_reserve.Take(layout_key);
-        if (set) ++stats.descriptor_reserve_hits;
+        const bool reserve_hit=bool(set);
+        if (reserve_hit) ++stats.descriptor_reserve_hits;
+        if(!set && parallel_binding_capture && parallel_binding_capture->ahead) {
+            auto* ahead=parallel_binding_capture->ahead;
+            if(ahead->pipeline_layout==pipeline.GetLayout() && ahead->layouts[index]==layout && ahead->sets[index]) {
+                set=ahead->sets[index];++ahead->used_sets;ahead->context->used_sets.fetch_add(1,std::memory_order_relaxed);parallel_binding_capture->ahead_used=true;
+            }
+        }
+        if (alloc_diag) { if (reserve_hit) ++descriptor_alloc_metrics.reserve_hits[alloc_kind]; else if(!set) ++alloc_misses; }
+        if(!set) {
         std::array<vk::DescriptorSetLayout, 32> layouts;
         layouts.fill(layout);
         std::array<vk::DescriptorSet, 32> allocated{};
-        u32 allocate_count = set ? 0 : u32(s.descriptor_reserve.BatchSize(layout_key));
+        u32 allocate_count = u32(s.descriptor_reserve.BatchSize(layout_key));
         for (u32 attempt = 0; attempt < 3 && !set; ++attempt) {
-            if (s.pools.empty() || attempt == 2) s.pools.push_back(TakeDescriptorPool());
+            if (s.pools.empty() || attempt == 2) {
+                if (alloc_diag) { if (s.pools.empty()) ++descriptor_alloc_metrics.pool_initial; else ++descriptor_alloc_metrics.pool_rotate; }
+                s.pools.push_back(TakeDescriptorPool());
+            }
             // A block may not fit: try one in the same pool, then one in a new pool.
             if (attempt != 0) allocate_count = 1;
             const vk::DescriptorSetAllocateInfo alloc{
@@ -3379,12 +3923,29 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
                 .pSetLayouts = layouts.data(),
             };
             ++stats.descriptor_allocate_calls;
-            if (vk_device.allocateDescriptorSets(&alloc, allocated.data()) == vk::Result::eSuccess) {
+            const bool sampled = alloc_diag && descriptor_alloc_metrics.NextSample();
+            u64 cpu_before=0, cpu_after=0;
+            const bool cpu_started = sampled && DescriptorThreadCpu100ns(cpu_before);
+            const auto wall_start = sampled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const auto allocation_result = vk_device.allocateDescriptorSets(&alloc, allocated.data());
+            if (alloc_diag) {
+                u64 wall_ns=0; bool cpu_valid=false;
+                if (sampled) {
+                    wall_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-wall_start).count();
+                    cpu_valid=cpu_started && DescriptorThreadCpu100ns(cpu_after) && cpu_after >= cpu_before;
+                }
+                const auto result = allocation_result == vk::Result::eSuccess ? Native::DescriptorResult::Success :
+                    (allocation_result == vk::Result::eErrorOutOfPoolMemory || allocation_result == vk::Result::eErrorFragmentedPool)
+                        ? Native::DescriptorResult::Capacity : Native::DescriptorResult::Other;
+                descriptor_alloc_metrics.Attempt(allocate_count > 1, attempt, result, sampled, wall_ns, cpu_valid, cpu_valid ? cpu_after-cpu_before : 0);
+            }
+            if (allocation_result == vk::Result::eSuccess) {
                 set = allocated[0];
                 stats.descriptor_allocations += allocate_count;
                 if (allocate_count > 1) s.descriptor_reserve.Store(layout_key,
                     std::span<const vk::DescriptorSet>{allocated.data() + 1, allocate_count - 1});
             }
+        }
         }
         if (!set) {
             static std::atomic<u32> logged{};
@@ -3396,19 +3957,50 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         // A miss needs mutable destinations. Hits and push sets borrow the original
         // writes directly; never leave a destination handle in per-draw storage.
         trace.Next(5);
-        Native::AppendDescriptorUpdates(writes,set,updates);
+        if(deferred)pending->Stage(writes,set);
+        else Native::AppendDescriptorUpdates(writes,set,updates);
         trace.Next(7);
         if (cacheable) s.descriptor_sets.Store(key_hash, descriptor_key, set);
         sets[index] = set;
+    }} catch(...) {
+        // A partially built immediate draw may already have published earlier sets.
+        // Keep its borrowed payload alive until all such writes have been applied.
+        if(pending) {
+            pending->Flush(vk_device,PendingDescriptorUpdates::Exception);
+            if(!updates.empty()) {vk_device.updateDescriptorSets(updates,{});++pending->actual_calls;}
+        }
+        throw;
     }
+    if (alloc_diag) descriptor_alloc_metrics.Draw(alloc_kind, alloc_misses);
+    if(parallel_binding_capture) {
+        if(deferred && pending->staged_rows!=staged_before)++pending->logical_draws;
+        if(!updates.empty()) {trace.Next(6);vk_device.updateDescriptorSets(updates,{});
+            if(pending){++pending->actual_calls;++pending->logical_draws;++pending->immediate_draws;}}
+        parallel_binding_capture->sets=sets;
+        return;
+    }
+    std::array<vk::DescriptorSet, Shader::Backend::MaxDescriptorSets> bind_run{};
+    u32 bind_first = 0, bind_count = 0;
+    const auto flush_bind_run = [&] {
+        if (!bind_count) return;
+        trace.Next(8);
+        cmdbuf.bindDescriptorSets(bind_point, pipeline.GetLayout(), bind_first,
+                                  vk::ArrayProxy<const vk::DescriptorSet>{bind_count, bind_run.data()}, {});
+        if (alloc_diag) { descriptor_bind_sets[alloc_kind] += bind_count; ++descriptor_bind_runs[alloc_kind]; if (bind_count > 1) ++descriptor_bind_multi[alloc_kind]; }
+        bind_count = 0;
+    };
     Native::CommitDescriptorBatch(updates,sets,pipeline.PushSet(),by_set,
         [&](const auto& all) {trace.Next(6);vk_device.updateDescriptorSets(all,{});},
         [&](u32 index,const auto& writes) {
+            flush_bind_run();
             trace.Next(2);cmdbuf.pushDescriptorSetKHR(bind_point,pipeline.GetLayout(),index,writes);
         },
         [&](u32 index,vk::DescriptorSet set) {
-            trace.Next(8);cmdbuf.bindDescriptorSets(bind_point,pipeline.GetLayout(),index,set,{});
+            if (bind_count && index != bind_first + bind_count) flush_bind_run();
+            if (!bind_count) bind_first = index;
+            bind_run[bind_count++] = set;
         });
+    flush_bind_run();
 }
 
 bool NativeRenderer::MirrorKind(char kind) {
@@ -4026,8 +4618,30 @@ struct PixelTrace {
 
 void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     std::scoped_lock lock{mutex};
+    if (ParallelRecordingRequested() && !parallel_sidecar_init_failed.load(std::memory_order_relaxed) && RytyGtsInRace() && !r.instance.IsIntel() && !FindParallelRuntime(this)) {
+        try {
+            auto sidecar=std::make_unique<ParallelRuntime>();
+            sidecar->ahead_context=FindAheadBlocking(this);
+            if(PreparedSampledProofRequested()) {
+                sidecar->prepared_proof_context=prepared_proof_contexts.FindBlocking(this);
+            }
+            if(const char* path=std::getenv("RYGT_PARALLEL_MODE_FILE");path && *path)
+                sidecar->mode_controller=std::make_unique<Native::Parallel::ModeController>(std::filesystem::path(path),true);
+            if(const char* path=std::getenv("RYGT_PARALLEL_VIEW_MODE_FILE");path && *path)
+                sidecar->view_mode_controller=std::make_unique<Native::Parallel::ModeController>(std::filesystem::path(path),sidecar->view_applied_mode.Enabled());
+            sidecar->coordinator=std::make_unique<Native::Parallel::PassCoordinator>(*device,r.instance,*timeline,2,32,64*1024*1024,64);
+            if(const char* path=std::getenv("RYGT_PARALLEL_TRANSFER_MODE_FILE");path && *path)
+                sidecar->transfer_mode_controller=std::make_unique<Native::Parallel::ModeController>(std::filesystem::path(path),sidecar->transfer_applied_mode.Enabled());
+            std::lock_guard sidecar_lock(parallel_sidecars_mutex);
+            auto [where,inserted]=parallel_sidecars.emplace(this,std::move(sidecar));
+            if(inserted && where->second->prepared_proof_context)where->second->prepared_proof_context->SetMode(true);
+            parallel_sidecars_generation.fetch_add(1,std::memory_order_release);
+        } catch(const std::exception&) {parallel_sidecar_init_failed.store(true,std::memory_order_relaxed);LOG_WARNING(Render_Vulkan,"PARALLEL-RECORD: initialization failed, using serial recorder");}
+    }
     const auto start = std::chrono::steady_clock::now();
-    t_timed = (++timing_tick & 15) == 0; // OPT-001
+    t_timed = r.FrameDumpCollecting() || (++timing_tick & 15) == 0; // F8: every draw
+    SceneTrace::CpuScope scene_trace{r.FrameDumpCollecting(),frame,"draw",stats.phase_ns,stats.record_ns};
+    if (SceneTrace::Id()) r.FrameDumpEvent(fmt::format("scene-pass id={} kind=draw indexed={} index_offset={}", SceneTrace::Id(),is_indexed,index_offset));
     stats.timed_draws += t_timed ? 1 : 0;
     struct Timed {
         std::chrono::steady_clock::time_point start;
@@ -4138,7 +4752,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     // OPT-010: the draw a game job thread prepared, if any.
     static const bool prepare = PrepareEnabled();
     PreparedDraw* prepared = nullptr;
-    if (prepare && !r.FrameDumpCollecting()) {
+    if (prepare && !r.FrameDumpCollecting() && RytyGtsInRace()) {
         prepared = TakePrepared(Rasterizer::t_draw_packet);
         stats.prepared_missing += prepared ? 0 : 1;
     }
@@ -4414,9 +5028,687 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             ++stats.passes_unblocked;
         }
     }
+    // Narrow upper bound only; no draw eligibility is enabled. Unknown query,
+    // alias and lifetime constraints are not established by these counters.
+    if (ParallelEligibilityEnabled()) {
+        if (parallel_eligibility_owner != this) { parallel_eligibility_stats={}; parallel_eligibility_owner=this; }
+        auto& probe=parallel_eligibility_stats;
+        if (!s.rendering || !(s.render==targets.state)) probe.Flush();
+        ++probe.observed;
+        const auto& depth=targets.state.depth_stencil_attachment;
+        const bool in_race=RytyGtsInRace();
+        probe.race+=in_race; probe.nonindexed+=!quad_list && !is_indexed;
+        probe.single_color+=targets.state.num_color_attachments==1;
+        probe.no_clear+=targets.state.num_color_attachments==1 && !targets.state.color_attachments[0].is_clear;
+        probe.no_depth+=!depth.has_depth && !depth.has_stencil; probe.no_descriptors+=b.writes.empty();
+        probe.no_storage+=!b.writes_buffers && b.stored.empty(); probe.no_feedback+=feedback.empty();
+        const bool eligible=in_race && !r.FrameDumpActive() && !quad_list && !is_indexed &&
+            targets.state.num_color_attachments==1 && !targets.state.color_attachments[0].is_clear &&
+            !depth.has_depth && !depth.has_stencil && b.writes.empty() && !b.writes_buffers &&
+            b.stored.empty() && feedback.empty();
+        if (eligible) {++probe.eligible;++probe.current;} else probe.Flush();
+    }
+    // Experimental first subset: a complete, descriptor-free, vertexless color
+    // scope. Every eligibility uncertainty falls back to the existing recorder.
+    auto* parallel=FindParallelRuntime(this);
+    // Declared after GiveBack: an uncommitted draw flushes before prepared owners
+    // and the renderer mutex are released, including during exception unwinding.
+    struct PendingDrawGuard {
+        PendingDescriptorUpdates* pending;vk::Device device;bool committed{};
+        ~PendingDrawGuard() noexcept {if(pending && !committed)pending->Flush(device,PendingDescriptorUpdates::Abandoned);}
+    } pending_draw_guard{parallel?&parallel->descriptor_updates:nullptr,r.instance.GetDevice()};
+    static const bool natural_boundary_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_NATURAL_BOUNDARY");return p && p[0]=='1' && !p[1];}();
+    bool preclosed_serial_scope=false;
+    if(parallel && !parallel->closing && parallel->applied_mode.Enabled() && natural_boundary_enabled) {
+        preclosed_serial_scope=Native::Parallel::CloseChangedSerialScope(true,bool(parallel->active),s.rendering,s.render,targets.state,[&]{EndRendering();});
+        if(preclosed_serial_scope)++parallel->natural_preclosed;
+    }
+    bool parallel_draw=false;
+    bool parallel_index_safe=false;u64 parallel_index_bytes=0;
+    ParallelBindingCapture parallel_bindings{};
+    std::shared_ptr<const DescriptorSnapshot> parallel_push_writes;
+    std::size_t parallel_descriptor_bytes=0;
+    u32 parallel_required_sets=0;
+    auto* worker_result = parallel && prepared && from_prepared && prepared->pipeline==pipeline ? &prepared->cpu_proof : nullptr;
+    const bool worker_identity = worker_result && worker_result->prepared_identity==prepared &&
+        worker_result->pipeline_identity==pipeline && worker_result->pipeline_layout==pipeline->GetLayout() &&
+        worker_result->writes_data==b.writes.data() && worker_result->writes_size==b.writes.size() &&
+        worker_result->buffers_data==b.buffers.data() && worker_result->buffers_size==b.buffers.size() &&
+        worker_result->images_data==b.images.data() && worker_result->images_size==b.images.size();
+    if(parallel && !parallel->closing && parallel->applied_mode.Enabled()) {
+        static const bool whole_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_WHOLE_PREFLIGHT");return p && p[0]=='1' && p[1]=='\0';}();
+        const bool whole_sample=whole_enabled && ((++parallel->whole_seq & 127u)==0);
+        u64 whole_cpu_begin=0,whole_cpu_end=0;
+        const bool whole_cpu_started=whole_sample && DescriptorThreadCpu100ns(whole_cpu_begin);
+        const auto whole_begin=whole_sample?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+        ++parallel->considered;
+        const auto& fast_depth=targets.state.depth_stencil_attachment;
+        const bool extended=ParallelExtendedEnabled();
+        bool any_clear=targets.state.color_attachments[0].is_clear;
+        if(extended) {
+            any_clear=fast_depth.depth_clear || fast_depth.stencil_clear;
+            for(u32 i=0;i<targets.state.num_color_attachments && i<targets.state.color_attachments.size();++i)any_clear|=targets.state.color_attachments[i].is_clear;
+        }
+        const bool prohibited_clear=any_clear;
+        const bool fast_race=RytyGtsInRace(),fast_patch=EmulatorSettings.IsPatchShaders();
+        const bool fast_trace=r.FrameDumpActive() || SceneTrace::Id() || Native::GpuCheckpoints::Requested();
+        static const bool serial_audit=[] {const char* p=std::getenv("RYGT_PARALLEL_SERIAL_AUDIT");return p && p[0]=='1' && p[1]=='\0';}();
+        // An already-open serial rendering scope cannot capture this draw: the
+        // admission path starts only at a non-rendering boundary.
+        const bool serial_scope_bypass=!serial_audit && s.rendering && !parallel->active;
+        const bool fast_reject=serial_scope_bypass || !fast_race || fast_patch || fast_trace || quad_list || quad_triangles ||
+            (!extended && is_indexed) || scale_composition || native_fsr_composition ||
+            (!extended && targets.state.num_color_attachments!=1) || targets.state.num_color_attachments>8 || prohibited_clear ||
+            (!extended && (fast_depth.has_depth || fast_depth.has_stencil || bool(vi->index_buffer))) ||
+            !feedback.empty() || !prepared || !from_prepared ||
+            prepared->pipeline!=pipeline || !prepared->pipeline_keepalive ||
+            b.writes_buffers || !b.gpu_writes.empty() || !b.stored.empty();
+        if(fast_reject) {
+            ++parallel->fast_rejected;if(extended && any_clear)++parallel->extended_clear_rejected;if(serial_scope_bypass)++parallel->serial_scope_bypassed;
+            if(ParallelGateDiagEnabled()) {
+                // Bit 25 means deeper stage/view/alias/descriptor checks were not examined.
+                u64 mask=u64{1}<<25;if(serial_scope_bypass)mask|=u64{1}<<26;const auto fail=[&](u32 bit,bool bad){if(bad)mask|=u64{1}<<bit;};
+                fail(0,!fast_race);fail(1,fast_patch);fail(2,fast_trace);fail(4,!feedback.empty());
+                fail(5,!extended && targets.state.num_color_attachments!=1);fail(6,prohibited_clear);
+                fail(7,!extended && (fast_depth.has_depth || fast_depth.has_stencil));fail(8,quad_list || quad_triangles || (!extended && is_indexed));
+                fail(9,scale_composition || native_fsr_composition);fail(12,!extended && bool(vi->index_buffer));
+                fail(13,!prepared || !from_prepared || prepared->pipeline!=pipeline || !prepared->pipeline_keepalive);
+                fail(23,b.writes_buffers || !b.gpu_writes.empty() || !b.stored.empty());parallel->gates.Add(mask,true);
+            }
+            parallel->FinishSerialEligibleRun();
+            if(parallel->active){EndRendering();PassBarrier();}
+        } else {
+        const auto& db=targets.state.depth_stencil_attachment;
+        // These draw-local requirements are mandatory in cheap_eligible below.
+        // Avoid region/mirror scans for draws that can never be admitted.
+        const bool vertex_preflight= !quad_list && !quad_triangles && (extended || !is_indexed) &&
+            !scale_composition && !native_fsr_composition && (extended || targets.state.num_color_attachments==1) &&
+            !prohibited_clear && (extended || (!db.has_depth && !db.has_stencil && !vi->index_buffer)) &&
+            feedback.empty() && prepared && from_prepared &&
+            prepared->pipeline==pipeline && prepared->pipeline_keepalive;
+        const bool vertex_requested=ParallelVertexEnabled();
+        const bool has_vertex_input=!vi->buffers.empty() || !vi->input_bindings.empty() || !vi->attributes.empty();
+        bool vertex_safe=!has_vertex_input && vi->offsets.empty() && vi->sizes.empty() && vi->strides.empty() && (extended || !vi->index_buffer);
+        bool vertex_shape_ok=false,vertex_binding_ok=true,vertex_pnext_ok=true,vertex_owner_missing=false;
+        if(vertex_requested && has_vertex_input && vertex_preflight &&
+           prepared->has_vertices && prepared->vertex_index.get()==vi &&
+           vi->buffers.size()<=32 && vi->input_bindings.size()<=32 && vi->attributes.size()<=32 &&
+           vi->buffers.size()==vi->offsets.size() && vi->buffers.size()==vi->sizes.size() &&
+           vi->buffers.size()==vi->strides.size() && !vi->buffers.empty() &&
+           vi->buffers.size()==vi->input_bindings.size() && vi->buffers.size()==vi->attributes.size()) {
+            vertex_shape_ok=true;vertex_safe=true;
+            const bool known_shape=worker_identity && worker_result->vertex_identity==vi &&
+                worker_result->vertex_buffers_data==vi->buffers.data() && worker_result->vertex_buffers_size==vi->buffers.size() && worker_result->vertex_shape;
+            if (known_shape) {vertex_binding_ok=worker_result->vertex_bindings;vertex_pnext_ok=worker_result->vertex_pnext;++parallel->producer_vertex_hits;}
+            else {
+                for(std::size_t i=0;i<vi->buffers.size();++i)
+                    if(vi->input_bindings[i].binding!=i || vi->attributes[i].binding!=i)vertex_binding_ok=false;
+                for(const auto& x:vi->input_bindings) if(x.pNext)vertex_pnext_ok=false;
+                for(const auto& x:vi->attributes) if(x.pNext)vertex_pnext_ok=false;
+            }
+            vertex_safe=vertex_binding_ok && vertex_pnext_ok;
+            for(std::size_t i=0;i<vi->buffers.size() && vertex_safe;++i) {
+                const auto handle=vi->buffers[i];const auto offset=vi->offsets[i],size=vi->sizes[i];
+                bool owned=false;
+                const auto matches=[&](const auto* value){
+                    if(!value || !value->buffer || !handle || !size)return false;
+                    if(vk::Buffer{Handle<VkBuffer_T>(value->buffer->NativeHandle())}!=handle)return false;
+                    const u64 capacity=value->buffer->Size();return offset<=capacity && size<=capacity-offset;
+                };
+                for(const auto& region:prepared->regions) if(matches(region.region)){owned=true;break;}
+                if(!owned)for(const auto* mirror:prepared->mirrors)if(matches(mirror)){owned=true;break;}
+                if(!owned && handle && size && ParallelDirectVertexEnabled() && ParallelD2Enabled() &&
+                   prepared->in_place.size()<=32) {
+                    auto* direct=r.buffer_cache.GetDirectMemory();
+                    if(direct) for(const auto& [address,bytes]:prepared->in_place) {
+                        if(bytes!=size)continue;
+                        ++parallel->vertex_direct_attempts;
+                        u32 parts=0;bool exact=false;
+                        const bool covered=direct->TryForEachPart(address,bytes,
+                            [&] {return VideoCore::ParallelDirectViewCoherent(direct,address,bytes);},
+                            [&](const VideoCore::Buffer& source,u64 source_offset,u64 part_offset,u64 length) {
+                                ++parts;exact=source.Handle()==handle && source_offset==offset && part_offset==0 && length==bytes;
+                            });
+                        if(covered && parts==1 && exact){owned=true;++parallel->vertex_direct_matches;break;}
+                    }
+                }
+                if(!owned){vertex_owner_missing=true;vertex_safe=false;}
+            }
+        }
+        if(vertex_requested && has_vertex_input) {
+            ++parallel->vertex_candidates;
+            if(vertex_preflight) {
+                ++parallel->vertex_preflight_draws;
+                if(!vertex_shape_ok)++parallel->vertex_bad_structure;
+                else if(!vertex_binding_ok)++parallel->vertex_bad_binding;
+                else if(!vertex_pnext_ok)++parallel->vertex_bad_pnext;
+                else if(vertex_owner_missing)++parallel->vertex_unknown_backing;
+                if(prepared && !prepared->in_place.empty())++parallel->vertex_direct_ranges;
+            }
+            if(vertex_safe)++parallel->vertex_backing_pass;
+        }
+        bool stages_safe=true,resource_key_known=true;
+        for(const auto* stage:pipeline->GetStages()) if(stage && !stage->resource_usage_known) resource_key_known=false;
+        if(!resource_key_known) ++parallel->unknown_resource_key;
+        for(const auto* stage:pipeline->GetStages()) if(stage &&
+            (!stage->fmasks.empty() || !stage->attribute_flags_known || !stage->resource_usage_known || stage->translation_failed ||
+             (stage->sw_stage!=Shader::SwStage::Vertex && stage->sw_stage!=Shader::SwStage::Fragment) ||
+             (stage->has_fetch_shader && !(vertex_requested && has_vertex_input && vertex_safe && stage->sw_stage==Shader::SwStage::Vertex)) || stage->uses_patches || stage->uses_dma ||
+             (stage->uses_direct && !ParallelD2Enabled()) ||
+             stage->has_storage_images || stage->uses_shader_clock ||
+             std::ranges::any_of(stage->buffers,[](const auto& buffer){return buffer.is_written;}))) stages_safe=false;
+        // Submission-window N protects only views actually tracked by the native
+        // registry; the epoch token itself is not an owning image reference.
+        bool native_attachment=true;
+        {
+            std::scoped_lock views_lock{views_mutex};
+            const auto tracked=[&](const Native::ImageEntry* entry,vk::ImageView handle) {
+                if(!entry || !handle)return false;
+                const auto found=views.find(entry);
+                return found!=views.end() && std::ranges::any_of(found->second,[&](const auto& view){return view.use==ViewUse::Attachment && *view.view==handle;});
+            };
+            for(u32 i=0;i<targets.state.num_color_attachments;++i) {
+                const auto handle=targets.state.color_attachments[i].image_view;
+                if(handle ? !tracked(targets.colors[i],handle) : bool(targets.colors[i]))native_attachment=false;
+            }
+            if(db.has_depth || db.has_stencil) {
+                if(!tracked(targets.depth,db.image_view))native_attachment=false;
+            } else if(extended && (targets.depth || db.image_view))native_attachment=false;
+            if(!extended && (!targets.colors[0] || !targets.state.color_attachments[0].image_view))native_attachment=false;
+        }
+        std::array<Native::Parallel::GuestImageRange,9> writable_ranges{};std::size_t writable_count=0;
+        if(extended) {
+            for(u32 i=0;i<targets.state.num_color_attachments;++i)if(const auto* e=targets.colors[i])
+                writable_ranges[writable_count++]={e->info.guest_address,e->info.guest_size};
+            if(targets.depth)writable_ranges[writable_count++]={targets.depth->info.guest_address,targets.depth->info.guest_size};
+        }
+        bool sampled_alias=extended && !Native::Parallel::WritableRangesDisjoint(writable_ranges,writable_count);
+        for(const auto* sampled:b.sampled) {
+            if(!sampled || !sampled->info.guest_size || (extended && !Native::Parallel::ValidGuestImageRange({sampled->info.guest_address,sampled->info.guest_size}))){sampled_alias=true;break;}
+            const auto overlaps=[&](const Native::ImageEntry* target) {
+                if(!target)return false;const u64 a=sampled->info.guest_address,as=sampled->info.guest_size;
+                const u64 t=target->info.guest_address,ts=target->info.guest_size;
+                return !ts || (a<=t ? t-a<as : a-t<ts);
+            };
+            for(const auto* target:targets.colors)if(overlaps(target)){sampled_alias=true;break;}
+            if(extended && overlaps(targets.depth))sampled_alias=true;
+            if(sampled_alias)break;
+        }
+        // Match the committed index packet to the exact prepared guest interval
+        // and a currently tracked backing. The worker retains handles only.
+        bool index_safe=!is_indexed && !vi->index_buffer;
+        u64 checked_index_bytes=0;
+        if(extended && is_indexed && prepared && prepared->has_vertices && prepared->vertex_index.get()==vi &&
+           prepared->indexed && prepared->index_offset==index_offset && vi->index_buffer && vi->index_count==regs.num_indices &&
+           (vi->index_type==vk::IndexType::eUint16 || vi->index_type==vk::IndexType::eUint32)) {
+            const u64 element=vi->index_type==vk::IndexType::eUint16?2:4;
+            const u64 base=regs.index_base_address.Address<VAddr>();
+            const u64 address=prepared->index_address;
+            if(Native::Parallel::PreparedIndexRange(base,index_offset,regs.num_indices,element,address,vi->index_offset,checked_index_bytes)) {
+                const auto matches=[&](const auto* value){
+                    if(!value || !value->buffer || vk::Buffer{Handle<VkBuffer_T>(value->buffer->NativeHandle())}!=vi->index_buffer)return false;
+                    return Native::Parallel::PreparedIndexBacking(address,checked_index_bytes,value->begin,value->end,vi->index_offset,value->buffer->Size());
+                };
+                for(const auto& use:prepared->regions)if(matches(use.region)){index_safe=true;break;}
+                if(!index_safe)for(const auto* mirror:prepared->mirrors)if(matches(mirror)){index_safe=true;break;}
+                if(!index_safe && ParallelDirectVertexEnabled() && ParallelD2Enabled()) {
+                    auto* direct=r.buffer_cache.GetDirectMemory();
+                    if(direct && std::ranges::any_of(prepared->in_place,[&](const auto& part){return part.first==address && part.second==checked_index_bytes;})) {
+                        u32 parts=0;bool exact=false;
+                        const bool covered=direct->TryForEachPart(address,checked_index_bytes,
+                            [&]{return VideoCore::ParallelDirectViewCoherent(direct,address,checked_index_bytes);},
+                            [&](const VideoCore::Buffer& source,u64 source_offset,u64 part_offset,u64 length){++parts;exact=source.Handle()==vi->index_buffer && source_offset==vi->index_offset && !part_offset && length==checked_index_bytes;});
+                        index_safe=covered && parts==1 && exact;
+                    }
+                }
+            }
+        }
+        if(!b.buffers.empty())++parallel->buffer_rejected;
+        if(sampled_alias)++parallel->alias_rejected;
+        const bool cheap_eligible=native_attachment && !sampled_alias && !EmulatorSettings.IsPatchShaders() && RytyGtsInRace() &&
+            !r.FrameDumpActive() && !SceneTrace::Id() && !Native::GpuCheckpoints::Requested() &&
+            !quad_list && !quad_triangles && (extended || !is_indexed) && !scale_composition && !native_fsr_composition &&
+            (extended || targets.state.num_color_attachments==1) && !prohibited_clear &&
+            (extended || (!db.has_depth && !db.has_stencil)) && feedback.empty() && vertex_safe && index_safe &&
+            prepared && from_prepared && prepared->pipeline==pipeline && prepared->pipeline_keepalive && stages_safe;
+        bool descriptor_safe=cheap_eligible && !b.writes_buffers && b.gpu_writes.empty() && b.stored.empty();
+        u32 descriptor_fail_reason=0;
+        const bool sample_preflight=descriptor_safe && ((++parallel->preflight_seq & 127u)==0);
+        const bool phase_sample=sample_preflight && ParallelProofPhaseEnabled();
+        u64 preflight_cpu_begin=0,preflight_cpu_end=0;
+        const bool preflight_cpu_started=sample_preflight && DescriptorThreadCpu100ns(preflight_cpu_begin);
+        const auto preflight_begin=sample_preflight?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+        if(descriptor_safe && !b.writes.empty()) {
+            try {
+                constexpr std::size_t MaxSnapshotBytes=64*1024;
+                // Inspect ordinary writes in place; only the push group is copied.
+                const auto image_infos=std::span<const vk::DescriptorImageInfo>{b.images.data(),b.images.size()};
+                const auto buffer_infos=std::span<const vk::DescriptorBufferInfo>{b.buffers.data(),b.buffers.size()};
+                static const bool reuse_stage_proof=[] {const char* p=std::getenv("RYGT_PARALLEL_DRAW_PROOF_REUSE");return p && p[0]=='1' && !p[1];}();
+                std::optional<Native::Parallel::PerDrawStageProof<Shader::Info,Shader::MaxStageTypes-1>> stage_proof;
+                if(reuse_stage_proof)stage_proof.emplace();
+                static const bool view_proof_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_VIEW_PROOF_INDEX");return p && p[0]=='1' && !p[1];}();
+                static const bool wanted_view_filter=[] {const char* p=std::getenv("RYGT_PARALLEL_WANTED_VIEW_FILTER");return p && p[0]=='1' && !p[1];}();
+                static const bool view_sample_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_VIEW_PROOF_SAMPLE");return p && p[0]=='1' && !p[1];}();
+                const bool sample_view=view_sample_enabled && ((++parallel->view_sample.sequence & 127u)==0);
+                Native::Parallel::ViewProofStats local_view_stats{};const bool gate_view=ParallelGateDiagEnabled();
+                Native::Parallel::PerDrawViewProof<vk::ImageView> view_proof{sample_view?&local_view_stats:(gate_view?&parallel->view_proof_stats:nullptr),wanted_view_filter};
+                const auto note_view_cardinality=[&](std::size_t n) {if(sample_view)++parallel->view_sample.cardinality[n==0?0:n==1?1:n==2?2:n<=4?3:n<=8?4:n<=16?5:n<=32?6:n<=64?7:n<=128?8:9];};
+                const bool known_structure=worker_identity && worker_result->descriptor_structure;
+                if(known_structure)++parallel->producer_structure_hits;
+                for(const auto& write:b.writes) {
+                    if(!known_structure && (write.pNext || write.pTexelBufferView)){descriptor_fail_reason=1;descriptor_safe=false;break;}
+                    const bool buffer_type=write.descriptorType==vk::DescriptorType::eUniformBuffer ||
+                                           write.descriptorType==vk::DescriptorType::eStorageBuffer;
+                    if(buffer_type) {
+                        SampledProofTimer phase{parallel->proof_phases[0],phase_sample};
+                        if(!known_structure && (write.pImageInfo || !DescriptorSnapshot::BufferSliceValid(write.pBufferInfo,write.descriptorCount,buffer_infos))) {descriptor_fail_reason=2;descriptor_safe=false;break;}
+                        for(u32 j=0;j<write.descriptorCount;++j) {
+                            const auto* info=&write.pBufferInfo[j];
+                            const std::size_t index=static_cast<std::size_t>(info-b.buffers.data());
+                            const auto absent_slot=[&](const Shader::Info& stage,std::size_t local,std::span<const std::byte> bytes) -> bool {
+                                static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_ABSENT_GUEST");return p && p[0]=='1' && !p[1];}();
+                                if(!enabled || write.descriptorType!=vk::DescriptorType::eStorageBuffer || local>=stage.buffers.size() ||
+                                   stage.buffers.size()>(SIZE_MAX-16)/16 || bytes.size()!=16+stage.buffers.size()*16)return false;
+                                u32 words[4]{};std::memcpy(words,bytes.data()+16+local*16,sizeof(words));
+                                if(words[3]!=0)return false;
+                                ++parallel->absent_mode0_attempts;
+                                const auto& desc=stage.buffers[local];const auto sharp=desc.GetSharp(stage);
+                                // The linked Instance requires and enables nullDescriptor before
+                                // exposing its logical device; see vk_instance.cpp 394-400, 687.
+                                const bool null_enabled=bool(r.instance.GetDevice());
+                                const bool accepted=Native::Parallel::IsPreparedAbsentDirectSlot(bytes,stage.buffers.size(),local,
+                                    desc.IsDirectEligible(),null_enabled,!info->buffer,info->offset,info->range,sharp.base_address,sharp.GetSize());
+                                if(accepted)++parallel->absent_mode0_accepted;else ++parallel->absent_mode0_rejected;
+                                return accepted;
+                            };
+                            const auto direct_slot=[&]() -> bool {
+                                if(info->buffer || info->offset!=0 || info->range!=VK_WHOLE_SIZE) return false;
+                                auto* direct=r.buffer_cache.GetDirectMemory();if(!direct)return false;
+                                const auto stages=pipeline->GetStages();
+                                if(reuse_stage_proof) {
+                                    const auto* hit=stage_proof->Find(stages,index);if(!hit)return false;
+                                    const auto local=index-hit->begin;const auto* stage=hit->stage;
+                                    if(!stage->uses_direct || !stage->buffers[local].IsDirectEligible())return false;
+                                    const auto bytes=stage_proof->Table(hit,prepared->uploads,prepared->upload_bytes,
+                                        direct->L1Address(),direct->ZeroPageAddress(),[](const auto& slot){return slot.buffer_type==Shader::BufferType::DirectTable;});
+                                    if(bytes.empty())return false;
+                                    if(absent_slot(*stage,local,bytes))return true;
+                                    if(!Native::Parallel::IsPreparedDirectSlot(bytes,hit->count,local,true,true,info->offset,info->range))return false;
+                                    u32 words[4]{};std::memcpy(words,bytes.data()+16+local*16,sizeof(words));
+                                    const u64 address=u64(words[0])|(u64(words[1])<<32);
+                                    return VideoCore::ParallelDirectViewCoherent(direct,address,words[2]);
+                                }
+                                const auto count=std::min<std::size_t>(stages.size(),Shader::MaxStageTypes-1);
+                                std::size_t base_index=0;
+                                for(std::size_t si=0;si<count;++si) {
+                                    const auto* stage=stages[si];if(!stage)continue;
+                                    const auto n=stage->buffers.size();
+                                    if(index<base_index || index-base_index>=n){base_index+=n;continue;}
+                                    const auto local=index-base_index;
+                                    if(!stage->uses_direct || !stage->buffers[local].IsDirectEligible())return false;
+                                    std::size_t table_index=n;
+                                    for(std::size_t j=0;j<n;++j)if(stage->buffers[j].buffer_type==Shader::BufferType::DirectTable){if(table_index!=n)return false;table_index=j;}
+                                    if(table_index==n || n>(SIZE_MAX-16)/16)return false;
+                                    const auto expected=16+n*16;const auto global_table=base_index+table_index;
+                                    const PreparedDraw::Upload* table_upload=nullptr;
+                                    for(const auto& upload:prepared->uploads)if(upload.info==global_table){if(table_upload)return false;table_upload=&upload;}
+                                    if(!table_upload || table_upload->flat_stage>=0 || table_upload->size!=expected ||
+                                       table_upload->offset>prepared->upload_bytes.size() || expected>prepared->upload_bytes.size()-table_upload->offset)return false;
+                                    const auto* data=prepared->upload_bytes.data()+table_upload->offset;
+                                    u32 header[4]{};std::memcpy(header,data,sizeof(header));
+                                    const u64 l1=u64(header[0])|(u64(header[1])<<32),zero=u64(header[2])|(u64(header[3])<<32);
+                                    if(l1!=direct->L1Address() || zero!=direct->ZeroPageAddress())return false;
+                                    const auto bytes=std::span<const std::byte>{reinterpret_cast<const std::byte*>(data),expected};
+                                    if(absent_slot(*stage,local,bytes))return true;
+                                    if(!Native::Parallel::IsPreparedDirectSlot(bytes,n,local,true,true,info->offset,info->range))return false;
+                                    u32 words[4]{};std::memcpy(words,data+16+local*16,sizeof(words));
+                                    const u64 address=u64(words[0])|(u64(words[1])<<32);
+                                    return VideoCore::ParallelDirectViewCoherent(direct,address,words[2]);
+                                }
+                                return false;
+                            };
+                            const bool recorded=TimedProofInvoke(parallel->proof_phases[4],phase_sample,[&] {return std::ranges::any_of(prepared->uploads,[&](const auto& upload){return upload.info==index && upload.size==info->range;});});
+                            const auto retained_scan=[&] {return TimedProofInvoke(parallel->proof_phases[5],phase_sample,[&] {return std::ranges::any_of(s.chunks,[&](const auto& chunk){
+                                if(!chunk.buffer || !chunk.buffer->Mapped() ||
+                                   vk::Buffer{Handle<VkBuffer_T>(chunk.buffer->NativeHandle())}!=info->buffer ||
+                                   info->range==VK_WHOLE_SIZE || !info->range)return false;
+                                const u64 size=chunk.buffer->Size();return info->offset<=size && info->range<=size-info->offset;
+                            });});};
+                            const bool retained=recorded && retained_scan();
+                            const auto readonly_slot=[&]() -> bool {
+                                if(!ParallelReadonlyDescriptorEnabled() || write.descriptorType!=vk::DescriptorType::eStorageBuffer || !info->buffer || !info->range ||
+                                   info->range==VK_WHOLE_SIZE || prepared->buffer_ranges.size()>64 || prepared->regions.size()>64)return false;
+                                ++parallel->descriptor_readonly_attempts;
+                                const auto stages=pipeline->GetStages();const auto stage_count=std::min<std::size_t>(stages.size(),Shader::MaxStageTypes-1);
+                                const Shader::Info* matched=nullptr;std::size_t local=0,start=0;
+                                for(std::size_t si=0;si<stage_count;++si){const auto* stage=stages[si];if(!stage)continue;const auto n=stage->buffers.size();
+                                    if(index>=start && index-start<n){matched=stage;local=index-start;break;}start+=n;}
+                                if(!matched)return false;const auto& desc=matched->buffers[local];
+                                if(desc.IsSpecial() || desc.is_written)return false;
+                                const auto sharp=desc.GetSharp(*matched);const u64 base=sharp.base_address,sharp_size=sharp.GetSize();
+                                // ClampRangeSize returns the original size below 1 GiB without a map lookup.
+                                // Larger ranges remain on the serial path; do not add a recorder map lock.
+                                constexpr u64 Limit=u64{1}<<40,NoClampLimit=u64{1}<<30;
+                                if(!base || !sharp_size || sharp_size>=NoClampLimit || base>=Limit || sharp_size>Limit-base)return false;
+                                const u64 bytes=sharp_size;
+                                bool contained=false;
+                                for(const auto& [begin,end]:prepared->buffer_ranges)
+                                    if(begin<=base && end>=base && bytes<=end-base){contained=true;break;}
+                                if(!contained){++parallel->descriptor_readonly_uncontained;return false;}
+                                const u64 alignment=r.instance.StorageMinAlignment();if(!alignment)return false;
+                                const auto normalized=[&](u64 source_offset,u64 count) {
+                                    const u64 aligned=Common::AlignDown(source_offset,alignment),adjust=source_offset-aligned;
+                                    return count<=UINT64_MAX-adjust && info->offset==aligned && info->range==count+adjust;
+                                };
+                                for(const auto& use:prepared->regions) {
+                                    if(use.address!=base || use.size!=bytes || !use.region || !use.region->buffer || base<use.region->begin)continue;
+                                    const auto& buffer=*use.region->buffer;const u64 source_offset=base-use.region->begin;
+                                    if(vk::Buffer{Handle<VkBuffer_T>(buffer.NativeHandle())}==info->buffer &&
+                                       source_offset<=buffer.Size() && bytes<=buffer.Size()-source_offset && normalized(source_offset,bytes)){
+                                        ++parallel->descriptor_readonly_regions;return true;
+                                    }
+                                }
+                                auto* direct=r.buffer_cache.GetDirectMemory();
+                                if(direct){u32 parts=0;bool exact=false;
+                                    const bool covered=direct->TryForEachPart(base,bytes,
+                                        [&]{return VideoCore::ParallelDirectViewCoherent(direct,base,bytes);},
+                                        [&](const VideoCore::Buffer& source,u64 source_offset,u64 part_offset,u64 length){
+                                            ++parts;exact=source.Handle()==info->buffer && part_offset==0 && length==bytes && normalized(source_offset,bytes);
+                                        });
+                                    if(covered && parts==1 && exact){++parallel->descriptor_readonly_imports;return true;}
+                                }
+                                ++parallel->descriptor_readonly_unmatched;
+                                return false;
+                            };
+                            const auto disabled_clip_null=[&]() -> bool {
+                                if(!ParallelReadonlyDescriptorEnabled() || write.descriptorType!=vk::DescriptorType::eStorageBuffer ||
+                                   info->buffer || info->offset!=0 || info->range!=VK_WHOLE_SIZE ||
+                                   regs.clipper_control.user_clip_plane_enable!=0)return false;
+                                const auto stages=pipeline->GetStages();std::size_t start=0;
+                                for(std::size_t si=0;si<std::min<std::size_t>(stages.size(),Shader::MaxStageTypes-1);++si){
+                                    const auto* stage=stages[si];if(!stage)continue;const auto n=stage->buffers.size();
+                                    if(index>=start && index-start<n){const auto& desc=stage->buffers[index-start];
+                                        if(desc.buffer_type!=Shader::BufferType::ClipPlanes || desc.is_written)return false;
+                                        ++parallel->descriptor_clip_nulls;return true;
+                                    }start+=n;
+                                }
+                                return false;
+                            };
+                            if(!recorded || !retained){++parallel->direct_slot_attempts;const bool direct_ok=TimedProofInvoke(parallel->proof_phases[6],phase_sample,direct_slot);if(!direct_ok && !TimedProofInvoke(parallel->proof_phases[7],phase_sample,readonly_slot) && !TimedProofInvoke(parallel->proof_phases[8],phase_sample,disabled_clip_null)){
+                                descriptor_fail_reason=3;
+                                if(ParallelGateDiagEnabled() && parallel->descriptor_samples<4) {
+                                    ++parallel->descriptor_samples;u32 stage_id=~u32{0},kind=~u32{0},mode=~u32{0};bool stage_direct=false,eligible=false;
+                                    std::size_t start=0;const auto stages=pipeline->GetStages();
+                                    for(std::size_t si=0;si<std::min<std::size_t>(stages.size(),Shader::MaxStageTypes-1);++si) {
+                                        const auto* stage=stages[si];if(!stage)continue;const auto n=stage->buffers.size();
+                                        if(index>=start && index-start<n) {
+                                            const auto local=index-start;stage_id=static_cast<u32>(si);const auto& desc=stage->buffers[local];
+                                            kind=static_cast<u32>(desc.buffer_type);stage_direct=stage->uses_direct;eligible=desc.IsDirectEligible();
+                                            for(std::size_t k=0;k<n;++k)if(stage->buffers[k].buffer_type==Shader::BufferType::DirectTable)
+                                                for(const auto& upload:prepared->uploads)if(upload.info==start+k && upload.flat_stage<0 &&
+                                                   upload.offset<=prepared->upload_bytes.size() && upload.size<=prepared->upload_bytes.size()-upload.offset &&
+                                                   n<=(SIZE_MAX-16)/16 && upload.size==16+n*16) {
+                                                    std::memcpy(&mode,prepared->upload_bytes.data()+upload.offset+16+local*16+12,4);
+                                                }
+                                            break;
+                                        }
+                                        start+=n;
+                                    }
+                                    LOG_INFO(Render_Vulkan,"PARALLEL-DESCRIPTOR-SAMPLE index={} type={} null={} offset={} range={} upload={} retained={} stage={} resource_kind={} stage_direct={} direct_eligible={} direct_mode={}",
+                                        index,u32(write.descriptorType),!info->buffer,info->offset,info->range,recorded,
+                                        recorded ? retained : retained_scan(),stage_id,kind,stage_direct,eligible,mode);
+                                }
+                                descriptor_safe=false;break;}else if(direct_ok)++parallel->direct_slot_accepted;}
+                        }
+                        if(!descriptor_safe)break;
+                        continue;
+                    }
+                    if(!known_structure && (write.pBufferInfo || !DescriptorSnapshot::ImageSliceValid(write.pImageInfo,write.descriptorCount,image_infos) ||
+                       (write.descriptorType!=vk::DescriptorType::eSampledImage && write.descriptorType!=vk::DescriptorType::eSampler))) {descriptor_fail_reason=4;descriptor_safe=false;break;}
+                    for(u32 j=0;j<write.descriptorCount;++j) {
+                        const auto& info=write.pImageInfo[j];
+                        if(write.descriptorType==vk::DescriptorType::eSampler) {
+                            SampledProofTimer phase{parallel->proof_phases[1],phase_sample};
+                            if(!info.sampler || info.imageView) {descriptor_fail_reason=5;descriptor_safe=false;break;}
+                            bool known=false;
+                            static const bool sampler_cache_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_SAMPLER_PROOF_CACHE");return p && p[0]=='1' && !p[1];}();
+                            if(sampler_cache_enabled) {
+                                const auto handle_key=reinterpret_cast<u64>(static_cast<VkSampler>(info.sampler));
+                                const bool diag=ParallelGateDiagEnabled();
+                                known=parallel->sampler_proof.Contains(info.sampler,handle_key);
+                                if(known) {if(diag)++parallel->sampler_proof_hits;}
+                                else {
+                                    if(diag)++parallel->sampler_proof_misses;
+                                    std::scoped_lock sampler_lock{sampler_mutex};
+                                    for(const auto& [key,value]:samplers) {if(diag)++parallel->sampler_scan_steps;if(value && value->Handle()==info.sampler) {known=true;break;}}
+                                    if(known){parallel->sampler_proof.Insert(info.sampler,handle_key);if(diag)++parallel->sampler_scan_positives;}
+                                }
+                            } else {std::scoped_lock sampler_lock{sampler_mutex};
+                                for(const auto& [key,value]:samplers) if(value && value->Handle()==info.sampler) {known=true;break;}}
+                            if(!known){descriptor_fail_reason=6;descriptor_safe=false;break;}
+                        } else {
+                            SampledProofTimer phase{parallel->proof_phases[2],phase_sample};
+                            if(!info.imageView || info.sampler || info.imageLayout!=vk::ImageLayout::eGeneral) {
+                                if(ParallelGateDiagEnabled()) {
+                                    if(!info.imageView)++parallel->sampled_null_view;
+                                    if(info.sampler)++parallel->sampled_nonnull_sampler;
+                                    if(info.imageLayout!=vk::ImageLayout::eGeneral)++parallel->sampled_nongeneral;
+                                    if(!info.imageView && !info.sampler && info.imageLayout==vk::ImageLayout::eGeneral)++parallel->sampled_canonical_null;
+                                }
+                                static const bool absent_sampled_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_ABSENT_SAMPLED_IMAGE");return p && p[0]=='1' && !p[1];}();
+                                bool absent_sampled=false;
+                                const bool canonical_attempt=absent_sampled_enabled && !info.imageView && !info.sampler && info.imageLayout==vk::ImageLayout::eGeneral;
+                                if(canonical_attempt && ParallelGateDiagEnabled())++parallel->absent_sampled_attempts;
+                                if(absent_sampled_enabled && !info.imageView && !info.sampler &&
+                                   info.imageLayout==vk::ImageLayout::eGeneral && r.instance.GetDevice() &&
+                                   b.write_sets.size()==b.writes.size()) {
+                                    const auto index=static_cast<std::size_t>(&write-b.writes.data());
+                                    const auto stages=pipeline->GetStages();
+                                    absent_sampled=Native::Parallel::AbsentSampledImage<Shader::Info>(
+                                        {stages.data(),stages.size()},b.write_sets[index],write.dstBinding,
+                                        write.dstArrayElement,write.descriptorCount,
+                                        [](const Shader::Info& stage) {return Shader::Backend::StageSet(u32(stage.sw_stage));},
+                                        [](const Shader::Info& stage) -> u64 {
+                                            const auto start=Shader::Backend::StageStart(u32(stage.sw_stage));
+                                            if(stage.buffers.size()>u64(UINT32_MAX)-start.unified)return UINT64_MAX;
+                                            return PlanStageResourceBindings(stage,start).textures.unified;
+                                        });
+                                }
+                                if(absent_sampled) {if(ParallelGateDiagEnabled())++parallel->absent_sampled_accepted;continue;}
+                                if(canonical_attempt && ParallelGateDiagEnabled())++parallel->absent_sampled_rejected;
+                                descriptor_fail_reason=7;descriptor_safe=false;break;
+                            }
+                            const auto full_scan=[&](vk::ImageView wanted) {
+                                std::scoped_lock views_lock{views_mutex};
+                                for(const auto* entry:b.sampled) {const auto it=views.find(entry);if(sample_view)note_view_cardinality(it==views.end()?0:it->second.size());if(it==views.end())continue;
+                                    if(std::ranges::any_of(it->second,[&](const auto& view){return (view.use==ViewUse::Sampled || view.use==ViewUse::CubeSampled) && *view.view==wanted;}))return true;}
+                                return false;
+                            };
+                            bool known=false;
+                            if(PreparedSampledProofRequested() && from_prepared && prepared && prepared->pipeline==pipeline &&
+                               prepared->proof_context && prepared->proof_context->Valid(prepared->proof_mode_state)) {
+                                ++parallel->prepared_view_attempts;
+                                const auto slot=static_cast<std::size_t>(&info-b.images.data());
+                                known=Native::Parallel::MatchSampledViewProof(prepared->sampled_view_proofs,slot,info.imageView,
+                                    sampler_cache_epoch.load(std::memory_order_acquire),b.sampled);
+                                if(known)++parallel->prepared_view_accepted;else ++parallel->prepared_view_fallbacks;
+                            }
+                            if(!known && view_proof_enabled) {
+                                const auto hash=[](vk::ImageView h) noexcept {u64 key=reinterpret_cast<u64>(static_cast<VkImageView>(h));key^=key>>33;key*=0xff51afd7ed558ccdULL;key^=key>>33;return key;};
+                                const auto walk=[&](std::size_t& cursor,vk::ImageView wanted,auto&& add) {
+                                    std::scoped_lock views_lock{views_mutex};
+                                    if(parallel->view_applied_mode.Enabled()) return Native::Parallel::BatchViewWalk(cursor,b.sampled.size(),wanted,
+                                        [&](std::size_t i,auto&& visit) {
+                                            const auto it=views.find(b.sampled[i]);
+                                            if(sample_view)note_view_cardinality(it==views.end()?0:it->second.size());
+                                            if(it!=views.end())for(const auto& view:it->second) {
+                                                const bool sampled=view.use==ViewUse::Sampled || view.use==ViewUse::CubeSampled;
+                                                if(!visit(sampled,sampled?*view.view:vk::ImageView{}))return false;
+                                            }
+                                            return true;
+                                        },add);
+                                    while(cursor<b.sampled.size()) {
+                                        const auto it=views.find(b.sampled[cursor]);if(sample_view)note_view_cardinality(it==views.end()?0:it->second.size());bool found=false;
+                                        if(it!=views.end())for(const auto& view:it->second) {
+                                            if(view.use!=ViewUse::Sampled && view.use!=ViewUse::CubeSampled)continue;
+                                            const auto handle=*view.view;found|=handle==wanted;
+                                            if(!add(handle))return false;
+                                        }
+                                        ++cursor;if(found)return true;
+                                    }
+                                    return false;
+                                };
+                                const auto build_wanted=[&](auto&& add) {
+                                    // b.images is owned and stable through this draw; do not inspect
+                                    // future write pointers before their normal validation.
+                                    if(b.images.size()>512)return false;
+                                    for(const auto& image:b.images)if(image.imageView && !image.sampler && image.imageLayout==vk::ImageLayout::eGeneral)
+                                        if(!add(image.imageView))return false;
+                                    return true;
+                                };
+                                known=view_proof.Query(info.imageView,hash,full_scan,walk,build_wanted);
+                            } else if(!known) known=full_scan(info.imageView);
+                            if(!known){descriptor_fail_reason=8;descriptor_safe=false;break;}
+                        }
+                    }
+                    if(!descriptor_safe)break;
+                }
+                if(sample_view) {
+                    auto& v=parallel->view_sample;++v.draws;if(local_view_stats.queries)++v.queried_draws;
+                    v.image_infos+=b.images.size();v.sampled_entries+=b.sampled.size();
+                    const auto add=[](auto& to,const auto& from) {to.queries+=from.queries;to.first_hits+=from.first_hits;to.index_hits+=from.index_hits;to.walks+=from.walks;to.fallbacks+=from.fallbacks;to.overflows+=from.overflows;to.wanted_builds+=from.wanted_builds;to.wanted_overflows+=from.wanted_overflows;to.filtered_views+=from.filtered_views;};
+                    add(v.proof,local_view_stats);if(gate_view)add(parallel->view_proof_stats,local_view_stats);
+                }
+                if(stage_proof && ParallelGateDiagEnabled()){parallel->proof_table_builds+=stage_proof->Builds();parallel->proof_table_hits+=stage_proof->Hits();}
+                if(descriptor_safe) {
+                    if(!b.groups_ready)b.PrepareWriteGroups();
+                    const u32 push=pipeline->PushSet();
+                    if(push<b.grouped_writes.size() && !b.grouped_writes[push].empty()) {
+                        SampledProofTimer phase{parallel->proof_phases[3],phase_sample};
+                        const auto snapshot_matches=[&] {
+                            if(!worker_identity || !known_structure || !feedback.empty() || !worker_result->push_snapshot || worker_result->push_index!=push ||
+                               worker_result->push_data!=b.grouped_writes[push].data() || worker_result->push_size!=b.grouped_writes[push].size()) return false;
+                            const auto old=std::static_pointer_cast<const DescriptorSnapshot>(worker_result->push_snapshot)->Writes();const auto& now=b.grouped_writes[push];
+                            if(old.size()!=now.size())return false;
+                            for(size_t i=0;i<old.size();++i) {
+                                const auto& a=old[i];const auto& c=now[i];
+                                if(a.dstBinding!=c.dstBinding || a.dstArrayElement!=c.dstArrayElement || a.descriptorCount!=c.descriptorCount || a.descriptorType!=c.descriptorType) return false;
+                                if(c.pImageInfo) for(u32 j=0;j<c.descriptorCount;++j) {
+                                    const auto& x=a.pImageInfo[j];const auto& y=c.pImageInfo[j];
+                                    if(x.sampler!=y.sampler || x.imageView!=y.imageView || x.imageLayout!=y.imageLayout)return false;
+                                }
+                            }
+                            return true;
+                        };
+                        bool reused_snapshot=false;
+                        if(snapshot_matches() && worker_result->push_snapshot.use_count()==1 &&
+                           worker_result->push_buffer_first<=b.buffers.size() &&
+                           worker_result->push_buffer_count<=b.buffers.size()-worker_result->push_buffer_first) {
+                            auto owned=std::static_pointer_cast<DescriptorSnapshot>(std::move(worker_result->push_snapshot));
+                            const auto current=std::span<const vk::DescriptorBufferInfo>{b.buffers.data(),b.buffers.size()}.subspan(worker_result->push_buffer_first,worker_result->push_buffer_count);
+                            if(owned->PatchBufferBindings(current)) {
+                                parallel_push_writes=std::move(owned);++parallel->producer_snapshot_hits;
+                                parallel_descriptor_bytes=parallel_push_writes->OwnedBytes()+128;reused_snapshot=true;
+                            }
+                        }
+                        if(!reused_snapshot) {
+                            auto snap=DescriptorSnapshot::Make(b.grouped_writes[push],
+                                std::span<const vk::DescriptorBufferInfo>{b.buffers.data(),b.buffers.size()},
+                                std::span<const vk::DescriptorImageInfo>{b.images.data(),b.images.size()},MaxSnapshotBytes);
+                            if(!snap){descriptor_fail_reason=9;descriptor_safe=false;}
+                            else {parallel_descriptor_bytes=snap->OwnedBytes()+128;parallel_push_writes=std::make_shared<const DescriptorSnapshot>(std::move(*snap));}
+                        }
+                    }
+                }
+            } catch(const std::bad_alloc&) {descriptor_fail_reason=9;descriptor_safe=false;parallel_push_writes.reset();}
+        }
+        if(sample_preflight) {
+            ++parallel->preflight_samples;
+            parallel->preflight_wall_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-preflight_begin).count();
+            if(preflight_cpu_started && DescriptorThreadCpu100ns(preflight_cpu_end) && preflight_cpu_end>=preflight_cpu_begin) {
+                ++parallel->preflight_cpu_samples;parallel->preflight_cpu_100ns+=preflight_cpu_end-preflight_cpu_begin;
+            }
+        }
+        if(cheap_eligible && !descriptor_safe){++parallel->descriptor_rejected;if(ParallelGateDiagEnabled())++parallel->descriptor_fail_reasons[descriptor_fail_reason];}
+        if(ParallelGateDiagEnabled()) {
+            u64 mask=0;const auto fail=[&](u32 bit,bool bad){if(bad)mask|=u64{1}<<bit;};
+            fail(0,!RytyGtsInRace());fail(1,EmulatorSettings.IsPatchShaders());
+            fail(2,r.FrameDumpActive() || SceneTrace::Id() || Native::GpuCheckpoints::Requested());
+            fail(3,!native_attachment);fail(4,sampled_alias || !feedback.empty());
+            fail(5,!extended && targets.state.num_color_attachments!=1);fail(6,prohibited_clear);
+            fail(7,!extended && (db.has_depth || db.has_stencil));fail(8,quad_list || quad_triangles || (!extended && is_indexed));
+            fail(9,scale_composition || native_fsr_composition);fail(10,vertex_preflight && !vertex_safe && !vi->buffers.empty());
+            fail(11,vertex_preflight && !vertex_safe && (!vi->input_bindings.empty() || !vi->attributes.empty()));fail(12,!index_safe);
+            fail(13,!prepared || !from_prepared || prepared->pipeline!=pipeline || !prepared->pipeline_keepalive);
+            for(const auto* stage:pipeline->GetStages()) if(stage) {
+                fail(14,(stage->sw_stage!=Shader::SwStage::Vertex && stage->sw_stage!=Shader::SwStage::Fragment) || stage->uses_patches);
+                fail(15,!stage->attribute_flags_known);fail(16,!stage->resource_usage_known);fail(17,stage->translation_failed);
+                fail(18,stage->has_fetch_shader && !(vertex_requested && has_vertex_input && (!vertex_preflight || vertex_safe) && stage->sw_stage==Shader::SwStage::Vertex));fail(19,stage->uses_dma || (stage->uses_direct && !ParallelD2Enabled()));
+                fail(20,!stage->fmasks.empty() || stage->has_storage_images);fail(21,stage->uses_shader_clock);
+                fail(22,std::ranges::any_of(stage->buffers,[](const auto& buffer){return buffer.is_written;}));
+            }
+            const bool stable=(mask==0)==cheap_eligible;
+            fail(23,cheap_eligible && (b.writes_buffers || !b.gpu_writes.empty() || !b.stored.empty()));
+            fail(24,cheap_eligible && !descriptor_safe && !b.writes_buffers && b.gpu_writes.empty() && b.stored.empty());
+            parallel->gates.Add(mask,stable);
+        }
+        const bool eligible=descriptor_safe;
+        if(eligible) {++parallel->eligible;
+            if(parallel->active)++parallel->eligible_in_active_scope;
+            else if(s.rendering)++parallel->eligible_in_serial_scope;
+            else ++parallel->eligible_at_boundary;
+        }
+        if(eligible && !parallel->active && s.rendering && s.render==targets.state)
+            parallel->NoteSerialEligible();
+        else parallel->FinishSerialEligibleRun();
+        if(parallel->active && (!eligible || !s.rendering || !(s.render==targets.state) || parallel->active->draws.size()>=256)) {
+            EndRendering();PassBarrier(); // continuation uses LOAD, with an attachment dependency
+        }
+        if(eligible && !parallel->active && !s.rendering) {
+            // Allocate every packet container before changing logical rendering.
+            try {
+                parallel->sync_pins.Collect(r.scheduler.GetWorkSemaphore()->KnownGpuTick(),
+                    [&](auto& callback) noexcept {return Native::Rhi::TryEnqueueCompleted(*device,callback);});
+                const auto slot=parallel->sync_pins.Reserve();
+                if(slot!=Native::Parallel::SyncOwnerPins<>::Invalid) {
+                    parallel->pin_slot=slot;
+                    parallel->scratch_draws.reserve(256);
+                    const u64 epoch=r.scheduler.CurrentTick();
+                    auto lease=std::make_shared<const u64>(epoch);
+                    Native::Parallel::Pass pass{};pass.target=targets.state;pass.resource_lease=lease;pass.extended_verified=extended;
+                    pass.draws.swap(parallel->scratch_draws);
+                    parallel->epoch=epoch;parallel->lease=std::move(lease);parallel->active.emplace(std::move(pass));
+                    s.rendering=true;s.render=targets.state;++stats.passes;++parallel->passes;
+                } else ++parallel->owner_slot_pressure;
+            } catch(const std::bad_alloc&) {
+                if(parallel->pin_slot!=Native::Parallel::SyncOwnerPins<>::Invalid)parallel->sync_pins.CancelEmpty(parallel->pin_slot);
+                parallel->pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;parallel->active.reset();parallel->lease.reset();
+            }
+        }
+        parallel_draw=parallel->active && s.rendering && s.render==targets.state && eligible;
+        if(parallel_draw){parallel_index_safe=index_safe;parallel_index_bytes=checked_index_bytes;}
+        }
+        if(whole_sample) {
+            const u64 elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-whole_begin).count();
+            ++parallel->whole_samples;parallel->whole_wall_ns+=elapsed;parallel->whole_max_ns=std::max(parallel->whole_max_ns,elapsed);
+            if(whole_cpu_started && DescriptorThreadCpu100ns(whole_cpu_end) && whole_cpu_end>=whole_cpu_begin){
+                ++parallel->whole_cpu_samples;parallel->whole_cpu_100ns+=whole_cpu_end-whole_cpu_begin;
+            }
+        }
+    }
+    // Wait for an existing non-rendering boundary: never restart a clear pass for diagnostics.
+    if(preclosed_serial_scope && !parallel_draw)++parallel->natural_serial_fallback;
+    if(SceneTrace::Id() && !SceneTrace::state.attempted && !s.rendering && !preclosed_serial_scope) {
+        const auto families=r.instance.GetPhysicalDevice().getQueueFamilyProperties();
+        const u32 family=r.instance.GetGraphicsQueueFamilyIndex();
+        SceneTrace::Prepare(r.instance.GetDevice(),s.cmd,
+            family<families.size()?families[family].timestampValidBits:0,
+            r.instance.GetPhysicalDevice().getProperties().limits.timestampPeriod);
+    }
     {
         PhaseClock part{stats.record_ns[1]};
-        BeginRendering(targets.state);
+        if(!parallel_draw) BeginRendering(targets.state);
     }
 
     // The renderer's dynamic state code, filling this list's state.
@@ -4464,24 +5756,70 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             s.dynamic.SetViewports(viewports);
             s.dynamic.SetScissors(scissors);
         }
-        s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
+        if(!parallel_draw) s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
         Rasterizer::t_dynamic_state = saved;
     }
     {
         PhaseClock part{stats.record_ns[3]};
-        RecordVertexIndex(*vi);
+        if(!parallel_draw) RecordVertexIndex(*vi);
     }
     const u32 index_count = vi->index_count;
     const CmdBuf cmdbuf{s.cmd};
     {
         PhaseClock part{stats.record_ns[4]};
-        s.pipelines.Graphics(pipeline->Handle(), [&] {
+        if(!parallel_draw) s.pipelines.Graphics(pipeline->Handle(), [&] {
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
         });
     }
     {
         PhaseClock part{stats.record_ns[5]};
-        PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
+        if(parallel_draw) {
+            std::shared_ptr<AheadLease> ahead;std::function<void()> ahead_release;
+            std::size_t ahead_slot=parallel->ahead_flights.size();
+            if(from_prepared && prepared && AheadRequested()) {
+                ahead=std::static_pointer_cast<AheadLease>(prepared->ahead_descriptor_lease.load(std::memory_order_acquire));
+                if(ahead && ahead->context && ahead->lease && ahead->context->mode.load(std::memory_order_acquire)) {
+                    for(std::size_t n=0;n<parallel->ahead_flights.size();++n) {
+                        const auto i=(parallel->ahead_cursor+n)%parallel->ahead_flights.size();
+                        if(!parallel->ahead_flights[i].release){ahead_slot=i;parallel->ahead_cursor=(i+1)%parallel->ahead_flights.size();break;}
+                    }
+                    if(ahead_slot<parallel->ahead_flights.size()) {
+                        try {ahead_release=[owner=ahead]{};parallel_bindings.ahead=ahead.get();}
+                        catch(...) {ahead_slot=parallel->ahead_flights.size();}
+                    }
+                    else ahead->context->capacity.fetch_add(1,std::memory_order_relaxed);
+                }
+            }
+            parallel_bindings.write_structure_proven=true; // descriptor_safe validated every source row
+            {ScopedParallelBindingCapture capture{parallel_bindings};PushBindings(*pipeline,vk::PipelineBindPoint::eGraphics,b);}
+            if(parallel_bindings.ahead_used) {
+                ASSERT_MSG(ahead && ahead_slot<parallel->ahead_flights.size(),"ahead descriptor lease missing");
+                ahead->used=true;ahead->context->used.fetch_add(1,std::memory_order_relaxed);
+                parallel->ahead_flights[ahead_slot].lease=std::move(ahead);parallel->ahead_flights[ahead_slot].release=std::move(ahead_release);parallel->ahead_flights[ahead_slot].tick=0;++parallel->ahead_live;
+            }
+            static_assert(Shader::Backend::MaxDescriptorSets<=32);
+            bool missing=false;
+            if(!b.writes.empty()) for(u32 i=0;i<b.grouped_writes.size();++i) {
+                if(i==pipeline->PushSet() || b.grouped_writes[i].empty())continue;
+                parallel_required_sets|=u32{1}<<i;
+                if(!parallel_bindings.sets[i])missing=true;
+            }
+            if(missing) {
+                // A fresh secondary cannot inherit a serial command buffer's old
+                // descriptor bindings. Never enqueue an incomplete packet.
+                if(parallel->active->draws.empty()) {
+                    parallel->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::Abandoned);
+                    ASSERT_MSG(parallel->sync_pins.CancelEmpty(parallel->pin_slot),"parallel empty owner slot not empty");
+                    parallel->pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;
+                    parallel->scratch_draws.swap(parallel->active->draws);
+                    parallel->active.reset();parallel->lease.reset();s.rendering=false;
+                    s.dynamic.Invalidate();s.pipelines.Invalidate();s.vertex_state_known=false;
+                } else {EndRendering();PassBarrier();}
+                if(preclosed_serial_scope)++parallel->natural_binding_skip;
+                ++parallel->missing_sets;++stats.skipped;
+                return;
+            }
+        } else PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
     }
     {
         PhaseClock part{stats.record_ns[6]};
@@ -4490,6 +5828,48 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             DrawOffsets(regs, vs_info, pipeline->GetFetchShader());
         const u32 instances = regs.num_instances.NumInstances();
         const auto* fs = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        scene_trace.Programs(vs_info.pgm_hash,fs?fs->pgm_hash:0);
+        if(SceneTrace::Id()) {
+            const auto& d=s.dynamic;
+            r.FrameDumpEvent(fmt::format("scene-occlusion-registers id={} db_render={:08x} db_count={:08x} db_depth_view={:08x} db_override={:08x}",SceneTrace::Id(),regs.reg_array[0xA000],regs.reg_array[0xA001],regs.reg_array[0xA002],regs.reg_array[0xA003]));
+            r.FrameDumpEvent(fmt::format("scene-draw id={} vs={:#x} ps={:#x} indices={} instances={} vertex_offset={} instance_offset={} depth_test={} depth_write={} compare={} bias_enable={} depth_bias={}/{}/{} cull={} front={} discard={} viewport_count={} depth_target={:#x} size={}x{} layers={}",
+                SceneTrace::Id(),vs_info.pgm_hash,fs?fs->pgm_hash:0,regs.num_indices,instances,vertex_offset,instance_offset,
+                d.depth_test_enabled,d.depth_write_enabled,u32(d.depth_compare_op),d.depth_bias_enabled,d.depth_bias_constant,d.depth_bias_slope,d.depth_bias_clamp,
+                u32(d.cull_mode),u32(d.front_face),d.rasterizer_discard_enable,d.viewports.size(),targets.depth?targets.depth->info.guest_address:0,targets.state.width,targets.state.height,targets.state.num_layers));
+            if(targets.depth)r.FrameDumpEvent(fmt::format("scene-depth id={} address={:#x} format={} clear_depth={} clear_stencil={} write={}",SceneTrace::Id(),targets.depth->info.guest_address,u32(targets.depth->info.pixel_format),targets.state.depth_stencil_attachment.depth_clear,targets.state.depth_stencil_attachment.stencil_clear,d.depth_write_enabled));
+            for(size_t cb=0;cb<targets.colors.size();++cb)if(const auto* e=targets.colors[cb])r.FrameDumpEvent(fmt::format("scene-target id={} attachment={} address={:#x} size={}x{} format={} samples={} levels={} layers={} mask={} clear={}",SceneTrace::Id(),cb,e->info.guest_address,e->info.size.width,e->info.size.height,u32(e->info.pixel_format),e->info.num_samples,e->info.resources.levels,e->info.resources.layers,regs.color_target_mask.GetMask(cb),targets.state.color_attachments[cb].is_clear));
+            for(size_t vi=0;vi<d.viewports.size();++vi){const auto& v=d.viewports[vi];r.FrameDumpEvent(fmt::format("scene-viewport id={} slot={} xy={}/{} size={}/{} depth={}/{}",SceneTrace::Id(),vi,v.x,v.y,v.width,v.height,v.minDepth,v.maxDepth));}
+        }
+        if(parallel_draw) {
+            Native::Parallel::Draw captured{};
+            captured.pipeline=pipeline->Handle();captured.layout=pipeline->GetLayout();
+            captured.pipeline_owner=prepared->pipeline_keepalive;captured.dynamic=s.dynamic;captured.push=b.push;
+            captured.sets=parallel_bindings.sets;captured.required_sets_mask=parallel_required_sets;
+            captured.immutable_upload_buffers_verified=true;captured.push_writes=std::move(parallel_push_writes);
+            captured.push_set=pipeline->PushSet()<captured.sets.size()?pipeline->PushSet():static_cast<u32>(captured.sets.size());
+            captured.descriptor_bytes=parallel_descriptor_bytes;
+            captured.vertex_attribute_count=static_cast<u32>(vi->attributes.size());
+            captured.vertex_binding_count=static_cast<u32>(vi->input_bindings.size());
+            captured.vertex_buffer_count=static_cast<u32>(vi->buffers.size());
+            captured.vertex_backing_verified=true;
+            captured.vertex_attributes.assign(vi->attributes.begin(),vi->attributes.end());
+            captured.vertex_bindings.assign(vi->input_bindings.begin(),vi->input_bindings.end());
+            captured.vertex_buffers.assign(vi->buffers.begin(),vi->buffers.end());
+            captured.vertex_offsets.assign(vi->offsets.begin(),vi->offsets.end());
+            captured.vertex_sizes.assign(vi->sizes.begin(),vi->sizes.end());
+            captured.vertex_strides.assign(vi->strides.begin(),vi->strides.end());
+            captured.vertices=regs.num_indices;captured.instances=instances;
+            captured.first_vertex=vertex_offset;captured.first_instance=instance_offset;
+            if(is_indexed) {captured.indexed=true;captured.index_backing_verified=parallel_index_safe;
+                captured.index_buffer=vi->index_buffer;captured.index_offset=vi->index_offset;captured.index_size=parallel_index_bytes;
+                captured.index_type=vi->index_type;captured.vertex_offset=s32(vertex_offset);}
+            ASSERT_MSG(parallel->sync_pins.Pin(parallel->pin_slot,captured.pipeline_owner),"parallel pipeline owner pin failed");
+            if(ParallelGateDiagEnabled()) {const auto n=captured.vertex_buffer_count;
+                ++parallel->captured_vertex_counts[n==0?0:n==1?1:n<4?2:n<8?3:n<16?4:n<32?5:6];parallel->captured_vertex_sum+=n;}
+            parallel->active->draws.push_back(std::move(captured));pending_draw_guard.committed=true;++parallel->draws;
+            if(preclosed_serial_scope)++parallel->natural_captured;
+        } else {
+        SceneTrace::GpuBegin(s.cmd);
         Native::GpuCheckpoints::Record(static_cast<VkCommandBuffer>(s.cmd), 1, frame,
             vs_info.pgm_hash, fs ? fs->pgm_hash : 0, regs.num_indices);
         if (quad_triangles) {
@@ -4502,6 +5882,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                instance_offset);
         } else {
             cmdbuf.draw(regs.num_indices, instances, vertex_offset, instance_offset);
+        }
+        SceneTrace::GpuEnd(s.cmd);
         }
     }
     {
@@ -4626,6 +6008,10 @@ void NativeRenderer::PreparedDraw::Reset() {
     packet = nullptr;
     epoch = 0;
     pipeline = nullptr;
+    if(AheadRequested())ahead_descriptor_lease.store({},std::memory_order_release);
+    cpu_proof = {};
+    sampled_view_proofs.clear();
+    proof_context.reset();proof_mode_state=0;
     pipeline_keepalive.reset();
     stage_hashes = {};
     bindings.Clear();
@@ -4688,6 +6074,7 @@ void NativeRenderer::FreePrepared(PreparedDraw* draw) {
 }
 
 bool NativeRenderer::HasPrepared(const void* packet) {
+    if (!RytyGtsInRace()) return false; // required menu work stays on the recorder
     if (!packet) {
         return false;
     }
@@ -4759,7 +6146,7 @@ u64 NativeRenderer::StageHash(const Shader::Info& info) {
     for (const auto& desc : info.samplers) {
         add(desc.GetSharp(info));
     }
-    return XXH3_64bits_withSeed(words.data(), words.size() * sizeof(u32), info.pgm_base);
+    return Native::Parallel::AdaptiveXXH3Seed(words.data(), words.size() * sizeof(u32), info.pgm_base);
 }
 
 void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu::Regs& regs,
@@ -4767,8 +6154,13 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
                                     std::shared_ptr<const void> pipeline_keepalive,
                                     std::span<const Shader::Info* const> stages, bool is_indexed,
                                     u32 index_offset) {
+    if (!RytyGtsInRace()) return; // do not retain speculative menu bindings
+    AheadPrepareGuard ahead_guard{FindAhead(this)};
+    auto proof_guard=PreparedSampledProofRequested()?prepared_proof_contexts.TryEnter(this):Native::Parallel::ProofProducerGuard{};
+
     const auto start = std::chrono::steady_clock::now();
     PreparedDraw* p = NewPrepared();
+    p->proof_context=proof_guard.context;p->proof_mode_state=proof_guard.state;
     p->packet = packet;
     p->epoch = epoch;
     p->pipeline = &pipeline;
@@ -4838,6 +6230,109 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
     if (DrawPreparationEnabled(2)) StableUniquePrepared(p->regions);
     p->bindings.PrepareWriteGroups(); // binding-owned spans, published with this draw
     p->bindings.PrepareDescriptorKeys(pipeline);
+    if (ParallelRecordingRequested()) try {
+        auto* candidate=&p->cpu_proof;candidate->prepared_identity=p;candidate->pipeline_identity=&pipeline;
+        candidate->pipeline_layout=pipeline.GetLayout();
+        const auto& b=p->bindings;candidate->writes_data=b.writes.data();candidate->writes_size=b.writes.size();
+        candidate->buffers_data=b.buffers.data();candidate->buffers_size=b.buffers.size();candidate->images_data=b.images.data();candidate->images_size=b.images.size();
+        const auto buffers=std::span<const vk::DescriptorBufferInfo>{b.buffers.data(),b.buffers.size()};
+        const auto images=std::span<const vk::DescriptorImageInfo>{b.images.data(),b.images.size()};
+        candidate->descriptor_structure=true;
+        for(const auto& w:b.writes) {
+            const bool buf=w.descriptorType==vk::DescriptorType::eUniformBuffer || w.descriptorType==vk::DescriptorType::eStorageBuffer;
+            const bool img=w.descriptorType==vk::DescriptorType::eSampledImage || w.descriptorType==vk::DescriptorType::eSampler;
+            if(w.pNext || w.pTexelBufferView || (buf ? (w.pImageInfo || !DescriptorSnapshot::BufferSliceValid(w.pBufferInfo,w.descriptorCount,buffers)) :
+                (!img || w.pBufferInfo || !DescriptorSnapshot::ImageSliceValid(w.pImageInfo,w.descriptorCount,images)))) {candidate->descriptor_structure=false;break;}
+        }
+        if(p->has_vertices && p->vertex_index) {
+            const auto& v=*p->vertex_index;candidate->vertex_identity=&v;candidate->vertex_buffers_data=v.buffers.data();candidate->vertex_buffers_size=v.buffers.size();
+            const size_t n=v.buffers.size();candidate->vertex_shape=n && n<=32 && v.input_bindings.size()==n && v.attributes.size()==n && v.offsets.size()==n && v.sizes.size()==n && v.strides.size()==n;
+            if(candidate->vertex_shape) {
+                candidate->vertex_bindings=true;candidate->vertex_pnext=true;
+                for(size_t i=0;i<n;++i)if(v.input_bindings[i].binding!=i || v.attributes[i].binding!=i)candidate->vertex_bindings=false;
+                for(const auto& x:v.input_bindings)if(x.pNext)candidate->vertex_pnext=false;
+                for(const auto& x:v.attributes)if(x.pNext)candidate->vertex_pnext=false;
+            }
+        }
+        const u32 push=pipeline.PushSet();
+        if(candidate->descriptor_structure && push<b.grouped_writes.size() && !b.grouped_writes[push].empty()) {
+            const auto& group=b.grouped_writes[push];bool contiguous=true,has_buffer=false;size_t first=0,count=0;
+            for(const auto& w:group) if(w.pBufferInfo) {
+                // descriptor_structure validated this exact slice before pointer subtraction.
+                const size_t offset=static_cast<size_t>(w.pBufferInfo-b.buffers.data());
+                if(!has_buffer){first=offset;has_buffer=true;}
+                if(offset!=first+count || w.descriptorCount>b.buffers.size()-offset){contiguous=false;break;}
+                count+=w.descriptorCount;
+            }
+            if(contiguous)if(auto snap=DescriptorSnapshot::Make(group,buffers,images,64*1024)) {
+                candidate->push_index=push;candidate->push_data=group.data();candidate->push_size=group.size();
+                candidate->push_buffer_first=first;candidate->push_buffer_count=count;
+                candidate->push_snapshot=std::make_shared<DescriptorSnapshot>(std::move(*snap));
+            }
+        }
+    } catch(const std::bad_alloc&) {p->cpu_proof = {};}
+    if(auto context=ahead_guard.context;context && p->pipeline_keepalive && context->mode.load(std::memory_order_acquire)) {
+        context->attempts.fetch_add(1,std::memory_order_relaxed);
+        try {
+            auto candidate=std::make_shared<AheadLease>();candidate->context=context;candidate->pipeline_owner=p->pipeline_keepalive;candidate->pipeline_layout=pipeline.GetLayout();
+            std::array<vk::DescriptorSetLayout,Shader::Backend::MaxDescriptorSets> layouts{};
+            std::array<u32,Shader::Backend::MaxDescriptorSets> indices{};std::array<std::size_t,4> counts{};std::size_t n=0;bool supported=true;
+            const auto& groups=p->bindings.grouped_writes;
+            // Validate both the selected job schema and the pipeline's immutable
+            // canonical schema against every ordinary write. DynamicIndex counts
+            // depend on mutable T# values and cannot be safely speculated here.
+            const auto schema_matches=[&](auto stage_list) {
+                std::array<bool,Shader::Backend::MaxDescriptorSets> seen_sets{};
+                bool valid=groups.size()<=layouts.size();
+                for(const auto* stage:stage_list)if(valid && stage) {
+                    const auto set=Shader::Backend::StageSet(u32(stage->sw_stage));
+                    if(set>=groups.size() || seen_sets[set]){valid=false;break;}seen_sets[set]=true;
+                    for(const auto& image:stage->images)if(image.mip_fallback_mode==Shader::MipStorageFallbackMode::DynamicIndex){valid=false;break;}
+                    if(!valid || set==pipeline.PushSet())continue;
+                    const auto& group=groups[set];std::size_t at=0;u32 binding=0;
+                    const auto expect=[&](vk::DescriptorType type,u32 n){
+                        if(at>=group.size())return false;const auto& w=group[at++];
+                        const bool ok=!w.pNext && w.dstBinding==binding && w.dstArrayElement==0 && w.descriptorType==type && w.descriptorCount==n;
+                        if(n>UINT32_MAX-binding)return false;binding+=n;return ok;
+                    };
+                    for(const auto& buffer:stage->buffers){(void)buffer;if(!expect(vk::DescriptorType::eStorageBuffer,1)){valid=false;break;}}
+                    for(const auto& image:stage->images)if(!expect(image.is_written?vk::DescriptorType::eStorageImage:vk::DescriptorType::eSampledImage,1)){valid=false;break;}
+                    for(const auto& sampler:stage->samplers){(void)sampler;if(!expect(vk::DescriptorType::eSampler,1)){valid=false;break;}}
+                    if(at!=group.size())valid=false;
+                }
+                for(std::size_t i=0;valid && i<groups.size();++i)if(i!=pipeline.PushSet() && !groups[i].empty() && !seen_sets[i])valid=false;
+                return valid;
+            };
+            const auto& canonical=pipeline.CanonicalStages();
+            constexpr std::size_t graphics_stages=Shader::MaxStageTypes-1;
+            if(stages.size()<graphics_stages || canonical.size()<graphics_stages)supported=false;
+            if(supported) supported=schema_matches(std::span<const Shader::Info* const>{stages.data(),graphics_stages}) &&
+                schema_matches(std::span<const Shader::Info* const>{canonical.data(),graphics_stages});
+            for(u32 i=0;supported && i<groups.size();++i) {
+                if(groups[i].empty() || i==pipeline.PushSet())continue;
+                auto layout=pipeline.SetLayout(i);if(!layout || n==layouts.size()){supported=false;break;}
+                layouts[n]=layout;indices[n++]=i;candidate->layouts[i]=layout;
+                for(const auto& w:groups[i]) {
+                    std::size_t type=0;
+                    switch(w.descriptorType){case vk::DescriptorType::eStorageBuffer:type=0;break;case vk::DescriptorType::eSampledImage:type=1;break;case vk::DescriptorType::eStorageImage:type=2;break;case vk::DescriptorType::eSampler:type=3;break;default:supported=false;continue;}
+                    if(w.descriptorCount>AheadVulkanBackend::MaxDescriptorsPerPool[type]-counts[type]){supported=false;break;}
+                    counts[type]+=w.descriptorCount;
+                }
+            }
+            if(supported && n) {
+                AheadPools::Failure reason{};
+                auto lease=context->pools.TryPrepare(std::span<const vk::DescriptorSetLayout>{layouts.data(),n},counts,p->pipeline_keepalive,r.scheduler.GetWorkSemaphore()->KnownGpuTick(),&reason);
+                if(lease) {for(std::size_t k=0;k<n;++k)candidate->sets[indices[k]]=lease->sets[k];candidate->prepared_sets=n;candidate->lease=std::move(lease);p->ahead_descriptor_lease.store(std::move(candidate),std::memory_order_release);context->ready.fetch_add(1,std::memory_order_relaxed);}
+                else if(reason==AheadPools::Failure::Capacity)context->capacity.fetch_add(1,std::memory_order_relaxed);
+                else if(reason!=AheadPools::Failure::Disabled)context->failures.fetch_add(1,std::memory_order_relaxed);
+            } else context->capacity.fetch_add(1,std::memory_order_relaxed);
+        } catch(...) {context->failures.fetch_add(1,std::memory_order_relaxed);}
+    }
+    // An off/on transition invalidates all tokens from the old mode generation.
+    // A transition racing this check is also rejected by the recorder's Valid check.
+    if(p->proof_context && !p->proof_context->Valid(p->proof_mode_state)) {
+        p->sampled_view_proofs.clear();p->proof_context.reset();p->proof_mode_state=0;
+    }
     std::vector<PreparedDraw*> dropped;
     {
         PreparedShard& shard = ShardFor(packet);
@@ -4925,7 +6420,17 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
     const bool descriptor_postprocess = postprocess_descriptors &&
         stage.sw_stage == Shader::SwStage::Fragment &&
         (stage.pgm_hash == 0x184b619c || stage.pgm_hash == 0x7cd92fb8);
-    auto* direct = stage.uses_direct && !descriptor_composition
+    // Diagnostic A/B: retain shader compilation but use descriptor bindings.
+    static const bool descriptor_only_a82d2fe = [] {
+        const char* value = std::getenv("RYGT_A82D2FE_DESCRIPTOR_ONLY");
+        return value && value[0] == '1';
+    }();
+    const bool force_descriptor = descriptor_only_a82d2fe &&
+        stage.sw_stage == Shader::SwStage::Compute && stage.pgm_hash == 0xa82d2fe;
+    static std::atomic<bool> descriptor_diagnostic_logged{};
+    if (force_descriptor && !descriptor_diagnostic_logged.exchange(true))
+        LOG_WARNING(Render_Vulkan, "DIAG: 0xa82d2fe descriptor-only buffer binding active");
+    auto* direct = stage.uses_direct && !descriptor_composition && !force_descriptor
         ? r.buffer_cache.GetDirectMemory() : nullptr;
     static thread_local std::vector<std::array<u32, 4>> direct_entries;
     direct_entries.assign(stage.buffers.size(), {});
@@ -5093,6 +6598,12 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
     };
     const u64 now_frame = shared_frame.load(std::memory_order_relaxed);
     static thread_local std::array<TextureMemo, 4096> memos{};
+    using ProofMemoArray=std::array<Native::Parallel::SampledMemoProof<vk::ImageView>,4096>;
+    static_assert(std::tuple_size_v<ProofMemoArray> == std::tuple_size_v<decltype(memos)>);
+    static thread_local std::unique_ptr<ProofMemoArray> proof_memos;
+    const bool proof_enabled=p.proof_context && p.proof_context->Valid(p.proof_mode_state);
+    if(proof_enabled && !proof_memos)proof_memos.reset(new(std::nothrow) ProofMemoArray{});
+    const u64 proof_epoch=proof_enabled ? sampler_cache_epoch.load(std::memory_order_acquire) : 0;
     for (const auto& image_desc : stage.images) {
         auto tsharp = image_desc.GetSharp(stage);
         if (!MatchExperimentalCompositionTexture(tsharp, stage, image_desc, *registry)) {
@@ -5137,6 +6648,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
         TextureMemo& memo = memos[XXH3_64bits_withSeed(raw_sharp.data(), sizeof(raw_sharp),
                                                        memo_flags) &
                                   (memos.size() - 1)];
+        auto* proof_memo=proof_enabled && proof_memos ? &(*proof_memos)[static_cast<std::size_t>(&memo-memos.data()) & (proof_memos->size()-1)] : nullptr;
         const VAddr address = tsharp.Address();
         if (memo.entry && memo.flags == memo_flags && memo.sharp == raw_sharp &&
             memo.generation == memo_generation) {
@@ -5149,7 +6661,30 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
                 b.images.push_back({VK_NULL_HANDLE, memo.views[i], vk::ImageLayout::eGeneral});
             }
             (storage ? b.stored : b.sampled).push_back(entry);
-            p.image_ranges.emplace_back(address, address + std::max<u64>(entry->info.guest_size, 1));
+            if(proof_memo && !storage && p.proof_context->Valid(p.proof_mode_state) && sampler_cache_epoch.load(std::memory_order_acquire)==proof_epoch) {
+                bool known=proof_memo->Matches(this,&memo,entry,proof_epoch,p.image_generation,p.unmap_gen,raw_sharp,memo_flags,cube_sampling,memo.views);
+                if(!known) {
+                    // An ordinary memo can predate proof mode. Rebuild its proof only
+                    // from live owner records; contention simply retains fallback.
+                    std::unique_lock views_lock{views_mutex,std::try_to_lock};
+                    if(views_lock.owns_lock()) {
+                        const auto it=views.find(entry);
+                        known=it!=views.end() && num_bindings!=0;
+                        for(u32 i=0;known && i<num_bindings;++i) {
+                            const auto wanted=memo.views[i];
+                            known=bool(wanted) && std::ranges::any_of(it->second,[&](const auto& view) {
+                                return (view.use==ViewUse::Sampled || view.use==ViewUse::CubeSampled) && view.view && *view.view==wanted;
+                            });
+                        }
+                        if(known && p.proof_context->Valid(p.proof_mode_state) && sampler_cache_epoch.load(std::memory_order_acquire)==proof_epoch)
+                            *proof_memo={this,&memo,entry,proof_epoch,p.image_generation,p.unmap_gen,raw_sharp,memo_flags,cube_sampling,memo.views};
+                        else known=false;
+                    }
+                }
+                if(known)
+                    for(u32 i=0;i<num_bindings;++i)Native::Parallel::AddSampledViewProof(p.sampled_view_proofs,first+i,b.sampled.size()-1,memo.views[i],entry,proof_epoch,cube_sampling);
+            }
+            p.image_ranges.emplace_back(entry->info.guest_address, entry->info.guest_address + std::max<u64>(entry->info.guest_size, 1));
             add_write();
             continue;
         }
@@ -5164,11 +6699,21 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
             bind_null();
             continue;
         }
-        const VideoCore::TextureCache::ImageDesc desc{tsharp, image_desc};
+        VideoCore::TextureCache::ImageDesc desc{tsharp, image_desc};
+        const bool original_backing=HasImageBacking(desc.info.guest_address,desc.info.guest_size);
+        const u64 original_address=desc.info.guest_address;
+        const u32 original_first_mip=desc.view_info.range.base.level;
+        const bool resident_view=!original_backing && !storage && !cube_sampling && num_bindings==1 &&
+            image_desc.mip_fallback_mode==Shader::MipStorageFallbackMode::None &&
+            RebaseResidentPrtView(desc,[&](u64 address,u64 bytes){return HasImageBacking(address,bytes);});
+        if (resident_view && SceneTrace::Id()) r.FrameDumpEvent(fmt::format(
+            "scene-prt-resident-view id={} program={:#x} original={:#x} first_mip={} resolved={:#x} bytes={} size={}x{} levels={}",
+            SceneTrace::Id(),stage.pgm_hash,original_address,original_first_mip,desc.info.guest_address,
+            desc.info.guest_size,desc.info.size.width,desc.info.size.height,desc.info.resources.levels));
         // A valid base address is not sufficient: stale optional descriptors can
         // span gigabytes beyond their allocation. Reject before image creation,
         // guest-memory import, staging allocation or a detiling dispatch.
-        if (!HasImageBacking(desc.info.guest_address, desc.info.guest_size)) {
+        if (!original_backing && !resident_view) {
             static std::atomic<u32> logged{};
             if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
                 LOG_WARNING(Render_Vulkan,
@@ -5222,7 +6767,14 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
             memo.views[i] = b.images[first + i].imageView;
         }
         memo.generation = memo_generation;
+        if(proof_memo) {
+            if(!storage && p.proof_context->Valid(p.proof_mode_state) && sampler_cache_epoch.load(std::memory_order_acquire)==proof_epoch)
+                *proof_memo={this,&memo,entry,proof_epoch,p.image_generation,p.unmap_gen,raw_sharp,memo_flags,cube_sampling,memo.views};
+            else *proof_memo={};
+        }
         (storage ? b.stored : b.sampled).push_back(entry);
+        if(proof_enabled && !storage && p.proof_context->Valid(p.proof_mode_state) && sampler_cache_epoch.load(std::memory_order_acquire)==proof_epoch)
+            for(u32 i=0;i<num_bindings;++i)Native::Parallel::AddSampledViewProof(p.sampled_view_proofs,first+i,b.sampled.size()-1,memo.views[i],entry,proof_epoch,cube_sampling);
         p.image_ranges.emplace_back(desc.info.guest_address,
                                     desc.info.guest_address +
                                         std::max<u64>(desc.info.guest_size, 1));
@@ -5266,7 +6818,7 @@ u64 NativeRenderer::VertexHash(const GraphicsPipeline& pipeline, const Shader::I
             count += 4;
         }
     }
-    return XXH3_64bits(words.data(), count * sizeof(u32));
+    return Native::Parallel::AdaptiveXXH3(words.data(), count * sizeof(u32));
 }
 
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobVertexBuffer(VAddr address, u64 size,
@@ -5852,6 +7404,8 @@ void NativeRenderer::DispatchDirect() {
                          .count();
         }
     } timed{start, stats.dispatch_ns};
+    SceneTrace::CpuScope scene_trace{r.FrameDumpCollecting(),frame,"dispatch"};
+    if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-pass id={} kind=dispatch",SceneTrace::Id()));
     t_timed = false; // OPT-001: the phase timers are the draws'
     r.scheduler.PopPendingOperations();
     const auto& cs_program = r.liverpool->DrawCsRegs();
@@ -5880,6 +7434,131 @@ void NativeRenderer::DispatchDirect() {
     ReadFillShader(pipeline->GetStage(Shader::SwStage::Compute), b); // NAT-120
     PrepareImages();
     GlobalBarrier();
+    // Intrusive opt-in diagnostic. Submit the bound input copy and wait before
+    // recording this dispatch; shader and loop bounds are never modified.
+    const auto& diag_cs = pipeline->GetStage(Shader::SwStage::Compute);
+    static const u64 capture_budget = [] {
+        const char* p=std::getenv("RYGT_A82_GPU_CAPTURE");
+        return p && *p ? std::min<u64>(std::strtoull(p,nullptr,0),256) : u64{0};
+    }();
+    static const u64 capture_from = [] {
+        const char* p=std::getenv("RYGT_A82_GPU_CAPTURE_FROM_FRAME");
+        return p && *p ? std::strtoull(p,nullptr,0) : u64{0};
+    }();
+    static u64 captures=0;
+    const char* forced_descriptor=std::getenv("RYGT_A82D2FE_DESCRIPTOR_ONLY");
+    const bool after_race_ready=A82CaptureAfterRace();
+    if (after_race_ready && capture_budget && captures < capture_budget && frame >= capture_from &&
+        diag_cs.pgm_hash == 0xa82d2fe && forced_descriptor && forced_descriptor[0]=='1' &&
+        !diag_cs.buffers.empty() && !diag_cs.buffers[0].IsSpecial() && !b.buffers.empty()) {
+        constexpr u64 max_bytes=512;
+        const u64 bytes = b.buffers[0].range == VK_WHOLE_SIZE || b.buffers[0].range < b.push.buf_offsets[0]
+            ? 0 : std::min<u64>((b.buffers[0].range-b.push.buf_offsets[0]) & ~u64{3},max_bytes);
+        const auto descriptor=b.buffers[0];
+        const u64 adjust=b.push.buf_offsets[0];
+        const bool valid=descriptor.buffer && bytes >= 332 && adjust % 4 == 0 &&
+            descriptor.offset <= std::numeric_limits<u64>::max()-adjust-bytes &&
+            (descriptor.range != VK_WHOLE_SIZE &&
+             (descriptor.range >= adjust && descriptor.range-adjust >= bytes));
+        auto readback=valid ? device->CreateBuffer({.size=bytes,
+            .usage=Native::Rhi::BufferUsageTransferDst | Native::Rhi::BufferUsageStorage,
+            .memory=Native::Rhi::MemoryKind::Readback, .name="a82 input diagnostic"}) : nullptr;
+        if (readback && readback->Mapped()) {
+            const u64 capture=++captures;
+            const auto original_push=b.push;
+            std::string push_words;
+            std::array<u32,sizeof(original_push)/4> push{};
+            std::memcpy(push.data(), &original_push, sizeof(original_push));
+            for(u32 word:push) push_words += fmt::format(" {:08x}",word);
+            s.cmd.copyBuffer(descriptor.buffer,
+                vk::Buffer{Handle<VkBuffer_T>(readback->NativeHandle())},
+                vk::BufferCopy{.srcOffset=descriptor.offset+adjust,.dstOffset=0,.size=bytes});
+            const vk::MemoryBarrier2 to_host{
+                .srcStageMask=vk::PipelineStageFlagBits2::eAllTransfer,
+                .srcAccessMask=vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask=vk::PipelineStageFlagBits2::eHost,
+                .dstAccessMask=vk::AccessFlagBits2::eHostRead};
+            s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount=1,.pMemoryBarriers=&to_host});
+            Splice();
+            r.scheduler.Finish();
+            readback->Invalidate(0,bytes);
+            std::array<u32,128> words{};
+            std::memcpy(words.data(),readback->Mapped(),bytes);
+            std::string raw; for(u64 i=0;i<bytes/4;++i) raw+=fmt::format(" {:08x}",words[i]);
+            LOG_WARNING(Render_Vulkan,
+                "DIAG-A82 GPU-PRE-DISPATCH capture={} frame={} groups={}x{}x{} "
+                "descriptor={:#x} offset={} range={} adjust={} bytes={} n={} push:{} words:{}",
+                capture,frame,cs_program.dim_x,cs_program.dim_y,cs_program.dim_z,
+                reinterpret_cast<u64>(static_cast<VkBuffer>(descriptor.buffer)),
+                descriptor.offset,descriptor.range,adjust,bytes,words[72],push_words,raw);
+            LOG_WARNING(Render_Vulkan,
+                "DIAG-A82 GPU-METADATA capture={} local={}x{}x{} lds_per_group={} bound_lds_range={}",
+                capture,cs_program.num_thread_x.full,cs_program.num_thread_y.full,
+                cs_program.num_thread_z.full,cs_program.SharedMemSize(),
+                b.buffers.size()>2 ? b.buffers[2].range : u64{0});
+            for(size_t i=0;i<b.images.size();++i) {
+                const auto& d=b.images[i];
+                LOG_WARNING(Render_Vulkan,"DIAG-A82 GPU-METADATA capture={} bound_image={} view={:#x} sampler={:#x} layout={}",
+                    capture,i,reinterpret_cast<u64>(static_cast<VkImageView>(d.imageView)),
+                    reinterpret_cast<u64>(static_cast<VkSampler>(d.sampler)),u32(d.imageLayout));
+            }
+            for(size_t i=0;i<diag_cs.images.size();++i) {
+                const auto sharp=diag_cs.images[i].GetSharp(diag_cs);
+                std::array<u32,sizeof(sharp)/4> raw_sharp{};
+                std::memcpy(raw_sharp.data(),&sharp,sizeof(sharp));
+                std::string text;for(u32 word:raw_sharp)text+=fmt::format(" {:08x}",word);
+                LOG_WARNING(Render_Vulkan,"DIAG-A82 GPU-METADATA capture={} image_sharp={} words:{}",capture,i,text);
+            }
+            for(size_t i=0;i<diag_cs.samplers.size();++i) {
+                const auto sharp=diag_cs.samplers[i].GetSharp(diag_cs);
+                std::array<u32,sizeof(sharp)/4> raw_sharp{};
+                std::memcpy(raw_sharp.data(),&sharp,sizeof(sharp));
+                std::string text;for(u32 word:raw_sharp)text+=fmt::format(" {:08x}",word);
+                LOG_WARNING(Render_Vulkan,"DIAG-A82 GPU-METADATA capture={} sampler_sharp={} words:{}",capture,i,text);
+            }
+            // Splice retires upload chunks. Rebuild all bindings in a fresh stream;
+            // the subsequent descriptor can differ, so this is a pre-rebind snapshot.
+            Begin();
+            b.Clear();
+            b.push=UserData(regs);
+            BindStages(pipeline->GetStages(),regs,true,b);
+            if (b.failed) { ++stats.skipped; return; }
+            PrepareImages();
+            GlobalBarrier();
+            const auto rebound=b.buffers.empty()?vk::DescriptorBufferInfo{}:b.buffers[0];
+            // Only replace when the entire original logical descriptor was copied.
+            // This does not rely on the hash identifying a particular SPIR-V variant.
+            const char* freeze_env=std::getenv("RYGT_A82_FREEZE_CAPTURE");
+            const bool frozen=freeze_env && freeze_env[0]=='1' && !b.buffers.empty() &&
+                !diag_cs.buffers[0].is_written && descriptor.range-adjust == bytes;
+            if (frozen) {
+                b.buffers[0]={Handle<VkBuffer_T>(readback->NativeHandle()),0,bytes};
+                b.push.buf_offsets[0]=0;
+                s.keep.push_back(std::move(readback)); // retained until this command list completes
+            }
+            std::array<u32,sizeof(b.push)/4> effective_push{};
+            std::memcpy(effective_push.data(),&b.push,sizeof(b.push));
+            std::string effective;for(u32 word:effective_push)effective+=fmt::format(" {:08x}",word);
+            LOG_WARNING(Render_Vulkan,
+                "DIAG-A82 POST-REBIND capture={} descriptor={:#x} offset={} range={} adjust={} frozen={} push:{}",
+                capture,reinterpret_cast<u64>(static_cast<VkBuffer>(rebound.buffer)),
+                rebound.offset,rebound.range,b.push.buf_offsets[0],frozen,effective);
+        } else {
+            LOG_WARNING(Render_Vulkan,"DIAG-A82 GPU input capture skipped: invalid descriptor or readback allocation");
+            captures=capture_budget; // avoid repeating a failed diagnostic every dispatch
+        }
+    }
+    // Wait for an existing non-rendering boundary: never restart a clear pass for diagnostics.
+    if(SceneTrace::Id() && !SceneTrace::state.attempted && !s.rendering) {
+        const auto families=r.instance.GetPhysicalDevice().getQueueFamilyProperties();
+        const u32 family=r.instance.GetGraphicsQueueFamilyIndex();
+        SceneTrace::Prepare(r.instance.GetDevice(),s.cmd,
+            family<families.size()?families[family].timestampValidBits:0,
+            r.instance.GetPhysicalDevice().getProperties().limits.timestampPeriod);
+    }
+    scene_trace.Programs(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash);
+    if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-compute id={} cs={:#x} groups={}x{}x{} threads={}x{}x{} host_subgroup={}",SceneTrace::Id(),pipeline->GetStage(Shader::SwStage::Compute).pgm_hash,cs_program.dim_x,cs_program.dim_y,cs_program.dim_z,cs_program.num_thread_x.full,cs_program.num_thread_y.full,cs_program.num_thread_z.full,r.instance.SubgroupSize()));
+    SceneTrace::GpuBegin(s.cmd);
     const CmdBuf cmdbuf{s.cmd};
     bool transferred = false;
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
@@ -5916,11 +7595,107 @@ void NativeRenderer::DispatchDirect() {
         s.pipelines.Compute(pipeline->Handle(), r.instance.IsIntel(), [&] {
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
         });
+        // CPU guest bytes may differ from the GPU descriptor; label accordingly.
+        static const bool capture_a82 = [] {
+            const char* p = std::getenv("RYGT_A82_INPUT_DIAG"); return p && p[0] == '1';
+        }();
+        if (capture_a82 && cs.pgm_hash == 0xa82d2fe && !cs.buffers.empty() &&
+            !cs.buffers[0].IsSpecial() && !b.buffers.empty()) {
+            const auto sharp = cs.buffers[0].GetSharp(cs);
+            const u64 base = sharp.base_address, size = sharp.GetSize();
+            std::array<u32, 80> words{};
+            const bool readable = base && size >= sizeof(words) &&
+                Core::RytyMemory::GuardedCopy(words.data(),
+                    reinterpret_cast<const void*>(base), sizeof(words));
+            static u64 serial = 0;
+            static u32 last_n = ~u32{0};
+            static u64 last_base = ~u64{0};
+            static bool last_readable = false;
+            const u64 number = ++serial;
+            const u32 n = readable ? words[72] : 0;
+            if (number <= 4 || number % 300 == 0 || base != last_base ||
+                readable != last_readable || (readable && n != last_n)) {
+                last_n = n; last_base = base; last_readable = readable;
+                const auto& descriptor = b.buffers[0];
+                std::string raw;
+                if (readable) for (u32 word : words) raw += fmt::format(" {:08x}", word);
+                LOG_WARNING(Render_Vulkan,
+                    "DIAG-A82 CPU-GUEST-NOT-GPU frame={} serial={} groups={}x{}x{} "
+                    "buffer0={:#x}+{:#x} region={} readable={} n={} gpu_buffer={:#x} "
+                    "gpu_offset={} gpu_range={} push_offset={} words:{}",
+                    frame, number, cs_program.dim_x, cs_program.dim_y, cs_program.dim_z,
+                    base, size, RegionOver(base, size) != nullptr, readable, n,
+                    reinterpret_cast<u64>(static_cast<VkBuffer>(descriptor.buffer)),
+                    descriptor.offset, descriptor.range, b.push.buf_offsets[0], raw);
+                for (size_t i=0; i<b.images.size(); ++i) {
+                    const auto& d = b.images[i];
+                    LOG_WARNING(Render_Vulkan, "DIAG-A82 bound_image={} view={:#x} sampler={:#x} layout={}",
+                        i, reinterpret_cast<u64>(static_cast<VkImageView>(d.imageView)),
+                        reinterpret_cast<u64>(static_cast<VkSampler>(d.sampler)), u32(d.imageLayout));
+                }
+                for (size_t i=0; i<cs.samplers.size(); ++i) {
+                    const auto sharp_sampler=cs.samplers[i].GetSharp(cs);
+                    std::array<u32, sizeof(sharp_sampler)/sizeof(u32)> data{};
+                    std::memcpy(data.data(), &sharp_sampler, sizeof(sharp_sampler));
+                    std::string sampler_words;
+                    for (u32 word : data) sampler_words += fmt::format(" {:08x}", word);
+                    LOG_WARNING(Render_Vulkan, "DIAG-A82 sampler={} words:{}", i, sampler_words);
+                }
+                for (size_t i=0; i<cs.images.size(); ++i) {
+                    const auto image = cs.images[i].GetSharp(cs);
+                    LOG_WARNING(Render_Vulkan,
+                        "DIAG-A82 image={} guest={:#x} {}x{} layers={}-{} type={} fmt={}/{}",
+                        i, image.Address(), image.width+1, image.height+1,
+                        u32(image.base_array), u32(image.last_array), u32(image.GetType()),
+                        u32(image.GetDataFmt()), u32(image.GetNumberFmt()));
+                }
+            }
+        }
+        // Opt-in: when buffer0 is an upload chunk, its already-copied bytes are
+        // the bound snapshot, unlike a second read of mutable guest memory.
+        static const bool inspect_snapshot=[] {
+            const char* p=std::getenv("RYGT_A82_INPUT_DIAG"); return p && p[0]=='1';
+        }();
+        if (inspect_snapshot && cs.pgm_hash==0xa82d2fe && !b.buffers.empty()) {
+            constexpr u64 wanted=336;
+            const auto info=b.buffers[0]; const u64 adjust=b.push.buf_offsets[0];
+            bool found=false;
+            for (const auto& chunk:s.chunks) {
+                if (!chunk.buffer || !chunk.buffer->Mapped() ||
+                    vk::Buffer{Handle<VkBuffer_T>(chunk.buffer->NativeHandle())}!=info.buffer ||
+                    info.offset>chunk.buffer->Size() || adjust>chunk.buffer->Size()-info.offset ||
+                    wanted>chunk.buffer->Size()-info.offset-adjust ||
+                    info.range==VK_WHOLE_SIZE || info.range<adjust || wanted>info.range-adjust) continue;
+                std::array<u32,84> copied{};
+                std::memcpy(copied.data(),chunk.buffer->Mapped()+info.offset+adjust,wanted);
+                static u64 serial=0;static u32 last=~u32{0};static u64 last_base=~u64{0};
+                const u64 number=++serial;
+                const u64 base=cs.buffers.empty() || cs.buffers[0].IsSpecial()
+                    ? 0 : cs.buffers[0].GetSharp(cs).base_address;
+                if (number<=4 || number%300==0 || copied[72]!=last || base!=last_base) {
+                    last=copied[72];last_base=base;std::string raw;
+                    for(u32 word:copied)raw+=fmt::format(" {:08x}",word);
+                    LOG_WARNING(Render_Vulkan,
+                        "DIAG-A82 UPLOAD-SNAPSHOT frame={} serial={} guest={:#x} n={} buffer={:#x} offset={} adjust={} words:{}",
+                        frame,number,base,copied[72],reinterpret_cast<u64>(static_cast<VkBuffer>(info.buffer)),
+                        info.offset,adjust,raw);
+                }
+                found=true;break;
+            }
+            if (!found) {
+                static std::atomic<u64> missing{};const auto n=++missing;
+                if(n<=4 || n%300==0)LOG_WARNING(Render_Vulkan,
+                    "DIAG-A82 UPLOAD-SNAPSHOT-UNAVAILABLE frame={} count={} descriptor={:#x}",
+                    frame,n,reinterpret_cast<u64>(static_cast<VkBuffer>(info.buffer)));
+            }
+        }
         PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
         Native::GpuCheckpoints::Record(static_cast<VkCommandBuffer>(s.cmd), 2, frame,
             cs.pgm_hash, cs_program.dim_x, u64(cs_program.dim_y) << 32 | cs_program.dim_z);
         cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     }
+    SceneTrace::GpuEnd(s.cmd);
+    if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-compute-path id={} transfer_rewrite={}",SceneTrace::Id(),transferred));
     NoteWrites(nullptr, b);
     if (Native::g_dump_request.exchange(false)) {
         r.StartFrameDumpNow(); // FIX-156 (diagnosis): a watched fill
@@ -5934,6 +7709,8 @@ void NativeRenderer::DispatchDirect() {
 
 void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     std::scoped_lock lock{mutex};
+    SceneTrace::CpuScope scene_trace{r.FrameDumpCollecting(),frame,"dispatch-indirect"};
+    if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-pass id={} kind=dispatch-indirect arguments={:#x}+{} bytes={}",SceneTrace::Id(),address,offset,size));
     t_timed = false; // OPT-001
     r.scheduler.PopPendingOperations();
     const ComputePipeline* pipeline = r.AcquireComputePipeline();
@@ -5966,7 +7743,26 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     });
     PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
+    // Wait for an existing non-rendering boundary: never restart a clear pass for diagnostics.
+    if(SceneTrace::Id() && !SceneTrace::state.attempted && !s.rendering) {
+        const auto families=r.instance.GetPhysicalDevice().getQueueFamilyProperties();
+        const u32 family=r.instance.GetGraphicsQueueFamilyIndex();
+        SceneTrace::Prepare(r.instance.GetDevice(),s.cmd,
+            family<families.size()?families[family].timestampValidBits:0,
+            r.instance.GetPhysicalDevice().getProperties().limits.timestampPeriod);
+    }
+    scene_trace.Programs(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash);
+    if(SceneTrace::Id() && scene_indirect_args.size()<128) {
+        if(!scene_indirect_buffer)scene_indirect_buffer=device->CreateBuffer({.size=128*16,.usage=Native::Rhi::BufferUsageTransferDst,.memory=Native::Rhi::MemoryKind::Readback,.name="scene indirect arguments"});
+        if(scene_indirect_buffer && scene_indirect_buffer->Mapped()){
+            const u64 target=scene_indirect_args.size()*16;
+            s.cmd.copyBuffer(args->first,vk::Buffer{Handle<VkBuffer_T>(scene_indirect_buffer->NativeHandle())},vk::BufferCopy{.srcOffset=args->second,.dstOffset=target,.size=12});
+            scene_indirect_args.push_back({SceneTrace::Id(),address,offset});
+        } else r.FrameDumpEvent(fmt::format("scene-indirect-snapshot id={} skipped=allocation",SceneTrace::Id()));
+    }else if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-indirect-snapshot id={} skipped=capacity",SceneTrace::Id()));
+    SceneTrace::GpuBegin(s.cmd);
     cmdbuf.dispatchIndirect(args->first, args->second);
+    SceneTrace::GpuEnd(s.cmd);
     NoteWrites(nullptr, b);
     s.buffers_written = true;
     ++stats.dispatches;
@@ -6742,6 +8538,7 @@ void NativeRenderer::Splice() {
     if (!s.list) {
         return;
     }
+    const u64 boundary_signal=ActiveSubmitSignal()?ActiveSubmitSignal():r.scheduler.CurrentTick();
     EndRendering();
     if (!writebacks.empty()) {
         GlobalBarrier(); // NAT-112: written back in this submission
@@ -6751,6 +8548,25 @@ void NativeRenderer::Splice() {
         s.list->End();
     }
     r.scheduler.EndRendering();
+    if (auto* sidecar=FindParallelRuntime(this); sidecar) {
+        const u64 signal=boundary_signal;
+        ASSERT_MSG(sidecar->sync_pins.AssignPending(signal),"parallel synchronous pin epoch mismatch");
+        sidecar->coordinator->Collect(r.scheduler.GetWorkSemaphore()->KnownGpuTick());
+        sidecar->sync_pins.Collect(r.scheduler.GetWorkSemaphore()->KnownGpuTick(),
+            [&](auto& callback) noexcept {return Native::Rhi::TryEnqueueCompleted(*device,callback);});
+        if(sidecar->coordinator->PendingNodes()) {
+        const auto parallel_wait_start=std::chrono::steady_clock::now();
+        const bool drained=sidecar->coordinator->Drain(signal,
+            [&](Native::Rhi::CommandList* list,Native::Parallel::PassCoordinator::JobPtr,
+                Native::Parallel::PassCoordinator::PrefixPtr) noexcept {
+                const vk::CommandBuffer cmd{reinterpret_cast<VkCommandBuffer>(list->NativeHandle())};
+                r.scheduler.CommandBuffer().executeCommands(cmd);
+                device->MarkExecuted(list,{timeline.get(),signal});
+            });
+        sidecar->drain_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-parallel_wait_start).count();
+        ASSERT_MSG(drained,"parallel node preflight or submission epoch failed");
+        }
+    }
     if (!wrapped) {
         const vk::CommandBuffer secondary = s.cmd;
         r.scheduler.CommandBuffer().executeCommands(secondary);
@@ -6775,6 +8591,13 @@ void NativeRenderer::Splice() {
     // immutable binding memo is still cleared above: only unused bytes survive.
     s.descriptor_reserve.Clear(); // never-written spares retire with their pools
     s.descriptor_sets.Clear(); // descriptor pools retire with this list
+    if(auto* sidecar=FindParallelRuntime(this);sidecar && sidecar->ahead_context && sidecar->ahead_live) {
+        const auto completed=r.scheduler.GetWorkSemaphore()->KnownGpuTick();
+        for(auto& flight:sidecar->ahead_flights)if(flight.release) {
+            if(!flight.tick) {ASSERT_MSG(flight.lease && flight.lease->lease->MarkUsed(boundary_signal),"ahead descriptor invalid signal");flight.tick=boundary_signal;}
+            if(flight.tick<=completed) {flight.lease.reset();if(!Native::Rhi::TryEnqueueCompleted(*device,flight.release))continue;flight.tick=0;--sidecar->ahead_live;}
+        }
+    }
     s.pools.clear();
     s.keep.clear(); // freed by the device once the GPU ran this list (NAT-107)
     device->Collect(); // objects the GPU finished with (staging buffers of uploads)
@@ -6782,6 +8605,76 @@ void NativeRenderer::Splice() {
     s.list = nullptr;
     s.cmd = vk::CommandBuffer{};
     s.rendering = false;
+    if(auto* sidecar=FindParallelRuntime(this);sidecar && sidecar->transfer_mode_controller && !sidecar->closing) {
+        const auto changed=sidecar->transfer_applied_mode.Apply(sidecar->transfer_mode_controller->Requested(),true);
+        if(changed || !sidecar->transfer_mode_initial_logged) {
+            sidecar->transfer_mode_initial_logged=true;
+            const bool available=sidecar->coordinator->TransferEnabled();
+#ifdef _WIN32
+            LARGE_INTEGER qpc{},frequency{};SYSTEMTIME utc{};QueryPerformanceCounter(&qpc);QueryPerformanceFrequency(&frequency);GetSystemTime(&utc);
+            LOG_INFO(Render_Vulkan,"PARALLEL-TRANSFER-MODE-APPLIED mode={} generation={} signal={} qpc={} frequency={} utc={:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z pool_available={}",
+                sidecar->transfer_applied_mode.Enabled() && available,changed?changed->generation:0,boundary_signal,qpc.QuadPart,frequency.QuadPart,
+                utc.wYear,utc.wMonth,utc.wDay,utc.wHour,utc.wMinute,utc.wSecond,utc.wMilliseconds,available);
+#else
+            LOG_INFO(Render_Vulkan,"PARALLEL-TRANSFER-MODE-APPLIED mode={} generation={} signal={} pool_available={}",sidecar->transfer_applied_mode.Enabled() && available,changed?changed->generation:0,boundary_signal,available);
+#endif
+        }
+    }
+    if(auto* sidecar=FindParallelRuntime(this);sidecar && sidecar->view_mode_controller && !sidecar->closing) {
+        const auto changed=sidecar->view_applied_mode.Apply(sidecar->view_mode_controller->Requested(),true);
+        if(changed || !sidecar->view_mode_initial_logged) {
+            sidecar->view_mode_initial_logged=true;
+#ifdef _WIN32
+            LARGE_INTEGER qpc{},frequency{};SYSTEMTIME utc{};
+            QueryPerformanceCounter(&qpc);QueryPerformanceFrequency(&frequency);GetSystemTime(&utc);
+            LOG_INFO(Render_Vulkan,"PARALLEL-VIEW-MODE-APPLIED mode={} generation={} signal={} qpc={} frequency={} utc={:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+                sidecar->view_applied_mode.Enabled(),changed?changed->generation:0,boundary_signal,qpc.QuadPart,frequency.QuadPart,
+                utc.wYear,utc.wMonth,utc.wDay,utc.wHour,utc.wMinute,utc.wSecond,utc.wMilliseconds);
+#else
+            LOG_INFO(Render_Vulkan,"PARALLEL-VIEW-MODE-APPLIED mode={} generation={} signal={}",sidecar->view_applied_mode.Enabled(),changed?changed->generation:0,boundary_signal);
+#endif
+        }
+    }
+    // A mode change takes effect only after this stream and all ordered nodes
+    // have been appended and owner pins have their submission signal.
+    if(auto* sidecar=FindParallelRuntime(this);sidecar && sidecar->mode_controller && !sidecar->closing) {
+        const u64 signal=boundary_signal;
+        const auto request=sidecar->mode_controller->Requested();
+        if(sidecar->ahead_context && !request.enabled)SetAheadMode(*sidecar->ahead_context,false);
+        if(sidecar->prepared_proof_context && !request.enabled)sidecar->prepared_proof_context->SetMode(false);
+        const auto changed=sidecar->applied_mode.Apply(request,true);
+        if(sidecar->ahead_context && sidecar->applied_mode.Enabled())SetAheadMode(*sidecar->ahead_context,true);
+        if(sidecar->prepared_proof_context && sidecar->applied_mode.Enabled())sidecar->prepared_proof_context->SetMode(true);
+        if((changed || !sidecar->mode_initial_logged) && sidecar->prepared_proof_context) {
+            const auto state=sidecar->prepared_proof_context->state.load(std::memory_order_seq_cst);
+            const auto active=sidecar->prepared_proof_context->active.load(std::memory_order_seq_cst);
+#ifdef _WIN32
+            LARGE_INTEGER qpc{},frequency{};SYSTEMTIME utc{};QueryPerformanceCounter(&qpc);QueryPerformanceFrequency(&frequency);GetSystemTime(&utc);
+            LOG_INFO(Render_Vulkan,"PARALLEL-PREPARED-VIEW-STATE mode={} generation={} active={} control_generation={} signal={} qpc={} frequency={} utc={:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+                bool(state&1),state>>1,active,changed?changed->generation:0,signal,qpc.QuadPart,frequency.QuadPart,
+                utc.wYear,utc.wMonth,utc.wDay,utc.wHour,utc.wMinute,utc.wSecond,utc.wMilliseconds);
+#else
+            LOG_INFO(Render_Vulkan,"PARALLEL-PREPARED-VIEW-STATE mode={} generation={} active={} control_generation={} signal={}",bool(state&1),state>>1,active,changed?changed->generation:0,signal);
+#endif
+        }
+        if((changed || !sidecar->mode_initial_logged) && sidecar->ahead_context) {
+            const auto& a=*sidecar->ahead_context;
+            LOG_INFO(Render_Vulkan,"PARALLEL-PRODUCER-MODE mode={} preparing={} pool_quiescent={}",
+                a.mode.load(std::memory_order_acquire),a.active.load(std::memory_order_acquire),a.pools.Quiescent());
+        }
+        if(changed || !sidecar->mode_initial_logged) {
+            sidecar->mode_initial_logged=true;
+#ifdef _WIN32
+            LARGE_INTEGER qpc{},frequency{};SYSTEMTIME utc{};
+            QueryPerformanceCounter(&qpc);QueryPerformanceFrequency(&frequency);GetSystemTime(&utc);
+            LOG_INFO(Render_Vulkan,"PARALLEL-MODE-APPLIED mode={} generation={} signal={} qpc={} frequency={} utc={:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+                sidecar->applied_mode.Enabled(),changed?changed->generation:0,signal,qpc.QuadPart,frequency.QuadPart,
+                utc.wYear,utc.wMonth,utc.wDay,utc.wHour,utc.wMinute,utc.wSecond,utc.wMilliseconds);
+#else
+            LOG_INFO(Render_Vulkan,"PARALLEL-MODE-APPLIED mode={} generation={} signal={}",sidecar->applied_mode.Enabled(),changed?changed->generation:0,signal);
+#endif
+        }
+    }
     ++stats.splices;
 }
 
@@ -6844,6 +8737,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
                                                                    vk::Format view_format,
                                                                    vk::Extent2D output_size) {
     std::scoped_lock lock{mutex};
+    (void)A82CaptureAfterRace(); // Observe race even when target shader does not run.
     if (InPlaceSampled()) {
         for (u32 i = 0; i < in_place.pages.size(); ++i) {
             in_place.total[i] += in_place.pages[i].TakePageCount();
@@ -7117,6 +9011,7 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
         std::unique_ptr<Native::Rhi::Buffer> buffer;
         u64 size;
         u32 index;
+        u32 mip;
     };
     std::vector<Readback> readbacks;
     Stream& s = Begin();
@@ -7188,47 +9083,47 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
             std::fclose(file);
         }
     }
-    u32 index = 0;
-    for (const auto& [entry, name] : jobs) {
-        const u32 order = index++;
-        if (!entry->image) {
-            continue;
+    u64 extra_bytes=0, total_readback_bytes=0;
+    constexpr u64 TraceReadbackBudget=128ull<<20;
+    std::string mip_manifest="file,address,mip,width,height,depth,layers,unit_bytes,compressed,bytes,status,version,format,depth_aspect\n";
+    u32 index=0;
+    for(const auto& [entry,name]:jobs){
+        const u32 order=index++;
+        if(!entry->image)continue;
+        const auto& desc=entry->image->Desc();
+        const bool block=entry->info.props.is_block;
+        const u32 unit=entry->info.props.is_depth?(u32(desc.format)==u32(vk::Format::eD16Unorm)?2u:4u):std::max(entry->info.num_bits/8,1u);
+        const u32 layers=desc.dim==Native::Rhi::ImageDim::D3?1u:std::max(desc.layers,1u);
+        for(u32 mip=0;mip<std::min(desc.mips,32u);++mip){
+            const auto l=SceneTrace::Layout(desc.width,desc.height,desc.dim==Native::Rhi::ImageDim::D3?desc.depth:1u,layers,mip,unit,block);
+            const std::string file=mip==0?name:std::filesystem::path(name).stem().string()+fmt::format("_mip{}.bin",mip);
+            const char* status="queued";
+            if(desc.samples!=1)status="skipped_msaa";
+            else if(!(desc.usage & Native::Rhi::ImageUsageTransferSrc))status="skipped_no_transfer_src";
+            else if(!l.bytes)status="skipped_layout";
+            else if(mip==0 && entry->from_cpu)status="metadata_only_cpu_base";
+            else if(mip>0 && l.bytes>(64ull<<20)-extra_bytes)status="skipped_extra_mip_budget";
+            else if(l.bytes>TraceReadbackBudget-total_readback_bytes)status="skipped_total_readback_budget";
+            if(std::string_view(status)!="queued"){
+                mip_manifest+=fmt::format("{},{:#x},{},{},{},{},{},{},{},{},{},{},{},{}\n",file,entry->info.guest_address,mip,l.width,l.height,l.depth,l.layers,unit,block,l.bytes,status,entry->write_version.load(),u32(desc.format),bool(entry->info.props.is_depth));continue;
+            }
+            auto buffer=device->CreateBuffer({.size=l.bytes,.usage=Native::Rhi::BufferUsageTransferDst,.memory=Native::Rhi::MemoryKind::Readback,.name="scene trace mip"});
+            if(!buffer || !buffer->Mapped())status="allocation_failed";
+            else {
+                if(mip>0)extra_bytes+=l.bytes;
+                total_readback_bytes+=l.bytes;
+                s.cmd.copyImageToBuffer(vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},vk::ImageLayout::eGeneral,
+                    vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},vk::BufferImageCopy{.bufferOffset=0,.bufferRowLength=l.row,.bufferImageHeight=l.rows,
+                    .imageSubresource{.aspectMask=entry->info.props.is_depth?vk::ImageAspectFlagBits::eDepth:vk::ImageAspectFlagBits::eColor,.mipLevel=mip,.baseArrayLayer=0,.layerCount=l.layers},
+                    .imageOffset={0,0,0},.imageExtent={l.width,l.height,l.depth}});
+                readbacks.push_back({entry,std::move(buffer),l.bytes,order,mip});
+            }
+            mip_manifest+=fmt::format("{},{:#x},{},{},{},{},{},{},{},{},{},{},{},{}\n",file,entry->info.guest_address,mip,l.width,l.height,l.depth,l.layers,unit,block,l.bytes,status,entry->write_version.load(),u32(desc.format),bool(entry->info.props.is_depth));
         }
-        const auto& desc = entry->image->Desc();
-        const u32 texel = entry->info.props.is_depth ? 4u : std::max(entry->info.num_bits / 8, 1u);
-        // NAT-125: every layer of the first mip (cube faces, layered targets), one after another.
-        const u32 layers = desc.dim == Native::Rhi::ImageDim::D3 ? 1u : std::max(desc.layers, 1u);
-        // FIX-152 (diagnosis): block-compressed images give their blocks (4x4 texels each).
-        const bool block = entry->info.props.is_block;
-        const u32 row = block ? Common::AlignUp(desc.width, 4u) : desc.width;
-        const u32 rows = block ? Common::AlignUp(desc.height, 4u) : desc.height;
-        const u64 size = block ? u64(row / 4) * (rows / 4) * texel * layers
-                               : u64(desc.width) * desc.height * texel * layers;
-        auto buffer = device->CreateBuffer({.size = size,
-                                            .usage = Native::Rhi::BufferUsageTransferDst,
-                                            .memory = Native::Rhi::MemoryKind::Readback,
-                                            .name = "native dump"});
-        if (!buffer || !buffer->Mapped() || desc.samples != 1) {
-            continue;
-        }
-        const vk::BufferImageCopy copy{
-            .bufferOffset = 0,
-            .bufferRowLength = row,
-            .bufferImageHeight = rows,
-            .imageSubresource{.aspectMask = entry->info.props.is_depth
-                                               ? vk::ImageAspectFlagBits::eDepth
-                                               : vk::ImageAspectFlagBits::eColor,
-                              .mipLevel = 0,
-                              .baseArrayLayer = 0,
-                              .layerCount = layers},
-            .imageOffset = {0, 0, 0},
-            .imageExtent = {desc.width, desc.height, 1},
-        };
-        s.cmd.copyImageToBuffer(vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},
-                                vk::ImageLayout::eGeneral,
-                                vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())}, copy);
-        readbacks.push_back({entry, std::move(buffer), size, order});
     }
+    if(auto* f=std::fopen((dir/"mip-manifest.csv").string().c_str(),"w")){std::fwrite(mip_manifest.data(),1,mip_manifest.size(),f);std::fclose(f);}
+    const vk::MemoryBarrier2 trace_to_host{.srcStageMask=vk::PipelineStageFlagBits2::eAllTransfer,.srcAccessMask=vk::AccessFlagBits2::eTransferWrite,.dstStageMask=vk::PipelineStageFlagBits2::eHost,.dstAccessMask=vk::AccessFlagBits2::eHostRead};
+    s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount=1,.pMemoryBarriers=&trace_to_host});
     Splice();
     r.scheduler.Finish();
     if (!g_pixel_trace.hashes.empty()) {
@@ -7247,7 +9142,9 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
     for (const auto& readback : readbacks) {
         const auto& info = readback.entry->info;
         const auto& desc = readback.entry->image->Desc();
-        const auto path = dir / jobs[readback.index].second;
+        const auto& name=jobs[readback.index].second;
+        const auto path=dir/(readback.mip==0?name:std::filesystem::path(name).stem().string()+fmt::format("_mip{}.bin",readback.mip));
+        readback.buffer->Invalidate();
         if (std::FILE* file = std::fopen(path.string().c_str(), "wb")) {
             std::fwrite(readback.buffer->Mapped(), 1, readback.size, file);
             std::fclose(file);
@@ -7255,6 +9152,15 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
     }
     LOG_WARNING(Render_Vulkan, "NAT-116: {} render targets and textures of the frame dumped to {}",
                 readbacks.size(), dir.string());
+    if(scene_indirect_buffer){
+        scene_indirect_buffer->Invalidate();
+        if(auto* f=std::fopen((dir/"indirect-arguments.csv").string().c_str(),"w")){
+            std::fputs("id,guest_address,guest_offset,x,y,z\n",f);
+            for(size_t i=0;i<scene_indirect_args.size();++i){const auto& arg=scene_indirect_args[i];std::array<u32,3> xyz{};std::memcpy(xyz.data(),scene_indirect_buffer->Mapped()+i*16,12);std::fprintf(f,"%llu,0x%llx,%llu,%u,%u,%u\n",arg.id,arg.address,arg.offset,xyz[0],xyz[1],xyz[2]);}std::fclose(f);
+        }
+    }
+    scene_indirect_buffer.reset();scene_indirect_args.clear();
+    SceneTrace::Save(dir,r.instance.GetDevice());
     dump_entries.clear();
     dump_textures.clear();
 }
@@ -7421,8 +9327,106 @@ void NativeRenderer::Report() {
     LOG_INFO(Render_Vulkan, "NAT: flat uploads reused={} uploaded={} bytes_saved={}",
              stats.flat_upload_hits, stats.flat_upload_misses, stats.flat_upload_bytes_saved);
     stats.flat_upload_hits = stats.flat_upload_misses = stats.flat_upload_bytes_saved = 0;
+    if (ParallelEligibilityEnabled() && parallel_eligibility_owner==this) {
+        auto& probe=parallel_eligibility_stats; probe.Flush();
+        LOG_INFO(Render_Vulkan, "PARALLEL-ELIGIBILITY-DIAG observed={} upper_bound={} run_counts_1_2_4_8_16_32_64plus={}/{}/{}/{}/{}/{}/{} draws_per_bucket={}/{}/{}/{}/{}/{}/{}; not proof of safe worker recording",
+            probe.observed,probe.eligible,probe.runs[0],probe.runs[1],probe.runs[2],probe.runs[3],probe.runs[4],probe.runs[5],probe.runs[6],
+            probe.eligible_draws_in_runs[0],probe.eligible_draws_in_runs[1],probe.eligible_draws_in_runs[2],probe.eligible_draws_in_runs[3],probe.eligible_draws_in_runs[4],probe.eligible_draws_in_runs[5],probe.eligible_draws_in_runs[6]);
+        LOG_INFO(Render_Vulkan,"PARALLEL-ELIGIBILITY-DIAG independent_filters race={} nonindexed={} single_color={} no_clear={} no_depth={} no_descriptors={} no_storage={} no_feedback={}",
+            probe.race,probe.nonindexed,probe.single_color,probe.no_clear,probe.no_depth,probe.no_descriptors,probe.no_storage,probe.no_feedback);
+        probe={};
+    }
+    if(auto* sidecar=FindParallelRuntime(this)) {
+        LOG_INFO(Render_Vulkan,"PARALLEL-PRODUCER-CPU cumulative structure={} vertex={} snapshot={}",sidecar->producer_structure_hits,sidecar->producer_vertex_hits,sidecar->producer_snapshot_hits);
+        const auto& batch=sidecar->descriptor_updates;
+        LOG_INFO(Render_Vulkan,"PARALLEL-DESCRIPTOR-BATCH cumulative logical_draws={} actual_calls={} staged_rows={} immediate_draws={} overflow_draws={} unsupported_draws={} high_rows={} pending_rows={} flush_end={} flush_serial={} flush_abandoned={} flush_capacity={} flush_unsupported={} flush_exception={}",
+            batch.logical_draws,batch.actual_calls,batch.staged_rows,batch.immediate_draws,batch.overflow_draws,batch.unsupported_draws,batch.high_rows,batch.nw,batch.flushes[PendingDescriptorUpdates::EndPass],batch.flushes[PendingDescriptorUpdates::Serial],batch.flushes[PendingDescriptorUpdates::Abandoned],batch.flushes[PendingDescriptorUpdates::Capacity],batch.flushes[PendingDescriptorUpdates::Unsupported],batch.flushes[PendingDescriptorUpdates::Exception]);
+        sidecar->FinishSerialEligibleRun();
+        LOG_INFO(Render_Vulkan,"PARALLEL-SERIAL-ELIGIBLE runs_1={} runs_2_3={} runs_4_7={} runs_8plus={} max={} (serial bypass excludes unexamined draws; report boundaries split runs)",
+            sidecar->serial_eligible_runs[0],sidecar->serial_eligible_runs[1],sidecar->serial_eligible_runs[2],sidecar->serial_eligible_runs[3],sidecar->serial_eligible_run_max);
+        sidecar->serial_eligible_runs={};sidecar->serial_eligible_run_max=0;
+        if(sidecar->whole_samples) {
+            LOG_INFO(Render_Vulkan,"PARALLEL-WHOLE-PREFLIGHT sampled={} wall_ns={} max_ns={} cpu_samples={} cpu_100ns={} (1/128, enabled mode only)",
+                sidecar->whole_samples,sidecar->whole_wall_ns,sidecar->whole_max_ns,sidecar->whole_cpu_samples,sidecar->whole_cpu_100ns);
+            sidecar->whole_samples=sidecar->whole_wall_ns=sidecar->whole_max_ns=sidecar->whole_cpu_samples=sidecar->whole_cpu_100ns=0;
+        }
+        if(PreparedSampledProofRequested()) {
+            LOG_INFO(Render_Vulkan,"PARALLEL-PREPARED-VIEW attempts={} accepted={} fallback={}",sidecar->prepared_view_attempts,sidecar->prepared_view_accepted,sidecar->prepared_view_fallbacks);
+            sidecar->prepared_view_attempts=sidecar->prepared_view_accepted=sidecar->prepared_view_fallbacks=0;
+            if(sidecar->prepared_proof_context){const auto state=sidecar->prepared_proof_context->state.load(std::memory_order_seq_cst);
+                LOG_INFO(Render_Vulkan,"PARALLEL-PREPARED-VIEW-STATE mode={} generation={} active={}",bool(state&1),state>>1,sidecar->prepared_proof_context->active.load(std::memory_order_seq_cst));}
+        }
+        if(ParallelGateDiagEnabled()) {
+            const auto top=sidecar->gates.Top();u64 shown=0;
+            for(const auto& slot:top) if(slot.count) {shown+=slot.count;LOG_INFO(Render_Vulkan,"PARALLEL-GATE-DIAG mask={:#x} count={}",slot.mask,slot.count);}
+            const auto& gates=sidecar->gates;
+            LOG_INFO(Render_Vulkan,"PARALLEL-GATE-DIAG observed={} shown={} other={} overflow={} unstable={}",
+                gates.observed,shown,gates.observed-shown-gates.overflow-gates.unstable,gates.overflow,gates.unstable);
+            LOG_INFO(Render_Vulkan,"PARALLEL-GATE-LEGEND 0=race 1=shaderpatch 2=trace 3=native-view 4=alias 5=color-count 6=clear 7=depth 8=index-quad 9=composition 10=vertex-buffers 11=vertex-attributes 12=index-buffer 13=prepared-owner 14=stage-tess 15=attribute-known 16=resource-key-known 17=translation 18=fetch 19=direct-dma 20=fmask-storage-image 21=shader-clock 22=buffer-write 23=draw-write 24=descriptor-check 25=deep-unexamined 26=serial-scope-unexamined");
+            LOG_INFO(Render_Vulkan,"PARALLEL-CAPTURED-VERTEX counts_0_1_2to3_4to7_8to15_16to31_32={}/{}/{}/{}/{}/{}/{} sum={} (captured draws only)",
+                sidecar->captured_vertex_counts[0],sidecar->captured_vertex_counts[1],sidecar->captured_vertex_counts[2],sidecar->captured_vertex_counts[3],sidecar->captured_vertex_counts[4],sidecar->captured_vertex_counts[5],sidecar->captured_vertex_counts[6],sidecar->captured_vertex_sum);
+            sidecar->captured_vertex_counts={};sidecar->captured_vertex_sum=0;
+            const auto& vp=sidecar->view_proof_stats;
+            LOG_INFO(Render_Vulkan,"PARALLEL-VIEW-PROOF queries={} first_hits={} index_hits={} walks={} fallbacks={} overflows={} wanted_builds={} wanted_overflows={} filtered_views={} (enabled proof only)",vp.queries,vp.first_hits,vp.index_hits,vp.walks,vp.fallbacks,vp.overflows,vp.wanted_builds,vp.wanted_overflows,vp.filtered_views);
+            sidecar->view_proof_stats={};
+            sidecar->gates={};
+        }
+        if(sidecar->ahead_context) {const auto& a=*sidecar->ahead_context;const auto batch=a.pools.GetStats();
+            LOG_INFO(Render_Vulkan,"PARALLEL-PRODUCER-DESC mode={} preparing={} attempts={} ready={} used={} unused={} failures={} capacity={} allocation_calls={} allocated_sets={} spare_hits={} discarded_groups={} purged_spares={} used_sets={} unused_sets={} (cumulative; failures include busy/driver, capacity includes unsupported/cap)",
+                a.mode.load(std::memory_order_acquire),a.active.load(std::memory_order_acquire),a.attempts.load(),a.ready.load(),a.used.load(),a.unused.load(),a.failures.load(),a.capacity.load(),batch.calls,batch.sets_allocated,batch.spare_hits,batch.discarded,batch.purged,a.used_sets.load(),a.unused_sets.load());}
+        u64 sampler_entries=0;
+        if(ParallelGateDiagEnabled()){std::scoped_lock sampler_lock{sampler_mutex};sampler_entries=samplers.size();}
+        if(sidecar->view_sample.draws) {auto& v=sidecar->view_sample;const auto& q=v.proof;
+            LOG_INFO(Render_Vulkan,"PARALLEL-VIEW-SAMPLE draws={} queried_draws={} image_infos={} sampled_entries={} queries={} first_hits={} index_hits={} walks={} fallbacks={} late_fallbacks={} overflows={} wanted_builds={} wanted_overflows={} filtered_views={} entries_0_1_2_4_8_16_32_64_128_129plus={}/{}/{}/{}/{}/{}/{}/{}/{}/{} (1/128 descriptor-safe draws; entry cardinality weighted by existing map lookups)",
+                v.draws,v.queried_draws,v.image_infos,v.sampled_entries,q.queries,q.first_hits,q.index_hits,q.walks,q.fallbacks,q.fallbacks>=v.queried_draws?q.fallbacks-v.queried_draws:0,q.overflows,q.wanted_builds,q.wanted_overflows,q.filtered_views,
+                v.cardinality[0],v.cardinality[1],v.cardinality[2],v.cardinality[3],v.cardinality[4],v.cardinality[5],v.cardinality[6],v.cardinality[7],v.cardinality[8],v.cardinality[9]);
+            const auto sequence=v.sequence;v={};v.sequence=sequence;
+        }
+        if(ParallelProofPhaseEnabled()) {
+            LOG_INFO(Render_Vulkan,"PARALLEL-PROOF-PHASE-LEGEND 0=buffer-write-group 1=sampler-descriptor 2=sampled-view-descriptor 3=push-snapshot 4=upload-lookup 5=chunk-scan 6=direct-slot 7=readonly-slot 8=clip-slot; each subphase count is per invocation, wall overlaps outer phases and includes timer overhead");
+            for(u32 i=0;i<sidecar->proof_phases.size();++i) {const auto& t=sidecar->proof_phases[i];
+                LOG_INFO(Render_Vulkan,"PARALLEL-PROOF-PHASE phase={} samples={} wall_ns={} wall_max_ns={}",i,t.count,t.wall_ns,t.wall_max);
+            }
+            sidecar->proof_phases={};
+        }
+        const auto workers=sidecar->coordinator->TakeStats();
+        if(sidecar->coordinator->TransferEnabled()) {const auto transfer=sidecar->coordinator->TakeTransferStats();
+            LOG_INFO(Render_Vulkan,"PARALLEL-TRANSFER-PASSES attempts={} success={} fallback={}",transfer.success+transfer.fallback,transfer.success,transfer.fallback);}
+        const auto groups=sidecar->coordinator->TakeGroupStats();
+        if(ParallelGateDiagEnabled()) for(unsigned reason=0;reason<3;++reason) {
+            const auto& p=groups.passes[reason];const auto& d=groups.draws[reason];
+            LOG_INFO(Render_Vulkan,"PARALLEL-BATCH-GROUP reason={} passes1to8={},{},{},{},{},{},{},{} draws1to8plus={},{},{},{},{},{},{},{} lead_samples={} lead_ns={} lead_max_ns={}",reason,p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],d[1],d[2],d[3],d[4],d[5],d[6],d[7],d[8],groups.lead_samples,groups.lead_ns,groups.lead_max_ns);
+        }
+        if(ParallelGateDiagEnabled()) {
+            const auto& f=sidecar->descriptor_fail_reasons;
+            LOG_INFO(Render_Vulkan,"PARALLEL-DESCRIPTOR-FAIL write={} pnext={} buffer_slice={} buffer_unproved={} image_slice={} sampler_invalid={} sampler_unknown={} image_invalid={} image_unknown={} snapshot={} samples={}",
+                f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7],f[8],f[9],sidecar->descriptor_samples);
+            sidecar->descriptor_fail_reasons={};sidecar->descriptor_samples=0;
+        }
+        LOG_INFO(Render_Vulkan,"PARALLEL-RECORD-DIAG absent_sampled_attempts={} absent_sampled_accepted={} absent_sampled_rejected={} sampled_null_view={} sampled_nonnull_sampler={} sampled_nongeneral={} sampled_canonical_null={} absent_mode0_attempts={} absent_mode0_accepted={} absent_mode0_rejected={} natural_preclosed={} natural_captured={} natural_serial_fallback={} natural_binding_skip={} sampler_entries={} sampler_proof_hits={} sampler_proof_misses={} sampler_scan_steps={} sampler_scan_positives={} proof_table_builds={} proof_table_hits={} extended_clear_rejected={} fast_rejected={} serial_scope_bypassed={} owner_slot_pressure={} eligible_in_serial_scope_examined={} eligible_in_active_scope={} eligible_at_boundary={} vertex_candidates={} vertex_preflight={} vertex_backing_pass={} vertex_bad_structure={} vertex_bad_binding={} vertex_bad_pnext={} vertex_unknown_backing={} vertex_direct_ranges={} vertex_direct_attempts={} vertex_direct_matches={} descriptor_readonly_attempts={} descriptor_readonly_regions={} descriptor_readonly_imports={} descriptor_readonly_uncontained={} descriptor_readonly_unmatched={} descriptor_clip_nulls={} direct_slot_attempts={} direct_slot_accepted={} considered={} eligible={} resource_key_unknown={} buffer_present={} alias_rejected={} descriptor_rejected={} missing_sets={} preflight_samples={} preflight_wall_ns={} preflight_cpu_samples={} preflight_cpu_100ns={} passes={} draws={} queued={} synchronous={} worker_jobs={} worker_wall_ns_sum={} worker_cpu_100ns={} worker_cpu_samples={} peak_workers={} worker_recorded_passes={} worker_recorded_draws={} small_groups_submitted={} small_groups_synchronous={} small_passes={} small_submitted_draws={} drain_wall_ns={} coordinator_cpu_100ns={} coordinator_cpu_samples={} pending={} inflight={}",
+            sidecar->absent_sampled_attempts,sidecar->absent_sampled_accepted,sidecar->absent_sampled_rejected,sidecar->sampled_null_view,sidecar->sampled_nonnull_sampler,sidecar->sampled_nongeneral,sidecar->sampled_canonical_null,sidecar->absent_mode0_attempts,sidecar->absent_mode0_accepted,sidecar->absent_mode0_rejected,sidecar->natural_preclosed,sidecar->natural_captured,sidecar->natural_serial_fallback,sidecar->natural_binding_skip,sampler_entries,sidecar->sampler_proof_hits,sidecar->sampler_proof_misses,sidecar->sampler_scan_steps,sidecar->sampler_scan_positives,sidecar->proof_table_builds,sidecar->proof_table_hits,sidecar->extended_clear_rejected,sidecar->fast_rejected,sidecar->serial_scope_bypassed,sidecar->owner_slot_pressure,sidecar->eligible_in_serial_scope,sidecar->eligible_in_active_scope,sidecar->eligible_at_boundary,sidecar->vertex_candidates,sidecar->vertex_preflight_draws,sidecar->vertex_backing_pass,sidecar->vertex_bad_structure,sidecar->vertex_bad_binding,sidecar->vertex_bad_pnext,sidecar->vertex_unknown_backing,sidecar->vertex_direct_ranges,sidecar->vertex_direct_attempts,sidecar->vertex_direct_matches,sidecar->descriptor_readonly_attempts,sidecar->descriptor_readonly_regions,sidecar->descriptor_readonly_imports,sidecar->descriptor_readonly_uncontained,sidecar->descriptor_readonly_unmatched,sidecar->descriptor_clip_nulls,sidecar->direct_slot_attempts,sidecar->direct_slot_accepted,sidecar->considered,sidecar->eligible,sidecar->unknown_resource_key,sidecar->buffer_rejected,sidecar->alias_rejected,sidecar->descriptor_rejected,sidecar->missing_sets,sidecar->preflight_samples,sidecar->preflight_wall_ns,sidecar->preflight_cpu_samples,sidecar->preflight_cpu_100ns,sidecar->passes,sidecar->draws,sidecar->queued,sidecar->synchronous,workers.jobs,workers.wall_ns,workers.cpu_100ns,workers.cpu_samples,workers.peak,workers.recorded_passes,workers.recorded_draws,workers.small_groups_submitted,workers.small_groups_synchronous,workers.small_passes,workers.small_submitted_draws,sidecar->drain_ns,sidecar->coordinator_cpu_100ns,sidecar->coordinator_cpu_samples,
+            sidecar->coordinator->PendingNodes(),sidecar->coordinator->InFlightNodes());
+        sidecar->absent_sampled_attempts=sidecar->absent_sampled_accepted=sidecar->absent_sampled_rejected=sidecar->sampled_null_view=sidecar->sampled_nonnull_sampler=sidecar->sampled_nongeneral=sidecar->sampled_canonical_null=sidecar->absent_mode0_attempts=sidecar->absent_mode0_accepted=sidecar->absent_mode0_rejected=sidecar->natural_preclosed=sidecar->natural_captured=sidecar->natural_serial_fallback=sidecar->natural_binding_skip=sidecar->sampler_proof_hits=sidecar->sampler_proof_misses=sidecar->sampler_scan_steps=sidecar->sampler_scan_positives=sidecar->proof_table_builds=sidecar->proof_table_hits=sidecar->extended_clear_rejected=sidecar->fast_rejected=sidecar->serial_scope_bypassed=sidecar->owner_slot_pressure=sidecar->eligible_in_serial_scope=sidecar->eligible_in_active_scope=sidecar->eligible_at_boundary=sidecar->vertex_candidates=sidecar->vertex_preflight_draws=sidecar->vertex_backing_pass=sidecar->vertex_bad_structure=sidecar->vertex_bad_binding=sidecar->vertex_bad_pnext=sidecar->vertex_unknown_backing=sidecar->vertex_direct_ranges=sidecar->vertex_direct_attempts=sidecar->vertex_direct_matches=sidecar->descriptor_readonly_attempts=sidecar->descriptor_readonly_regions=sidecar->descriptor_readonly_imports=sidecar->descriptor_readonly_uncontained=sidecar->descriptor_readonly_unmatched=sidecar->descriptor_clip_nulls=sidecar->direct_slot_attempts=sidecar->direct_slot_accepted=sidecar->passes=sidecar->draws=sidecar->queued=sidecar->synchronous=sidecar->considered=sidecar->eligible=sidecar->unknown_resource_key=sidecar->buffer_rejected=sidecar->alias_rejected=sidecar->descriptor_rejected=sidecar->missing_sets=sidecar->preflight_samples=sidecar->preflight_wall_ns=sidecar->preflight_cpu_100ns=sidecar->preflight_cpu_samples=sidecar->drain_ns=sidecar->coordinator_cpu_100ns=sidecar->coordinator_cpu_samples=0;
+    }
     LOG_INFO(Render_Vulkan, "NAT: descriptor allocation calls={} reserve hits={} unused={}",
              stats.descriptor_allocate_calls, stats.descriptor_reserve_hits, stream.descriptor_reserve.SpareCount());
+    if (DescriptorAllocDiagEnabled() && descriptor_alloc_owner == this) {
+        const auto& m=descriptor_alloc_metrics;
+        for (u32 kind=0;kind<2;++kind) LOG_INFO(Render_Vulkan,
+            "DESC-ALLOC-DIAG kind={} miss-hist-0/1/2/3/4/5/6plus={}/{}/{}/{}/{}/{}/{} cache_hits={} reserve_hits={}",
+            kind,m.misses[kind][0],m.misses[kind][1],m.misses[kind][2],m.misses[kind][3],m.misses[kind][4],m.misses[kind][5],m.misses[kind][6],m.cache_hits[kind],m.reserve_hits[kind]);
+        for (u32 batch=0;batch<2;++batch) for(u32 attempt=0;attempt<3;++attempt) {
+            const auto& t=m.timing[batch][attempt];
+            LOG_INFO(Render_Vulkan,"DESC-ALLOC-DIAG batch={} attempt={} success={} capacity={} other={} samples={} wall_ns_sum={} wall_ns_max={} cpu_samples={} cpu_100ns_sum={} cpu_100ns_max={}",
+                batch,attempt,m.results[batch][attempt][0],m.results[batch][attempt][1],m.results[batch][attempt][2],t.samples,t.wall_ns,t.wall_max_ns,t.cpu_samples,t.cpu_100ns,t.cpu_max_100ns);
+        }
+        LOG_INFO(Render_Vulkan,"DESC-ALLOC-DIAG pool_initial={} pool_rotation={} spare={}",m.pool_initial,m.pool_rotate,stream.descriptor_reserve.SpareCount());
+        for (u32 kind=0;kind<2;++kind) LOG_INFO(Render_Vulkan,
+            "DESC-BIND-DIAG kind={} sets={} runs={} multi_runs={}",
+            kind,descriptor_bind_sets[kind],descriptor_bind_runs[kind],descriptor_bind_multi[kind]);
+        std::fill_n(descriptor_bind_sets, 2, 0); std::fill_n(descriptor_bind_runs, 2, 0); std::fill_n(descriptor_bind_multi, 2, 0);
+        descriptor_alloc_metrics={};
+    }
     stats.descriptor_allocate_calls = stats.descriptor_reserve_hits = 0;
     stats.descriptor_reuses = stats.descriptor_allocations = 0;
     LOG_INFO(Render_Vulkan, "DESC-HASH: {} prepared hashes reused, {} refreshed after buffer changes",
@@ -7461,3 +9465,6 @@ void NativeRenderer::Report() {
 }
 
 } // namespace Vulkan
+
+#include "video_core/renderer_vulkan/prt_view_selftest.h"
+#include "video_core/renderer_vulkan/prt_view_gpu_test.h"

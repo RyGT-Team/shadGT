@@ -484,6 +484,33 @@ bool RunRegionMergeOrderCase(Rhi::Device& device, Rhi::Fence& fence, u64& tick,
     return ok;
 }
 
+bool RunUnmapTargetLifetimeCase(Rhi::Device& device, std::string& log) {
+    ImageRegistry registry{device};
+    auto info = MakeInfo(AmdGpu::TileMode::DisplayLinearAligned, 16, 16, 1,
+                         0x720000000000ull);
+    ImageEntry* target = registry.Find(info, true, 1);
+    if (!target || !target->image) return false;
+    bool ok = registry.Find(info, false, 2) == target;
+    registry.CpuWrite(info.guest_address, info.guest_size, info.guest_size);
+    ok = ok && !target->reused.load() && registry.Find(info, false, 3) == target;
+    const u64 generation = registry.Generation();
+    const std::pair<VAddr, VAddr> range{info.guest_address, info.guest_address + info.guest_size};
+    registry.Invalidate(info.guest_address + 1, 1, ImageRegistry::Stale::Unmap);
+    ok = ok && target->reused.load() && !registry.Untouched(generation, {&range, 1});
+    ok = ok && target->image && registry.Count() == 1;
+    ImageEntry* texture = registry.Find(info, false, 4);
+    ok = ok && texture && texture != target && texture->from_cpu && registry.Count() == 2;
+    ok = ok && registry.Find(info, false, 5) == texture;
+    u32 retired = 0;
+    ok = registry.Evict(10, [&](ImageEntry& e) { if (&e == target) ++retired; },
+                        [&](ImageEntry& e) { return &e == target; }) == 1 &&
+         retired == 0 && registry.Count() == 1 && ok;
+    ok = registry.Evict(10, [&](ImageEntry& e) { if (&e == target) ++retired; }) == 1 &&
+         retired == 1 && registry.Count() == 0 && ok;
+    log += fmt::format("unmapped target lifetime and alias: {}\n", ok ? "passed" : "FAILED");
+    return ok;
+}
+
 bool RunEvictionBudgetCase(Rhi::Device& device, std::string& log) {
     ImageRegistry registry{device};
     constexpr VAddr base = 0x710000000000ull;
@@ -698,6 +725,7 @@ bool RunImageSelfTest(std::string& log) {
     bool ok = true;
     ok = RunAsyncMirrorCase(*device,*fence,tick,log) && ok;
     ok = RunEvictionBudgetCase(*device, log) && ok;
+    ok = RunUnmapTargetLifetimeCase(*device, log) && ok;
     ok = RunUploadChunkCacheCase(*device,*fence,tick,log) && ok;
     ok = RunLargeGatherScratchCase(*device,*fence,tick,log) && ok;
     ok = RunRegionMergeOrderCase(*device,*fence,tick,log) && ok;

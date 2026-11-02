@@ -1931,7 +1931,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::SetPredication: {
-                LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
+                // Keep the unsupported command visible without formatting and
+                // enqueueing the same warning hundreds of times per second.
+                static thread_local u64 packets = 0;
+                const auto total = ++packets;
+                if (total <= 3 || total % 4096 == 0)
+                    LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION ({} packets)", total);
                 break;
             }
             case PM4ItOpcode::IndexType: {

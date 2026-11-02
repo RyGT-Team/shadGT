@@ -1,3 +1,4 @@
+#include "ryty_gpu/native/rhi/completed_owner_release.h"
 #include "ryty_gpu/native/descriptor_update_batch.h"
 #include "ryty_gpu/native/rhi/descriptor_batch_test_spv.h"
 #include "ryty_gpu/native/rhi/gpu_timing_lease.h"
@@ -568,6 +569,9 @@ public:
     vk::CommandPool init_pool;
     std::deque<std::pair<u64, vk::CommandBuffer>> init_used; // (tick, buffer)
     std::vector<std::pair<vk::Image, vk::ImageAspectFlags>> pending_init;
+    // Retain a non-owning wrapper for the scheduler's semaphore until this
+    // device finishes its timing thread and deferred-resource collection.
+    std::unique_ptr<VulkanFence> external_fence_owner;
     Fence* external_fence = nullptr;
     std::function<u64()> external_current;
 };
@@ -982,7 +986,13 @@ void VulkanDevice::RecordPendingImageInit(CommandList& list) {
 }
 
 void VulkanDevice::UseExternalTimeline(Fence* fence, std::function<u64()> current) {
-    external_fence = fence;
+    // The caller's wrapper may die before this device. The scheduler owns the
+    // underlying semaphore and outlives the renderer/device.
+    auto* vulkan_fence = static_cast<VulkanFence*>(fence);
+    external_fence_owner = vulkan_fence
+        ? std::make_unique<VulkanFence>(device, vulkan_fence->semaphore, false)
+        : nullptr;
+    external_fence = external_fence_owner.get();
     external_current = std::move(current);
 }
 
@@ -1513,9 +1523,10 @@ void VulkanDevice::MarkExecuted(CommandList* list, FenceValue retire) {
     if (!list) return;
     auto* vulkan_list = static_cast<VulkanCommandList*>(list);
     vulkan_list->retire_fence.store(retire.fence, std::memory_order_relaxed);
-    vulkan_list->retire_value.store(retire.value, std::memory_order_release);
     PublishGpuTiming(vulkan_list->timing, static_cast<const VulkanFence*>(retire.fence)->semaphore, retire.value);
     vulkan_list->timing = nullptr;
+    // Publish retirement only after every coordinator access to this list ends.
+    vulkan_list->retire_value.store(retire.value, std::memory_order_release);
 }
 
 void VulkanDevice::Collect() {
@@ -1661,9 +1672,10 @@ void VulkanQueue::Submit(std::span<CommandList* const> lists, std::span<const Fe
     for (CommandList* list : lists) {
         auto* vulkan_list = static_cast<VulkanCommandList*>(list);
         vulkan_list->retire_fence.store(device.timeline_fence.get(), std::memory_order_relaxed);
-        vulkan_list->retire_value.store(tick, std::memory_order_release);
         device.PublishGpuTiming(vulkan_list->timing, device.timeline, tick);
         vulkan_list->timing = nullptr;
+        // The owning worker may recycle immediately after this release.
+        vulkan_list->retire_value.store(tick, std::memory_order_release);
     }
 }
 
@@ -2079,6 +2091,11 @@ void VulkanCommandList::EndMarker() {
 }
 
 } // namespace
+
+bool TryEnqueueCompleted(Device& device,std::function<void()>& release) noexcept {
+    try {return static_cast<VulkanDevice&>(device).completed_resources.TryEnqueue(release);}
+    catch (...) {return false;}
+}
 
 std::unique_ptr<Image> CreateVulkanImage(Device& device, const VkImageCreateInfo& image_ci,
                                          const ImageDesc& desc) {

@@ -12,6 +12,7 @@
 
 #include "video_core/buffer_cache/direct_memory.h"
 #include "video_core/cache_storage.h"
+#include "video_core/deferred_task_queue.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 
@@ -25,11 +26,7 @@
 
 namespace {
 
-std::mutex submit_mutex{};
-u32 num_requests{};
-std::condition_variable_any request_cv{};
-std::queue<std::packaged_task<void()>> req_queue{};
-std::mutex m_request{};
+Storage::DeferredTaskQueue<std::packaged_task<void()>> requests;
 
 mz_zip_archive zip_ar{};
 bool ar_is_read_only{true};
@@ -41,34 +38,8 @@ namespace Storage {
 void ProcessIO(const std::stop_token& stoken) {
     Common::SetCurrentThreadName("shadGT:PipelineCacheIO");
 
-    while (!stoken.stop_requested()) {
-        {
-            std::unique_lock lk{submit_mutex};
-            Common::CondvarWait(request_cv, lk, stoken, [&] { return num_requests; });
-        }
-
-        if (stoken.stop_requested()) {
-            break;
-        }
-
-        while (num_requests) {
-            std::packaged_task<void()> request{};
-            {
-                std::scoped_lock lock{m_request};
-                if (req_queue.empty()) {
-                    continue;
-                }
-                request = std::move(req_queue.front());
-                req_queue.pop();
-            }
-
-            if (request.valid()) {
-                request();
-                request.get_future().wait();
-            }
-
-            --num_requests;
-        }
+    while (auto request = requests.Pop(stoken)) {
+        if (request->valid()) (*request)();
     }
 }
 
@@ -227,29 +198,24 @@ void DataBase::Close() {
 template <typename T>
 bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector<T>&& v) {
     {
-        auto request = std::packaged_task<void()>{[=]() {
-            auto path{path_};
+        auto request = std::packaged_task<void()>{[type, path=std::move(path_), data=std::move(v)]() mutable {
             path.replace_extension(GetBlobFileExtension(type));
             if (EmulatorSettings.IsPipelineCacheArchived()) {
                 ASSERT_MSG(!ar_is_read_only,
                            "The archive is read-only. Did you forget to call `FinishPreload`?");
-                if (!mz_zip_writer_add_mem(&zip_ar, path.string().c_str(), v.data(),
-                                           v.size() * sizeof(T), MZ_BEST_COMPRESSION)) {
+                if (!mz_zip_writer_add_mem(&zip_ar, path.string().c_str(), data.data(),
+                                           data.size() * sizeof(T), MZ_BEST_COMPRESSION)) {
                     LOG_ERROR(Render, "Failed to add {} to the archive", path.string().c_str());
                 }
             } else {
                 using namespace Common::FS;
                 const auto file = IOFile{path, FileAccessMode::Create};
-                file.Write(v);
+                file.Write(data);
             }
         }};
-        std::scoped_lock lock{m_request};
-        req_queue.emplace(std::move(request));
+        requests.Push(std::move(request));
     }
 
-    std::scoped_lock lk{submit_mutex};
-    ++num_requests;
-    request_cv.notify_one();
     return true;
 }
 

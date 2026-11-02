@@ -3,6 +3,8 @@
 #include "video_core/renderer_vulkan/descriptor_set_reserve.h"
 #include "video_core/renderer_vulkan/prepared_descriptor_key.h"
 #include "video_core/renderer_vulkan/optional_mirror_budget.h"
+#include "ryty_gpu/native/prepared_sampled_view_proof.h"
+#include "ryty_gpu/native/prepared_proof_context.h"
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -521,11 +523,26 @@ private:
         u32 epoch = 0;
         const GraphicsPipeline* pipeline = nullptr;
         std::shared_ptr<const void> pipeline_keepalive;
+        std::atomic<std::shared_ptr<void>> ahead_descriptor_lease;
+        // Producer-only metadata, published by the existing prepared-draw shard.
+        struct CpuProof {
+            const void* prepared_identity{}; const void* pipeline_identity{}; vk::PipelineLayout pipeline_layout{};
+            const void* writes_data{}; size_t writes_size{}; const void* buffers_data{}; size_t buffers_size{}; const void* images_data{}; size_t images_size{};
+            const void* vertex_identity{}; const void* vertex_buffers_data{}; size_t vertex_buffers_size{};
+            bool descriptor_structure{},vertex_shape{},vertex_bindings{},vertex_pnext{};
+            u32 push_index{}; const void* push_data{}; size_t push_size{}, push_buffer_first{}, push_buffer_count{};
+            std::shared_ptr<void> push_snapshot;
+        } cpu_proof;
+
         std::array<u64, Shader::MaxStageTypes> stage_hashes{};
         u64 image_generation = 0;
         u64 buffer_seq = 0;
         u64 unmap_gen = 0;
         DrawBindings bindings;
+        // Private heap packet metadata; no NativeRenderer layout change.
+        std::vector<Native::Parallel::SampledViewProof<vk::ImageView>> sampled_view_proofs;
+        std::shared_ptr<Native::Parallel::ProofProducerContext> proof_context;
+        u64 proof_mode_state{};
         struct RegionUse {
             Region* region;
             VAddr address;

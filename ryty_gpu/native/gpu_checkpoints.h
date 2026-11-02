@@ -2,6 +2,7 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <memory>
 #include <vector>
 #include "common/logging/log.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -19,7 +20,13 @@ inline std::atomic<uint64_t> sequence{};
 struct Slot {
     std::atomic<uint64_t> stamp{}, kind{}, frame{}, program{}, companion{}, detail{};
 };
-inline std::array<Slot, 32768> slots;
+// Allocate only if diagnostics are requested and a marker is recorded or read.
+// At 20,000 markers per second this retains about 52 seconds of metadata.
+inline constexpr size_t SlotCount = 1 << 20;
+inline Slot* Slots() {
+    static const auto slots = std::make_unique<Slot[]>(SlotCount);
+    return slots.get();
+}
 
 inline void Record(VkCommandBuffer command, uint64_t kind, uint64_t frame,
                    uint64_t program, uint64_t companion, uint64_t detail) {
@@ -27,7 +34,7 @@ inline void Record(VkCommandBuffer command, uint64_t kind, uint64_t frame,
     const auto set_checkpoint = VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdSetCheckpointNV;
     if (!set_checkpoint) return;
     const auto id = sequence.fetch_add(1, std::memory_order_relaxed) + 1;
-    auto& slot = slots[id % slots.size()];
+    auto& slot = Slots()[id % SlotCount];
     slot.stamp.store(0, std::memory_order_release);
     slot.kind.store(kind, std::memory_order_relaxed);
     slot.frame.store(frame, std::memory_order_relaxed);
@@ -41,21 +48,37 @@ inline void Record(VkCommandBuffer command, uint64_t kind, uint64_t frame,
 
 inline void Log(VkQueue queue) {
     if (!supported.load(std::memory_order_relaxed)) return;
+    if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdSetCheckpointNV) {
+        LOG_CRITICAL(Render_Vulkan, "GPU-CHECKPOINT: vkCmdSetCheckpointNV unavailable");
+    }
     const auto get = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV;
-    if (!get) return;
+    if (!get) {
+        LOG_CRITICAL(Render_Vulkan, "GPU-CHECKPOINT: vkGetQueueCheckpointDataNV unavailable");
+        return;
+    }
     uint32_t count = 0;
     get(queue, &count, nullptr);
+    if (count == 0) {
+        LOG_CRITICAL(Render_Vulkan, "GPU-CHECKPOINT: driver returned zero checkpoints; recorded={}",
+                     sequence.load(std::memory_order_relaxed));
+        return;
+    }
     if (count > 256) {
         LOG_CRITICAL(Render_Vulkan, "GPU-CHECKPOINT: refused invalid count {}", count);
         return;
     }
     std::vector<VkCheckpointDataNV> checkpoints(count);
     for (auto& checkpoint : checkpoints) checkpoint.sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV;
-    if (count) get(queue, &count, checkpoints.data());
+    get(queue, &count, checkpoints.data());
+    if (count == 0) {
+        LOG_CRITICAL(Render_Vulkan, "GPU-CHECKPOINT: driver returned zero checkpoint records on second query; recorded={}",
+                     sequence.load(std::memory_order_relaxed));
+        return;
+    }
     for (uint32_t i = 0; i < count && i < checkpoints.size(); ++i) {
         const auto& checkpoint = checkpoints[i];
         const auto id = uint64_t(uintptr_t(checkpoint.pCheckpointMarker));
-        const auto& slot = slots[id % slots.size()];
+        const auto& slot = Slots()[id % SlotCount];
         const auto before = slot.stamp.load(std::memory_order_acquire);
         const auto kind = slot.kind.load(std::memory_order_relaxed);
         const auto frame = slot.frame.load(std::memory_order_relaxed);
@@ -68,8 +91,8 @@ inline void Log(VkQueue queue) {
                 "GPU-CHECKPOINT: stage={:#x} id={} kind={} frame={} program={:#x} companion={:#x} detail={:#x}",
                 uint32_t(checkpoint.stage), id, kind, frame, program, companion, detail);
         } else {
-            LOG_CRITICAL(Render_Vulkan, "GPU-CHECKPOINT: stage={:#x} id={} metadata expired; latest={}",
-                uint32_t(checkpoint.stage), id, sequence.load(std::memory_order_relaxed));
+            LOG_CRITICAL(Render_Vulkan, "GPU-CHECKPOINT: stage={:#x} id={} metadata expired; latest={} capacity={}",
+                uint32_t(checkpoint.stage), id, sequence.load(std::memory_order_relaxed), SlotCount);
         }
     }
 }

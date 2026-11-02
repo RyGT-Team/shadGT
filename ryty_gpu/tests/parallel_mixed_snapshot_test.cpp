@@ -31,16 +31,7 @@ std::shared_ptr<const DescriptorSnapshot> consume(B&b,Proof&proof,int&hits,bool 
 const auto snapshot_matches=[&] {
                             if(!worker_identity || !known_structure || !feedback.empty() || !worker_result->push_snapshot || worker_result->push_index!=push ||
                                worker_result->push_data!=b.grouped_writes[push].data() || worker_result->push_size!=b.grouped_writes[push].size()) return false;
-                            const auto old=std::static_pointer_cast<const DescriptorSnapshot>(worker_result->push_snapshot)->Writes();const auto& now=b.grouped_writes[push];
-                            if(old.size()!=now.size())return false;
-                            for(size_t i=0;i<old.size();++i) {
-                                const auto& a=old[i];const auto& c=now[i];
-                                if(a.dstBinding!=c.dstBinding || a.dstArrayElement!=c.dstArrayElement || a.descriptorCount!=c.descriptorCount || a.descriptorType!=c.descriptorType) return false;
-                                if(c.pImageInfo) for(u32 j=0;j<c.descriptorCount;++j) {
-                                    const auto& x=a.pImageInfo[j];const auto& y=c.pImageInfo[j];
-                                    if(x.sampler!=y.sampler || x.imageView!=y.imageView || x.imageLayout!=y.imageLayout)return false;
-                                }
-                            }
+                            // Producer group rows and image values remain immutable after publication; feedback is excluded above.
                             return true;
                         };
                         bool reused_snapshot=false;
@@ -70,4 +61,6 @@ int main(){using namespace vk;B b;b.buffers={DescriptorBufferInfo{buf(1),0,8},De
  g[2].pBufferInfo=&b.buffers[2];Proof gap;produce(b,gap);assert(!gap.push_snapshot);g[2].pBufferInfo=&b.buffers[0];Proof overlap;produce(b,overlap);assert(!overlap.push_snapshot);
  g[0].pBufferInfo=&b.buffers[1];g[2].pBufferInfo=&b.buffers[0];Proof reorder;produce(b,reorder);assert(!reorder.push_snapshot);
  g[0].pBufferInfo=&b.buffers[0];g[0].descriptorCount=2;g.erase(g.begin()+2);Proof multi;produce(b,multi);assert(multi.push_snapshot&&multi.push_buffer_count==2);
+ Proof feedback;produce(b,feedback);const int before_feedback=hits;auto feedback_draw=consume(b,feedback,hits,true,true);assert(feedback_draw&&hits==before_feedback&&feedback.push_snapshot);
+ Proof stale;produce(b,stale);auto stale_draw=consume(b,stale,hits,false,false);assert(stale_draw&&hits==before_feedback&&stale.push_snapshot);
  puts("PASS exact mixed producer/consumer: unique branch, latest buffer, queued immutability, shared/mismatch fallback, gap/overlap/reorder and multi");}

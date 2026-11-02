@@ -526,6 +526,8 @@ private:
         std::atomic<std::shared_ptr<void>> ahead_descriptor_lease;
         // Producer-only metadata, published by the existing prepared-draw shard.
         struct CpuProof {
+            struct StageSchema { u64 identity{}; size_t count{}; size_t table_local{SIZE_MAX}; size_t table_upload{SIZE_MAX}; };
+            std::array<StageSchema, Shader::MaxStageTypes - 1> stages{};
             const void* prepared_identity{}; const void* pipeline_identity{}; vk::PipelineLayout pipeline_layout{};
             const void* writes_data{}; size_t writes_size{}; const void* buffers_data{}; size_t buffers_size{}; const void* images_data{}; size_t images_size{};
             const void* vertex_identity{}; const void* vertex_buffers_data{}; size_t vertex_buffers_size{};
@@ -533,6 +535,17 @@ private:
             u32 push_index{}; const void* push_data{}; size_t push_size{}, push_buffer_first{}, push_buffer_count{};
             std::shared_ptr<void> push_snapshot;
         } cpu_proof;
+        // Bounded producer action plan; capacity is retained when the draw is recycled.
+        struct DescriptorAction {
+            std::size_t buffer_first{};
+            std::size_t stage_local{};
+            u32 stage_index{~u32{0}};
+            u32 upload_size{};
+            // 0: no matching upload, 1: unique matching upload, 2: use the original scan.
+            u8 upload_match{2};
+            bool is_buffer{};
+        };
+        std::vector<DescriptorAction> descriptor_actions;
 
         std::array<u64, Shader::MaxStageTypes> stage_hashes{};
         u64 image_generation = 0;

@@ -21,7 +21,9 @@ bool ThreadCpu100ns(u64& out) noexcept {
 }
 PassCoordinator::PassCoordinator(Rhi::Device& device,const Vulkan::Instance& instance,Rhi::Fence& timeline,
     std::size_t worker_count,std::size_t count_cap,std::size_t byte_cap,std::size_t node_cap)
-    :device_(device),instance_(instance),timeline_(timeline),budget_(count_cap,byte_cap),workers_(worker_count,count_cap),node_cap_(node_cap),in_flight_(node_cap) {
+    // Prefixes and pass jobs each retain a credit; bound those credits by the
+    // existing node limit while keeping the worker queue's separate limit.
+    :device_(device),instance_(instance),timeline_(timeline),budget_(node_cap,byte_cap),workers_(worker_count,count_cap),node_cap_(node_cap),in_flight_(node_cap) {
     if(TransferPasses())try {draw_pool_=std::make_shared<DrawPool>();} catch(...) {}
 }
 PassCoordinator::~PassCoordinator() {
@@ -71,13 +73,41 @@ std::function<void()> PassCoordinator::MakeRelease(const JobPtr& job) {
         } else (void)pool->Seed(draws);
     };
 }
+PassCoordinator::RejectReason PassCoordinator::PrefixStateRejection(u64 epoch,Rhi::CommandList* list,bool has_resources) const noexcept {
+    if(failed_)return RejectReason::Failed;
+    if(!epoch)return RejectReason::ZeroEpoch;
+    if(pending_epoch_ && pending_epoch_!=epoch)return RejectReason::EpochMismatch;
+    if(!list || !has_resources)return RejectReason::Invalid;
+    if(nodes_.size()+in_flight_count_>=node_cap_)return RejectReason::NodeCap;
+    return RejectReason::Count;
+}
+bool PassCoordinator::PrefixPreflight(u64 epoch,Rhi::CommandList* list,const std::shared_ptr<const void>& resources,std::size_t total_owned_bytes) {
+    auto why=PrefixStateRejection(epoch,list,bool(resources));
+    if(why==RejectReason::Count) {
+        const auto budget=budget_.CheckAcquire(total_owned_bytes);
+        if(budget==PassBudget::Rejection::Count)why=RejectReason::BudgetCount;
+        else if(budget==PassBudget::Rejection::Bytes)why=RejectReason::BudgetBytes;
+    }
+    if(why==RejectReason::Count)return true;
+    ++admission_diag_.prefix_attempts;++admission_diag_.prefix_rejected[static_cast<std::size_t>(why)];return false;
+}
 bool PassCoordinator::Prefix(u64 epoch,Rhi::CommandList* list,std::shared_ptr<const void> resources,std::size_t total_owned_bytes) {
-    if(failed_ || !epoch || (pending_epoch_ && pending_epoch_!=epoch) || !list || !resources || nodes_.size()+in_flight_count_>=node_cap_)return false;
-    auto credit=budget_.TryAcquire(total_owned_bytes);if(!credit)return false;
-    auto lease=std::make_shared<PrefixLease>(std::move(resources),std::move(*credit));
-    nodes_.push_back({list,{},std::move(lease),{},true});pending_epoch_=epoch;return true;
+    ++admission_diag_.prefix_attempts;
+    const auto reject=[&](RejectReason why){++admission_diag_.prefix_rejected[static_cast<std::size_t>(why)];return false;};
+    const auto state=PrefixStateRejection(epoch,list,bool(resources));
+    if(state!=RejectReason::Count)return reject(state);
+    PassBudget::Rejection reason{};auto credit=budget_.TryAcquire(total_owned_bytes,&reason);
+    if(!credit)return reject(reason==PassBudget::Rejection::Count?RejectReason::BudgetCount:RejectReason::BudgetBytes);
+    try {
+        auto lease=std::make_shared<PrefixLease>(std::move(resources),std::move(*credit));
+        nodes_.push_back({list,{},std::move(lease),{},true});pending_epoch_=epoch;++admission_diag_.prefix_accepted;return true;
+    } catch(...) {++admission_diag_.prefix_exceptions;throw;}
 }
 void PassCoordinator::CloseSmall(unsigned reason) noexcept {
+    if(pending_small_ && !pending_small_->submitted) {
+        if(reason==0)++admission_diag_.partial_drain;
+        else if(reason==1)++admission_diag_.partial_large;
+    }
     if(pending_small_ && BatchDiag() && reason<3) {
         ++group_stats_.passes[reason][std::min<std::size_t>(8,pending_small_->jobs.size())];
         ++group_stats_.draws[reason][std::min<std::size_t>(8,pending_small_->draws)];
@@ -120,22 +150,28 @@ bool PassCoordinator::SubmitGroup(const GroupPtr& group) {
     } catch(...) {return false;}
 }
 bool PassCoordinator::TryPass(u64 epoch,const Pass& pass,std::size_t total_owned_bytes) {
+    ++admission_diag_.large_attempts;
+    const auto reject=[&](RejectReason why){++admission_diag_.large_rejected[static_cast<std::size_t>(why)];return false;};
     // A later task must not overtake an earlier, incomplete group in the future queue.
     CloseSmall(1); // larger pass splits a pending group before admission
-    if(failed_ || !epoch || (pending_epoch_ && pending_epoch_!=epoch) || nodes_.size()+in_flight_count_>=node_cap_ || !ValidatePass(pass))return false;
-    if(pass.draws.capacity()>(~std::size_t{0}-sizeof(Pass))/sizeof(Draw))return false;
-    if(total_owned_bytes<sizeof(Pass)+pass.draws.capacity()*sizeof(Draw))return false;
+    if(failed_)return reject(RejectReason::Failed);
+    if(!epoch)return reject(RejectReason::ZeroEpoch);
+    if(pending_epoch_ && pending_epoch_!=epoch)return reject(RejectReason::EpochMismatch);
+    if(nodes_.size()+in_flight_count_>=node_cap_)return reject(RejectReason::NodeCap);
+    if(!ValidatePass(pass))return reject(RejectReason::Validation);
+    if(pass.draws.capacity()>(~std::size_t{0}-sizeof(Pass))/sizeof(Draw))return reject(RejectReason::Overflow);
+    if(total_owned_bytes<sizeof(Pass)+pass.draws.capacity()*sizeof(Draw))return reject(RejectReason::Charge);
     auto group=std::make_shared<Group>();
-    if(group->jobs.capacity()>(~std::size_t{0}-sizeof(Group))/sizeof(JobPtr))return false;
+    if(group->jobs.capacity()>(~std::size_t{0}-sizeof(Group))/sizeof(JobPtr))return reject(RejectReason::Overflow);
     const auto overhead=sizeof(Group)+group->jobs.capacity()*sizeof(JobPtr);
-    if(total_owned_bytes>~std::size_t{0}-overhead)return false;
-    auto credit=budget_.TryAcquire(total_owned_bytes+overhead);if(!credit)return false;
+    if(total_owned_bytes>~std::size_t{0}-overhead)return reject(RejectReason::Overflow);
+    PassBudget::Rejection reason{};auto credit=budget_.TryAcquire(total_owned_bytes+overhead,&reason);if(!credit)return reject(reason==PassBudget::Rejection::Count?RejectReason::BudgetCount:RejectReason::BudgetBytes);
     auto job=std::make_shared<Job>(pass,std::move(*credit));
     group->jobs.push_back(job);group->draws=pass.draws.size();
     std::function<void()> release=MakeRelease(job);
     nodes_.push_back({nullptr,job,{},group,false,std::move(release)});
-    if(!SubmitGroup(group)){nodes_.pop_back();return false;}
-    pending_epoch_=epoch;return true;
+    if(!SubmitGroup(group)){nodes_.pop_back();++admission_diag_.large_submit_failed;return false;}
+    pending_epoch_=epoch;++admission_diag_.large_accepted;return true;
 }
 bool PassCoordinator::TryPassTransfer(u64 epoch,Pass& pass,std::size_t total_owned_bytes) {
     if(!draw_pool_)return TryPass(epoch,pass,total_owned_bytes);
@@ -145,14 +181,21 @@ bool PassCoordinator::TryPassTransfer(u64 epoch,Pass& pass,std::size_t total_own
     } loan{draw_pool_.get(),DrawPool::Invalid,{}};
     loan.index=draw_pool_->TryTake(loan.spare,pass.draws.capacity());
     if(loan.index==DrawPool::Invalid){++transfer_fallback_;return TryPass(epoch,pass,total_owned_bytes);}
+    ++admission_diag_.large_attempts;
+    const auto reject=[&](RejectReason why){++admission_diag_.large_rejected[static_cast<std::size_t>(why)];return false;};
     CloseSmall(1);
-    if(failed_ || !epoch || (pending_epoch_ && pending_epoch_!=epoch) || nodes_.size()+in_flight_count_>=node_cap_ || !ValidatePass(pass))return false;
-    if(pass.draws.capacity()>(~std::size_t{0}-sizeof(Pass))/sizeof(Draw) || total_owned_bytes<sizeof(Pass)+pass.draws.capacity()*sizeof(Draw))return false;
+    if(failed_)return reject(RejectReason::Failed);
+    if(!epoch)return reject(RejectReason::ZeroEpoch);
+    if(pending_epoch_ && pending_epoch_!=epoch)return reject(RejectReason::EpochMismatch);
+    if(nodes_.size()+in_flight_count_>=node_cap_)return reject(RejectReason::NodeCap);
+    if(!ValidatePass(pass))return reject(RejectReason::Validation);
+    if(pass.draws.capacity()>(~std::size_t{0}-sizeof(Pass))/sizeof(Draw))return reject(RejectReason::Overflow);
+    if(total_owned_bytes<sizeof(Pass)+pass.draws.capacity()*sizeof(Draw))return reject(RejectReason::Charge);
     auto group=std::make_shared<Group>();
-    if(group->jobs.capacity()>(~std::size_t{0}-sizeof(Group))/sizeof(JobPtr))return false;
+    if(group->jobs.capacity()>(~std::size_t{0}-sizeof(Group))/sizeof(JobPtr))return reject(RejectReason::Overflow);
     const auto overhead=sizeof(Group)+group->jobs.capacity()*sizeof(JobPtr);
-    if(total_owned_bytes>~std::size_t{0}-overhead)return false;
-    auto credit=budget_.TryAcquire(total_owned_bytes+overhead);if(!credit)return false;
+    if(total_owned_bytes>~std::size_t{0}-overhead)return reject(RejectReason::Overflow);
+    PassBudget::Rejection reason{};auto credit=budget_.TryAcquire(total_owned_bytes+overhead,&reason);if(!credit)return reject(reason==PassBudget::Rejection::Count?RejectReason::BudgetCount:RejectReason::BudgetBytes);
     auto job=std::make_shared<Job>(std::move(*credit));
     job->pass.target=pass.target;job->pass.extended_verified=pass.extended_verified;job->pass.resource_lease=pass.resource_lease;
     group->jobs.push_back(job);group->draws=pass.draws.size();
@@ -162,22 +205,31 @@ bool PassCoordinator::TryPassTransfer(u64 epoch,Pass& pass,std::size_t total_own
     job->pass.draws.swap(pass.draws);pass.draws.swap(loan.spare);
     if(!SubmitGroup(group)) {
         pass.draws.swap(loan.spare);job->pass.draws.swap(pass.draws);job->loan=DrawPool::Invalid;
-        nodes_.pop_back();return false; // loan destructor restores the spare
+        nodes_.pop_back();++admission_diag_.large_submit_failed;return false; // loan destructor restores the spare
     }
-    loan.index=DrawPool::Invalid;++transfer_success_;pending_epoch_=epoch;return true;
+    loan.index=DrawPool::Invalid;++transfer_success_;pending_epoch_=epoch;++admission_diag_.large_accepted;return true;
 }
 bool PassCoordinator::TrySmallPass(u64 epoch,const Pass& pass,std::size_t total_owned_bytes) {
-    if(failed_ || !epoch || (pending_epoch_ && pending_epoch_!=epoch) || nodes_.size()+in_flight_count_>=node_cap_ || !ValidatePass(pass) || pass.draws.empty() || pass.draws.size()>=8)return false;
-    if(pass.draws.capacity()>(~std::size_t{0}-sizeof(Pass))/sizeof(Draw) || total_owned_bytes<sizeof(Pass)+pass.draws.capacity()*sizeof(Draw))return false;
+    ++admission_diag_.small_attempts;
+    const auto reject=[&](RejectReason why){++admission_diag_.small_rejected[static_cast<std::size_t>(why)];return false;};
+    if(failed_)return reject(RejectReason::Failed);
+    if(!epoch)return reject(RejectReason::ZeroEpoch);
+    if(pending_epoch_ && pending_epoch_!=epoch)return reject(RejectReason::EpochMismatch);
+    if(nodes_.size()+in_flight_count_>=node_cap_)return reject(RejectReason::NodeCap);
+    if(!ValidatePass(pass))return reject(RejectReason::Validation);
+    if(pass.draws.empty() || pass.draws.size()>=8)return reject(RejectReason::Invalid);
+    if(pass.draws.capacity()>(~std::size_t{0}-sizeof(Pass))/sizeof(Draw))return reject(RejectReason::Overflow);
+    if(total_owned_bytes<sizeof(Pass)+pass.draws.capacity()*sizeof(Draw))return reject(RejectReason::Charge);
     auto group=pending_small_;
     if(!group) {
         group=std::make_shared<Group>();group->is_small=true;
-        if(group->jobs.capacity()>(~std::size_t{0}-sizeof(Group))/sizeof(JobPtr))return false;
+        if(group->jobs.capacity()>(~std::size_t{0}-sizeof(Group))/sizeof(JobPtr))return reject(RejectReason::Overflow);
         const auto overhead=sizeof(Group)+group->jobs.capacity()*sizeof(JobPtr);
-        if(total_owned_bytes>~std::size_t{0}-overhead)return false;
+        if(total_owned_bytes>~std::size_t{0}-overhead)return reject(RejectReason::Overflow);
         total_owned_bytes+=overhead;
     }
-    auto credit=budget_.TryAcquire(total_owned_bytes);if(!credit)return false;
+    PassBudget::Rejection reason{};auto credit=budget_.TryAcquire(total_owned_bytes,&reason);
+    if(!credit)return reject(reason==PassBudget::Rejection::Count?RejectReason::BudgetCount:RejectReason::BudgetBytes);
     auto job=std::make_shared<Job>(pass,std::move(*credit));
     std::function<void()> release=MakeRelease(job);
     group->jobs.push_back(job); // Group constructor pre-reserves all eight entries.
@@ -186,8 +238,8 @@ bool PassCoordinator::TrySmallPass(u64 epoch,const Pass& pass,std::size_t total_
     group->draws+=pass.draws.size();++small_passes_;pending_epoch_=epoch;pending_small_=group;
     if(group->draws>=8 || group->jobs.size()==8 || (BatchTwoPass() && group->jobs.size()>=2)) {
         // Once published, a failed submission remains an ordered synchronous group.
-        if(SubmitGroup(group)){++small_groups_submitted_;small_submitted_draws_+=group->draws;}CloseSmall(2);
+        if(SubmitGroup(group)){++small_groups_submitted_;small_submitted_draws_+=group->draws;}else ++admission_diag_.small_submit_failed;CloseSmall(2);
     }
-    return true;
+    ++admission_diag_.small_accepted;return true;
 }
 }

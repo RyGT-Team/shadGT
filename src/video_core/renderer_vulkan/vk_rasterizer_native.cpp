@@ -187,6 +187,7 @@ struct ScopedParallelBindingCapture {
     ~ScopedParallelBindingCapture(){parallel_binding_capture=previous;}
 };
 struct ProofPhaseStats {u64 count{},wall_ns{},wall_max{};};
+struct RecordPartitionMetric {u64 count{},wall_ns{};};
 bool BatchViewWalkRequested() noexcept {
     static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_BATCH_VIEW_WALK");return p && p[0]=='1' && !p[1];}();
     return enabled;
@@ -255,8 +256,15 @@ struct PendingDescriptorUpdates {
     }
 };
 struct ParallelRuntime {
+    // Mode at Draw's record-phase entry; every metric uses the existing 1/16 sample.
+    std::array<std::array<RecordPartitionMetric,5>,2> record_partition{};
+    Native::Parallel::RotationDiag rotation_diag{};
+    std::array<u64,9> pass_size_hist{};
+    u64 small_admission_exceptions{},large_admission_exceptions{};
+    u64 serial_split_attempts{},serial_split_success{},serial_split_first_draws{};
     PendingDescriptorUpdates descriptor_updates;
     u64 producer_structure_hits{},producer_vertex_hits{},producer_snapshot_hits{};
+    u64 producer_action_hits{},producer_upload_lookup_hits{},producer_stage_schema_hits{},producer_stage_lookup_hits{},clip_fast_hits{},direct_table_cache_hits{};
     std::unique_ptr<Native::Parallel::PassCoordinator> coordinator;
     std::unique_ptr<Native::Parallel::ModeController> mode_controller;
     Native::Parallel::AppliedMode applied_mode{true};bool mode_initial_logged{};
@@ -360,7 +368,8 @@ struct SampledProofTimer {
         ++stats->count;stats->wall_ns+=wall;stats->wall_max=std::max(stats->wall_max,wall);}
 };
 template<class F> auto TimedProofInvoke(ProofPhaseStats& stats,bool sampled,F&& fn) {
-    SampledProofTimer timer{stats,sampled};return std::forward<F>(fn)();
+    if(!sampled)return std::forward<F>(fn)();
+    SampledProofTimer timer{stats,true};return std::forward<F>(fn)();
 }
 }
 struct SceneIndirectArgs {u64 id,address,offset;};
@@ -685,6 +694,27 @@ struct PhaseClock {
                           .count();
         }
     }
+};
+// Diagnostic-only nested interval. Finish permits a precise boundary while
+// the destructor also records early returns; a completed sample is added once.
+struct RecordPartitionClock {
+    RecordPartitionMetric* metric{};
+    std::chrono::steady_clock::time_point start{};
+    explicit RecordPartitionClock(RecordPartitionMetric* value) : metric{t_timed ? value : nullptr} {
+        if(metric)start=std::chrono::steady_clock::now();
+    }
+    void Finish() noexcept {
+        if(!metric)return;
+        metric->wall_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();
+        ++metric->count;metric=nullptr;
+    }
+    ~RecordPartitionClock(){Finish();}
+};
+thread_local RecordPartitionMetric* t_record_partition_end=nullptr;
+struct RecordPartitionEndGuard {
+    RecordPartitionMetric* previous;
+    explicit RecordPartitionEndGuard(RecordPartitionMetric* current) noexcept : previous{t_record_partition_end} {t_record_partition_end=current;}
+    ~RecordPartitionEndGuard(){t_record_partition_end=previous;}
 };
 
 constexpr u64 ChunkSize = 8_MB;
@@ -1483,22 +1513,24 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
 }
 
 void NativeRenderer::EndRendering() {
+    RecordPartitionClock end_partition{t_record_partition_end};
     auto* sidecar=FindParallelRuntime(this);
     if(sidecar)sidecar->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::EndPass);
     if(sidecar)sidecar->FinishSerialEligibleRun();
     if (sidecar && sidecar->active) {
         auto& pass=*sidecar->active;
+        ++sidecar->pass_size_hist[std::min<std::size_t>(8,pass.draws.size())];
         u64 coordinator_start=0,coordinator_end=0;const bool cpu_started=ParallelGateDiagEnabled() && DescriptorThreadCpu100ns(coordinator_start);
         stream.rendering=false; // the captured pass has not begun on stream.cmd
         bool queued=false;
         if((pass.draws.size()>=8 || ParallelSmallPassBatchEnabled()) && !sidecar->closing) {
             const auto reset=[&]() noexcept {stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;};
             if(Native::Parallel::RotateSegment(*sidecar->coordinator,*device,sidecar->epoch,
-                    stream.list,stream.cmd,sidecar->lease,64*1024,reset)) {
+                    stream.list,stream.cmd,sidecar->lease,64*1024,reset,&sidecar->rotation_diag)) {
                 std::size_t bytes=sizeof(pass)+pass.draws.capacity()*sizeof(Native::Parallel::Draw);
                 for(const auto& draw:pass.draws) bytes+=draw.descriptor_bytes;
                 try {queued=pass.draws.size()>=8 ? (sidecar->transfer_applied_mode.Enabled() ? sidecar->coordinator->TryPassTransfer(sidecar->epoch,pass,bytes) : sidecar->coordinator->TryPass(sidecar->epoch,pass,bytes)) : sidecar->coordinator->TrySmallPass(sidecar->epoch,pass,bytes);}
-                catch(const std::bad_alloc&) {queued=false;}
+                catch(const std::bad_alloc&) {if(pass.draws.size()<8)++sidecar->small_admission_exceptions;else ++sidecar->large_admission_exceptions;queued=false;}
             }
         }
         if(queued) {++sidecar->queued;sidecar->sync_pins.Queued(sidecar->pin_slot);} else {
@@ -4870,6 +4902,17 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         PhaseClock clock{stats.phase_ns[2]};
         from_prepared = CommitPrepared(*prepared, *pipeline, regs, trusted);
     }
+    bool prepared_vertices_valid=false;
+    if(from_prepared && prepared->has_vertices && !prepared->bindings.failed) {
+        PhaseClock clock{stats.phase_ns[5]};
+        prepared_vertices_valid=CommitPreparedVertices(*prepared,*pipeline,regs,is_indexed,index_offset,quad_triangles,trusted);
+        // MirrorBuffer may process CPU writes after CommitPrepared. A changed
+        // range invalidates both prepared bindings and vertices, not only vi.
+        if(prepared->unmap_gen!=unmap_generation.load(std::memory_order_acquire) ||
+           !buffer_log.Untouched(prepared->buffer_seq,prepared->buffer_ranges)) {
+            from_prepared=false;prepared_vertices_valid=false;
+        }
+    }
     DrawBindings& b = from_prepared ? prepared->bindings : bindings;
     if (!from_prepared) {
         b.Clear();
@@ -4884,9 +4927,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     const VertexIndexState* vi = &vertex_index;
     {
         PhaseClock clock{stats.phase_ns[5]};
-        if (from_prepared && prepared->has_vertices &&
-            CommitPreparedVertices(*prepared, *pipeline, regs, is_indexed, index_offset,
-                                   quad_triangles, trusted)) {
+        if (from_prepared && prepared_vertices_valid) {
             vi = prepared->vertex_index.get(); // OPT-011
         } else {
             vertex_index = {};
@@ -5028,6 +5069,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             ++stats.passes_unblocked;
         }
     }
+    auto* parallel=FindParallelRuntime(this);
+    const auto partition_mode=parallel && parallel->applied_mode.Enabled()?1u:0u;
+    RecordPartitionEndGuard end_partition_guard{parallel?&parallel->record_partition[partition_mode][4]:nullptr};
+    RecordPartitionClock admission_partition{parallel?&parallel->record_partition[partition_mode][0]:nullptr};
     // Narrow upper bound only; no draw eligibility is enabled. Unknown query,
     // alias and lifetime constraints are not established by these counters.
     if (ParallelEligibilityEnabled()) {
@@ -5050,7 +5095,6 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     }
     // Experimental first subset: a complete, descriptor-free, vertexless color
     // scope. Every eligibility uncertainty falls back to the existing recorder.
-    auto* parallel=FindParallelRuntime(this);
     // Declared after GiveBack: an uncommitted draw flushes before prepared owners
     // and the renderer mutex are released, including during exception unwinding.
     struct PendingDrawGuard {
@@ -5059,6 +5103,21 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     } pending_draw_guard{parallel?&parallel->descriptor_updates:nullptr,r.instance.GetDevice()};
     static const bool natural_boundary_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_NATURAL_BOUNDARY");return p && p[0]=='1' && !p[1];}();
     bool preclosed_serial_scope=false;
+    bool serial_split_started=false;
+    bool serial_split_prebound=false;
+    const auto cancel_empty_split=[&]() noexcept {
+        if(!serial_split_started || !parallel || !parallel->active || !parallel->active->draws.empty())return;
+        parallel->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::Abandoned);
+        if(!parallel->sync_pins.CancelEmpty(parallel->pin_slot))std::terminate();
+        parallel->pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;
+        parallel->scratch_draws.swap(parallel->active->draws);
+        parallel->active.reset();parallel->lease.reset();s.rendering=false;
+        s.dynamic.Invalidate();s.pipelines.Invalidate();s.vertex_state_known=false;
+    };
+    struct EmptySplitGuard {
+        const decltype(cancel_empty_split)& cancel;
+        ~EmptySplitGuard() noexcept {cancel();}
+    } empty_split_guard{cancel_empty_split};
     if(parallel && !parallel->closing && parallel->applied_mode.Enabled() && natural_boundary_enabled) {
         preclosed_serial_scope=Native::Parallel::CloseChangedSerialScope(true,bool(parallel->active),s.rendering,s.render,targets.state,[&]{EndRendering();});
         if(preclosed_serial_scope)++parallel->natural_preclosed;
@@ -5093,16 +5152,24 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         const bool fast_race=RytyGtsInRace(),fast_patch=EmulatorSettings.IsPatchShaders();
         const bool fast_trace=r.FrameDumpActive() || SceneTrace::Id() || Native::GpuCheckpoints::Requested();
         static const bool serial_audit=[] {const char* p=std::getenv("RYGT_PARALLEL_SERIAL_AUDIT");return p && p[0]=='1' && p[1]=='\0';}();
-        // An already-open serial rendering scope cannot capture this draw: the
-        // admission path starts only at a non-rendering boundary.
-        const bool serial_scope_bypass=!serial_audit && s.rendering && !parallel->active;
-        const bool fast_reject=serial_scope_bypass || !fast_race || fast_patch || fast_trace || quad_list || quad_triangles ||
+        // Split only a matching scope whose attachments need LOAD on continuation.
+        bool split_clear=fast_depth.depth_clear || fast_depth.stencil_clear;
+        for(u32 i=0;i<targets.state.num_color_attachments && i<targets.state.color_attachments.size();++i)
+            split_clear|=targets.state.color_attachments[i].is_clear;
+        const bool same_serial_scope=s.rendering && !parallel->active && s.render==targets.state;
+        const bool split_candidate=same_serial_scope && !split_clear;
+        const bool serial_scope_bypass=!serial_audit && s.rendering && !parallel->active && !split_candidate;
+        bool fast_reject=serial_scope_bypass || !fast_race || fast_patch || fast_trace || quad_list || quad_triangles ||
             (!extended && is_indexed) || scale_composition || native_fsr_composition ||
             (!extended && targets.state.num_color_attachments!=1) || targets.state.num_color_attachments>8 || prohibited_clear ||
             (!extended && (fast_depth.has_depth || fast_depth.has_stencil || bool(vi->index_buffer))) ||
             !feedback.empty() || !prepared || !from_prepared ||
             prepared->pipeline!=pipeline || !prepared->pipeline_keepalive ||
             b.writes_buffers || !b.gpu_writes.empty() || !b.stored.empty();
+        // UI/stream preparation may retire mirrors after vertex commit. Do not
+        // inspect prepared owner pointers if any prepared range changed since.
+        if(!fast_reject && (prepared->unmap_gen!=unmap_generation.load(std::memory_order_acquire) ||
+           !buffer_log.Untouched(prepared->buffer_seq,prepared->buffer_ranges))) fast_reject=true;
         if(fast_reject) {
             ++parallel->fast_rejected;if(extended && any_clear)++parallel->extended_clear_rejected;if(serial_scope_bypass)++parallel->serial_scope_bypassed;
             if(ParallelGateDiagEnabled()) {
@@ -5295,17 +5362,58 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 Native::Parallel::PerDrawViewProof<vk::ImageView> view_proof{sample_view?&local_view_stats:(gate_view?&parallel->view_proof_stats:nullptr),wanted_view_filter};
                 const auto note_view_cardinality=[&](std::size_t n) {if(sample_view)++parallel->view_sample.cardinality[n==0?0:n==1?1:n==2?2:n<=4?3:n<=8?4:n<=16?5:n<=32?6:n<=64?7:n<=128?8:9];};
                 const bool known_structure=worker_identity && worker_result->descriptor_structure;
+                const bool known_actions=known_structure && prepared->descriptor_actions.size()==b.writes.size();
+                const auto current_stages=pipeline->GetStages();
+                bool known_stage_schema=known_actions;
+                if(known_stage_schema)for(size_t si=0;si<worker_result->stages.size();++si) {
+                    const auto* stage=si<current_stages.size()?current_stages[si]:nullptr;
+                    const auto& schema=worker_result->stages[si];
+                    if((stage && !stage->identity) || (stage ? stage->identity : 0)!=schema.identity ||
+                       (stage ? stage->buffers.size() : 0)!=schema.count){known_stage_schema=false;break;}
+                }
                 if(known_structure)++parallel->producer_structure_hits;
+                if(known_actions)++parallel->producer_action_hits;
+                if(known_stage_schema)++parallel->producer_stage_schema_hits;
+                struct DrawTableCache {const std::byte* data{};std::size_t size{};const void* owner{};u64 l1{},zero{};};
+                std::array<DrawTableCache,Shader::MaxStageTypes-1> table_cache{};
+                std::size_t action_index=0, action_upload_lookups=0;
                 for(const auto& write:b.writes) {
+                    const auto* action=known_actions ? &prepared->descriptor_actions[action_index] : nullptr;
+                    ++action_index;
                     if(!known_structure && (write.pNext || write.pTexelBufferView)){descriptor_fail_reason=1;descriptor_safe=false;break;}
-                    const bool buffer_type=write.descriptorType==vk::DescriptorType::eUniformBuffer ||
-                                           write.descriptorType==vk::DescriptorType::eStorageBuffer;
+                    const bool buffer_type=action ? action->is_buffer :
+                        (write.descriptorType==vk::DescriptorType::eUniformBuffer || write.descriptorType==vk::DescriptorType::eStorageBuffer);
                     if(buffer_type) {
                         SampledProofTimer phase{parallel->proof_phases[0],phase_sample};
                         if(!known_structure && (write.pImageInfo || !DescriptorSnapshot::BufferSliceValid(write.pBufferInfo,write.descriptorCount,buffer_infos))) {descriptor_fail_reason=2;descriptor_safe=false;break;}
                         for(u32 j=0;j<write.descriptorCount;++j) {
                             const auto* info=&write.pBufferInfo[j];
-                            const std::size_t index=static_cast<std::size_t>(info-b.buffers.data());
+                            const std::size_t index=action ? action->buffer_first+j : static_cast<std::size_t>(info-b.buffers.data());
+                            bool planned_stage_checked=false;const Shader::Info* planned_stage_value=nullptr;
+                            const auto planned_stage=[&]() -> const Shader::Info* {
+                                if(planned_stage_checked)return planned_stage_value;
+                                planned_stage_checked=true;
+                                if(!known_stage_schema || !action || write.descriptorCount!=1 ||
+                                   action->stage_index>=current_stages.size() || action->stage_index>=worker_result->stages.size())return nullptr;
+                                const auto* stage=current_stages[action->stage_index];
+                                if(stage && action->stage_local<stage->buffers.size()) {++parallel->producer_stage_lookup_hits;planned_stage_value=stage;return stage;}
+                                return nullptr;
+                            };
+                            // This is the old final clip proof reached early only for a
+                            // validated current stage and the same live null/clip predicates.
+                            if(ParallelReadonlyDescriptorEnabled() && write.descriptorType==vk::DescriptorType::eStorageBuffer &&
+                               !info->buffer && info->offset==0 && info->range==VK_WHOLE_SIZE && !regs.clipper_control.user_clip_plane_enable) {
+                                const auto fast_clip=[&]() -> bool {
+                                    if(const auto* stage=planned_stage()) {
+                                        const auto& desc=stage->buffers[action->stage_local];
+                                        if(desc.buffer_type==Shader::BufferType::ClipPlanes && !desc.is_written) {
+                                            ++parallel->descriptor_clip_nulls;++parallel->clip_fast_hits;return true;
+                                        }
+                                    }
+                                    return false;
+                                };
+                                if(TimedProofInvoke(parallel->proof_phases[8],phase_sample,fast_clip))continue;
+                            }
                             const auto absent_slot=[&](const Shader::Info& stage,std::size_t local,std::span<const std::byte> bytes) -> bool {
                                 static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_ABSENT_GUEST");return p && p[0]=='1' && !p[1];}();
                                 if(!enabled || write.descriptorType!=vk::DescriptorType::eStorageBuffer || local>=stage.buffers.size() ||
@@ -5326,6 +5434,33 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                 if(info->buffer || info->offset!=0 || info->range!=VK_WHOLE_SIZE) return false;
                                 auto* direct=r.buffer_cache.GetDirectMemory();if(!direct)return false;
                                 const auto stages=pipeline->GetStages();
+                                if(const auto* stage=planned_stage()) {
+                                    const auto& schema=worker_result->stages[action->stage_index];
+                                    if(schema.table_local<stage->buffers.size() && schema.table_upload<prepared->uploads.size() &&
+                                       stage->buffers[schema.table_local].buffer_type==Shader::BufferType::DirectTable &&
+                                       index>=action->stage_local && index-action->stage_local<=SIZE_MAX-schema.table_local &&
+                                       prepared->uploads[schema.table_upload].info==index-action->stage_local+schema.table_local) {
+                                        const auto local=action->stage_local,n=stage->buffers.size();
+                                        if(!stage->uses_direct || !stage->buffers[local].IsDirectEligible() || n>(SIZE_MAX-16)/16)return false;
+                                        const auto expected=16+n*16;const auto& upload=prepared->uploads[schema.table_upload];
+                                        auto& cached=table_cache[action->stage_index];const u64 l1=direct->L1Address(),zero=direct->ZeroPageAddress();
+                                        const std::byte* data=cached.data;
+                                        if(data && cached.owner==direct && cached.size==expected && cached.l1==l1 && cached.zero==zero)++parallel->direct_table_cache_hits;
+                                        else {
+                                            if(upload.flat_stage>=0 || upload.size!=expected || upload.offset>prepared->upload_bytes.size() ||
+                                               expected>prepared->upload_bytes.size()-upload.offset)return false;
+                                            data=reinterpret_cast<const std::byte*>(prepared->upload_bytes.data()+upload.offset);
+                                            u32 header[4]{};std::memcpy(header,data,sizeof(header));
+                                            if((u64(header[0])|(u64(header[1])<<32))!=l1 || (u64(header[2])|(u64(header[3])<<32))!=zero)return false;
+                                            cached={data,expected,direct,l1,zero};
+                                        }
+                                        const auto bytes=std::span<const std::byte>{reinterpret_cast<const std::byte*>(data),expected};
+                                        if(absent_slot(*stage,local,bytes))return true;
+                                        if(!Native::Parallel::IsPreparedDirectSlot(bytes,n,local,true,true,info->offset,info->range))return false;
+                                        u32 words[4]{};std::memcpy(words,data+16+local*16,sizeof(words));
+                                        return VideoCore::ParallelDirectViewCoherent(direct,u64(words[0])|(u64(words[1])<<32),words[2]);
+                                    }
+                                }
                                 if(reuse_stage_proof) {
                                     const auto* hit=stage_proof->Find(stages,index);if(!hit)return false;
                                     const auto local=index-hit->begin;const auto* stage=hit->stage;
@@ -5368,7 +5503,13 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                 }
                                 return false;
                             };
-                            const bool recorded=TimedProofInvoke(parallel->proof_phases[4],phase_sample,[&] {return std::ranges::any_of(prepared->uploads,[&](const auto& upload){return upload.info==index && upload.size==info->range;});});
+                            const bool recorded=TimedProofInvoke(parallel->proof_phases[4],phase_sample,[&] {
+                                if(action && action->upload_match!=2) {
+                                    ++action_upload_lookups;
+                                    return action->upload_match==1 && action->upload_size==info->range;
+                                }
+                                return std::ranges::any_of(prepared->uploads,[&](const auto& upload){return upload.info==index && upload.size==info->range;});
+                            });
                             const auto retained_scan=[&] {return TimedProofInvoke(parallel->proof_phases[5],phase_sample,[&] {return std::ranges::any_of(s.chunks,[&](const auto& chunk){
                                 if(!chunk.buffer || !chunk.buffer->Mapped() ||
                                    vk::Buffer{Handle<VkBuffer_T>(chunk.buffer->NativeHandle())}!=info->buffer ||
@@ -5381,8 +5522,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                    info->range==VK_WHOLE_SIZE || prepared->buffer_ranges.size()>64 || prepared->regions.size()>64)return false;
                                 ++parallel->descriptor_readonly_attempts;
                                 const auto stages=pipeline->GetStages();const auto stage_count=std::min<std::size_t>(stages.size(),Shader::MaxStageTypes-1);
-                                const Shader::Info* matched=nullptr;std::size_t local=0,start=0;
-                                for(std::size_t si=0;si<stage_count;++si){const auto* stage=stages[si];if(!stage)continue;const auto n=stage->buffers.size();
+                                const Shader::Info* matched=planned_stage();std::size_t local=matched?action->stage_local:0,start=0;
+                                if(!matched)for(std::size_t si=0;si<stage_count;++si){const auto* stage=stages[si];if(!stage)continue;const auto n=stage->buffers.size();
                                     if(index>=start && index-start<n){matched=stage;local=index-start;break;}start+=n;}
                                 if(!matched)return false;const auto& desc=matched->buffers[local];
                                 if(desc.IsSpecial() || desc.is_written)return false;
@@ -5425,6 +5566,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                 if(!ParallelReadonlyDescriptorEnabled() || write.descriptorType!=vk::DescriptorType::eStorageBuffer ||
                                    info->buffer || info->offset!=0 || info->range!=VK_WHOLE_SIZE ||
                                    regs.clipper_control.user_clip_plane_enable!=0)return false;
+                                if(const auto* stage=planned_stage()) {
+                                    const auto& desc=stage->buffers[action->stage_local];
+                                    if(desc.buffer_type!=Shader::BufferType::ClipPlanes || desc.is_written)return false;
+                                    ++parallel->descriptor_clip_nulls;return true;
+                                }
                                 const auto stages=pipeline->GetStages();std::size_t start=0;
                                 for(std::size_t si=0;si<std::min<std::size_t>(stages.size(),Shader::MaxStageTypes-1);++si){
                                     const auto* stage=stages[si];if(!stage)continue;const auto n=stage->buffers.size();
@@ -5574,6 +5720,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                     }
                     if(!descriptor_safe)break;
                 }
+                parallel->producer_upload_lookup_hits+=action_upload_lookups;
                 if(sample_view) {
                     auto& v=parallel->view_sample;++v.draws;if(local_view_stats.queries)++v.queried_draws;
                     v.image_infos+=b.images.size();v.sampled_entries+=b.sampled.size();
@@ -5589,16 +5736,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                         const auto snapshot_matches=[&] {
                             if(!worker_identity || !known_structure || !feedback.empty() || !worker_result->push_snapshot || worker_result->push_index!=push ||
                                worker_result->push_data!=b.grouped_writes[push].data() || worker_result->push_size!=b.grouped_writes[push].size()) return false;
-                            const auto old=std::static_pointer_cast<const DescriptorSnapshot>(worker_result->push_snapshot)->Writes();const auto& now=b.grouped_writes[push];
-                            if(old.size()!=now.size())return false;
-                            for(size_t i=0;i<old.size();++i) {
-                                const auto& a=old[i];const auto& c=now[i];
-                                if(a.dstBinding!=c.dstBinding || a.dstArrayElement!=c.dstArrayElement || a.descriptorCount!=c.descriptorCount || a.descriptorType!=c.descriptorType) return false;
-                                if(c.pImageInfo) for(u32 j=0;j<c.descriptorCount;++j) {
-                                    const auto& x=a.pImageInfo[j];const auto& y=c.pImageInfo[j];
-                                    if(x.sampler!=y.sampler || x.imageView!=y.imageView || x.imageLayout!=y.imageLayout)return false;
-                                }
-                            }
+                            // Producer group rows and image values remain immutable after publication; feedback is excluded above.
                             return true;
                         };
                         bool reused_snapshot=false;
@@ -5659,27 +5797,59 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             else if(s.rendering)++parallel->eligible_in_serial_scope;
             else ++parallel->eligible_at_boundary;
         }
-        if(eligible && !parallel->active && s.rendering && s.render==targets.state)
+        if(eligible && same_serial_scope)
             parallel->NoteSerialEligible();
         else parallel->FinishSerialEligibleRun();
         if(parallel->active && (!eligible || !s.rendering || !(s.render==targets.state) || parallel->active->draws.size()>=256)) {
             EndRendering();PassBarrier(); // continuation uses LOAD, with an attachment dependency
         }
-        if(eligible && !parallel->active && !s.rendering) {
+        const bool split_now=split_candidate && s.rendering && !parallel->active && s.render==targets.state;
+        if(eligible && !parallel->active && (!s.rendering || split_now)) {
             // Allocate every packet container before changing logical rendering.
             try {
+                if(split_now)++parallel->serial_split_attempts;
                 parallel->sync_pins.Collect(r.scheduler.GetWorkSemaphore()->KnownGpuTick(),
                     [&](auto& callback) noexcept {return Native::Rhi::TryEnqueueCompleted(*device,callback);});
                 const auto slot=parallel->sync_pins.Reserve();
                 if(slot!=Native::Parallel::SyncOwnerPins<>::Invalid) {
                     parallel->pin_slot=slot;
+                    struct ReservedPinGuard {
+                        ParallelRuntime* parallel;
+                        bool committed=false;
+                        ~ReservedPinGuard() noexcept {
+                            if(!committed) {
+                                if(!parallel->sync_pins.CancelEmpty(parallel->pin_slot))std::terminate();
+                                parallel->pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;
+                            }
+                        }
+                    } reserved_pin{parallel};
                     parallel->scratch_draws.reserve(256);
                     const u64 epoch=r.scheduler.CurrentTick();
                     auto lease=std::make_shared<const u64>(epoch);
                     Native::Parallel::Pass pass{};pass.target=targets.state;pass.resource_lease=lease;pass.extended_verified=extended;
-                    pass.draws.swap(parallel->scratch_draws);
-                    parallel->epoch=epoch;parallel->lease=std::move(lease);parallel->active.emplace(std::move(pass));
-                    s.rendering=true;s.render=targets.state;++stats.passes;++parallel->passes;
+                    bool prebind_ok=true;
+                    if(split_now) {
+                        const auto* prebind_list=s.list;
+                        const auto prebind_cmd=s.cmd;
+                        parallel_bindings.write_structure_proven=true;
+                        {ScopedParallelBindingCapture capture{parallel_bindings};PushBindings(*pipeline,vk::PipelineBindPoint::eGraphics,b);}
+                        if(!b.writes.empty())for(u32 i=0;i<b.grouped_writes.size();++i) {
+                            if(i==pipeline->PushSet() || b.grouped_writes[i].empty())continue;
+                            parallel_required_sets|=u32{1}<<i;
+                            if(!parallel_bindings.sets[i])prebind_ok=false;
+                        }
+                        prebind_ok=prebind_ok && s.rendering && !parallel->active && s.render==targets.state &&
+                            s.list==prebind_list && s.cmd==prebind_cmd && r.scheduler.CurrentTick()==epoch;
+                        if(!prebind_ok)parallel->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::Abandoned);
+                    }
+                    if(prebind_ok) {
+                        static_assert(std::is_nothrow_move_constructible_v<Native::Parallel::Pass>);
+                        pass.draws.swap(parallel->scratch_draws);
+                        if(split_now) {EndRendering();PassBarrier();serial_split_started=true;++parallel->serial_split_success;serial_split_prebound=true;}
+                        parallel->epoch=epoch;parallel->lease=std::move(lease);parallel->active.emplace(std::move(pass));
+                        reserved_pin.committed=true;
+                        s.rendering=true;s.render=targets.state;++stats.passes;++parallel->passes;
+                    }
                 } else ++parallel->owner_slot_pressure;
             } catch(const std::bad_alloc&) {
                 if(parallel->pin_slot!=Native::Parallel::SyncOwnerPins<>::Invalid)parallel->sync_pins.CancelEmpty(parallel->pin_slot);
@@ -5706,6 +5876,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             family<families.size()?families[family].timestampValidBits:0,
             r.instance.GetPhysicalDevice().getProperties().limits.timestampPeriod);
     }
+    admission_partition.Finish();
     {
         PhaseClock part{stats.record_ns[1]};
         if(!parallel_draw) BeginRendering(targets.state);
@@ -5776,7 +5947,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         if(parallel_draw) {
             std::shared_ptr<AheadLease> ahead;std::function<void()> ahead_release;
             std::size_t ahead_slot=parallel->ahead_flights.size();
-            if(from_prepared && prepared && AheadRequested()) {
+            if(!serial_split_prebound && from_prepared && prepared && AheadRequested()) {
                 ahead=std::static_pointer_cast<AheadLease>(prepared->ahead_descriptor_lease.load(std::memory_order_acquire));
                 if(ahead && ahead->context && ahead->lease && ahead->context->mode.load(std::memory_order_acquire)) {
                     for(std::size_t n=0;n<parallel->ahead_flights.size();++n) {
@@ -5790,8 +5961,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                     else ahead->context->capacity.fetch_add(1,std::memory_order_relaxed);
                 }
             }
-            parallel_bindings.write_structure_proven=true; // descriptor_safe validated every source row
-            {ScopedParallelBindingCapture capture{parallel_bindings};PushBindings(*pipeline,vk::PipelineBindPoint::eGraphics,b);}
+            if(!serial_split_prebound) {
+                parallel_bindings.write_structure_proven=true; // descriptor_safe validated every source row
+                {ScopedParallelBindingCapture capture{parallel_bindings};PushBindings(*pipeline,vk::PipelineBindPoint::eGraphics,b);}
+            }
             if(parallel_bindings.ahead_used) {
                 ASSERT_MSG(ahead && ahead_slot<parallel->ahead_flights.size(),"ahead descriptor lease missing");
                 ahead->used=true;ahead->context->used.fetch_add(1,std::memory_order_relaxed);
@@ -5841,7 +6014,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             for(size_t vi=0;vi<d.viewports.size();++vi){const auto& v=d.viewports[vi];r.FrameDumpEvent(fmt::format("scene-viewport id={} slot={} xy={}/{} size={}/{} depth={}/{}",SceneTrace::Id(),vi,v.x,v.y,v.width,v.height,v.minDepth,v.maxDepth));}
         }
         if(parallel_draw) {
-            Native::Parallel::Draw captured{};
+            auto& draws=parallel->active->draws;
+            draws.emplace_back();
+            struct UnfinishedDrawGuard {
+                std::vector<Native::Parallel::Draw>& draws;
+                bool committed=false;
+                ~UnfinishedDrawGuard() {if(!committed)draws.pop_back();}
+            } unfinished_draw_guard{draws};
+            auto& captured=draws.back();
             captured.pipeline=pipeline->Handle();captured.layout=pipeline->GetLayout();
             captured.pipeline_owner=prepared->pipeline_keepalive;captured.dynamic=s.dynamic;captured.push=b.push;
             captured.sets=parallel_bindings.sets;captured.required_sets_mask=parallel_required_sets;
@@ -5866,7 +6046,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             ASSERT_MSG(parallel->sync_pins.Pin(parallel->pin_slot,captured.pipeline_owner),"parallel pipeline owner pin failed");
             if(ParallelGateDiagEnabled()) {const auto n=captured.vertex_buffer_count;
                 ++parallel->captured_vertex_counts[n==0?0:n==1?1:n<4?2:n<8?3:n<16?4:n<32?5:6];parallel->captured_vertex_sum+=n;}
-            parallel->active->draws.push_back(std::move(captured));pending_draw_guard.committed=true;++parallel->draws;
+            unfinished_draw_guard.committed=true;pending_draw_guard.committed=true;++parallel->draws;
+            if(serial_split_started)++parallel->serial_split_first_draws;
             if(preclosed_serial_scope)++parallel->natural_captured;
         } else {
         SceneTrace::GpuBegin(s.cmd);
@@ -5890,6 +6071,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         PhaseClock part{stats.record_ns[7]};
         NoteWrites(&targets, b);
     }
+    RecordPartitionClock tail_partition{parallel?&parallel->record_partition[partition_mode][1]:nullptr};
     if (!feedback.empty()) {
         EndRendering();
         feedback_layout(vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT,
@@ -5987,8 +6169,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
 
     ++stats.draws;
     ++s.commands;
-    ChunkFlushCheck();
-    Report();
+    tail_partition.Finish();
+    {RecordPartitionClock chunk_partition{parallel?&parallel->record_partition[partition_mode][2]:nullptr};ChunkFlushCheck();}
+    {RecordPartitionClock report_partition{parallel?&parallel->record_partition[partition_mode][3]:nullptr};Report();}
 }
 
 bool NativeRenderer::PrepareEnabled() {
@@ -6010,6 +6193,7 @@ void NativeRenderer::PreparedDraw::Reset() {
     pipeline = nullptr;
     if(AheadRequested())ahead_descriptor_lease.store({},std::memory_order_release);
     cpu_proof = {};
+    descriptor_actions.clear(); // retain capacity for the next prepared draw
     sampled_view_proofs.clear();
     proof_context.reset();proof_mode_state=0;
     pipeline_keepalive.reset();
@@ -6238,12 +6422,58 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
         const auto buffers=std::span<const vk::DescriptorBufferInfo>{b.buffers.data(),b.buffers.size()};
         const auto images=std::span<const vk::DescriptorImageInfo>{b.images.data(),b.images.size()};
         candidate->descriptor_structure=true;
+        size_t stage_base=0;
+        for(size_t si=0;si<candidate->stages.size();++si) {
+            auto& schema=candidate->stages[si];schema={};schema.table_upload=SIZE_MAX;
+            if(si>=stages.size() || !stages[si])continue;
+            const auto& stage=*stages[si];schema.identity=stage.identity;schema.count=stage.buffers.size();
+            size_t table=SIZE_MAX;
+            for(size_t j=0;j<schema.count;++j)if(stage.buffers[j].buffer_type==Shader::BufferType::DirectTable) {
+                if(table!=SIZE_MAX){table=SIZE_MAX-1;break;}table=j;
+            }
+            if(table<schema.count && stage_base<=SIZE_MAX-table) {
+                schema.table_local=table;
+                const auto global=stage_base+table;
+                for(size_t j=0;j<p->uploads.size();++j)if(p->uploads[j].info==global) {
+                    if(schema.table_upload!=SIZE_MAX){schema.table_upload=SIZE_MAX-1;break;}
+                    schema.table_upload=j;
+                }
+            }
+            if(schema.count>SIZE_MAX-stage_base){candidate->descriptor_structure=false;break;}
+            stage_base+=schema.count;
+        }
+        p->descriptor_actions.clear();
+        const bool build_actions=candidate->descriptor_structure && b.writes.size()<=128;
+        if(build_actions)p->descriptor_actions.reserve(b.writes.size());
         for(const auto& w:b.writes) {
             const bool buf=w.descriptorType==vk::DescriptorType::eUniformBuffer || w.descriptorType==vk::DescriptorType::eStorageBuffer;
             const bool img=w.descriptorType==vk::DescriptorType::eSampledImage || w.descriptorType==vk::DescriptorType::eSampler;
             if(w.pNext || w.pTexelBufferView || (buf ? (w.pImageInfo || !DescriptorSnapshot::BufferSliceValid(w.pBufferInfo,w.descriptorCount,buffers)) :
                 (!img || w.pBufferInfo || !DescriptorSnapshot::ImageSliceValid(w.pImageInfo,w.descriptorCount,images)))) {candidate->descriptor_structure=false;break;}
+            if(build_actions) {
+                PreparedDraw::DescriptorAction action{};action.is_buffer=buf;
+                if(buf) {
+                    action.buffer_first=static_cast<std::size_t>(w.pBufferInfo-b.buffers.data());
+                    if(w.descriptorCount==1) {
+                        size_t base=0;
+                        for(size_t si=0;si<candidate->stages.size();++si) {
+                            const auto n=candidate->stages[si].count;
+                            if(action.buffer_first>=base && action.buffer_first-base<n) {
+                                action.stage_index=static_cast<u32>(si);action.stage_local=action.buffer_first-base;break;
+                            }
+                            base+=n;
+                        }
+                        action.upload_match=0;
+                        for(const auto& upload:p->uploads) if(upload.info==action.buffer_first) {
+                            if(action.upload_match==1){action.upload_match=2;break;}
+                            action.upload_match=1;action.upload_size=upload.size;
+                        }
+                    }
+                }
+                p->descriptor_actions.push_back(action);
+            }
         }
+        if(!candidate->descriptor_structure)p->descriptor_actions.clear();
         if(p->has_vertices && p->vertex_index) {
             const auto& v=*p->vertex_index;candidate->vertex_identity=&v;candidate->vertex_buffers_data=v.buffers.data();candidate->vertex_buffers_size=v.buffers.size();
             const size_t n=v.buffers.size();candidate->vertex_shape=n && n<=32 && v.input_bindings.size()==n && v.attributes.size()==n && v.offsets.size()==n && v.sizes.size()==n && v.strides.size()==n;
@@ -6270,7 +6500,7 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
                 candidate->push_snapshot=std::make_shared<DescriptorSnapshot>(std::move(*snap));
             }
         }
-    } catch(const std::bad_alloc&) {p->cpu_proof = {};}
+    } catch(const std::bad_alloc&) {p->cpu_proof = {};p->descriptor_actions.clear();}
     if(auto context=ahead_guard.context;context && p->pipeline_keepalive && context->mode.load(std::memory_order_acquire)) {
         context->attempts.fetch_add(1,std::memory_order_relaxed);
         try {
@@ -7053,6 +7283,13 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
             RefreshSources(entry); // NAT-104
         }
     }
+    // RefreshRegion can process CPU writes again after the first freshness
+    // check and retire a prepared mirror. Settle any new stream/promotion,
+    // then reject the whole prepared draw before selecting its bindings or
+    // dereferencing its vertex mirrors if any prepared range changed.
+    Begin();
+    if (p.unmap_gen != unmap_generation.load(std::memory_order_acquire)) return reject(2);
+    if (!buffer_log.Untouched(p.buffer_seq, p.buffer_ranges)) return reject(4);
     // The viewport transform the shaders get, from the registers as recorded.
     trace.Next(7);
     const Shader::PushData fresh = UserData(regs);
@@ -9337,7 +9574,12 @@ void NativeRenderer::Report() {
         probe={};
     }
     if(auto* sidecar=FindParallelRuntime(this)) {
-        LOG_INFO(Render_Vulkan,"PARALLEL-PRODUCER-CPU cumulative structure={} vertex={} snapshot={}",sidecar->producer_structure_hits,sidecar->producer_vertex_hits,sidecar->producer_snapshot_hits);
+        for(u32 mode=0;mode<sidecar->record_partition.size();++mode) {
+            const auto& p=sidecar->record_partition[mode];
+            LOG_INFO(Render_Vulkan,"PARALLEL-RECORD-PARTITION mode_at_entry={} nominal_sample_rate=1/16 admission_samples={} admission_ns={} tail_samples={} tail_ns={} chunk_samples={} chunk_ns={} report_samples={} report_ns={} end_calls={} end_ns={} (end is inclusive and overlaps other scopes; chunk may include Splice/Drain; report sample completes after this log)",mode,p[0].count,p[0].wall_ns,p[1].count,p[1].wall_ns,p[2].count,p[2].wall_ns,p[3].count,p[3].wall_ns,p[4].count,p[4].wall_ns);
+        }
+        sidecar->record_partition={};
+        LOG_INFO(Render_Vulkan,"PARALLEL-PRODUCER-CPU cumulative structure={} vertex={} snapshot={} actions={} upload_lookups={} stage_schemas={} stage_lookups={} clip_fast={} direct_table_cache_hits={}",sidecar->producer_structure_hits,sidecar->producer_vertex_hits,sidecar->producer_snapshot_hits,sidecar->producer_action_hits,sidecar->producer_upload_lookup_hits,sidecar->producer_stage_schema_hits,sidecar->producer_stage_lookup_hits,sidecar->clip_fast_hits,sidecar->direct_table_cache_hits);
         const auto& batch=sidecar->descriptor_updates;
         LOG_INFO(Render_Vulkan,"PARALLEL-DESCRIPTOR-BATCH cumulative logical_draws={} actual_calls={} staged_rows={} immediate_draws={} overflow_draws={} unsupported_draws={} high_rows={} pending_rows={} flush_end={} flush_serial={} flush_abandoned={} flush_capacity={} flush_unsupported={} flush_exception={}",
             batch.logical_draws,batch.actual_calls,batch.staged_rows,batch.immediate_draws,batch.overflow_draws,batch.unsupported_draws,batch.high_rows,batch.nw,batch.flushes[PendingDescriptorUpdates::EndPass],batch.flushes[PendingDescriptorUpdates::Serial],batch.flushes[PendingDescriptorUpdates::Abandoned],batch.flushes[PendingDescriptorUpdates::Capacity],batch.flushes[PendingDescriptorUpdates::Unsupported],batch.flushes[PendingDescriptorUpdates::Exception]);
@@ -9383,16 +9625,29 @@ void NativeRenderer::Report() {
             const auto sequence=v.sequence;v={};v.sequence=sequence;
         }
         if(ParallelProofPhaseEnabled()) {
-            LOG_INFO(Render_Vulkan,"PARALLEL-PROOF-PHASE-LEGEND 0=buffer-write-group 1=sampler-descriptor 2=sampled-view-descriptor 3=push-snapshot 4=upload-lookup 5=chunk-scan 6=direct-slot 7=readonly-slot 8=clip-slot; each subphase count is per invocation, wall overlaps outer phases and includes timer overhead");
+            LOG_INFO(Render_Vulkan,"PARALLEL-PROOF-PHASE-LEGEND 0=buffer-write-group 1=sampler-descriptor 2=sampled-view-descriptor 3=push-snapshot 4=upload-lookup 5=chunk-scan 6=direct-slot 7=readonly-slot 8=clip-slot; each subphase count is per invocation (including early clip probes), wall overlaps outer phases and includes timer overhead");
             for(u32 i=0;i<sidecar->proof_phases.size();++i) {const auto& t=sidecar->proof_phases[i];
                 LOG_INFO(Render_Vulkan,"PARALLEL-PROOF-PHASE phase={} samples={} wall_ns={} wall_max_ns={}",i,t.count,t.wall_ns,t.wall_max);
             }
             sidecar->proof_phases={};
         }
+        const auto admission=sidecar->coordinator->TakeAdmissionDiag();
+        const auto report_rejections=[&](const char* kind,const auto& v) {
+            LOG_INFO(Render_Vulkan,"PARALLEL-ADMISSION-REJECT kind={} failed={} zero_epoch={} epoch_mismatch={} node_cap={} validation={} invalid={} overflow={} charge={} budget_count={} budget_bytes={}",kind,v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8],v[9]);
+        };
+        report_rejections("small",admission.small_rejected);report_rejections("large",admission.large_rejected);report_rejections("prefix",admission.prefix_rejected);
+        LOG_INFO(Render_Vulkan,"PARALLEL-ADMISSION small_attempts={} small_accepted={} small_submit_failed={} small_exceptions={} large_attempts={} large_accepted={} large_submit_failed={} large_exceptions={} prefix_attempts={} prefix_accepted={} prefix_exceptions={} partial_drain={} partial_large={}",admission.small_attempts,admission.small_accepted,admission.small_submit_failed,sidecar->small_admission_exceptions,admission.large_attempts,admission.large_accepted,admission.large_submit_failed,sidecar->large_admission_exceptions,admission.prefix_attempts,admission.prefix_accepted,admission.prefix_exceptions,admission.partial_drain,admission.partial_large);
+        const auto& budget=admission.budget;
+        LOG_INFO(Render_Vulkan,"PARALLEL-BUDGET current_count={} current_bytes={} max_count={} max_bytes={} interval_peak_count={} interval_peak_bytes={}",budget.count,budget.bytes,budget.max_count,budget.max_bytes,budget.peak_count,budget.peak_bytes);
+        const auto& rotation=sidecar->rotation_diag;const auto& sizes=sidecar->pass_size_hist;
+        LOG_INFO(Render_Vulkan,"PARALLEL-ROTATION attempts={} success={} invalid={} preflight={} acquire={} command={} prefix={} exception={} pass_sizes_0_1_2_3_4_5_6_7_8plus={},{},{},{},{},{},{},{},{}",rotation.attempts,rotation.success,rotation.invalid,rotation.preflight,rotation.acquire,rotation.command,rotation.prefix,rotation.exception,sizes[0],sizes[1],sizes[2],sizes[3],sizes[4],sizes[5],sizes[6],sizes[7],sizes[8]);
+        sidecar->rotation_diag={};sidecar->pass_size_hist={};sidecar->small_admission_exceptions=sidecar->large_admission_exceptions=0;
         const auto workers=sidecar->coordinator->TakeStats();
         if(sidecar->coordinator->TransferEnabled()) {const auto transfer=sidecar->coordinator->TakeTransferStats();
             LOG_INFO(Render_Vulkan,"PARALLEL-TRANSFER-PASSES attempts={} success={} fallback={}",transfer.success+transfer.fallback,transfer.success,transfer.fallback);}
         const auto groups=sidecar->coordinator->TakeGroupStats();
+        LOG_INFO(Render_Vulkan,"PARALLEL-SERIAL-SPLIT attempts={} success={} first_draws={}",sidecar->serial_split_attempts,sidecar->serial_split_success,sidecar->serial_split_first_draws);
+        sidecar->serial_split_attempts=sidecar->serial_split_success=sidecar->serial_split_first_draws=0;
         if(ParallelGateDiagEnabled()) for(unsigned reason=0;reason<3;++reason) {
             const auto& p=groups.passes[reason];const auto& d=groups.draws[reason];
             LOG_INFO(Render_Vulkan,"PARALLEL-BATCH-GROUP reason={} passes1to8={},{},{},{},{},{},{},{} draws1to8plus={},{},{},{},{},{},{},{} lead_samples={} lead_ns={} lead_max_ns={}",reason,p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],d[1],d[2],d[3],d[4],d[5],d[6],d[7],d[8],groups.lead_samples,groups.lead_ns,groups.lead_max_ns);

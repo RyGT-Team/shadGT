@@ -19,6 +19,12 @@ namespace Native::Parallel {
 // they do not touch the renderer, registry, guest memory, or scheduler.
 class PassCoordinator {
 public:
+    enum class RejectReason : std::size_t { Failed, ZeroEpoch, EpochMismatch, NodeCap, Validation, Invalid, Overflow, Charge, BudgetCount, BudgetBytes, Count };
+    struct AdmissionDiag {
+        u64 small_attempts{},small_accepted{},small_submit_failed{},prefix_attempts{},prefix_accepted{},prefix_exceptions{},large_attempts{},large_accepted{},large_submit_failed{},partial_drain{},partial_large{};
+        std::array<u64,static_cast<std::size_t>(RejectReason::Count)> small_rejected{},prefix_rejected{},large_rejected{};
+        PassBudget::Snapshot budget{};
+    };
     using DrawPool=CompletedDrawVectorPool<Draw>;
     struct Job {
         Pass pass;
@@ -58,17 +64,20 @@ private:
     u64 pending_epoch_{};
     u64 small_groups_submitted_{},small_groups_synchronous_{},small_passes_{},small_submitted_draws_{};
     u64 transfer_success_{},transfer_fallback_{};
+    AdmissionDiag admission_diag_{};
     JobPtr Record(const JobPtr& job);
     std::function<void()> MakeRelease(const JobPtr& job);
     bool SubmitGroup(const GroupPtr& group);
     void CloseSmall(unsigned reason) noexcept;
     bool ResolveGroup(const GroupPtr& group, bool record_missing);
+    RejectReason PrefixStateRejection(u64 epoch,Rhi::CommandList* list,bool has_resources) const noexcept;
     static void DropGroupJob(const GroupPtr& group,const JobPtr& job) noexcept;
 public:
     PassCoordinator(Rhi::Device& device,const Vulkan::Instance& instance,Rhi::Fence& timeline,
                     std::size_t worker_count,std::size_t count_cap,std::size_t byte_cap,std::size_t node_cap);
     ~PassCoordinator();
     // Caller closes prefix and owns its list until Drain transfers it.
+    bool PrefixPreflight(u64 epoch,Rhi::CommandList* list,const std::shared_ptr<const void>& resources,std::size_t total_owned_bytes);
     bool Prefix(u64 epoch,Rhi::CommandList* list,std::shared_ptr<const void> resources,std::size_t total_owned_bytes);
     bool TryPass(u64 epoch,const Pass& pass,std::size_t total_owned_bytes);
     bool TryPassTransfer(u64 epoch,Pass& pass,std::size_t total_owned_bytes);
@@ -112,6 +121,7 @@ public:
     }
     struct WorkerStats {u64 jobs,wall_ns,cpu_100ns,cpu_samples,peak,recorded_passes,recorded_draws,small_groups_submitted,small_groups_synchronous,small_passes,small_submitted_draws;};
     struct TransferStats {u64 success,fallback;};
+    AdmissionDiag TakeAdmissionDiag() noexcept {auto result=admission_diag_;admission_diag_={};result.budget=budget_.TakeSnapshot();return result;}
     TransferStats TakeTransferStats() noexcept {return {std::exchange(transfer_success_,0),std::exchange(transfer_fallback_,0)};}
     bool TransferEnabled() const noexcept {return bool(draw_pool_);}
     WorkerStats TakeStats() noexcept {return {worker_jobs_.exchange(0),worker_wall_ns_.exchange(0),worker_cpu_100ns_.exchange(0),worker_cpu_samples_.exchange(0),worker_peak_.exchange(worker_active_.load()),worker_recorded_passes_.exchange(0),worker_recorded_draws_.exchange(0),std::exchange(small_groups_submitted_,0),std::exchange(small_groups_synchronous_,0),std::exchange(small_passes_,0),std::exchange(small_submitted_draws_,0)};}

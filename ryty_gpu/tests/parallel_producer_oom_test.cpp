@@ -10,15 +10,15 @@
 #include <array>
 #include <optional>
 #include <cstdio>
-using u32=uint32_t;using std::size_t;
+using u8=uint8_t;using u32=uint32_t;using u64=uint64_t;using std::size_t;
+namespace Shader {enum class BufferType { Other, DirectTable };struct Buffer {BufferType buffer_type{};};struct Info {u64 identity{};std::vector<Buffer> buffers;};}
 static bool fail_new=false;void* operator new(size_t n){if(fail_new){fail_new=false;throw std::bad_alloc();}if(auto p=malloc(n))return p;throw std::bad_alloc();}void operator delete(void*p) noexcept{free(p);}void operator delete(void*p,size_t) noexcept{free(p);}
 namespace vk{enum class DescriptorType{eUniformBuffer,eStorageBuffer,eSampledImage,eSampler};struct DescriptorBufferInfo{int x;};struct DescriptorImageInfo{int x;};struct WriteDescriptorSet{DescriptorType descriptorType{};u32 descriptorCount{};const void*pNext{},*pTexelBufferView{};const DescriptorBufferInfo*pBufferInfo{};const DescriptorImageInfo*pImageInfo{};};}
 struct DescriptorSnapshot{template<class T>static bool Valid(const T*p,size_t n,std::span<const T>x){return n&&p==x.data()&&n<=x.size();}static bool BufferSliceValid(const vk::DescriptorBufferInfo*p,size_t n,std::span<const vk::DescriptorBufferInfo>x){return Valid(p,n,x);}static bool ImageSliceValid(const vk::DescriptorImageInfo*p,size_t n,std::span<const vk::DescriptorImageInfo>x){return Valid(p,n,x);}static std::optional<DescriptorSnapshot> Make(auto,auto,auto,size_t){return DescriptorSnapshot{};}};
 struct Bind{u32 binding;const void*pNext;};struct Vertex{std::vector<int> buffers,offsets,sizes,strides;std::vector<Bind> input_bindings,attributes;};
-struct Proof{const void*prepared_identity{},*pipeline_identity{},*writes_data{},*buffers_data{},*images_data{},*vertex_identity{},*vertex_buffers_data{},*push_data{};size_t writes_size{},buffers_size{},images_size{},vertex_buffers_size{},push_size{},push_buffer_first{},push_buffer_count{};int pipeline_layout{};bool descriptor_structure{},vertex_shape{},vertex_bindings{},vertex_pnext{};u32 push_index{};std::shared_ptr<void> push_snapshot;};
-struct B{std::vector<vk::WriteDescriptorSet>writes;std::vector<vk::DescriptorBufferInfo>buffers;std::vector<vk::DescriptorImageInfo>images;std::array<std::vector<vk::WriteDescriptorSet>,1>grouped_writes;};struct P{Proof cpu_proof;B bindings;bool has_vertices{};std::unique_ptr<Vertex>vertex_index;};struct Pipeline{int GetLayout()const{return 4;}u32 PushSet()const{return 0;}};bool ParallelRecordingRequested(){return true;}
-void run(P*p,Pipeline&pipeline){if(ParallelRecordingRequested())try{
-
+struct Proof{struct StageSchema{u64 identity{};size_t count{},table_local{SIZE_MAX},table_upload{SIZE_MAX};};std::array<StageSchema,5> stages{};const void*prepared_identity{},*pipeline_identity{},*writes_data{},*buffers_data{},*images_data{},*vertex_identity{},*vertex_buffers_data{},*push_data{};size_t writes_size{},buffers_size{},images_size{},vertex_buffers_size{},push_size{},push_buffer_first{},push_buffer_count{};int pipeline_layout{};bool descriptor_structure{},vertex_shape{},vertex_bindings{},vertex_pnext{};u32 push_index{};std::shared_ptr<void> push_snapshot;};
+struct B{std::vector<vk::WriteDescriptorSet>writes;std::vector<vk::DescriptorBufferInfo>buffers;std::vector<vk::DescriptorImageInfo>images;std::array<std::vector<vk::WriteDescriptorSet>,1>grouped_writes;};struct PreparedDraw{struct DescriptorAction{size_t buffer_first{},stage_local{};u32 stage_index{~u32{0}},upload_size{};u8 upload_match{2};bool is_buffer{};};struct Upload{u32 info{},size{};};Proof cpu_proof;B bindings;std::vector<DescriptorAction> descriptor_actions;std::vector<Upload> uploads;bool has_vertices{};std::unique_ptr<Vertex>vertex_index;};using P=PreparedDraw;struct Pipeline{int GetLayout()const{return 4;}u32 PushSet()const{return 0;}};bool ParallelRecordingRequested(){return true;}
+void run(P*p,Pipeline&pipeline){std::array<const Shader::Info*,5> stages{};if(ParallelRecordingRequested())try{
         auto* candidate=&p->cpu_proof;candidate->prepared_identity=p;candidate->pipeline_identity=&pipeline;
         candidate->pipeline_layout=pipeline.GetLayout();
         const auto& b=p->bindings;candidate->writes_data=b.writes.data();candidate->writes_size=b.writes.size();
@@ -26,12 +26,58 @@ void run(P*p,Pipeline&pipeline){if(ParallelRecordingRequested())try{
         const auto buffers=std::span<const vk::DescriptorBufferInfo>{b.buffers.data(),b.buffers.size()};
         const auto images=std::span<const vk::DescriptorImageInfo>{b.images.data(),b.images.size()};
         candidate->descriptor_structure=true;
+        size_t stage_base=0;
+        for(size_t si=0;si<candidate->stages.size();++si) {
+            auto& schema=candidate->stages[si];schema={};schema.table_upload=SIZE_MAX;
+            if(si>=stages.size() || !stages[si])continue;
+            const auto& stage=*stages[si];schema.identity=stage.identity;schema.count=stage.buffers.size();
+            size_t table=SIZE_MAX;
+            for(size_t j=0;j<schema.count;++j)if(stage.buffers[j].buffer_type==Shader::BufferType::DirectTable) {
+                if(table!=SIZE_MAX){table=SIZE_MAX-1;break;}table=j;
+            }
+            if(table<schema.count && stage_base<=SIZE_MAX-table) {
+                schema.table_local=table;
+                const auto global=stage_base+table;
+                for(size_t j=0;j<p->uploads.size();++j)if(p->uploads[j].info==global) {
+                    if(schema.table_upload!=SIZE_MAX){schema.table_upload=SIZE_MAX-1;break;}
+                    schema.table_upload=j;
+                }
+            }
+            if(schema.count>SIZE_MAX-stage_base){candidate->descriptor_structure=false;break;}
+            stage_base+=schema.count;
+        }
+        p->descriptor_actions.clear();
+        const bool build_actions=candidate->descriptor_structure && b.writes.size()<=128;
+        if(build_actions)p->descriptor_actions.reserve(b.writes.size());
         for(const auto& w:b.writes) {
             const bool buf=w.descriptorType==vk::DescriptorType::eUniformBuffer || w.descriptorType==vk::DescriptorType::eStorageBuffer;
             const bool img=w.descriptorType==vk::DescriptorType::eSampledImage || w.descriptorType==vk::DescriptorType::eSampler;
             if(w.pNext || w.pTexelBufferView || (buf ? (w.pImageInfo || !DescriptorSnapshot::BufferSliceValid(w.pBufferInfo,w.descriptorCount,buffers)) :
                 (!img || w.pBufferInfo || !DescriptorSnapshot::ImageSliceValid(w.pImageInfo,w.descriptorCount,images)))) {candidate->descriptor_structure=false;break;}
+            if(build_actions) {
+                PreparedDraw::DescriptorAction action{};action.is_buffer=buf;
+                if(buf) {
+                    action.buffer_first=static_cast<std::size_t>(w.pBufferInfo-b.buffers.data());
+                    if(w.descriptorCount==1) {
+                        size_t base=0;
+                        for(size_t si=0;si<candidate->stages.size();++si) {
+                            const auto n=candidate->stages[si].count;
+                            if(action.buffer_first>=base && action.buffer_first-base<n) {
+                                action.stage_index=static_cast<u32>(si);action.stage_local=action.buffer_first-base;break;
+                            }
+                            base+=n;
+                        }
+                        action.upload_match=0;
+                        for(const auto& upload:p->uploads) if(upload.info==action.buffer_first) {
+                            if(action.upload_match==1){action.upload_match=2;break;}
+                            action.upload_match=1;action.upload_size=upload.size;
+                        }
+                    }
+                }
+                p->descriptor_actions.push_back(action);
+            }
         }
+        if(!candidate->descriptor_structure)p->descriptor_actions.clear();
         if(p->has_vertices && p->vertex_index) {
             const auto& v=*p->vertex_index;candidate->vertex_identity=&v;candidate->vertex_buffers_data=v.buffers.data();candidate->vertex_buffers_size=v.buffers.size();
             const size_t n=v.buffers.size();candidate->vertex_shape=n && n<=32 && v.input_bindings.size()==n && v.attributes.size()==n && v.offsets.size()==n && v.sizes.size()==n && v.strides.size()==n;
@@ -58,6 +104,7 @@ void run(P*p,Pipeline&pipeline){if(ParallelRecordingRequested())try{
                 candidate->push_snapshot=std::make_shared<DescriptorSnapshot>(std::move(*snap));
             }
         }
-    } catch(const std::bad_alloc&) {p->cpu_proof = {};}
+    } catch(const std::bad_alloc&) {p->cpu_proof = {};p->descriptor_actions.clear();}
+
 }
 int main(){P x;Pipeline pipeline;x.bindings.images.resize(1);vk::WriteDescriptorSet w{};w.descriptorType=vk::DescriptorType::eSampledImage;w.descriptorCount=1;w.pImageInfo=x.bindings.images.data();x.bindings.writes.push_back(w);x.bindings.grouped_writes[0].push_back(w);fail_new=true;run(&x,pipeline);assert(!fail_new&&!x.cpu_proof.prepared_identity&&!x.cpu_proof.push_snapshot&&!x.cpu_proof.descriptor_structure);run(&x,pipeline);assert(x.cpu_proof.prepared_identity==&x && x.cpu_proof.descriptor_structure && x.cpu_proof.push_snapshot);puts("PASS exact producer block OOM resets proof and later rebuild succeeds");}

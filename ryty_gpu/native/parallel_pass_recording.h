@@ -12,6 +12,8 @@ namespace Native::Parallel {
 // submission-window borrowing; the epoch marker itself does not own GPU handles.
 // Production extended admission currently excludes attachment clears.
 struct Draw {
+    // Avoid clearing unused inline vector storage; named members retain their defaults.
+    Draw() noexcept {}
     vk::Pipeline pipeline{};
     vk::PipelineLayout layout{};
     std::shared_ptr<const void> pipeline_owner;

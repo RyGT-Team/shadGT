@@ -181,3 +181,31 @@ add_test(NAME parallel_snapshot_source_fragments
 add_test(NAME ahead_capture_safety
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/verify_ahead_capture_safety.py"
             "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp")
+add_executable(parallel_region_writes_test parallel_region_writes_test.cpp)
+target_compile_features(parallel_region_writes_test PRIVATE cxx_std_23)
+target_include_directories(parallel_region_writes_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(parallel_region_writes_test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(parallel_region_writes_test PRIVATE -UNDEBUG)
+endif()
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/region-writes-under-test.inc"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_region_writes.py" "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" "${CMAKE_CURRENT_BINARY_DIR}/region-writes-under-test.inc"
+    DEPENDS extract_region_writes.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" VERBATIM)
+target_sources(parallel_region_writes_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/region-writes-under-test.inc")
+add_test(NAME parallel_region_writes COMMAND parallel_region_writes_test)
+add_executable(parallel_region_changed_runs_test parallel_region_changed_runs_test.cpp)
+target_compile_features(parallel_region_changed_runs_test PRIVATE cxx_std_23)
+target_include_directories(parallel_region_changed_runs_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(parallel_region_changed_runs_test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(parallel_region_changed_runs_test PRIVATE -UNDEBUG)
+endif()
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/region-changed-runs-under-test.inc"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_region_changed_runs.py" "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" "${CMAKE_CURRENT_BINARY_DIR}/region-changed-runs-under-test.inc"
+    DEPENDS extract_region_changed_runs.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" VERBATIM)
+target_sources(parallel_region_changed_runs_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/region-changed-runs-under-test.inc")
+add_test(NAME parallel_region_changed_runs COMMAND parallel_region_changed_runs_test)

@@ -2067,13 +2067,21 @@ void NativeRenderer::SortRegionWrites() {
         writes.swap(pending_region_writes);
     }
     for (const auto& [begin, end] : writes) {
-        for (auto& [base, region] : regions) {
+        auto region_it = regions.lower_bound(begin);
+        if (region_it != regions.begin() && std::prev(region_it)->second.end > begin) {
+            --region_it;
+        }
+        for (; region_it != regions.end() && region_it->second.begin < end; ++region_it) {
+            Region& region = region_it->second;
             if (region.begin < end && region.end > begin) {
                 for (VAddr page = std::max(begin, region.begin); page < std::min(end, region.end);
                      page += 4096) {
+                    if (region.dirty_sorted && !region.dirty_pages.empty()) {
+                        if (page == region.dirty_pages.back()) continue;
+                        if (page < region.dirty_pages.back()) region.dirty_sorted = false;
+                    }
                     region.dirty_pages.push_back(page);
                 }
-                region.dirty_sorted = false;
             }
         }
         // FIX-173: copies of pages no region holds are not needed.
@@ -2525,14 +2533,10 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         constexpr u64 Piece = 16;
         u64 run_begin = 0, run_end = 0, changed = 0;
         bool in_run = false;
-        for (u64 at = 0; at < page_bytes; at += Piece) {
-            const u64 n = std::min(Piece, page_bytes - at);
-            if (std::memcmp(now.data() + at, before->data() + at, n) == 0) {
-                continue;
-            }
+        const auto changed_piece = [&](u64 at, u64 n) {
             if (in_run && at - run_end < 64) {
                 run_end = at + n;
-                continue;
+                return;
             }
             if (in_run) {
                 copy_snapshot(page + run_begin, now.data() + run_begin, run_end - run_begin);
@@ -2541,6 +2545,16 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
             in_run = true;
             run_begin = at;
             run_end = at + n;
+        };
+        u64 at = 0;
+        for (; page_bytes - at >= Piece; at += Piece) {
+            if (std::memcmp(now.data() + at, before->data() + at, Piece) != 0) {
+                changed_piece(at, Piece);
+            }
+        }
+        if (at < page_bytes &&
+            std::memcmp(now.data() + at, before->data() + at, page_bytes - at) != 0) {
+            changed_piece(at, page_bytes - at);
         }
         if (in_run) {
             copy_snapshot(page + run_begin, now.data() + run_begin, run_end - run_begin);

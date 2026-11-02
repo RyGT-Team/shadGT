@@ -40,6 +40,25 @@ target_sources(tiling_specialization_test PRIVATE "${SHADGT_ROOT}/src/video_core
 target_compile_definitions(tiling_specialization_test PRIVATE FMT_HEADER_ONLY)
 
 add_test(NAME ghost_smoothing_disabled COMMAND ghost_smoothing_test disabled)
+add_executable(parallel_freshness_certificate_test parallel_freshness_certificate_test.cpp)
+target_compile_features(parallel_freshness_certificate_test PRIVATE cxx_std_23)
+target_include_directories(parallel_freshness_certificate_test PRIVATE "${SHADGT_ROOT}/src" "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(parallel_freshness_certificate_test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(parallel_freshness_certificate_test PRIVATE -UNDEBUG)
+endif()
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/freshness-log-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/freshness-admission-under-test.inc"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_freshness_certificate.py"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.h"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
+        "${CMAKE_CURRENT_BINARY_DIR}"
+    DEPENDS extract_freshness_certificate.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.h"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
+    VERBATIM)
+target_sources(parallel_freshness_certificate_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/freshness-log-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/freshness-admission-under-test.inc")
+add_test(NAME parallel_freshness_certificate COMMAND parallel_freshness_certificate_test)
 add_executable(parallel_vertex_owner_hint_test parallel_vertex_owner_hint_test.cpp)
 target_compile_features(parallel_vertex_owner_hint_test PRIVATE cxx_std_23)
 target_include_directories(parallel_vertex_owner_hint_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")

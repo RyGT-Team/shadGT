@@ -4935,9 +4935,15 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     }
     // OPT-010: the bindings the job thread worked out ahead, when they hold.
     bool from_prepared = false;
+    bool buffer_freshness_certified = false;
+    u64 buffer_freshness_seq = 0;
     if (prepared) {
         PhaseClock clock{stats.phase_ns[2]};
         from_prepared = CommitPrepared(*prepared, *pipeline, regs, trusted);
+        if (from_prepared) {
+            buffer_freshness_seq = buffer_log.Seq();
+            buffer_freshness_certified = true;
+        }
     }
     bool prepared_vertices_valid=false;
     if(from_prepared && prepared->has_vertices && !prepared->bindings.failed) {
@@ -4947,7 +4953,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         // range invalidates both prepared bindings and vertices, not only vi.
         if(prepared->unmap_gen!=unmap_generation.load(std::memory_order_acquire) ||
            !buffer_log.Untouched(prepared->buffer_seq,prepared->buffer_ranges)) {
-            from_prepared=false;prepared_vertices_valid=false;
+            from_prepared=false;prepared_vertices_valid=false;buffer_freshness_certified=false;
+        } else {
+            buffer_freshness_seq=buffer_log.Seq();
+            buffer_freshness_certified=true;
         }
     }
     DrawBindings& b = from_prepared ? prepared->bindings : bindings;
@@ -5221,7 +5230,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             b.writes_buffers || !b.gpu_writes.empty() || !b.stored.empty();
         // UI/stream preparation may retire mirrors after vertex commit. Do not
         // inspect prepared owner pointers if any prepared range changed since.
+        // The recorder owns log writes. Reuse only a successful check from this
+        // Draw while its sequence is unchanged; otherwise scan the original ranges.
         if(!fast_reject && (prepared->unmap_gen!=unmap_generation.load(std::memory_order_acquire) ||
+           !(from_prepared && buffer_freshness_certified && buffer_log.Seq()==buffer_freshness_seq) &&
            !buffer_log.Untouched(prepared->buffer_seq,prepared->buffer_ranges))) fast_reject=true;
         if(fast_reject) {
             ++parallel->fast_rejected;if(no_pass_room)++parallel->no_pass_room_rejected;if(extended && any_clear)++parallel->extended_clear_rejected;if(serial_scope_bypass)++parallel->serial_scope_bypassed;

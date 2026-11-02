@@ -9,12 +9,12 @@
 #include <array>
 #include <ranges>
 #include <cstdio>
-using u8=uint8_t;using u32=uint32_t;using u64=uint64_t;
+using u8=uint8_t;using u16=uint16_t;using u32=uint32_t;using u64=uint64_t;
 static bool fail_alloc=false;void* operator new(size_t n){if(fail_alloc){fail_alloc=false;throw std::bad_alloc();}if(auto*p=malloc(n))return p;throw std::bad_alloc();}void operator delete(void*p) noexcept{free(p);}void operator delete(void*p,size_t) noexcept{free(p);}
 struct Upload{u32 info{},size{};};struct Bindings{std::vector<vk::WriteDescriptorSet>writes;std::vector<vk::DescriptorBufferInfo>buffers;std::vector<vk::DescriptorImageInfo>images;};
-namespace Shader {enum class BufferType { Other, DirectTable }; struct Buffer { BufferType buffer_type{}; bool is_written{}; bool IsSpecial()const{return false;} struct Sharp {u64 base_address{};u64 GetSize()const{return 0;}}; Sharp GetSharp(const auto&)const{return {};} }; struct Info { u64 identity{}; std::vector<Buffer> buffers; };}
-struct PreparedDraw{struct DescriptorAction{std::size_t buffer_first{},stage_local{};u8 range_hint{255},region_hint{255};u32 stage_index{~u32{0}},upload_size{};u8 upload_match{2};bool is_buffer{};};struct Proof{struct StageSchema{u64 identity{};size_t count{},table_local{SIZE_MAX},table_upload{SIZE_MAX};};std::array<StageSchema,5> stages{};bool descriptor_structure{};}cpu_proof;Bindings bindings;std::vector<DescriptorAction>descriptor_actions;std::vector<Upload>uploads;std::vector<std::pair<u64,u64>>buffer_ranges;struct Region{u64 address,size;};std::vector<Region>regions;};
-void produce(PreparedDraw* p){try{std::array<const Shader::Info*,5> stages{};auto*candidate=&p->cpu_proof;const auto& b=p->bindings;const auto buffers=std::span<const vk::DescriptorBufferInfo>{b.buffers.data(),b.buffers.size()};const auto images=std::span<const vk::DescriptorImageInfo>{b.images.data(),b.images.size()};candidate->descriptor_structure=true;
+namespace Shader {constexpr u32 MaxStageTypes=6; enum class BufferType { Other, DirectTable }; struct Buffer { BufferType buffer_type{}; bool is_written{}; bool IsSpecial()const{return false;} struct Sharp {u64 base_address{};u64 GetSize()const{return 0;}}; Sharp GetSharp(const auto&)const{return {};} }; struct Info { u64 identity{}; std::vector<Buffer> buffers; };}
+struct PreparedDraw{struct DescriptorAction{u32 upload_size{};u16 buffer_first{},stage_local{};u8 range_hint{255},region_hint{255};u8 stage_index{255},upload_match{2};bool is_buffer{};};struct Proof{struct StageSchema{u64 identity{};size_t count{},table_local{SIZE_MAX},table_upload{SIZE_MAX};};std::array<StageSchema,5> stages{};bool descriptor_structure{};}cpu_proof;Bindings bindings;std::vector<DescriptorAction>descriptor_actions;std::vector<Upload>uploads;std::vector<std::pair<u64,u64>>buffer_ranges;struct Region{u64 address,size;};std::vector<Region>regions;};
+void produce(PreparedDraw* p,std::array<const Shader::Info*,5> stages={}){try{auto*candidate=&p->cpu_proof;const auto& b=p->bindings;const auto buffers=std::span<const vk::DescriptorBufferInfo>{b.buffers.data(),b.buffers.size()};const auto images=std::span<const vk::DescriptorImageInfo>{b.images.data(),b.images.size()};candidate->descriptor_structure=true;
         size_t stage_base=0;
         for(size_t si=0;si<candidate->stages.size();++si) {
             auto& schema=candidate->stages[si];schema={};schema.table_upload=SIZE_MAX;
@@ -36,7 +36,9 @@ void produce(PreparedDraw* p){try{std::array<const Shader::Info*,5> stages{};aut
             stage_base+=schema.count;
         }
         p->descriptor_actions.clear();
-        const bool build_actions=candidate->descriptor_structure && b.writes.size()<=128;
+        static_assert(Shader::MaxStageTypes-1<255);
+        const bool build_actions=candidate->descriptor_structure && b.writes.size()<=128 &&
+            b.buffers.size()<=UINT16_MAX;
         if(build_actions)p->descriptor_actions.reserve(b.writes.size());
         for(const auto& w:b.writes) {
             const bool buf=w.descriptorType==vk::DescriptorType::eUniformBuffer || w.descriptorType==vk::DescriptorType::eStorageBuffer;
@@ -46,13 +48,13 @@ void produce(PreparedDraw* p){try{std::array<const Shader::Info*,5> stages{};aut
             if(build_actions) {
                 PreparedDraw::DescriptorAction action{};action.is_buffer=buf;
                 if(buf) {
-                    action.buffer_first=static_cast<std::size_t>(w.pBufferInfo-b.buffers.data());
+                    action.buffer_first=static_cast<u16>(w.pBufferInfo-b.buffers.data());
                     if(w.descriptorCount==1) {
                         size_t base=0;
                         for(size_t si=0;si<candidate->stages.size();++si) {
                             const auto n=candidate->stages[si].count;
                             if(action.buffer_first>=base && action.buffer_first-base<n) {
-                                action.stage_index=static_cast<u32>(si);action.stage_local=action.buffer_first-base;break;
+                                action.stage_index=static_cast<u8>(si);action.stage_local=static_cast<u16>(action.buffer_first-base);break;
                             }
                             base+=n;
                         }
@@ -101,4 +103,4 @@ static bool oracle(const PreparedDraw&p,std::size_t index,u64 range){for(auto&x:
 int main(){PreparedDraw p;p.bindings.buffers.resize(4);for(auto&i:p.bindings.buffers)i.range=12;p.bindings.writes={row(&p.bindings.buffers[0]),row(&p.bindings.buffers[1]),row(&p.bindings.buffers[2],2)};p.uploads={{0,12},{1,8},{1,12},{2,12}};produce(&p);assert(p.cpu_proof.descriptor_structure&&p.descriptor_actions.size()==3);assert(p.descriptor_actions[0].upload_match==1&&p.descriptor_actions[1].upload_match==2&&p.descriptor_actions[2].upload_match==2);for(size_t i=0;i<4;++i){auto&a=p.descriptor_actions[i<2?i:2];for(u64 range:{0ull,8ull,12ull,13ull}){p.bindings.buffers[i].range=range;assert(query(&p,&a,i,&p.bindings.buffers[i])==oracle(p,i,range));assert(query(&p,nullptr,i,&p.bindings.buffers[i])==oracle(p,i,range));}}
  p.bindings.writes={row(&p.bindings.buffers[3])};produce(&p);assert(p.descriptor_actions[0].upload_match==0&&!query(&p,&p.descriptor_actions[0],3,&p.bindings.buffers[3]));auto cap=p.descriptor_actions.capacity();p.descriptor_actions.clear();assert(p.descriptor_actions.capacity()==cap);
  p.bindings.writes.assign(128,row(&p.bindings.buffers[0]));produce(&p);assert(p.cpu_proof.descriptor_structure&&p.descriptor_actions.size()==128);p.bindings.writes.push_back(row(&p.bindings.buffers[0]));produce(&p);assert(p.cpu_proof.descriptor_structure&&p.descriptor_actions.empty());
- p.bindings.writes={row(nullptr)};produce(&p);assert(!p.cpu_proof.descriptor_structure&&p.descriptor_actions.empty());PreparedDraw oom;oom.bindings.buffers.resize(1);oom.bindings.writes.assign(128,row(&oom.bindings.buffers[0]));fail_alloc=true;produce(&oom);assert(!fail_alloc&&!oom.cpu_proof.descriptor_structure&&oom.descriptor_actions.empty());puts("PASS exact producer/upload lookup: no upload, unique, duplicates, multi, range mutation, stale fallback, 128/129, malformed, reuse, OOM");}
+ p.bindings.writes={row(nullptr)};produce(&p);assert(!p.cpu_proof.descriptor_structure&&p.descriptor_actions.empty());PreparedDraw oom;oom.bindings.buffers.resize(1);oom.bindings.writes.assign(128,row(&oom.bindings.buffers[0]));fail_alloc=true;produce(&oom);assert(!fail_alloc&&!oom.cpu_proof.descriptor_structure&&oom.descriptor_actions.empty());puts("PASS exact producer/upload lookup: no upload, unique, duplicates, multi, range mutation, stale fallback, 128/129, malformed, reuse, OOM");return 0;}

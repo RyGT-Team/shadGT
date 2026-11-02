@@ -541,15 +541,15 @@ private:
         } cpu_proof;
         // Bounded producer action plan; capacity is retained when the draw is recycled.
         struct DescriptorAction {
-            std::size_t buffer_first{};
-            std::size_t stage_local{};
-            u8 range_hint{255}, region_hint{255};
-            u32 stage_index{~u32{0}};
             u32 upload_size{};
+            u16 buffer_first{}, stage_local{};
+            u8 range_hint{255}, region_hint{255};
+            u8 stage_index{255};
             // 0: no matching upload, 1: unique matching upload, 2: use the original scan.
             u8 upload_match{2};
             bool is_buffer{};
         };
+        static_assert(sizeof(DescriptorAction)==16);
         std::vector<DescriptorAction> descriptor_actions;
 
         std::array<u64, Shader::MaxStageTypes> stage_hashes{};

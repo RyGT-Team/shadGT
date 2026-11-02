@@ -36,6 +36,28 @@ foreach(name IN ITEMS parallel_initial_mode parallel_readonly_hint parallel_desc
     add_test(NAME ${name} COMMAND ${name}_test)
 endforeach()
 
+foreach(name IN ITEMS parallel_sampled_proof_compact parallel_descriptor_action_layout)
+    add_executable(${name}_test ${name}_test.cpp)
+    target_compile_features(${name}_test PRIVATE cxx_std_23)
+    target_include_directories(${name}_test PRIVATE
+        "${SHADGT_ROOT}" "${SHADGT_ROOT}/src" "${CMAKE_CURRENT_BINARY_DIR}"
+        "${SHADGT_ROOT}/externals/vulkan-headers/include")
+    if(MSVC)
+        target_compile_options(${name}_test PRIVATE /EHsc /UNDEBUG)
+    else()
+        target_compile_options(${name}_test PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME ${name} COMMAND ${name}_test)
+endforeach()
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/descriptor-action-under-test.inc"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_descriptor_action.py"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.h"
+        "${CMAKE_CURRENT_BINARY_DIR}/descriptor-action-under-test.inc"
+    DEPENDS extract_descriptor_action.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.h"
+    VERBATIM)
+target_sources(parallel_descriptor_action_layout_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/descriptor-action-under-test.inc")
+
 target_sources(tiling_specialization_test PRIVATE "${SHADGT_ROOT}/src/video_core/amdgpu/tiling.cpp")
 target_compile_definitions(tiling_specialization_test PRIVATE FMT_HEADER_ONLY)
 

@@ -5,12 +5,14 @@
 #include <vector>
 namespace Native::Parallel {
 template<class Handle> struct SampledViewProof {
-    std::size_t slot{},sampled_index{}; Handle handle{}; const void* entry{}; std::uint64_t owner_epoch{}; bool cube{};
+    Handle handle{}; const void* entry{}; std::uint64_t owner_epoch{};
+    std::uint32_t sampled_index{}; std::uint8_t slot{}; bool cube{};
 };
 template<class Handle> bool AddSampledViewProof(std::vector<SampledViewProof<Handle>>& out,
     std::size_t slot,std::size_t sampled_index,Handle handle,const void* entry,std::uint64_t owner_epoch,bool cube) noexcept {
     if(slot>=128 || !handle || !entry)return false;
-    try {if(out.size()<=slot)out.resize(slot+1);out[slot]={slot,sampled_index,handle,entry,owner_epoch,cube};return true;} catch(...) {return false;}
+    if(sampled_index>UINT32_MAX) {if(slot<out.size())out[slot]={};return false;}
+    try {if(out.size()<=slot)out.resize(slot+1);out[slot]={handle,entry,owner_epoch,static_cast<std::uint32_t>(sampled_index),static_cast<std::uint8_t>(slot),cube};return true;} catch(...) {return false;}
 }
 template<class Handle,class Entries> bool MatchSampledViewProof(const std::vector<SampledViewProof<Handle>>& proofs,
     std::size_t slot,Handle handle,std::uint64_t owner_epoch,const Entries& entries) noexcept {

@@ -6560,7 +6560,9 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
             stage_base+=schema.count;
         }
         p->descriptor_actions.clear();
-        const bool build_actions=candidate->descriptor_structure && b.writes.size()<=128;
+        static_assert(Shader::MaxStageTypes-1<255);
+        const bool build_actions=candidate->descriptor_structure && b.writes.size()<=128 &&
+            b.buffers.size()<=UINT16_MAX;
         if(build_actions)p->descriptor_actions.reserve(b.writes.size());
         for(const auto& w:b.writes) {
             const bool buf=w.descriptorType==vk::DescriptorType::eUniformBuffer || w.descriptorType==vk::DescriptorType::eStorageBuffer;
@@ -6570,13 +6572,13 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
             if(build_actions) {
                 PreparedDraw::DescriptorAction action{};action.is_buffer=buf;
                 if(buf) {
-                    action.buffer_first=static_cast<std::size_t>(w.pBufferInfo-b.buffers.data());
+                    action.buffer_first=static_cast<u16>(w.pBufferInfo-b.buffers.data());
                     if(w.descriptorCount==1) {
                         size_t base=0;
                         for(size_t si=0;si<candidate->stages.size();++si) {
                             const auto n=candidate->stages[si].count;
                             if(action.buffer_first>=base && action.buffer_first-base<n) {
-                                action.stage_index=static_cast<u32>(si);action.stage_local=action.buffer_first-base;break;
+                                action.stage_index=static_cast<u8>(si);action.stage_local=static_cast<u16>(action.buffer_first-base);break;
                             }
                             base+=n;
                         }

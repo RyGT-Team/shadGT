@@ -5285,6 +5285,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             const Region* vertex_region_hint=nullptr;
             const Mirror* vertex_mirror_hint=nullptr;
             vk::Buffer vertex_handle_hint{};
+            // Direct vertex ranges are appended in binding order by PrepareVertices.
+            // This is only a scan hint; every candidate still gets a live proof.
+            std::size_t vertex_direct_hint=0;
             for(std::size_t i=0;i<vi->buffers.size() && vertex_safe;++i) {
                 const auto handle=vi->buffers[i];const auto offset=vi->offsets[i],size=vi->sizes[i];
                 bool owned=false;
@@ -5304,8 +5307,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 if(!owned && handle && size && ParallelDirectVertexEnabled() && ParallelD2Enabled() &&
                    prepared->in_place.size()<=32) {
                     auto* direct=r.buffer_cache.GetDirectMemory();
-                    if(direct) for(const auto& [address,bytes]:prepared->in_place) {
-                        if(bytes!=size)continue;
+                    auto candidate=vertex_direct_hint;
+                    if(direct) for(std::size_t n=0;n<prepared->in_place.size();++n) {
+                        const auto& [address,bytes]=prepared->in_place[candidate];
+                        const auto next=candidate+1==prepared->in_place.size()?0:candidate+1;
+                        if(bytes!=size){candidate=next;continue;}
                         ++parallel->vertex_direct_attempts;
                         u32 parts=0;bool exact=false;
                         const bool covered=direct->TryForEachPart(address,bytes,
@@ -5313,7 +5319,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                             [&](const VideoCore::Buffer& source,u64 source_offset,u64 part_offset,u64 length) {
                                 ++parts;exact=source.Handle()==handle && source_offset==offset && part_offset==0 && length==bytes;
                             });
-                        if(covered && parts==1 && exact){owned=true;++parallel->vertex_direct_matches;break;}
+                        if(covered && parts==1 && exact){
+                            owned=true;++parallel->vertex_direct_matches;
+                            vertex_direct_hint=next;
+                            break;
+                        }
+                        candidate=next;
                     }
                 }
                 if(!owned){vertex_owner_missing=true;vertex_safe=false;}

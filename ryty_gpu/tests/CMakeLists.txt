@@ -334,20 +334,3 @@ add_custom_command(
 target_sources(mirror_probe_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/direct-try-parts-under-test.inc"
     "${CMAKE_CURRENT_BINARY_DIR}/mirror-resume-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-probe-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-merge-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-prepare-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-priority-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-requeue-under-test.inc")
 add_test(NAME mirror_probe COMMAND mirror_probe_test)
-
-add_executable(prepared_key_bypass_test prepared_key_bypass_test.cpp)
-target_compile_features(prepared_key_bypass_test PRIVATE cxx_std_23)
-target_include_directories(prepared_key_bypass_test PRIVATE "${SHADGT_ROOT}/src" "${SHADGT_ROOT}/externals/vulkan-headers/include" "${SHADGT_ROOT}/externals/xxhash" "${SHADGT_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}")
-if(MSVC)
-    target_compile_options(prepared_key_bypass_test PRIVATE /UNDEBUG)
-else()
-    target_compile_options(prepared_key_bypass_test PRIVATE -UNDEBUG)
-endif()
-add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/prepared-key-guard-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/prepared-key-refresh-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/prepared-key-build-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/prepared-key-layout-under-test.inc"
-    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_prepared_key_bypass.py"
-      "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
-      "${CMAKE_CURRENT_BINARY_DIR}/prepared-key-guard-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/prepared-key-refresh-under-test.inc"
-      "${CMAKE_CURRENT_BINARY_DIR}/prepared-key-build-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/prepared-key-layout-under-test.inc"
-    DEPENDS extract_prepared_key_bypass.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" VERBATIM)
-target_sources(prepared_key_bypass_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/prepared-key-guard-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/prepared-key-refresh-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/prepared-key-build-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/prepared-key-layout-under-test.inc")
-add_test(NAME prepared_key_bypass COMMAND prepared_key_bypass_test)

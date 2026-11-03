@@ -423,7 +423,7 @@ private:
     void BindTextures(const Shader::Info& stage, const AmdGpu::Regs& regs,
                       Shader::Backend::Bindings& binding, DrawBindings& b);
     void PushBindings(const Pipeline& pipeline, vk::PipelineBindPoint bind_point,
-                      DrawBindings& b, bool prepared_buffer_keys_unchanged = false);
+                      DrawBindings& b);
     /// A draw's vertex and index buffers: looked up before its pass starts (a lookup may gather
     /// on the GPU, outside rendering) and bound inside it.
     struct VertexIndexState {

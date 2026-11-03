@@ -275,10 +275,28 @@ else()
     target_compile_options(parallel_pass_closure_test PRIVATE -UNDEBUG)
 endif()
 add_custom_command(
-    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/pass-closure-under-test.inc"
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/pass-closure-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/emit-pass-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/inline-safe-under-test.inc"
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_pass_closure.py"
         "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
         "${CMAKE_CURRENT_BINARY_DIR}/pass-closure-under-test.inc"
-    DEPENDS extract_pass_closure.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" VERBATIM)
-target_sources(parallel_pass_closure_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/pass-closure-under-test.inc")
+        "${SHADGT_ROOT}/ryty_gpu/native/parallel_pass_recording.h" "${CMAKE_CURRENT_BINARY_DIR}/emit-pass-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/inline-safe-under-test.inc"
+    DEPENDS extract_pass_closure.py "${SHADGT_ROOT}/ryty_gpu/native/parallel_pass_recording.h" "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" VERBATIM)
+target_sources(parallel_pass_closure_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/pass-closure-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/emit-pass-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/inline-safe-under-test.inc")
 add_test(NAME parallel_pass_closure COMMAND parallel_pass_closure_test)
+
+add_executable(parallel_inline_continuation_test parallel_inline_continuation_test.cpp)
+target_compile_features(parallel_inline_continuation_test PRIVATE cxx_std_23)
+target_include_directories(parallel_inline_continuation_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(parallel_inline_continuation_test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(parallel_inline_continuation_test PRIVATE -UNDEBUG)
+endif()
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/inline-continuation-under-test.inc"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_inline_continuation.py"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
+        "${CMAKE_CURRENT_BINARY_DIR}/inline-continuation-under-test.inc"
+    DEPENDS extract_inline_continuation.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" VERBATIM)
+target_sources(parallel_inline_continuation_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/inline-continuation-under-test.inc")
+add_test(NAME parallel_inline_continuation COMMAND parallel_inline_continuation_test)

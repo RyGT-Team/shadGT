@@ -242,6 +242,7 @@ private:
 
     Stream& Begin();
     void EndRendering(u32 reason = 0);
+    bool ContinueSmallParallelPass(const RenderState& target, u32 reason, bool safe);
     void BeginRendering(const RenderState& state);
     void GlobalBarrier();
     /// NAT-140: attachment writes before it finish before attachment access after it (a pass

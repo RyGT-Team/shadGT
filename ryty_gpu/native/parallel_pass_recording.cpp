@@ -45,7 +45,8 @@ bool ValidatePass(const Pass& pass) {
     }
     return true;
 }
-bool RecordPass(vk::CommandBuffer cmd,const Vulkan::Instance& instance,const Pass& pass) {
+static bool RecordPassImpl(vk::CommandBuffer cmd,const Vulkan::Instance& instance,const Pass& pass,
+                           Vulkan::DynamicState* inline_dynamic,vk::Pipeline* inline_pipeline) {
     if(!cmd || !ValidatePass(pass)) return false;
     const auto& target=pass.target;
     std::array<vk::RenderingAttachmentInfo,8> colors{};
@@ -62,7 +63,9 @@ bool RecordPass(vk::CommandBuffer cmd,const Vulkan::Instance& instance,const Pas
     const Vulkan::CmdBuf commands{cmd};
     const auto flags=vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eTessellationControl |
         vk::ShaderStageFlagBits::eTessellationEvaluation | vk::ShaderStageFlagBits::eGeometry | vk::ShaderStageFlagBits::eFragment;
-    Vulkan::DynamicState dynamic{}; dynamic.Invalidate();
+    Vulkan::DynamicState local_dynamic{};
+    auto& dynamic=inline_dynamic?*inline_dynamic:local_dynamic;
+    dynamic.Invalidate();
     vk::Pipeline bound_pipeline{};
     EmitWholePass(pass,
         [&](const auto&) {cmd.beginRendering(vk::RenderingInfo{.renderArea{.offset={0,0},.extent={target.width,target.height}},
@@ -94,7 +97,15 @@ bool RecordPass(vk::CommandBuffer cmd,const Vulkan::Instance& instance,const Pas
                 commands.drawIndexed(draw.vertices,draw.instances,0,draw.vertex_offset,draw.first_instance);}
             else commands.draw(draw.vertices,draw.instances,draw.first_vertex,draw.first_instance);
         },
-        [&] {cmd.endRendering();});
+        [&] {if(!inline_dynamic)cmd.endRendering();});
+    if(inline_pipeline)*inline_pipeline=bound_pipeline;
     return true;
+}
+bool RecordPass(vk::CommandBuffer cmd,const Vulkan::Instance& instance,const Pass& pass) {
+    return RecordPassImpl(cmd,instance,pass,nullptr,nullptr);
+}
+bool RecordPassInline(vk::CommandBuffer cmd,const Vulkan::Instance& instance,const Pass& pass,
+                      Vulkan::DynamicState& dynamic,vk::Pipeline& last_pipeline) {
+    return RecordPassImpl(cmd,instance,pass,&dynamic,&last_pipeline);
 }
 }

@@ -75,4 +75,8 @@ void EmitWholePass(const Pass& pass,Begin&& begin,Emit&& emit,End&& end) {
 // This routine neither resolves registry/guest state nor schedules GPU work.
 bool ValidatePass(const Pass& pass);
 bool RecordPass(vk::CommandBuffer cmd,const Vulkan::Instance& instance,const Pass& pass);
+// Validates first, then leaves the rendering scope open and returns the final
+// command-buffer state through the supplied recorder-owned cache.
+bool RecordPassInline(vk::CommandBuffer cmd,const Vulkan::Instance& instance,const Pass& pass,
+                      Vulkan::DynamicState& dynamic,vk::Pipeline& last_pipeline);
 }

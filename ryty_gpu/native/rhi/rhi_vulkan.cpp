@@ -9,6 +9,7 @@
 #include <atomic>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <bit>
 #include <deque>
 #include <functional>
@@ -477,9 +478,13 @@ struct VulkanContext {
     std::function<void()> destroy; // owned objects
 };
 
+static bool GpuTimingRequested(const char* value) noexcept {
+    return value && value[0] == '1' && value[1] == '\0';
+}
+
 class VulkanDevice final : public Device {
 public:
-    explicit VulkanDevice(VulkanContext context);
+    explicit VulkanDevice(VulkanContext context, bool gpu_timing_enabled);
     ~VulkanDevice() override;
 
     const DeviceCaps& Caps() const override {
@@ -544,6 +549,7 @@ public:
     void EndGpuTiming(GpuListTiming* timing, vk::CommandBuffer cmd);
     void PublishGpuTiming(GpuListTiming* timing, vk::Semaphore completion, u64 tick);
     void ReadGpuTimings();
+    const bool gpu_timing_enabled;
     std::array<GpuListTiming, 64> gpu_timings;
     u32 gpu_timing_count = 0, timestamp_bits = 0;
     float timestamp_period = 0;
@@ -628,8 +634,8 @@ VulkanPipeline::~VulkanPipeline() {
     device.Retire([dev = device.device, pipeline = pipeline] { dev.destroyPipeline(pipeline); });
 }
 
-VulkanDevice::VulkanDevice(VulkanContext context)
-    : ctx{std::move(context)}, device{ctx.device}, allocator{ctx.allocator},
+VulkanDevice::VulkanDevice(VulkanContext context, bool timing_enabled)
+    : gpu_timing_enabled{timing_enabled}, ctx{std::move(context)}, device{ctx.device}, allocator{ctx.allocator},
       completed_resources{[] {
           Common::SetCurrentThreadName("shadGT:ResourceCleanup");
           Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
@@ -670,10 +676,12 @@ VulkanDevice::VulkanDevice(VulkanContext context)
     });
     ASSERT_MSG(pool_result == vk::Result::eSuccess, "NAT-011: command pool failed");
     init_pool = pool;
-    const auto queues = ctx.physical_device.getQueueFamilyProperties();
-    timestamp_bits = ctx.queue_family < queues.size() ? queues[ctx.queue_family].timestampValidBits : 0;
-    timestamp_period = properties.get<vk::PhysicalDeviceProperties2>().properties.limits.timestampPeriod;
-    if (timestamp_bits != 0 && timestamp_period > 0) {
+    if (gpu_timing_enabled) {
+        const auto queues = ctx.physical_device.getQueueFamilyProperties();
+        timestamp_bits = ctx.queue_family < queues.size() ? queues[ctx.queue_family].timestampValidBits : 0;
+        timestamp_period = properties.get<vk::PhysicalDeviceProperties2>().properties.limits.timestampPeriod;
+    }
+    if (gpu_timing_enabled && timestamp_bits != 0 && timestamp_period > 0) {
         for (auto& sample : gpu_timings) {
             const auto [query_result, queries] = device.createQueryPool(
                 vk::QueryPoolCreateInfo{.queryType = vk::QueryType::eTimestamp, .queryCount = 2});
@@ -688,8 +696,10 @@ VulkanDevice::VulkanDevice(VulkanContext context)
 }
 
 VulkanDevice::~VulkanDevice() {
-    stop_gpu_timings.store(true, std::memory_order_release);
-    if (gpu_timing_reader.joinable()) gpu_timing_reader.join();
+    if (gpu_timing_reader.joinable()) {
+        stop_gpu_timings.store(true, std::memory_order_release);
+        gpu_timing_reader.join();
+    }
     std::ignore = device.waitIdle();
     Collect();
     completed_resources.DrainAndStop();
@@ -1695,7 +1705,7 @@ void VulkanCommandList::Begin() {
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
         .pInheritanceInfo = level == CommandListLevel::Secondary ? &inheritance : nullptr,
     });
-    timing = device.BeginGpuTiming(cmd);
+    if (device.gpu_timing_enabled) timing = device.BeginGpuTiming(cmd);
 }
 
 void VulkanCommandList::End() {
@@ -2118,10 +2128,10 @@ std::unique_ptr<Device> CreateVulkanDevice(const Vulkan::Instance& instance) {
         .depth_clip_control = instance.IsDepthClipControlSupported(),
         .max_push_descriptors = instance.MaxPushDescriptors(),
     };
-    return std::make_unique<VulkanDevice>(std::move(context));
+    return std::make_unique<VulkanDevice>(std::move(context), GpuTimingRequested(std::getenv("RYGT_GPU_TIMING")));
 }
 
-std::unique_ptr<Device> CreateStandaloneVulkanDevice(std::string* error) {
+static std::unique_ptr<Device> CreateStandaloneVulkanDeviceImpl(std::string* error, bool timing_enabled) {
     const auto fail = [error](std::string why) -> std::unique_ptr<Device> {
         if (error) {
             *error = std::move(why);
@@ -2282,16 +2292,42 @@ std::unique_ptr<Device> CreateStandaloneVulkanDevice(std::string* error) {
                 delete kept_instance;
             },
     };
-    return std::make_unique<VulkanDevice>(std::move(context));
+    return std::make_unique<VulkanDevice>(std::move(context), timing_enabled);
+}
+
+std::unique_ptr<Device> CreateStandaloneVulkanDevice(std::string* error) {
+    return CreateStandaloneVulkanDeviceImpl(error, GpuTimingRequested(std::getenv("RYGT_GPU_TIMING")));
 }
 
 // Diagnostic harness uses the same backend, lease protocol and reader as gameplay.
 extern "C" __declspec(dllexport) int RytyNativeGpuTimingSelfTest(char* report, int report_size) {
     std::string error;
-    auto base = CreateStandaloneVulkanDevice(&error);
+    if (GpuTimingRequested(nullptr) || GpuTimingRequested("0") || !GpuTimingRequested("1") || GpuTimingRequested("11")) return 1;
+    auto off = CreateStandaloneVulkanDeviceImpl(&error, GpuTimingRequested(nullptr));
+    if (!off) return 1;
+    auto& off_device = static_cast<VulkanDevice&>(*off);
+    if (off_device.gpu_timing_enabled || off_device.gpu_timing_count || off_device.gpu_timing_reader.joinable()) return 1;
+    auto* off_list = off_device.AcquireCommandList(CommandListLevel::Primary);
+    off_list->Begin(); off_list->End(); off_device.ReleaseUnsubmitted(off_list);
+    if (off_device.gpu_timing_sequence.load() || off_device.gpu_timing_skipped.load()) return 1;
+    off.reset();
+    // Check the normal factory as well as the forced-on test path; this verifies
+    // the actual process environment without mutating it in a shared process.
+    auto configured = CreateStandaloneVulkanDevice(&error);
+    if (!configured) return 1;
+    auto& configured_device = static_cast<VulkanDevice&>(*configured);
+    const bool configured_enabled = GpuTimingRequested(std::getenv("RYGT_GPU_TIMING"));
+    const u32 configured_pools = configured_device.gpu_timing_count;
+    const bool configured_reader = configured_device.gpu_timing_reader.joinable();
+    if (configured_device.gpu_timing_enabled != configured_enabled ||
+        (!configured_enabled && (configured_pools || configured_reader)) ||
+        (configured_pools != 0) != configured_reader) return 1;
+    if (configured_enabled && configured_device.timestamp_bits && configured_device.timestamp_period > 0 && !configured_pools) return 1;
+    configured.reset();
+    auto base = CreateStandaloneVulkanDeviceImpl(&error, GpuTimingRequested("1"));
     if (!base) return 1;
     auto& device = static_cast<VulkanDevice&>(*base);
-    bool ok = device.gpu_timing_count == 64;
+    bool ok = device.gpu_timing_enabled && device.gpu_timing_count == 64 && device.gpu_timing_reader.joinable();
     // Exhaustion skips diagnostics, never recording or ownership. None of these
     // buffers execute: cancel must release their slots without reading stale queries.
     std::vector<CommandList*> unsubmitted;
@@ -2346,8 +2382,8 @@ extern "C" __declspec(dllexport) int RytyNativeGpuTimingSelfTest(char* report, i
             return 5;
         }
     }
-    const auto text = fmt::format("GPU timing: 64 bounded query pairs, 96 unsubmitted lists, 32 nonblocking skips, "
-        "cancellation, 240 reused query generations in primary/secondary lists and 10485760 GPU copy bytes verified: {}\n", ok ? "passed" : "FAILED");
+    const auto text = fmt::format("GPU timing: factory enabled={} pools={} reader={}; default-off 0 pools/0 reader/0 skipped; opt-in 64 bounded query pairs, 96 unsubmitted lists, 32 nonblocking skips, "
+        "cancellation, 240 reused query generations in primary/secondary lists and 10485760 GPU copy bytes verified: {}\n", configured_enabled, configured_pools, configured_reader, ok ? "passed" : "FAILED");
     if (report && report_size > 0) {
         const auto size = std::min<size_t>(text.size(), size_t(report_size - 1));
         std::memcpy(report, text.data(), size); report[size] = 0;

@@ -9,3 +9,5 @@ On Windows, `RytyNativeImageSelfTest` also exercises a deterministic upload race
 `RytyNativeDescriptorBatchSelfTest` checks 1,024 NVIDIA output values with cached ordinary sets and a push set in the middle. The fixture records 160 individual host-update calls versus 64 batched calls. Its shader source is `descriptor_batch_test.comp`; regenerate the embedded SPIR-V with glslangValidator using `-V` when changing the fixture.
 
 Gameplay improvement still requires a same-scene comparison. These tests do not establish that every frame meets 16.6 ms.
+
+GPU command-list timing is diagnostic and defaults off. Set `RYGT_GPU_TIMING=1` exactly to enable query pools and the timing reader; unset, `0`, and other values leave it off. `RytyNativeGpuTimingSelfTest` checks the environment-controlled factory and explicitly exercises both disabled and enabled timing, including its bounded query-lease tests.

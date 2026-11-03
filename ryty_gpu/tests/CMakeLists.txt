@@ -334,3 +334,18 @@ add_custom_command(
 target_sources(mirror_probe_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/direct-try-parts-under-test.inc"
     "${CMAKE_CURRENT_BINARY_DIR}/mirror-resume-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-probe-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-merge-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-prepare-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-priority-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-requeue-under-test.inc")
 add_test(NAME mirror_probe COMMAND mirror_probe_test)
+
+add_executable(gpu_timing_flag_test gpu_timing_flag_test.cpp)
+target_compile_features(gpu_timing_flag_test PRIVATE cxx_std_23)
+target_include_directories(gpu_timing_flag_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(gpu_timing_flag_test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(gpu_timing_flag_test PRIVATE -UNDEBUG)
+endif()
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/gpu-timing-flag-under-test.inc"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_gpu_timing_flag.py"
+      "${SHADGT_ROOT}/ryty_gpu/native/rhi/rhi_vulkan.cpp" "${CMAKE_CURRENT_BINARY_DIR}/gpu-timing-flag-under-test.inc"
+    DEPENDS extract_gpu_timing_flag.py "${SHADGT_ROOT}/ryty_gpu/native/rhi/rhi_vulkan.cpp" VERBATIM)
+target_sources(gpu_timing_flag_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/gpu-timing-flag-under-test.inc")
+add_test(NAME gpu_timing_flag COMMAND gpu_timing_flag_test)

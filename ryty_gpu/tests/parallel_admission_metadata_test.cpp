@@ -12,6 +12,7 @@ using u32 = std::uint32_t;
 namespace Shader {
 enum class SwStage { Fragment, TessellationControl, TessellationEval, Vertex, Geometry, Compute };
 struct Info {
+    std::uint64_t identity{1};
     bool attribute_flags_known{true}, resource_usage_known{true}, translation_failed{};
     SwStage sw_stage{SwStage::Vertex};
     bool has_fetch_shader{}, uses_patches{}, uses_dma{}, has_storage_images{}, uses_shader_clock{}, uses_direct{};
@@ -124,6 +125,22 @@ int main() {
     vertex.uses_direct=false;pipeline.SetStageInfos(stages);assert(!pipeline.GetParallelStageSummary().uses_direct);CheckStages(pipeline);
     Shader::Info compute;compute.translation_failed=true;stages[5]=&compute;pipeline.SetStageInfos(stages);CheckStages(pipeline);
     assert(pipeline.GetParallelStageSummary().safe); // graphics GetStages excludes compute
+
+    // SeedStage/ShadowOf keep copies by identity. Recovery can update the canonical
+    // flags while a matching older seed or recorder shadow remains unknown.
+    vertex.attribute_flags_known=false;
+    Shader::Info stale_seed=vertex;
+    vertex.attribute_flags_known=true;
+    pipeline.SetStageInfos(stages);
+    assert(pipeline.GetParallelStageSummary().known && vertex.identity==stale_seed.identity);
+    pipeline.stages[3]=&stale_seed;
+    CheckStages(pipeline);
+    assert((SelectStages(&pipeline,true,true,true)==std::pair{false,true}));
+    stale_seed.attribute_flags_known=true;stale_seed.resource_usage_known=false;
+    CheckStages(pipeline);
+    assert((SelectStages(&pipeline,true,true,true)==std::pair{false,false}));
+    stale_seed.resource_usage_known=true;CheckStages(pipeline);
+    assert((SelectStages(&pipeline,true,true,true)==std::pair{true,true}));
 
     Prepared p;Bindings b{{1},{2},{3}};
     const auto make_proof=[&] {

@@ -5621,7 +5621,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         whole_phases.Next(2);
         bool stages_safe=true,resource_key_known=true;
         const auto& stage_summary=pipeline->GetParallelStageSummary();
-        if(stage_summary.known) {
+        // An older seed/shadow can retain unknown flags after the same canonical
+        // identity recovers them. Preserve the original live gate for that draw.
+        const bool draw_stages_known=stage_summary.known && std::ranges::all_of(pipeline->GetStages(),[](const auto* stage) {
+            return !stage || (stage->attribute_flags_known && stage->resource_usage_known);
+        });
+        if(draw_stages_known) {
             stages_safe=stage_summary.safe &&
                 (!stage_summary.vertex_fetch || (vertex_requested && has_vertex_input && vertex_safe)) &&
                 (!stage_summary.uses_direct || ParallelD2Enabled());

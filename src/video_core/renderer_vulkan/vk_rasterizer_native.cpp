@@ -248,8 +248,8 @@ struct PendingDescriptorUpdates {
     template<class Rows> void Stage(const Rows& rows,vk::DescriptorSet set) noexcept {
         for(const auto& source:rows) {
             auto row=source;row.dstSet=set;
-            if(row.pBufferInfo) {std::copy_n(row.pBufferInfo,row.descriptorCount,buffers.data()+nb);row.pBufferInfo=buffers.data()+nb;nb+=row.descriptorCount;}
-            else {std::copy_n(row.pImageInfo,row.descriptorCount,images.data()+ni);row.pImageInfo=images.data()+ni;ni+=row.descriptorCount;}
+            if(row.pBufferInfo) {if(row.descriptorCount==1)buffers[nb]=*row.pBufferInfo;else std::copy_n(row.pBufferInfo,row.descriptorCount,buffers.data()+nb);row.pBufferInfo=buffers.data()+nb;nb+=row.descriptorCount;}
+            else {if(row.descriptorCount==1)images[ni]=*row.pImageInfo;else std::copy_n(row.pImageInfo,row.descriptorCount,images.data()+ni);row.pImageInfo=images.data()+ni;ni+=row.descriptorCount;}
             writes[nw++]=row;++staged_rows;
         }
         high_rows=std::max<u64>(high_rows,nw);

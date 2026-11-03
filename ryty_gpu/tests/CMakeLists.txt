@@ -26,7 +26,7 @@ foreach(name IN ITEMS parallel_initial_mode parallel_readonly_hint parallel_desc
     if(name STREQUAL "parallel_hash_fallback")
         target_include_directories(${name}_test PRIVATE "${SHADGT_ROOT}/externals/xxhash")
     endif()
-    if(name STREQUAL "parallel_initial_mode" OR name STREQUAL "parallel_readonly_hint" OR name STREQUAL "parallel_descriptor_actions" OR name STREQUAL "parallel_producer_oom" OR name STREQUAL "parallel_mixed_snapshot" OR name STREQUAL "parallel_descriptor_snapshot" OR name STREQUAL "parallel_hash_fallback" OR name STREQUAL "pipeline_retention" OR name STREQUAL "shared_pipeline_policy")
+    if(name STREQUAL "descriptor_update_batch" OR name STREQUAL "parallel_initial_mode" OR name STREQUAL "parallel_readonly_hint" OR name STREQUAL "parallel_descriptor_actions" OR name STREQUAL "parallel_producer_oom" OR name STREQUAL "parallel_mixed_snapshot" OR name STREQUAL "parallel_descriptor_snapshot" OR name STREQUAL "parallel_hash_fallback" OR name STREQUAL "pipeline_retention" OR name STREQUAL "shared_pipeline_policy")
         if(MSVC)
             target_compile_options(${name}_test PRIVATE /UNDEBUG)
         else()
@@ -257,3 +257,11 @@ add_custom_command(
     DEPENDS extract_upload_receipt.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" VERBATIM)
 target_sources(parallel_upload_receipt_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/upload-backing-proof.inc" "${CMAKE_CURRENT_BINARY_DIR}/upload-incarnation-bump.inc" "${CMAKE_CURRENT_BINARY_DIR}/upload-commit-proof.inc")
 add_test(NAME parallel_upload_receipt COMMAND parallel_upload_receipt_test)
+
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/descriptor-stage-under-test.inc"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_descriptor_stage.py"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
+        "${CMAKE_CURRENT_BINARY_DIR}/descriptor-stage-under-test.inc"
+    DEPENDS extract_descriptor_stage.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" VERBATIM)
+target_sources(descriptor_update_batch_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/descriptor-stage-under-test.inc")

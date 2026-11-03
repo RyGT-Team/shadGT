@@ -365,3 +365,39 @@ add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/fast-flip-wait-under-test
     DEPENDS extract_fast_flip_wait.py "${SHADGT_ROOT}/src/core/libraries/videoout/driver.cpp" VERBATIM)
 target_sources(fast_flip_wait_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/fast-flip-wait-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/fast-flip-eligibility-under-test.inc")
 add_test(NAME fast_flip_wait COMMAND fast_flip_wait_test)
+
+add_executable(cpu_stack_registry_test cpu_stack_registry_test.cpp)
+target_compile_features(cpu_stack_registry_test PRIVATE cxx_std_23)
+target_include_directories(cpu_stack_registry_test PRIVATE "${SHADGT_ROOT}")
+add_executable(cpu_stack_paths_test cpu_stack_paths_test.cpp)
+target_compile_features(cpu_stack_paths_test PRIVATE cxx_std_23)
+target_include_directories(cpu_stack_paths_test PRIVATE "${SHADGT_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(cpu_stack_registry_test PRIVATE /UNDEBUG)
+    target_compile_options(cpu_stack_paths_test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(cpu_stack_registry_test PRIVATE -UNDEBUG)
+    target_compile_options(cpu_stack_paths_test PRIVATE -UNDEBUG)
+endif()
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/cpu-stack-on.inc" "${CMAKE_CURRENT_BINARY_DIR}/cpu-stack-sort.inc" "${CMAKE_CURRENT_BINARY_DIR}/cpu-stack-copy.inc" "${CMAKE_CURRENT_BINARY_DIR}/cpu-stack-drop.inc" "${CMAKE_CURRENT_BINARY_DIR}/cpu-stack-unwatch.inc" "${CMAKE_CURRENT_BINARY_DIR}/cpu-stack-release.inc"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_cpu_stack.py"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
+        "${CMAKE_CURRENT_BINARY_DIR}/cpu-stack-on.inc" "${CMAKE_CURRENT_BINARY_DIR}/cpu-stack-sort.inc" "${CMAKE_CURRENT_BINARY_DIR}/cpu-stack-copy.inc"
+        "${CMAKE_CURRENT_BINARY_DIR}/cpu-stack-drop.inc" "${CMAKE_CURRENT_BINARY_DIR}/cpu-stack-unwatch.inc" "${CMAKE_CURRENT_BINARY_DIR}/cpu-stack-release.inc"
+    DEPENDS extract_cpu_stack.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
+    VERBATIM)
+target_sources(cpu_stack_paths_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/cpu-stack-on.inc" "${CMAKE_CURRENT_BINARY_DIR}/cpu-stack-sort.inc" "${CMAKE_CURRENT_BINARY_DIR}/cpu-stack-copy.inc")
+add_test(NAME cpu_stack_registry COMMAND cpu_stack_registry_test)
+add_test(NAME cpu_stack_paths COMMAND cpu_stack_paths_test)
+
+add_executable(cpu_stack_retire_test cpu_stack_retire_test.cpp)
+target_compile_features(cpu_stack_retire_test PRIVATE cxx_std_23)
+target_include_directories(cpu_stack_retire_test PRIVATE "${SHADGT_ROOT}" "${SHADGT_ROOT}/src" "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(cpu_stack_retire_test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(cpu_stack_retire_test PRIVATE -UNDEBUG)
+endif()
+target_sources(cpu_stack_retire_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/cpu-stack-on.inc" "${CMAKE_CURRENT_BINARY_DIR}/cpu-stack-sort.inc" "${CMAKE_CURRENT_BINARY_DIR}/cpu-stack-drop.inc" "${CMAKE_CURRENT_BINARY_DIR}/cpu-stack-unwatch.inc" "${CMAKE_CURRENT_BINARY_DIR}/cpu-stack-release.inc")
+add_test(NAME cpu_stack_retire COMMAND cpu_stack_retire_test)

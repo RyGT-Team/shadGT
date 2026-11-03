@@ -21,5 +21,5 @@ Path(sys.argv[5]).write_text(source[start:end],encoding='utf-8')
 Path(sys.argv[6]).write_text(source[priority:b],encoding='utf-8')
 
 start=source.index('        if (!ready) {',source.index('        bool source_callback=false;',b))
-end=source.index('        if(observation==MirrorWorker::Observation::Reused)',start)
+end=source.index('        // The copy is already recorded.',start)
 Path(sys.argv[7]).write_text(source[start:end],encoding='utf-8')

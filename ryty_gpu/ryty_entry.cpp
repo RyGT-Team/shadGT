@@ -26,6 +26,7 @@
 #include "core/libraries/videoout/video_out.h"
 #include "core/memory.h"
 #include "ryty_gpu/native/job_walker.h"
+#include "ryty_gpu/native/cpu_stack_registry.h"
 #include "core/signals.h"
 #include "core/loader/symbols_resolver.h"
 #include "input/controller.h"
@@ -703,6 +704,21 @@ extern "C" __declspec(dllexport) u64 RytyGpuGuestTsc() {
     return Common::GuestClock::ReadTsc();
 }
 
+// Host ABI used by Ryty's fiber module. A successful registration publishes the
+// range and queues mirror retirement before the fiber can write its context.
+extern "C" __declspec(dllexport) int RytyGpuRegisterCpuStack(u64 address, u64 size) noexcept {
+    try {
+        return Native::CpuStacks().Register(address, size, [&] {
+            if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
+                rasterizer->OnCpuStack(address, size);
+            }
+        }) ? 1 : 0;
+    } catch (...) { return 0; }
+}
+
+extern "C" __declspec(dllexport) void RytyGpuUnregisterCpuStack(u64 address, u64 size) noexcept {
+    try { Native::CpuStacks().Unregister(address, size); } catch (...) {}
+}
 // Ryty calls this before the kernel writes guest memory directly (a file read into a guest
 // buffer), which would fail on a write-protected page instead of faulting.
 extern "C" __declspec(dllexport) void RytyGpuInvalidateMemory(u64 address, u64 size) {

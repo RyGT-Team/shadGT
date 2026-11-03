@@ -5986,6 +5986,15 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
     return value;
 }
 
+void Rasterizer::OnCpuStack(VAddr addr, u64 size) {
+#ifdef RYTY_GPU
+    if (native) {
+        native->OnCpuStack(addr, size);
+        return;
+    }
+#endif
+    InvalidateMemory(addr, size);
+}
 bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks, u64 exact_write_size) {
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.

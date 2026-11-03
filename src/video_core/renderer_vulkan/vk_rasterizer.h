@@ -248,6 +248,7 @@ public:
     /// exact_write_size: bytes a faulting CPU store writes from addr, when known (PERF-011b).
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false,
                           u64 exact_write_size = 0);
+    void OnCpuStack(VAddr addr, u64 size);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     /// FIX-079: see BufferCache::CanWriteThrough; never over images.
     bool CanWriteThrough(VAddr addr, u64 size);

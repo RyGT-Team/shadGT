@@ -56,6 +56,7 @@ constexpr DrawEntry kDraws[kDrawKinds] = {
     {0x1c621b0, "PGL immediate-mode draw", "immediate"},
 };
 
+#ifndef NDEBUG
 // Draw counts per game thread: which threads record draws, and how many.
 struct ThreadCounts {
     std::atomic<u64> draws[kDrawKinds]{};
@@ -85,20 +86,25 @@ ThreadCounts& Counts() {
     return *t_counts;
 }
 
+#endif
 // The PGL draw functions take at most six integer arguments; all six registers are passed on.
 using DrawFn = void(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64);
 DrawFn g_draw_original[kDrawKinds]{};
 
+#ifndef NDEBUG
 // The renderer's log is ready once the game draws, so the reporter starts with the first draw.
 std::atomic<bool> g_reporter_started{false};
 void StartReporter();
 
+#endif
 template <int Kind>
 void PS4_SYSV_ABI DrawHook(u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
+#ifndef NDEBUG
     Counts().draws[Kind].fetch_add(1, std::memory_order_relaxed);
     if (!g_reporter_started.load(std::memory_order_relaxed)) {
         StartReporter();
     }
+#endif
     g_draw_original[Kind](a, b, c, d, e, f);
 }
 
@@ -195,7 +201,9 @@ std::atomic<u64> g_tls_mismatches{0};
 
 u64 PS4_SYSV_ABI JobBeginHook(u64 context, u64 b, u64 c, u64 d, u64 e, u64 f) {
     const u64 result = g_job_begin(context, b, c, d, e, f);
+#ifndef NDEBUG
     g_jobs.fetch_add(1, std::memory_order_relaxed);
+#endif
     if (ShadowEnabled()) {
         // Job begin makes the context current: a check of the guest TLS lookup.
         if (g_tls_ok.load(std::memory_order_relaxed) &&
@@ -238,6 +246,7 @@ u64 PS4_SYSV_ABI JobEndHook(u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
     return result;
 }
 
+#ifndef NDEBUG
 void ReporterLoop() {
     using namespace std::chrono_literals;
     const auto& work = Common::GetWorkCounters();
@@ -317,14 +326,20 @@ void StartReporter() {
     }
 }
 
+#endif
 } // namespace
 
 void InstallGtsHooks(u8* exe_base) {
+#ifndef NDEBUG
     const char* env = std::getenv("RYGT_NATIVE_HOOKS");
     if ((!env || env[0] != '1') && !ShadowEnabled()) {
+#else
+    if (!ShadowEnabled()) {
+#endif
         return;
     }
     static NearCode code{exe_base};
+#ifndef NDEBUG
     void* const hooks[kDrawKinds] = {
         reinterpret_cast<void*>(&DrawHook<Arrays>),
         reinterpret_cast<void*>(&DrawHook<ArraysInstanced>),
@@ -342,14 +357,22 @@ void InstallGtsHooks(u8* exe_base) {
         entry.counter = CountEntry(code, exe_base, entry.eboot_va, entry.prologue, entry.name);
         installed += entry.counter != nullptr;
     }
+#endif
     g_job_begin = reinterpret_cast<JobFn>(HookEntry(code, exe_base, kPglJobBegin, kPushR15,
                                                     reinterpret_cast<void*>(&JobBeginHook),
                                                     "PGL job begin"));
     g_job_end = reinterpret_cast<JobFn>(HookEntry(code, exe_base, kPglJobEnd, kPushR15,
                                                   reinterpret_cast<void*>(&JobEndHook),
                                                   "PGL job end"));
+#ifndef NDEBUG
     installed += (g_job_begin != nullptr) + (g_job_end != nullptr);
+#endif
+#ifndef NDEBUG
     int expected = static_cast<int>(kDrawKinds) + static_cast<int>(kCountKinds) + 2;
+#else
+    int installed = (g_job_begin != nullptr) + (g_job_end != nullptr);
+    int expected = 2;
+#endif
     if (ShadowEnabled()) {
         g_exe_base = reinterpret_cast<u64>(exe_base);
         g_tls = FindGuestTls(exe_base);

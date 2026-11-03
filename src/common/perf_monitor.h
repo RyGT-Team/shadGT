@@ -16,40 +16,67 @@ namespace Common {
 /// PERF-DIAG-007: CPU time used by each thread of this process since the previous call,
 /// as "name pct%" entries for the busiest threads (percent of one core), plus the process total.
 /// Returns an empty string where unsupported.
+#if !defined(NDEBUG)
 std::string SampleThreadCpuUsage(size_t max_threads);
+#else
+inline std::string SampleThreadCpuUsage(size_t) { return {}; }
+#endif
+
+#if defined(NDEBUG)
+// Reporting counters have no Release readers. Draws remains atomic for boot/save progress.
+struct DiagnosticCounter {
+    constexpr u64 operator++() noexcept { return 0; }
+    constexpr void operator+=(u64) noexcept {}
+    constexpr u64 fetch_add(u64, std::memory_order = std::memory_order_seq_cst) noexcept { return 0; }
+    constexpr u64 load(std::memory_order = std::memory_order_seq_cst) const noexcept { return 0; }
+};
+#else
+using DiagnosticCounter = std::atomic<u64>;
+#endif
 
 /// PERF-DIAG-010: work done by the emulator's GPU frontend, read and reset by the monitor.
 struct WorkCounters {
-    std::atomic<u64> pm4_packets{};
+    DiagnosticCounter pm4_packets{};
     std::atomic<u64> draws{};
-    std::atomic<u64> dispatches{};
-    std::atomic<u64> find_image{};
-    std::atomic<u64> obtain_buffer{};
-    std::atomic<u64> obtain_stream{};
-    std::atomic<u64> uploads{};
-    std::atomic<u64> upload_bytes{};
-    std::atomic<u64> protects{};
-    std::atomic<u64> protect_bytes{};
-    std::atomic<u64> shaders_compiled{};
-    std::atomic<u64> pipelines_compiled{};
-    std::atomic<u64> upload_epochs{};
-    std::atomic<u64> waits_skipped{};
+    DiagnosticCounter dispatches{};
+    DiagnosticCounter find_image{};
+    DiagnosticCounter obtain_buffer{};
+    DiagnosticCounter obtain_stream{};
+    DiagnosticCounter uploads{};
+    DiagnosticCounter upload_bytes{};
+    DiagnosticCounter protects{};
+    DiagnosticCounter protect_bytes{};
+    DiagnosticCounter shaders_compiled{};
+    DiagnosticCounter pipelines_compiled{};
+    DiagnosticCounter upload_epochs{};
+    DiagnosticCounter waits_skipped{};
     // DIAG-033: where the time of a long frame went (cumulative, like the counters above).
-    std::atomic<u64> gpu_waits{};
-    std::atomic<u64> gpu_wait_us{};
-    std::atomic<u64> frontend_waits{};
-    std::atomic<u64> frontend_wait_us{};
-    std::atomic<u64> pipeline_waits{};
-    std::atomic<u64> pipeline_wait_us{};
-    std::atomic<u64> file_reads{};
-    std::atomic<u64> file_read_bytes{};
-    std::atomic<u64> file_read_us{};
+    DiagnosticCounter gpu_waits{};
+    DiagnosticCounter gpu_wait_us{};
+    DiagnosticCounter frontend_waits{};
+    DiagnosticCounter frontend_wait_us{};
+    DiagnosticCounter pipeline_waits{};
+    DiagnosticCounter pipeline_wait_us{};
+    DiagnosticCounter file_reads{};
+    DiagnosticCounter file_read_bytes{};
+    DiagnosticCounter file_read_us{};
 };
+#if !defined(NDEBUG)
 WorkCounters& GetWorkCounters();
+#else
+inline WorkCounters& GetWorkCounters() {
+    static WorkCounters counters;
+    return counters;
+}
+#endif
 
 /// Experimental-branch switch: false when the PERF id (e.g. 14 for PERF-014) is listed in the
 /// SHADGT_DISABLE_PERF environment variable (comma separated), for A/B runs without rebuilding.
+#if !defined(NDEBUG)
 bool PerfFeatureEnabled(u32 id);
+#else
+inline constexpr bool PerfFeatureEnabled(u32) noexcept { return true; }
+#endif
 
 /// PERF-DIAG-011: command thread time per step of a draw, in TSC ticks, reported every 2 s.
 enum class Phase : u32 {
@@ -85,22 +112,35 @@ enum class Phase : u32 {
     SelSpec,    ///< DIAG-121: StageSpecialization built during program matching
     Count,
 };
+#if !defined(NDEBUG)
 std::array<std::atomic<u64>, size_t(Phase::Count)>& GetPhaseTicks();
+#endif
 
 /// DIAG-033: called for every presented game frame. A frame that took longer than
 /// SHADGT_STALL_MS (default 100) is logged with what the emulator did during it.
+#if !defined(NDEBUG)
 void NoteGameFrame();
+#else
+inline void NoteGameFrame() noexcept {}
+#endif
 
 // PERF-026: the draw-step timers run about 14 times per draw, so the counter read and the
 // tick array are inline instead of function calls.
+#if !defined(NDEBUG)
 inline std::array<std::atomic<u64>, size_t(Phase::Count)> g_phase_ticks{};
+#endif
 
 /// SHADGT_LEAN=1: no per-draw timing (PhaseTimer) or sampled selection checks (PERF-047),
 /// for the best frame rate a build gives; the 2 s lines then show zero step times.
+#if !defined(NDEBUG)
 bool LeanRun();
+#else
+inline constexpr bool LeanRun() noexcept { return true; }
+#endif
 
 class PhaseTimer {
 public:
+#if !defined(NDEBUG)
     explicit PhaseTimer(Phase phase_) : phase{phase_}, start{Enabled() ? ReadTsc() : 0} {}
     ~PhaseTimer() {
         if (start != 0) {
@@ -123,7 +163,17 @@ public:
 private:
     Phase phase;
     u64 start;
+#else
+    explicit constexpr PhaseTimer(Phase) noexcept {}
+    static constexpr bool Enabled() noexcept { return false; }
+    static constexpr u64 ReadTsc() noexcept { return 0; }
+    static constexpr u64 ReadTscFallback() noexcept { return 0; }
+#endif
 };
+#if !defined(NDEBUG)
 std::string TakeWorkCounters();
+#else
+inline std::string TakeWorkCounters() { return {}; }
+#endif
 
 } // namespace Common

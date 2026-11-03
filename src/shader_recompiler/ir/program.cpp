@@ -17,6 +17,7 @@
 namespace Shader::IR {
 
 void DumpProgram(const Program& program, const Info& info, const std::string& type) {
+#ifndef NDEBUG
     using namespace Common::FS;
 
     if (!EmulatorSettings.IsDumpShaders()) {
@@ -54,6 +55,9 @@ void DumpProgram(const Program& program, const Info& info, const std::string& ty
         std::string s = IR::DumpASLNode(node, block_to_index, inst_to_index) + '\n';
         asl_file.WriteString(s);
     }
+#else
+    (void)program; (void)info; (void)type;
+#endif
 }
 
 } // namespace Shader::IR

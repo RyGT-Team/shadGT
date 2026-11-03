@@ -28,6 +28,7 @@ ScopedSubmitSignal::~ScopedSubmitSignal() {active_submit_signal=previous_;}
 
 std::mutex Scheduler::submit_mutex;
 
+#ifndef NDEBUG
 // PERF-DIAG-001: where threads block on the GPU (scheduler Wait/Finish), reported every 2 s.
 static void RecordGpuWait(const std::source_location& loc, std::chrono::steady_clock::duration d) {
     auto& counters = Common::GetWorkCounters();
@@ -59,6 +60,7 @@ static void RecordGpuWait(const std::source_location& loc, std::chrono::steady_c
     window_start = now;
 }
 
+#endif
 Scheduler::Scheduler(const Instance& instance)
     : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
 #if TRACY_GPU_ENABLED
@@ -70,7 +72,9 @@ Scheduler::Scheduler(const Instance& instance)
 }
 
 void Scheduler::StartPerfMonitor() {
+#ifndef NDEBUG
     perf_monitor_thread = std::jthread(std::bind_front(&Scheduler::PerfMonitorThread, this));
+#endif
 }
 
 Scheduler::~Scheduler() {
@@ -142,7 +146,9 @@ void Scheduler::ReplayChunk(CommandRing& worker_ring, u64 start, u64 end) {
 }
 
 void CommandRing::WaitForSpace(size_t needed) {
+#ifndef NDEBUG
     ++full_waits;
+#endif
     while (head_local + needed - tail.load(std::memory_order_acquire) > Capacity) {
         std::this_thread::yield();
     }
@@ -179,7 +185,9 @@ void Scheduler::SyncCommandThread() {
     if (ring->Replayed() >= target) {
         return;
     }
+#ifndef NDEBUG
     const auto start = std::chrono::steady_clock::now();
+#endif
     u32 spins = 0;
     while (ring->Replayed() < target) {
         if (++spins < 512) {
@@ -188,11 +196,14 @@ void Scheduler::SyncCommandThread() {
             std::this_thread::yield();
         }
     }
+#ifndef NDEBUG
     sync_waits.fetch_add(1, std::memory_order_relaxed);
     sync_wait_ns.fetch_add(u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::steady_clock::now() - start)
                                    .count()),
                            std::memory_order_relaxed);
+#endif
+
 }
 
 void Scheduler::WaitSubmitted(u64 tick) {
@@ -216,13 +227,16 @@ void Scheduler::CommandThread(std::stop_token stoken) {
     Common::PreferPerformanceCores(); // PERF-088
     auto& commands = *ring;
     u64 position = commands.Replayed();
+#ifndef NDEBUG
     u64 window_commands = 0;
     u64 window_busy_ns = 0;
     auto window_start = std::chrono::steady_clock::now();
+#endif
     while (!stoken.stop_requested()) {
         const u64 end = commands.Published();
         if (position == end) {
             commands.SetReplayed(position);
+#ifndef NDEBUG
             const auto now = std::chrono::steady_clock::now();
             if (now - window_start >= std::chrono::seconds{2}) {
                 const double seconds = std::chrono::duration<double>(now - window_start).count();
@@ -238,16 +252,21 @@ void Scheduler::CommandThread(std::stop_token stoken) {
                 window_busy_ns = 0;
                 window_start = now;
             }
+#endif
             commands.WaitForWork(position, stoken);
             continue;
         }
+#ifndef NDEBUG
         const auto start = std::chrono::steady_clock::now();
+#endif
         u32 since_progress = 0;
         while (position != end) {
             auto* header = commands.At(position);
             if (header->exec != nullptr) {
                 header->exec(*this, reinterpret_cast<u8*>(header) + header->fn_offset);
+#ifndef NDEBUG
                 ++window_commands;
+#endif
             }
             position += header->size;
             if (++since_progress == 64) {
@@ -256,9 +275,12 @@ void Scheduler::CommandThread(std::stop_token stoken) {
             }
         }
         commands.SetReplayed(position);
+#ifndef NDEBUG
         window_busy_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                   std::chrono::steady_clock::now() - start)
                                   .count());
+#endif
+
     }
 }
 
@@ -359,6 +381,7 @@ vk::CommandBuffer Scheduler::OpenUploadCommandBuffer() {
     return upload_cmdbuf;
 }
 
+#ifndef NDEBUG
 // DIAG-118: where submits come from, every 2 s.
 static void NoteFlush(const std::source_location& loc) {
     static std::mutex diag_mutex;
@@ -382,8 +405,11 @@ static void NoteFlush(const std::source_location& loc) {
     }
 }
 
+#endif
 void Scheduler::Flush(SubmitInfo& info, std::source_location loc) {
+#ifndef NDEBUG
     NoteFlush(loc);
+#endif
     // When flushing, we only send data to the driver; no waiting is necessary.
     SubmitExecution(info);
 }
@@ -411,9 +437,13 @@ void Scheduler::Wait(u64 tick, std::source_location loc) {
         return;
     }
     Common::Nvtx::Scope nvtx{"wait for GPU"}; // DIAG-056
+#ifndef NDEBUG
     const auto start = std::chrono::steady_clock::now();
+#endif
     work_semaphore.Wait(tick);
+#ifndef NDEBUG
     RecordGpuWait(loc, std::chrono::steady_clock::now() - start);
+#endif
 }
 
 void Scheduler::PopPendingOperations() {
@@ -522,17 +552,23 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         EndSession(); // FIX-188: Intel Arc (#65)
     }
 
+#ifndef NDEBUG
     const auto callback_start = std::chrono::steady_clock::now();
+#endif
     if (on_submit) {
         on_submit(info);
     }
 
+#ifndef NDEBUG
     const auto callback_end = std::chrono::steady_clock::now();
+#endif
     if (!instance.IsIntel()) {
         EndSession();
     }
 
+#ifndef NDEBUG
     const auto session_end = std::chrono::steady_clock::now();
+#endif
     info.AddSignal(work_semaphore.Handle(), signal_value);
     if (ring) {
         ring->RecordControl([info, signal_value](Scheduler& scheduler) mutable {
@@ -542,12 +578,17 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         SubmitSessions(info, signal_value);
     }
 
+#ifndef NDEBUG
     const auto queue_end = std::chrono::steady_clock::now();
+#endif
     BeginSession();
 
     // Apply pending operations
+#ifndef NDEBUG
     const auto begin_end = std::chrono::steady_clock::now();
+#endif
     PopPendingOperations();
+#ifndef NDEBUG
     const auto finish = std::chrono::steady_clock::now();
     const auto ms = [](auto end, auto begin) {
         return std::chrono::duration<double, std::milli>(end - begin).count();
@@ -558,6 +599,8 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
                     ms(callback_end, callback_start), ms(session_end, callback_end),
                     ms(queue_end, session_end), ms(begin_end, queue_end), ms(finish, begin_end));
     }
+#endif
+
 }
 
 void Scheduler::SubmitSessions(SubmitInfo& info, u64 signal_value) {
@@ -611,6 +654,7 @@ void Scheduler::SubmitSessions(SubmitInfo& info, u64 signal_value) {
     }
 }
 
+#ifndef NDEBUG
 void Scheduler::PerfMonitorThread(std::stop_token stoken) {
     // PERF-DIAG-007: every 2 s, how busy the GPU was (sampled: submitted work not yet complete)
     // and which threads used the CPU, to tell GPU-bound, CPU-bound and serialized frames apart.
@@ -659,6 +703,7 @@ void Scheduler::PerfMonitorThread(std::stop_token stoken) {
     }
 }
 
+#endif
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadGT:GpuSchedPriorityPendingOpsRunner");
 

@@ -355,19 +355,23 @@ s64 ReadFile(Core::FileSys::File* file, void* buf, u64 nbytes) {
     if (file_buf.capacity() < nbytes) {
         file_buf.reserve(nbytes);
     }
+#ifndef NDEBUG
     const auto read_start = std::chrono::steady_clock::now();
+#endif
     s64 bytes = file->Read(file_buf.data(), nbytes);
     if (bytes < 0) {
         return bytes;
     }
     std::memcpy(buf, file_buf.data(), bytes);
     // DIAG-033: the game's file reads, for the stall report.
+#ifndef NDEBUG
     auto& counters = Common::GetWorkCounters();
     ++counters.file_reads;
     counters.file_read_bytes += u64(bytes);
     counters.file_read_us += u64(std::chrono::duration_cast<std::chrono::microseconds>(
                                      std::chrono::steady_clock::now() - read_start)
                                      .count());
+#endif
     return bytes;
 }
 

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#ifndef NDEBUG
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -216,3 +217,4 @@ void Complete(const Row& row) noexcept {
         state->drops.fetch_add(1, std::memory_order_relaxed);
 }
 } // namespace Common::FrameQueueTrace
+#endif

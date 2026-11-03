@@ -903,6 +903,7 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size,
                   [this](VAddr address, u8* to, u64 n) { CopySparseMemory(address, to, n); });
 }
 
+#ifndef NDEBUG
 namespace {
 // DIAG-071: the renderer's recent writes into guest memory, for DescribeBackingWrites.
 struct BackingWrite {
@@ -960,6 +961,9 @@ std::string MemoryManager::DescribeBackingWrites(VAddr address, u64 margin) {
     }
     return out.empty() ? std::string{" none"} : out;
 }
+#else
+std::string MemoryManager::DescribeBackingWrites(VAddr, u64) { return {}; }
+#endif
 
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size,
                                     std::source_location loc) {
@@ -967,7 +971,9 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size,
     if (!RytyMemory::IsValidMapping(virtual_addr, size)) {
         return false;
     }
+#ifndef NDEBUG
     RecordBackingWrite(virtual_addr, size, loc); // DIAG-071
+#endif
     static const bool cached_alias_first = Common::PerfFeatureEnabled(112);
     if (cached_alias_first && WriteThroughCachedAlias(virtual_addr, data, size)) {
         RytyMemory::NoteOwnWrite(virtual_addr, size); // FIX-073
@@ -987,10 +993,12 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size,
     return written;
 }
 
+#ifndef NDEBUG
 void MemoryManager::NoteEmulatorWrite(VAddr address, u64 size, const void*,
                                       std::source_location loc) {
     RecordBackingWrite(address, size, loc); // DIAG-071
 }
+#endif
 
 } // namespace Core
 

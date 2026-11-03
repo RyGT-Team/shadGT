@@ -1,10 +1,28 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
+#ifndef NDEBUG
 #include <array>
 #include <atomic>
+#endif
 #include <cstdint>
 namespace Common::FrameQueueTrace {
 using U64 = unsigned long long;
+#ifdef NDEBUG
+struct Ticket {};
+struct Row {};
+inline void Initialize() noexcept {}
+inline Ticket Start() noexcept { return {}; }
+inline void Prepare(Ticket&) noexcept {}
+inline void Enqueue(Ticket&) noexcept {}
+inline void Dequeue(Ticket&) noexcept {}
+inline U64 Now(const Ticket&) noexcept { return 0; }
+inline bool Valid(const Ticket&) noexcept { return false; }
+inline void Complete(const Row&) noexcept {}
+inline constexpr Row* current = nullptr;
+struct Scope {
+    explicit Scope(Row*) noexcept {}
+};
+#else
 struct Ticket {
     U64 generation{}, id{}, submit{}, prepare_begin{}, enqueue{}, dequeue{};
 };
@@ -74,4 +92,5 @@ struct Scope {
         current = prior;
     }
 };
+#endif
 } // namespace Common::FrameQueueTrace

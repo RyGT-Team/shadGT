@@ -18,7 +18,9 @@
 
 #include <windows.h>
 #include <timeapi.h>
+#ifndef NDEBUG
 #pragma comment(lib, "winmm.lib")
+#endif
 
 #include <fmt/format.h>
 
@@ -28,6 +30,23 @@
 namespace Common::SamplingProfiler {
 namespace {
 
+// Address descriptions remain available to normal error and crash reporting.
+std::string DescribeAddress(u64 address) {
+    HMODULE module{};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(address), &module)) {
+        return fmt::format("{:#x}", address);
+    }
+    char path[MAX_PATH]{};
+    GetModuleFileNameA(module, path, MAX_PATH);
+    std::string name{path};
+    if (const auto slash = name.find_last_of("\\/"); slash != std::string::npos)
+        name = name.substr(slash + 1);
+    return fmt::format("{}+{:#x}", name, address - reinterpret_cast<u64>(module));
+}
+
+#ifndef NDEBUG
 bool Enabled() {
     static const bool enabled = [] {
         const char* env = std::getenv("SHADGT_PROFILE");
@@ -188,19 +207,7 @@ private:
 
 public:
     static std::string Describe(u64 address) {
-        HMODULE module{};
-        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                reinterpret_cast<LPCWSTR>(address), &module)) {
-            return fmt::format("{:#x}", address);
-        }
-        char path[MAX_PATH]{};
-        GetModuleFileNameA(module, path, MAX_PATH);
-        std::string name{path};
-        if (const auto slash = name.find_last_of("\\/"); slash != std::string::npos) {
-            name = name.substr(slash + 1);
-        }
-        return fmt::format("{}+{:#x}", name, address - reinterpret_cast<u64>(module));
+        return DescribeAddress(address);
     }
 
 private:
@@ -253,9 +260,11 @@ private:
     std::vector<std::unique_ptr<SampledThread>> threads;
     std::jthread worker;
 };
+#endif
 
 } // namespace
 
+#ifndef NDEBUG
 void RegisterCurrentThread(const char* name) {
     if (Enabled()) {
         ULONG_PTR low{};
@@ -281,21 +290,24 @@ void RegisterGuestThread(const char* name, const void* stack_low, const void* st
         Sampler::Instance().Register(fmt::format("guest:{}", name).c_str(), low, high, 4);
     }
 }
+#endif
 
 std::string DescribeCode(u64 address) {
-    return Sampler::Describe(address);
+    return DescribeAddress(address);
 }
 
+#ifndef NDEBUG
 bool IsProfilerThread() {
     return t_profiler_thread;
 }
+#endif
 
 std::string DescribeStack() {
     void* frames[24];
     const USHORT count = RtlCaptureStackBackTrace(1, 24, frames, nullptr);
     std::string out;
     for (USHORT i = 0; i < count; ++i) {
-        out += ' ' + Sampler::Describe(reinterpret_cast<u64>(frames[i]));
+        out += ' ' + DescribeAddress(reinterpret_cast<u64>(frames[i]));
     }
     return out;
 }
@@ -307,17 +319,21 @@ std::string DescribeStack() {
 #include <fmt/format.h>
 
 namespace Common::SamplingProfiler {
+#ifndef NDEBUG
 void RegisterCurrentThread(const char*) {}
 void RegisterGuestThread(const char*, const void*, const void*) {}
+#endif
 std::string DescribeCode(u64 address) {
     return fmt::format("{:#x}", address);
 }
 std::string DescribeStack() {
     return {};
 }
+#ifndef NDEBUG
 bool IsProfilerThread() {
     return false;
 }
+#endif
 } // namespace Common::SamplingProfiler
 
 #endif

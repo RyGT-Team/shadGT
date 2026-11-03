@@ -427,3 +427,35 @@ add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/vertex-validate-under-tes
     DEPENDS extract_vertex_validate.py "${SHADGT_ROOT}/ryty_gpu/native/parallel_pass_recording.cpp" VERBATIM)
 target_sources(parallel_vertex_validate_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/vertex-validate-under-test.inc")
 add_test(NAME parallel_vertex_validate COMMAND parallel_vertex_validate_test)
+
+# Keep NDEBUG: assertion-enabled fixtures cannot establish Release behavior.
+add_executable(frame_queue_release_test frame_queue_release_test.cpp
+    "${SHADGT_ROOT}/src/common/frame_queue_trace.cpp")
+target_compile_features(frame_queue_release_test PRIVATE cxx_std_23)
+target_compile_definitions(frame_queue_release_test PRIVATE NDEBUG)
+target_include_directories(frame_queue_release_test PRIVATE "${SHADGT_ROOT}/src")
+if(MSVC)
+    target_compile_options(frame_queue_release_test PRIVATE /EHsc)
+endif()
+add_test(NAME frame_queue_release COMMAND frame_queue_release_test
+    "${CMAKE_CURRENT_BINARY_DIR}/frame-queue-release-disabled")
+
+# Source-extracted functions use the production diagnostic macro, including its
+# NDEBUG branch, rather than a duplicated test-only definition.
+set(NATIVE_DIAGNOSTIC_CONTEXT "${CMAKE_CURRENT_BINARY_DIR}/native-diagnostic-context.h")
+add_custom_command(OUTPUT "${NATIVE_DIAGNOSTIC_CONTEXT}"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_native_diagnostic.py"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
+        "${NATIVE_DIAGNOSTIC_CONTEXT}"
+    DEPENDS extract_native_diagnostic.py
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
+    VERBATIM)
+get_directory_property(NATIVE_TEST_TARGETS BUILDSYSTEM_TARGETS)
+foreach(NATIVE_TEST_TARGET IN LISTS NATIVE_TEST_TARGETS)
+    target_sources(${NATIVE_TEST_TARGET} PRIVATE "${NATIVE_DIAGNOSTIC_CONTEXT}")
+    if(MSVC)
+        target_compile_options(${NATIVE_TEST_TARGET} PRIVATE "/FI${NATIVE_DIAGNOSTIC_CONTEXT}")
+    else()
+        target_compile_options(${NATIVE_TEST_TARGET} PRIVATE -include "${NATIVE_DIAGNOSTIC_CONTEXT}")
+    endif()
+endforeach()

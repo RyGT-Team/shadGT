@@ -169,6 +169,7 @@ bool LooksLikeEnvironmentSetting(const u8* base, std::string* reject_log = nullp
 }
 
 void MiscMonitor() {
+#ifndef NDEBUG
     // RYGT_ENV_AB=<seconds>: the scale is on and off for alternating periods of the same run,
     // with draws per frame and frame rate logged for each state (run-to-run differences of the
     // test race are larger than the effects measured).
@@ -206,9 +207,15 @@ void MiscMonitor() {
                 ab[0] = ab[1] = {};
             }
         }
+#else
+    for (;;) {
+        Sleep(100);
+        constexpr bool scale_on = true;
+#endif
         std::scoped_lock lock{g_misc_mutex};
         for (auto& instance : g_misc) {
             const size_t span = 0x590;
+#ifndef NDEBUG
             std::string reject;
             if (instance.site != 0 || !LooksLikeEnvironmentSetting(instance.base, &reject)) {
                 if (!reject.empty() && reject != instance.reject) {
@@ -218,6 +225,11 @@ void MiscMonitor() {
                 }
                 continue;
             }
+#else
+            if (instance.site != 0 || !LooksLikeEnvironmentSetting(instance.base)) {
+                continue;
+            }
+#endif
             // RYGT_ENV_SET=<hex offset>:<i|f|b><value>,...: fields of every EnvironmentSetting
             // set to a value (graphics-option experiments: shadow splitCount at 0x3d8/0x42c...).
             static const auto env_sets = [] {
@@ -272,7 +284,9 @@ void MiscMonitor() {
                     }
                 }
             }
+#ifndef NDEBUG
             std::string changes;
+#endif
             for (size_t i = 0; i < std::size(kMiscFields); ++i) {
                 if (kMiscFields[i].offset >= span) {
                     continue;
@@ -287,7 +301,9 @@ void MiscMonitor() {
                     continue; // our own override
                 }
                 if (value != instance.seen[i]) {
+#ifndef NDEBUG
                     changes += fmt::format(" {}={}", kMiscFields[i].name, value);
+#endif
                     instance.seen[i] = value;
                 }
                 // A copy of another instance's already scaled value is not scaled again.
@@ -299,6 +315,7 @@ void MiscMonitor() {
                     instance.written[i] = scaled;
                 }
             }
+#ifndef NDEBUG
             if (!changes.empty()) {
                 std::fprintf(stderr, "[env] DIAG-097 misc %p (site %d):%s\n", instance.base,
                              instance.site, changes.c_str());
@@ -322,6 +339,7 @@ void MiscMonitor() {
                 Vulkan::RytyWatchWrites(reinterpret_cast<u64>(watched) + watch_offset, 2000,
                                         fmt::format("rw env+{:#x} later", watch_offset));
             }
+#endif
         }
     }
 }
@@ -343,6 +361,7 @@ void RecordMisc(void* self, int site) {
     std::fill(std::begin(instance.seen), std::end(instance.seen), -1.0f);
     std::fill(std::begin(instance.written), std::end(instance.written), -1.0f);
     g_misc.push_back(instance);
+#ifndef NDEBUG
     // RYGT_ENV_WATCH_NEW=<hex offset>: reads and writes of that field of each new
     // EnvironmentSetting for its first 1.5 s (skipped while another watch runs).
     // (Not during boot: the watch logs through the renderer's log, which starts later.)
@@ -353,6 +372,7 @@ void RecordMisc(void* self, int site) {
         Vulkan::RytyWatchWrites(reinterpret_cast<u64>(self) + offset, 1500,
                                 fmt::format("rw new env {} +{:#x}", self, offset));
     }
+#endif
 }
 
 template <int Site>
@@ -599,6 +619,7 @@ void NoteProjectScript(const u8* data, s64 read) {
         return;
     }
     std::string_view name = head.substr(at + 15);
+#ifndef NDEBUG
     if (std::getenv("RYGT_LOG_PROJECTS")) {
         // DIAG-135: every project script the game loads, with the time.
         SYSTEMTIME now;
@@ -608,6 +629,7 @@ void NoteProjectScript(const u8* data, s64 read) {
                      now.wSecond, now.wMilliseconds, static_cast<int>(std::min<size_t>(path.size(), 80)),
                      path.data());
     }
+#endif
     name = name.substr(0, name.find('/'));
     static constexpr std::string_view menus[] = {
         "gtmode", "arcade", "campaign", "garage", "brand_central", "gallery", "livery2",
@@ -626,6 +648,7 @@ void NoteProjectScript(const u8* data, s64 read) {
     }
 }
 
+#ifndef NDEBUG
 // DIAG-163: the first 60 scripts the game loads, with their source path and the time since the
 // first one, so a boot that ends early shows how far its scripts got. RYGT_LOG_BOOT=0 turns it off.
 void NoteBootScript(const u8* data, s64 read) {
@@ -665,6 +688,8 @@ void NoteBootScript(const u8* data, s64 read) {
                  name.c_str());
 }
 
+#endif
+
 s64 PS4_SYSV_ABI StreamRefillHook(void* file, GuestIoVec* iov) {
     const s64 read = g_file_read(file, iov);
     if (read <= 0 || !iov || !iov->base) {
@@ -675,8 +700,11 @@ s64 PS4_SYSV_ABI StreamRefillHook(void* file, GuestIoVec* iov) {
     if (!g_script_replacements.empty()) {
         ServeReplacement(file, begin, read);
     }
+#ifndef NDEBUG
     NoteBootScript(begin, read); // DIAG-163
+#endif
     NoteProjectScript(begin, read); // FIX-110
+#ifndef NDEBUG
     static const bool log_scripts = std::getenv("RYGT_LOG_SCRIPTS") != nullptr;
     if (log_scripts) {
         // DIAG-107: the start of each script chunk read (first 48 printable bytes).
@@ -686,6 +714,7 @@ s64 PS4_SYSV_ABI StreamRefillHook(void* file, GuestIoVec* iov) {
         }
         std::fprintf(stderr, "[scripts] file %p read %lld: %s\n", file, static_cast<long long>(read), text.c_str());
     }
+#endif
     for (const auto& patch : g_script_patches) {
         u8* found = std::search(begin, end, patch.original.begin(), patch.original.end());
         if (found != end) {
@@ -696,6 +725,7 @@ s64 PS4_SYSV_ABI StreamRefillHook(void* file, GuestIoVec* iov) {
     return read;
 }
 
+#ifndef NDEBUG
 // PB-3 (RYGT_SCAN_READS=1): the game's other file reads (all calls of the read function but the
 // script streams') are scanned for PS4 shader programs, to see which shaders a loading screen
 // brings in before anything is drawn with them.
@@ -757,6 +787,8 @@ void InstallShaderLoadScan(u8* base) {
     }
 }
 
+#endif
+
 void InstallScriptPatches(u8* base) {
     const char* livery = std::getenv("RYGT_LIVERY");
     if (!(livery && livery[0] == '0')) {
@@ -783,11 +815,17 @@ void InstallScriptPatches(u8* base) {
         RedirectCall(base, stubs + i * 16, kStreamRefillCalls[i], kFileRead,
                      reinterpret_cast<void*>(&StreamRefillHook), "GTS-003 script reads");
     }
+#ifndef NDEBUG
     InstallShaderLoadScan(base);
+#endif
 }
 
 void InstallMiscHooks(u8* base) {
+#ifndef NDEBUG
     const char* diag = std::getenv("RYGT_ENV_DIAG");
+#else
+    constexpr const char* diag = nullptr;
+#endif
     const char* scale = std::getenv("RYGT_ENV_SCALE");
     if (!(diag && diag[0] == '1') && !scale && !std::getenv("RYGT_ENV_SET")) {
         return;
@@ -847,6 +885,7 @@ void InstallMiscHooks(u8* base) {
 
 } // namespace
 
+#ifndef NDEBUG
 // DIAG-106: the game's text-entry routine (eboot 0xf34700, this, pad slot) opens the keyboard
 // dialog or the inline keyboard. It refuses when the slot is above 3, a keyboard is already open
 // ([this+0xf4]) or the slot's user id (pad table 0x31a6bc0, 0x550 bytes per slot, +0x40) is -1.
@@ -885,6 +924,8 @@ void InstallTextEntryDiag(u8* base) {
                      reinterpret_cast<void*>(&OpenTextEntryHook), "DIAG-106 text entry");
     }
 }
+
+#endif
 
 // GTS-006: custom decals offline. <exe dir>\decals\*.svg are copied to /APP_CACHE/decals (the
 // game's <exe dir>\temp0\decals) as "<id>_<name>.svg"; the patched GRIM script lists them as the
@@ -1465,7 +1506,9 @@ void RytyApplyGamePatches() {
     InstallMiscHooks(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallLewisChallenge(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallScriptPatches(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+#ifndef NDEBUG
     InstallTextEntryDiag(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+#endif
     InstallFatalErrorDiag(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     if (!(std::getenv("RYGT_DECALS") && std::getenv("RYGT_DECALS")[0] == '0')) {
         SyncDecals();

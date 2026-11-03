@@ -222,6 +222,7 @@ bool HasEmptyScopeBeforeElse(std::span<const u32> code) {
     return false;
 }
 
+#ifndef NDEBUG
 // DIAG-209 (RYGT_NAN_TRACE=<hash>): that pixel shader paints the index of the first NaN among the
 // F32 values of the block that writes RenderTarget0, in base 8 over R, G and B (digit + 1) / 8.
 static void NanTracePass(IR::Program& program, const Info& info) {
@@ -284,6 +285,8 @@ static void NanTracePass(IR::Program& program, const Info& info) {
     }
 }
 
+#endif
+
 IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Info& info,
                              RuntimeInfo& runtime_info, const Profile& device_profile) {
     auto profile = device_profile;
@@ -343,11 +346,15 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
         Shader::Optimization::DomainShaderTransform(program, runtime_info);
     }
     Shader::Optimization::RingAccessElimination(program, runtime_info);
+#ifndef NDEBUG
     Shader::IR::DumpProgram(program, info, "pre-res-discover.");
+#endif
     auto resources = Shader::Optimization::ResourceDiscoverPass(program, profile);
     Shader::Optimization::LowerDynamicReadConstPass(program, resources);
     Shader::Optimization::FlattenExtendedUserdataPass(program);
+#ifndef NDEBUG
     Shader::IR::DumpProgram(program, info, "pre-res-patch.");
+#endif
     Shader::Optimization::ResourcePatchingPass(program.info, resources, profile);
     Shader::Optimization::LowerBufferFormatToRaw(program);
     Shader::Optimization::SharedMemorySimplifyPass(program, profile);
@@ -355,7 +362,9 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::Optimization::LowerUserClipPlanes(program, runtime_info);
     Shader::Optimization::PhiSimplificationPass(program);
     Shader::Optimization::InverseBallotEliminationPass(program);
+#ifndef NDEBUG
     Shader::IR::DumpProgram(program, info, "pre-lower-phi.");
+#endif
 
     // Prepare for structurization by clearing flow graph and lowering phis
     for (auto* ir_block : program.blocks) {
@@ -379,9 +388,13 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::Optimization::LowerHardwareIntrinsics(program);
     Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
     Shader::Optimization::DeadCodeEliminationPass(program);
+ #ifndef NDEBUG
     NanTracePass(program, info);
+ #endif
     Shader::Optimization::CollectShaderInfoPass(program, profile);
+#ifndef NDEBUG
     Shader::IR::DumpProgram(program, info);
+#endif
 
     return program;
 }

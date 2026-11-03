@@ -8,6 +8,7 @@
 #include "video_core/renderer_vulkan/vk_common.h"
 
 namespace Native::GpuCheckpoints {
+#ifndef NDEBUG
 inline bool Requested() {
     static const bool requested = [] {
         const char* value = std::getenv("RYGT_GPU_CHECKPOINTS");
@@ -96,4 +97,10 @@ inline void Log(VkQueue queue) {
         }
     }
 }
+#else
+inline constexpr bool Requested() noexcept { return false; }
+inline void Record(VkCommandBuffer, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) noexcept {}
+inline void Log(VkQueue) noexcept {}
+#endif
+
 }

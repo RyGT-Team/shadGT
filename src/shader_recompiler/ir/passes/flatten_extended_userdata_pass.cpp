@@ -790,10 +790,12 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
         c.getCurr() - reinterpret_cast<const u8*>(info.srt_info.walker_func);
     ReportSrtCodegenUse();
 
+#ifndef NDEBUG
     if (EmulatorSettings.IsDumpShaders()) {
         DumpSrtProgram(info, reinterpret_cast<const u8*>(info.srt_info.walker_func),
                        info.srt_info.walker_func_size);
     }
+#endif
 
     info.srt_info.flattened_bufsize_dw = pass_info.dst_off_dw;
 }

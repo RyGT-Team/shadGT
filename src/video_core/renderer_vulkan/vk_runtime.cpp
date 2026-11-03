@@ -190,6 +190,7 @@ void Runtime::ReportHoisting() {
     hoist_report = now;
 }
 
+#ifndef NDEBUG
 // DIAG-057: cut reasons.
 static constexpr std::array<const char*, 6> BatchCutNames{
     "buffer write over a batch read", "buffer copy from a batch write", "image layout change",
@@ -281,6 +282,15 @@ void Runtime::DiagBatchDraw(std::span<const std::tuple<vk::Buffer, u64, u64, boo
         d.since = now;
     }
 }
+
+#else
+void Runtime::DiagBatchBufferWrite(vk::Buffer, u64, u64, int) {}
+void Runtime::DiagBatchBufferRead(vk::Buffer, u64, u64, int) {}
+void Runtime::DiagBatchImage(vk::Image, int) {}
+void Runtime::DiagBatchCut(int) {}
+void Runtime::DiagBatchDraw(std::span<const std::tuple<vk::Buffer, u64, u64, bool>>,
+                            std::span<const vk::Image>) {}
+#endif
 
 void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
                          std::span<const vk::BufferCopy> copies) {

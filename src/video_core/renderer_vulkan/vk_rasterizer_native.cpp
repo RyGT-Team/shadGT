@@ -112,6 +112,12 @@ vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type);
 #include <windows.h>
 #endif
 
+#if defined(NDEBUG)
+#define NATIVE_DIAGNOSTIC(...) ((void)0)
+#else
+#define NATIVE_DIAGNOSTIC(...) __VA_ARGS__
+#endif
+
 namespace Vulkan {
 namespace {
 enum MirrorDiagnosticReason : u32 { MirrorCandidateNew,MirrorCandidateSameFrame,MirrorCandidateDynamic,
@@ -120,8 +126,12 @@ enum MirrorDiagnosticReason : u32 { MirrorCandidateNew,MirrorCandidateSameFrame,
     MirrorAcquireReused,MirrorDiscardSize,MirrorDiscardGeneration,MirrorCpuDrop,MirrorUnmapDrop,
     MirrorPromotionSuccess,MirrorPromotionCapacity,MirrorNoDirect,MirrorAcquireInvalid };
 bool MirrorDiagnosticEnabled() {
+#if !defined(NDEBUG)
     static const bool enabled=[] {const char* p=std::getenv("RYGT_NATIVE_MIRROR_DIAG");return p && p[0]=='1' && !p[1];}();
     return enabled;
+#else
+    return false;
+#endif
 }
 struct AheadVulkanBackend {
     using Pool=vk::DescriptorPool;using Layout=vk::DescriptorSetLayout;using Set=vk::DescriptorSet;
@@ -259,14 +269,14 @@ struct PendingDescriptorUpdates {
             auto row=source;row.dstSet=set;
             if(row.pBufferInfo) {if(row.descriptorCount==1)buffers[nb]=*row.pBufferInfo;else std::copy_n(row.pBufferInfo,row.descriptorCount,buffers.data()+nb);row.pBufferInfo=buffers.data()+nb;nb+=row.descriptorCount;}
             else {if(row.descriptorCount==1)images[ni]=*row.pImageInfo;else std::copy_n(row.pImageInfo,row.descriptorCount,images.data()+ni);row.pImageInfo=images.data()+ni;ni+=row.descriptorCount;}
-            writes[nw++]=row;++staged_rows;
+            writes[nw++]=row;NATIVE_DIAGNOSTIC(++staged_rows);
         }
-        high_rows=std::max<u64>(high_rows,nw);
+        NATIVE_DIAGNOSTIC(high_rows=std::max<u64>(high_rows,nw));
     }
     void Flush(vk::Device device,Reason reason) noexcept {
         if(!nw)return;
         device.updateDescriptorSets(vk::ArrayProxy<const vk::WriteDescriptorSet>{static_cast<u32>(nw),writes.data()},{});
-        ++actual_calls;++flushes[reason];nw=nb=ni=0;
+        NATIVE_DIAGNOSTIC(++actual_calls);NATIVE_DIAGNOSTIC(++flushes[reason]);nw=nb=ni=0;
     }
 };
 // Recorder-owned interval diagnostics. Closure bits describe predicates that
@@ -284,9 +294,11 @@ struct PassClosureStats {
         return n==0?0:n==1?1:n<4?2:n<8?3:n<32?4:n<256?5:6;
     }
     void Close(std::size_t draws,bool queued,u32 mask) noexcept {
+#if !defined(NDEBUG)
         ++sizes[origin][queued?0:1][Bucket(draws)];
         if(!mask)++reasons[origin][0];
         for(u32 i=0;i<6;++i)if(mask & (u32{1}<<i))++reasons[origin][i+1];
+#endif
     }
 };
 static bool CanInlineContinuation(std::size_t draws,bool small_batch,bool closing,bool rendering,
@@ -351,12 +363,16 @@ struct ParallelRuntime {
     u64 proof_table_builds{},proof_table_hits{},extended_clear_rejected{},fast_rejected{},no_pass_room_rejected{},serial_scope_bypassed{},owner_slot_pressure{},eligible_in_serial_scope{},eligible_in_active_scope{},eligible_at_boundary{},vertex_candidates{},vertex_preflight_draws{},vertex_backing_pass{},vertex_bad_structure{},vertex_bad_binding{},vertex_bad_pnext{},vertex_unknown_backing{},vertex_direct_ranges{},vertex_direct_attempts{},vertex_direct_matches{},direct_slot_attempts{},direct_slot_accepted{},passes{},draws{},queued{},synchronous{},considered{},eligible{},unknown_resource_key{},buffer_rejected{},alias_rejected{},descriptor_rejected{},missing_sets{},preflight_seq{},preflight_samples{},preflight_wall_ns{},preflight_cpu_100ns{},preflight_cpu_samples{},drain_ns{},coordinator_cpu_100ns{},coordinator_cpu_samples{};
     u64 serial_eligible_run{},serial_eligible_run_max{};std::array<u64,4> serial_eligible_runs{};
     void FinishSerialEligibleRun() noexcept {
+#if !defined(NDEBUG)
         if(!serial_eligible_run)return;
         const auto n=serial_eligible_run;++serial_eligible_runs[n==1?0:n<4?1:n<8?2:3];serial_eligible_run=0;
+#endif
     }
     void NoteSerialEligible() noexcept {
+#if !defined(NDEBUG)
         if(serial_eligible_run!=UINT64_MAX)++serial_eligible_run;
         serial_eligible_run_max=std::max(serial_eligible_run_max,serial_eligible_run);
+#endif
     }
     bool closing{};
 };
@@ -386,9 +402,19 @@ bool ParallelSmallPassBatchEnabled() { static const bool enabled=[] {const char*
 // Experimental indexed/MRT/depth packet. Clear admission remains separately gated.
 bool ParallelExtendedEnabled() {static const bool on=[] {const char* p=std::getenv("RYGT_PARALLEL_EXTENDED");return p && p[0]=='1' && !p[1];}();return on;}
 bool ParallelD2Enabled() { static const bool yes=[] {const char* p=std::getenv("RYGT_PARALLEL_D2"); return p && p[0]=='1' && p[1]=='\0';}();return yes; }
-bool ParallelProofPhaseEnabled() {static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_PROOF_PHASE_DIAG");return p && p[0]=='1' && !p[1];}();return enabled;}
+bool ParallelProofPhaseEnabled() {
+#if !defined(NDEBUG)
+static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_PROOF_PHASE_DIAG");return p && p[0]=='1' && !p[1];}();return enabled;
+#else
+    return false;
+#endif
+}
 bool ParallelGateDiagEnabled() {
+#if !defined(NDEBUG)
     static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_GATE_DIAG");return p&&p[0]=='1'&&p[1]=='\0';}();return enabled;
+#else
+    return false;
+#endif
 }
 struct ParallelEligibilityStats {
     u64 observed{}, eligible{}, race{}, nonindexed{}, single_color{}, no_clear{}, no_depth{}, no_descriptors{}, no_storage{}, no_feedback{}, eligible_draws_in_runs[7]{}, runs[7]{}, current{};
@@ -396,16 +422,26 @@ struct ParallelEligibilityStats {
 };
 thread_local ParallelEligibilityStats parallel_eligibility_stats;
 thread_local const NativeRenderer* parallel_eligibility_owner=nullptr;
-bool ParallelEligibilityEnabled() { static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_ELIGIBILITY_DIAG");return p&&p[0]=='1';}();return enabled; }
+bool ParallelEligibilityEnabled() {
+#if !defined(NDEBUG)
+ static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_ELIGIBILITY_DIAG");return p&&p[0]=='1';}();return enabled;
+#else
+    return false;
+#endif
+}
 thread_local Native::DescriptorAllocMetrics descriptor_alloc_metrics;
 thread_local u64 descriptor_bind_sets[2]{}, descriptor_bind_runs[2]{}, descriptor_bind_multi[2]{};
 thread_local const NativeRenderer* descriptor_alloc_owner = nullptr;
 bool DescriptorAllocDiagEnabled() {
+#if !defined(NDEBUG)
     static const bool enabled = [] { const char* e=std::getenv("RYGT_DESC_ALLOC_DIAG"); return e && e[0]=='1'; }();
     return enabled;
+#else
+    return false;
+#endif
 }
 bool DescriptorThreadCpu100ns(u64& result) {
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(NDEBUG)
     FILETIME created{}, exited{}, kernel{}, user{};
     if (GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) {
         result=(u64(kernel.dwHighDateTime)<<32 | kernel.dwLowDateTime) + (u64(user.dwHighDateTime)<<32 | user.dwLowDateTime);
@@ -414,6 +450,7 @@ bool DescriptorThreadCpu100ns(u64& result) {
 #endif
     result=0; return false;
 }
+#if !defined(NDEBUG)
 struct SampledProofTimer {
     ProofPhaseStats* stats{};std::chrono::steady_clock::time_point start{};
     SampledProofTimer(ProofPhaseStats& s,bool sampled) noexcept {if(sampled){stats=&s;start=std::chrono::steady_clock::now();}}
@@ -435,6 +472,20 @@ template<class F> auto TimedProofInvoke(ProofPhaseStats& stats,bool sampled,F&& 
     if(!sampled)return std::forward<F>(fn)();
     SampledProofTimer timer{stats,true};return std::forward<F>(fn)();
 }
+#else
+struct SampledProofTimer {
+    constexpr SampledProofTimer(ProofPhaseStats&,bool) noexcept {}
+};
+struct WholePhaseTimer {
+    constexpr WholePhaseTimer(std::array<ProofPhaseStats,8>&,bool) noexcept {}
+    constexpr void Stop() noexcept {}
+    constexpr void Next(size_t) noexcept {}
+};
+template<class F> auto TimedProofInvoke(ProofPhaseStats&,bool,F&& fn) {
+    return std::forward<F>(fn)();
+}
+#endif
+
 }
 struct SceneIndirectArgs {u64 id,address,offset;};
 static std::unique_ptr<Native::Rhi::Buffer> scene_indirect_buffer;
@@ -445,6 +496,7 @@ extern std::atomic<u64> g_prepared_frames;
 bool RytyGtsMenuSnapshotsAllowed();
 namespace {
 bool A82CaptureAfterRace() {
+#if !defined(NDEBUG)
     static const bool enabled=[] { const char* p=std::getenv("RYGT_A82_CAPTURE_AFTER_RACE"); return p && p[0]=='1'; }();
     if (!enabled) return true;
     static A82RaceGate gate;
@@ -455,6 +507,9 @@ bool A82CaptureAfterRace() {
     if (state==A82RaceGate::Armed && !logged_armed.exchange(true))
         LOG_WARNING(Render_Vulkan,"DIAG-A82 gate armed after race; capture enabled");
     return state==A82RaceGate::Armed;
+#else
+    return false;
+#endif
 }
 thread_local u64 descriptor_hash_reused = 0;
 thread_local u64 descriptor_hash_refreshed = 0;
@@ -742,6 +797,7 @@ T* Handle(u64 handle) {
 /// NAT-110: adds the time until the end of the scope to a counter.
 // OPT-001: the phase timers read the clock on one draw in 16 (reading it in every phase of every
 // draw was 7% of the recorder's time); the report divides by the draws timed.
+#if !defined(NDEBUG)
 thread_local bool t_timed = true;
 struct PhaseClock {
     u64* total;
@@ -774,12 +830,30 @@ struct RecordPartitionClock {
     }
     ~RecordPartitionClock(){Finish();}
 };
+#else
+inline constexpr bool t_timed = false;
+struct PhaseClock {
+    explicit constexpr PhaseClock(u64&) noexcept {}
+};
+struct RecordPartitionClock {
+    explicit constexpr RecordPartitionClock(RecordPartitionMetric*) noexcept {}
+    constexpr void Finish() noexcept {}
+};
+#endif
+
+#if !defined(NDEBUG)
 thread_local RecordPartitionMetric* t_record_partition_end=nullptr;
 struct RecordPartitionEndGuard {
     RecordPartitionMetric* previous;
     explicit RecordPartitionEndGuard(RecordPartitionMetric* current) noexcept : previous{t_record_partition_end} {t_record_partition_end=current;}
     ~RecordPartitionEndGuard(){t_record_partition_end=previous;}
 };
+#else
+inline constexpr RecordPartitionMetric* t_record_partition_end=nullptr;
+struct RecordPartitionEndGuard {
+    explicit constexpr RecordPartitionEndGuard(RecordPartitionMetric*) noexcept {}
+};
+#endif
 
 constexpr u64 ChunkSize = 8_MB;
 constexpr u32 SpliceAfter = 512; ///< commands per list before it is run and submitted
@@ -866,19 +940,19 @@ void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Ta
     const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
     if (!fs || regs.num_indices > 6 ||
         regs.num_instances.NumInstances() != 1 || targets.state.num_color_attachments != 2 ||
-        bindings.sampled.size() != 4 || !targets.colors[0] || !targets.colors[1]) { static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 1, fs {:#x}", fs ? fs->pgm_hash : 0); return; }
+        bindings.sampled.size() != 4 || !targets.colors[0] || !targets.colors[1]) { NATIVE_DIAGNOSTIC(static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 1, fs {:#x}", fs ? fs->pgm_hash : 0);); return; }
     const auto* history_out = targets.colors[0];
     const auto* resolved = targets.colors[1];
     const vk::Extent2D size{resolved->info.size.width, resolved->info.size.height};
     if (history_out->info.pixel_format != vk::Format::eR16G16B16A16Sfloat ||
         resolved->info.pixel_format != vk::Format::eB10G11R11UfloatPack32 ||
         history_out->info.size.width != size.width || history_out->info.size.height != size.height)
-        { static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 2, fs {:#x}", fs ? fs->pgm_hash : 0); return; }
+        { NATIVE_DIAGNOSTIC(static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 2, fs {:#x}", fs ? fs->pgm_hash : 0);); return; }
     const Native::ImageEntry *color{}, *depth{}, *motion{}, *history{};
     for (const auto* e : bindings.sampled) {
         const auto& i = e->info;
         if (i.size.width != size.width || i.size.height != size.height || i.num_samples != 1 ||
-            i.resources.layers != 1 || i.resources.levels != 1) { static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 3, fs {:#x}", fs ? fs->pgm_hash : 0); return; }
+            i.resources.layers != 1 || i.resources.levels != 1) { NATIVE_DIAGNOSTIC(static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 3, fs {:#x}", fs ? fs->pgm_hash : 0);); return; }
         // The sampled R32 descriptor may alias the real depth/stencil attachment.
         // TemporalImage preserves its actual aspects; Capture extracts D32 through
         // a buffer into FSR's separate R32 image instead of making a D32-only view.
@@ -888,9 +962,9 @@ void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Ta
         else if (i.pixel_format == vk::Format::eR16G16Sfloat) motion = e;
         else if (i.pixel_format == vk::Format::eB10G11R11UfloatPack32) color = e;
         else if (i.pixel_format == vk::Format::eR16G16B16A16Sfloat) history = e;
-        else { static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 4, fs {:#x}", fs ? fs->pgm_hash : 0); return; }
+        else { NATIVE_DIAGNOSTIC(static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 4, fs {:#x}", fs ? fs->pgm_hash : 0);); return; }
     }
-    if (!color || !depth || !motion || !history || color == resolved || history == history_out) { static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 5, fs {:#x}", fs ? fs->pgm_hash : 0); return; }
+    if (!color || !depth || !motion || !history || color == resolved || history == history_out) { NATIVE_DIAGNOSTIC(static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 5, fs {:#x}", fs ? fs->pgm_hash : 0);); return; }
     std::array<float, 28> constants{};
     bool valid = false;
     for (const auto& buffer : fs->buffers) {
@@ -898,7 +972,7 @@ void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Ta
         const auto sharp = buffer.GetSharp(*fs);
         if (!sharp.base_address || sharp.GetSize() != sizeof(constants)) continue;
         if (!Core::RytyMemory::GuardedCopy(constants.data(),
-                reinterpret_cast<const void*>(sharp.base_address), sizeof(constants))) { static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 6, fs {:#x}", fs ? fs->pgm_hash : 0); return; }
+                reinterpret_cast<const void*>(sharp.base_address), sizeof(constants))) { NATIVE_DIAGNOSTIC(static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 6, fs {:#x}", fs ? fs->pgm_hash : 0);); return; }
         valid = std::ranges::all_of(constants, [](float v) { return std::isfinite(v); }) &&
             std::abs(constants[14] - size.width * .5f) <= .01f &&
             std::abs(constants[15] + size.height * .5f) <= .01f &&
@@ -907,15 +981,17 @@ void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Ta
             std::abs(constants[21] * constants[15]) <= 1.f;
         break;
     }
-    if (!valid) { static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 7, fs {:#x}", fs ? fs->pgm_hash : 0); return; }
+    if (!valid) { NATIVE_DIAGNOSTIC(static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 7, fs {:#x}", fs ? fs->pgm_hash : 0);); return; }
     Splice();
     const auto captured_frame = g_prepared_frames.load(std::memory_order_relaxed);
     const bool captured = r.temporalDlss.Capture(captured_frame, TemporalImage(*color),
         TemporalImage(*depth), TemporalImage(*motion), TemporalImage(*resolved), constants);
+#if !defined(NDEBUG)
     static u32 captured_logged{};
     if (captured_logged++ < 12)
         LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture frame {} fs {:#x} accepted {} resolved {:#x}",
             captured_frame, fs->pgm_hash, captured, resolved->image->NativeHandle());
+#endif
 }
 
 bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, const Targets& targets,
@@ -1591,22 +1667,28 @@ void NativeRenderer::EndRendering(u32 reason) {
     if (sidecar && sidecar->active) {
         auto& pass=*sidecar->active;
         const auto captured_draws=pass.draws.size(); // transfer can swap the vector
-        ++sidecar->pass_size_hist[std::min<std::size_t>(8,pass.draws.size())];
+        NATIVE_DIAGNOSTIC(++sidecar->pass_size_hist[std::min<std::size_t>(8,pass.draws.size())]);
         u64 coordinator_start=0,coordinator_end=0;const bool cpu_started=ParallelGateDiagEnabled() && DescriptorThreadCpu100ns(coordinator_start);
         stream.rendering=false; // the captured pass has not begun on stream.cmd
         bool queued=false;
         if((pass.draws.size()>=8 || ParallelSmallPassBatchEnabled()) && !sidecar->closing) {
             const auto reset=[&]() noexcept {stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;};
             if(Native::Parallel::RotateSegment(*sidecar->coordinator,*device,sidecar->epoch,
-                    stream.list,stream.cmd,sidecar->lease,64*1024,reset,&sidecar->rotation_diag)) {
+                    stream.list,stream.cmd,sidecar->lease,64*1024,reset,
+#if !defined(NDEBUG)
+                    &sidecar->rotation_diag
+#else
+                    nullptr
+#endif
+                    )) {
                 std::size_t bytes=sizeof(pass)+pass.draws.capacity()*sizeof(Native::Parallel::Draw);
                 for(const auto& draw:pass.draws) bytes+=draw.descriptor_bytes;
                 try {queued=pass.draws.size()>=8 ? (sidecar->transfer_applied_mode.Enabled() ? sidecar->coordinator->TryPassTransfer(sidecar->epoch,pass,bytes) : sidecar->coordinator->TryPass(sidecar->epoch,pass,bytes)) : sidecar->coordinator->TrySmallPass(sidecar->epoch,pass,bytes);}
-                catch(const std::bad_alloc&) {if(pass.draws.size()<8)++sidecar->small_admission_exceptions;else ++sidecar->large_admission_exceptions;queued=false;}
+                catch(const std::bad_alloc&) {if(pass.draws.size()<8)NATIVE_DIAGNOSTIC(++sidecar->small_admission_exceptions);else NATIVE_DIAGNOSTIC(++sidecar->large_admission_exceptions);queued=false;}
             }
         }
-        if(queued) {++sidecar->queued;sidecar->sync_pins.Queued(sidecar->pin_slot);} else {
-            ++sidecar->synchronous;
+        if(queued) {NATIVE_DIAGNOSTIC(++sidecar->queued);sidecar->sync_pins.Queued(sidecar->pin_slot);} else {
+            NATIVE_DIAGNOSTIC(++sidecar->synchronous);
             ASSERT_MSG(Native::Parallel::RecordPass(stream.cmd,r.instance,pass),"parallel pass synchronous fallback failed");
             ASSERT_MSG(sidecar->sync_pins.Tag(sidecar->pin_slot,sidecar->epoch),"parallel synchronous owner pin failed");
             stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;
@@ -1616,7 +1698,7 @@ void NativeRenderer::EndRendering(u32 reason) {
         sidecar->pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;
         sidecar->active.reset();sidecar->lease.reset();
         if(cpu_started && DescriptorThreadCpu100ns(coordinator_end) && coordinator_end>=coordinator_start) {
-            sidecar->coordinator_cpu_100ns+=coordinator_end-coordinator_start;++sidecar->coordinator_cpu_samples;
+            NATIVE_DIAGNOSTIC(sidecar->coordinator_cpu_100ns+=coordinator_end-coordinator_start);NATIVE_DIAGNOSTIC(++sidecar->coordinator_cpu_samples);
         }
         return;
     }
@@ -1641,13 +1723,13 @@ bool NativeRenderer::ContinueSmallParallelPass(const RenderState& target,u32 rea
     sidecar->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::EndPass);
     sidecar->FinishSerialEligibleRun();
     const auto draws=pass.draws.size();
-    ++sidecar->pass_size_hist[std::min<std::size_t>(8,draws)];
+    NATIVE_DIAGNOSTIC(++sidecar->pass_size_hist[std::min<std::size_t>(8,draws)]);
     u64 begin=0,end=0;const bool timed=ParallelGateDiagEnabled() && DescriptorThreadCpu100ns(begin);
     vk::Pipeline last{};
     ASSERT_MSG(Native::Parallel::RecordPassInline(stream.cmd,r.instance,pass,stream.dynamic,last),
                "parallel pass inline continuation failed");
     ASSERT_MSG(sidecar->sync_pins.Tag(sidecar->pin_slot,sidecar->epoch),"parallel synchronous owner pin failed");
-    ++sidecar->synchronous;++sidecar->inline_continuations;
+    NATIVE_DIAGNOSTIC(++sidecar->synchronous);NATIVE_DIAGNOSTIC(++sidecar->inline_continuations);
     sidecar->pass_closure.Close(draws,false,reason);
     // Only graphics was bound by replay; preserve independent compute binding.
     stream.pipelines.handles[0]=last;
@@ -1656,7 +1738,7 @@ bool NativeRenderer::ContinueSmallParallelPass(const RenderState& target,u32 rea
     sidecar->pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;
     sidecar->active.reset();sidecar->lease.reset();
     if(timed && DescriptorThreadCpu100ns(end) && end>=begin) {
-        sidecar->coordinator_cpu_100ns+=end-begin;++sidecar->coordinator_cpu_samples;
+        NATIVE_DIAGNOSTIC(sidecar->coordinator_cpu_100ns+=end-begin);NATIVE_DIAGNOSTIC(++sidecar->coordinator_cpu_samples);
     }
     return true;
 }
@@ -1706,7 +1788,7 @@ void NativeRenderer::BeginRendering(const RenderState& state) {
     });
     s.rendering = true;
     s.render = state;
-    ++stats.passes;
+    NATIVE_DIAGNOSTIC(++stats.passes);
 }
 
 void NativeRenderer::GlobalBarrier() {
@@ -1726,7 +1808,7 @@ void NativeRenderer::GlobalBarrier() {
     s.buffers_written = false;
     s.attach_dirty.clear();
     s.read.clear();
-    ++stats.barriers;
+    NATIVE_DIAGNOSTIC(++stats.barriers);
     FlushWritebacks();
 }
 
@@ -1751,7 +1833,7 @@ void NativeRenderer::PassBarrier() {
         .pMemoryBarriers = &barrier,
     });
     s.attach_dirty.clear();
-    ++stats.pass_barriers;
+    NATIVE_DIAGNOSTIC(++stats.pass_barriers);
 }
 
 void NativeRenderer::FlushWritebacks() {
@@ -1775,7 +1857,7 @@ void NativeRenderer::FlushWritebacks() {
             reinterpret_cast<u64>(static_cast<VkBuffer>(found->first->Handle())),
             found->first->SizeBytes());
         if (registry->RecordDownload(*s.list, *entry, *out, found->second)) {
-            ++stats.writebacks;
+            NATIVE_DIAGNOSTIC(++stats.writebacks);
             if (RegionOver(address, size)) {
                 // Image writes are authoritative for their entire byte range. A CPU-page
                 // delta cannot represent them: its saved baseline can already contain the
@@ -1958,30 +2040,30 @@ vk::DescriptorBufferInfo NativeRenderer::UploadFlatData(u32 stage, const u8* sou
     FlatUploadMemo::Lookup lookup;
     if (reuse_enabled) {
         lookup = memo.Find(stage, bytes, [this](const void* data, size_t length) {
-            stats.flat_upload_bytes_hashed += length;
+            NATIVE_DIAGNOSTIC(stats.flat_upload_bytes_hashed += length);
             return Native::Parallel::AdaptiveXXH3(data, length);
         });
         if (lookup.binding) {
             if(backing_proven)*backing_proven=lookup.backing_proven;
-            ++stats.flat_upload_hits;
-            stats.flat_upload_bytes_saved += size;
+            NATIVE_DIAGNOSTIC(++stats.flat_upload_hits);
+            NATIVE_DIAGNOSTIC(stats.flat_upload_bytes_saved += size);
             return *lookup.binding;
         }
     }
     // This is also the uploaded count in the existing report: include bypasses.
-    ++stats.flat_upload_misses;
+    NATIVE_DIAGNOSTIC(++stats.flat_upload_misses);
     trace.Next(1);
     bool allocated_backing=false;
     const auto [buffer, offset, data] = Allocate(size, r.instance.StorageMinAlignment(), backing_proven?&allocated_backing:nullptr);
     if(backing_proven)*backing_proven=allocated_backing;
     trace.Next(2);
     std::memcpy(data, source, size);
-    stats.flat_upload_bytes_uploaded += size;
+    NATIVE_DIAGNOSTIC(stats.flat_upload_bytes_uploaded += size);
     const vk::DescriptorBufferInfo binding{buffer, offset, size};
     trace.Next(3);
     if (reuse_enabled) {
         memo.Store(lookup, stage, bytes, binding, allocated_backing);
-        if (lookup.slot < 128) stats.flat_upload_reference_bytes += size;
+        if (lookup.slot < 128) NATIVE_DIAGNOSTIC(stats.flat_upload_reference_bytes += size);
     }
     trace.Next(4);
     return binding;
@@ -2148,7 +2230,8 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
     // CPU writes to it from now on are copied in before its next use.
     WatchPages(begin, end - begin);
     DropMirrors(begin, end - begin); // NAT-150: reads there use the region from now on
-    ++stats.regions_made;
+    NATIVE_DIAGNOSTIC(++stats.regions_made);
+#if !defined(NDEBUG)
     if (end-begin >= 4_MB && !merged.empty()) {
         LOG_INFO(Render_Vulkan,
             "NAT-REGION-INIT: begin={:#x} bytes={} guest-init={} gpu-retained={} gaps={} old-regions={}",
@@ -2156,6 +2239,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
     }
     LOG_INFO(Render_Vulkan, "NAT-114: region {:#x}+{:#x} on the GPU ({} taken in)", begin,
              end - begin, merged.size());
+#endif
     std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
     auto [it, inserted] = regions.emplace(begin, std::move(region));
     return &it->second;
@@ -2208,6 +2292,7 @@ void NativeRenderer::SortRegionWrites() {
                 }
                 written->second = frame;
             }
+#if !defined(NDEBUG)
             // FIX-184 (diagnosis, RYGT_NATIVE_MIRROR_NODROP=1): CPU-written mirrors stay (their
             // pages are copied in at the next use as usual).
             static const bool no_drop = [] {
@@ -2217,10 +2302,11 @@ void NativeRenderer::SortRegionWrites() {
             if (dynamic && no_drop) {
                 dynamic = false;
             }
+#endif
             if (dynamic) {
                 if(mirror_diag)NoteMirrorDiagnostic(MirrorCpuDrop,begin,end,mirror.begin,mirror.end,unmap_generation.load(),blocked_granule,blocked_age);
                 mirror_bytes -= mirror.end - mirror.begin;
-                ++stats.mirrors_dropped;
+                NATIVE_DIAGNOSTIC(++stats.mirrors_dropped);
                 ++buffer_generation; // OPT-003
                 buffer_log.Note(mirror.begin, mirror.end); // OPT-010
                 retired_watch_ranges.emplace_back(mirror.begin, mirror.end);
@@ -2306,7 +2392,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr add
     if (mirror) {
         RefreshMirror(*mirror);
         mirror->used_frame = frame;
-        ++stats.mirror_binds;
+        NATIVE_DIAGNOSTIC(++stats.mirror_binds);
         memo_kind = MemoKind::Mirror; // OPT-003
         memo_mirror = mirror;
         return std::pair{vk::Buffer{Handle<VkBuffer_T>(mirror->buffer->NativeHandle())},
@@ -2391,7 +2477,7 @@ void NativeRenderer::RefreshMirror(Mirror& mirror) {
         }
     }
     s.buffers_written = true;
-    stats.mirror_refresh_pages += pages.size();
+    NATIVE_DIAGNOSTIC(stats.mirror_refresh_pages += pages.size());
 }
 
 void NativeRenderer::MakePendingMirrors() {
@@ -2531,7 +2617,7 @@ void NativeRenderer::MakePendingMirrors() {
                 if (it->second.used_frame + 120 < frame &&
                     !(it->second.begin < end && it->second.end > begin)) {
                     mirror_bytes -= it->second.end - it->second.begin;
-                    ++stats.mirrors_evicted;
+                    NATIVE_DIAGNOSTIC(++stats.mirrors_evicted);
                     ++buffer_generation;
                     buffer_log.Note(it->second.begin, it->second.end);
                     retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
@@ -2542,7 +2628,7 @@ void NativeRenderer::MakePendingMirrors() {
             }
         }
         if (mirror_bytes - taken + (end - begin) > budget) {
-            ++stats.mirror_over_budget;
+            NATIVE_DIAGNOSTIC(++stats.mirror_over_budget);
             if(mirror_diag)NoteMirrorDiagnostic(MirrorPromotionCapacity,~u64{0},~u64{0},begin,end,unmap_generation.load());
             continue;
         }
@@ -2591,7 +2677,7 @@ void NativeRenderer::MakePendingMirrors() {
             }
             continue;
         }
-        if(observation==MirrorWorker::Observation::Reused)++stats.mirror_cross_address_reuses;
+        if(observation==MirrorWorker::Observation::Reused)NATIVE_DIAGNOSTIC(++stats.mirror_cross_address_reuses);
         if(mirror_diag)NoteMirrorDiagnostic(MirrorPromotionSuccess,~u64{0},~u64{0},begin,end,unmap_generation.load());
         promotion_trace.Next(3);
         ++buffer_generation; // Only actual map changes invalidate prepared draws.
@@ -2610,8 +2696,8 @@ void NativeRenderer::MakePendingMirrors() {
         promotion_trace.Next(5);
         WatchPages(begin, end - begin);
         mirror_bytes += end - begin;
-        ++stats.mirrors_made;
-        stats.mirror_made_bytes += end - begin;
+        NATIVE_DIAGNOSTIC(++stats.mirrors_made);
+        NATIVE_DIAGNOSTIC(stats.mirror_made_bytes += end - begin);
         promotion_trace.Next(6);
         std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
         mirrors.emplace(begin, Mirror{.begin = begin,
@@ -2662,6 +2748,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
     }
     std::vector<VAddr> pages(first, last);
     dirty.erase(first, last);
+#if !defined(NDEBUG)
     const auto refresh_start = std::chrono::steady_clock::now();
     struct Timed {
         std::chrono::steady_clock::time_point start;
@@ -2672,7 +2759,9 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
                          .count();
         }
     } timed{refresh_start, stats.region_refresh_ns};
-    stats.region_refresh_pages += pages.size();
+    NATIVE_DIAGNOSTIC(stats.region_refresh_pages += pages.size());
+
+#endif
     auto* direct = r.buffer_cache.GetDirectMemory();
     if (!direct) {
         return;
@@ -2770,16 +2859,18 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
             copy_snapshot(page + run_begin, now.data() + run_begin, run_end - run_begin);
             changed += run_end - run_begin;
         }
-        ++stats.region_partial_pages;
-        stats.region_partial_bytes += changed;
+        NATIVE_DIAGNOSTIC(++stats.region_partial_pages);
+        NATIVE_DIAGNOSTIC(stats.region_partial_bytes += changed);
     }
     s.buffers_written = true;
-    ++stats.region_refreshes;
+    NATIVE_DIAGNOSTIC(++stats.region_refreshes);
+#if !defined(NDEBUG)
     if (stats.region_partial_pages != 0 && Sample(logged_partial)) {
         LOG_INFO(Render_Vulkan, "FIX-173: region pages copied in part: {} ({:.1f} KB of {:.1f} KB)",
                  stats.region_partial_pages, stats.region_partial_bytes / 1024.0,
                  stats.region_partial_pages * 4.0);
     }
+#endif
 }
 
 u64 NativeRenderer::SnapshotBelow() {
@@ -2798,7 +2889,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
         return std::nullopt;
     }
     PhaseClock guest_clock{stats.guest_buffer_ns}; // NAT-145
-    ++stats.guest_buffer_calls;
+    NATIVE_DIAGNOSTIC(++stats.guest_buffer_calls);
     last_mirror = nullptr; // OPT-004
     // OPT-003: the range's last result, when nothing it depends on changed.
     const u32 flags = u32(write) | (u32(mirror) << 1);
@@ -2816,14 +2907,14 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
             (!memo.mirror || memo.mirror->dirty_pages.empty());
         if (fresh) {
             if (memo.region) {
-                ++stats.region_binds;
+                NATIVE_DIAGNOSTIC(++stats.region_binds);
             } else if (memo.mirror) {
-                ++stats.mirror_binds;
+                NATIVE_DIAGNOSTIC(++stats.mirror_binds);
                 memo.mirror->used_frame = frame;
             }
             last_bound = memo.bound;
             last_mirror = memo.mirror; // OPT-004
-            ++stats.buffer_memo_hits;
+            NATIVE_DIAGNOSTIC(++stats.buffer_memo_hits);
             return std::pair{memo.buffer, memo.offset};
         }
     }
@@ -2861,7 +2952,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
         }
         if (region) {
             RefreshRegion(*region, address, size);
-            ++stats.region_binds;
+            NATIVE_DIAGNOSTIC(++stats.region_binds);
             memo_kind = MemoKind::Region; // OPT-003
             memo_region = region;
             return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
@@ -2908,7 +2999,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     });
     if (write && write_regions && size <= 256_MB && address < inplace_from && !listed_in_place) {
         if (Region* region = MakeRegion(address, size)) {
-            ++stats.region_binds;
+            NATIVE_DIAGNOSTIC(++stats.region_binds);
             memo_kind = MemoKind::Region; // OPT-003
             memo_region = region;
             return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
@@ -2947,11 +3038,11 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     }
     if (write) {
         if (Region* region = MakeRegion(address, size)) {
-            ++stats.region_binds;
+            NATIVE_DIAGNOSTIC(++stats.region_binds);
             return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
                              u64{address - region->begin}};
         }
-        ++stats.unbound;
+        NATIVE_DIAGNOSTIC(++stats.unbound);
         static std::atomic<u32> logged{};
         if (Sample(logged)) {
             LOG_WARNING(Render_Vulkan,
@@ -2962,7 +3053,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
         return std::nullopt;
     }
     if (size > 64_MB) {
-        ++stats.unbound;
+        NATIVE_DIAGNOSTIC(++stats.unbound);
         static std::atomic<u32> logged{};
         if (Sample(logged)) {
             LOG_WARNING(Render_Vulkan,
@@ -2988,8 +3079,8 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
     if (readable < size) {
         std::memset(data + readable, 0, size - readable);
     }
-    ++stats.copied_reads;
-    stats.copied_bytes += size;
+    NATIVE_DIAGNOSTIC(++stats.copied_reads);
+    NATIVE_DIAGNOSTIC(stats.copied_bytes += size);
     return std::pair{buffer, offset};
 }
 
@@ -3025,8 +3116,8 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GatherOnGpu(VAddr addr
     if (!all) {
         return std::nullopt;
     }
-    ++stats.gathers;
-    stats.gathered_bytes += size;
+    NATIVE_DIAGNOSTIC(++stats.gathers);
+    NATIVE_DIAGNOSTIC(stats.gathered_bytes += size);
     return std::pair{dst, u64{0}};
 }
 
@@ -3238,7 +3329,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
         const VideoCore::TextureCache::ImageDesc desc{col_buf, r.liverpool->DrawCbExtent(cb)};
         Native::ImageEntry* entry = registry->Find(desc.info, true, frame);
         if (!entry) {
-            ++stats.null_images;
+            NATIVE_DIAGNOSTIC(++stats.null_images);
             continue;
         }
         const vk::ImageView view = View(*entry, desc.view_info, ViewUse::Attachment);
@@ -3246,6 +3337,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
             continue;
         }
         ApplyRewrite(*entry); // NAT-120
+#if !defined(NDEBUG)
         if (Native::WatchedTexture(entry->info.guest_address, entry->info.guest_address + 1) &&
             Native::WatchSample()) {
             LOG_WARNING(Render_Vulkan, "FIX-153 watch: draw into target {:#x} {}x{} layers {} "
@@ -3255,6 +3347,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
                         entry->info.guest_size, desc.view_info.range.base.layer,
                         desc.view_info.range.extent.layers, desc.view_info.range.base.level);
         }
+#endif
         out.colors[cb] = entry;
         out.color_formats[cb] = desc.view_info.format;
         // FIX-154: the draw covers the target it names, not the larger picture it may share
@@ -3312,7 +3405,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
                 if (!meta_clear && desc.info.meta_info.htile_addr != 0 && !entry->from_cpu &&
                     entry->write_version.load(std::memory_order_relaxed) == 0) {
                     meta_clear = fresh = true;
-                    ++stats.meta_clears;
+                    NATIVE_DIAGNOSTIC(++stats.meta_clears);
                 }
             }
             const auto aspects =
@@ -3320,6 +3413,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
                                          regs.depth_render_control, meta_clear);
             const bool depth_clear = bool(aspects & vk::ImageAspectFlagBits::eDepth);
             const bool stencil_clear = bool(aspects & vk::ImageAspectFlagBits::eStencil);
+#if !defined(NDEBUG)
             if (Native::WatchedTexture(entry->info.guest_address, entry->info.guest_address + 1) &&
                 Native::WatchSample()) {
                 const auto& dc = regs.depth_control;
@@ -3337,6 +3431,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
                             u32(regs.depth_render_control.depth_clear_enable),
                             u32(regs.depth_render_control.stencil_clear_enable), frame);
             }
+#endif
             db.image_view = view;
             if (r.FrameDumpCollecting() && entry->info.guest_address == 0x100ca70000) {
                 r.FrameDumpEvent(fmt::format(
@@ -3362,7 +3457,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
             num_layers = std::min<u32>(num_layers, desc.view_info.range.extent.layers);
             out.depth = entry;
         } else {
-            ++stats.null_images;
+            NATIVE_DIAGNOSTIC(++stats.null_images);
         }
     }
     state.width = static_cast<u16>(std::min<u32>(width, 0xffff));
@@ -3408,6 +3503,7 @@ void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
 void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs, bool compute,
                                  Shader::Backend::Bindings& binding, DrawBindings& b) {
     const u64 alignment = r.instance.StorageMinAlignment();
+#if !defined(NDEBUG)
     if (r.FrameDumpCollecting() && !compute &&
         regs.depth_buffer.DepthAddress() == 0x100ca70000 &&
         stage.sw_stage == Shader::SwStage::Vertex) {
@@ -3451,6 +3547,9 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
         LOG_WARNING(Render_Vulkan, "DIAG-150: native shader {:#x} use {} sources:{}",
                     stage.pgm_hash, watched_bind, sources);
     }
+#else
+    constexpr bool log_watched = false;
+#endif
     // AMD defaults to the validated descriptor-backed buffer path
     // rather than repeating guest page-table walks for each scalar constant load.
     static const bool composition_descriptors = [&] {
@@ -3466,6 +3565,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
     const bool descriptor_postprocess = postprocess_descriptors &&
         stage.sw_stage == Shader::SwStage::Fragment &&
         (stage.pgm_hash == 0x184b619c || stage.pgm_hash == 0x7cd92fb8);
+#if !defined(NDEBUG)
     // Diagnostic A/B: retain shader compilation but use descriptor bindings.
     static const bool descriptor_only_a82d2fe = [] {
         const char* value = std::getenv("RYGT_A82D2FE_DESCRIPTOR_ONLY");
@@ -3476,6 +3576,9 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
     static std::atomic<bool> descriptor_diagnostic_logged{};
     if (force_descriptor && !descriptor_diagnostic_logged.exchange(true))
         LOG_WARNING(Render_Vulkan, "DIAG: 0xa82d2fe descriptor-only buffer binding active");
+#else
+    constexpr bool force_descriptor = false;
+#endif
     auto* direct = stage.uses_direct && !descriptor_composition && !force_descriptor
         ? r.buffer_cache.GetDirectMemory() : nullptr;
     // D3's table: page table L1 and zero page, then base, size and valid of each buffer read
@@ -3569,6 +3672,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
             const auto vsharp = desc.GetSharp(stage);
             const u64 base = vsharp.base_address;
             const u64 sharp_size = vsharp.GetSize();
+#if !defined(NDEBUG)
             // DIAG-204 (RYGT_PROBE_SHADER=<hash>): that program's buffers and their first bytes.
             static const u64 probe_hash = [] {
                 const char* env = std::getenv("RYGT_PROBE_SHADER");
@@ -3591,6 +3695,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                                      : std::string{"unreadable"});
                 }
             }
+#endif
             // FIX-031 / FIX-036 / FIX-046: V#s that are not buffers are bound empty.
             const bool impossible =
                 vsharp.num_records != UINT32_MAX &&
@@ -3600,6 +3705,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                 !impossible && base != 0 && sharp_size != 0 && !r.IsMappedStart(base);
             if (base != 0 && sharp_size != 0 && !impossible && !unmapped) {
                 const u64 size = r.memory->ClampRangeSize(base, sharp_size);
+#if !defined(NDEBUG)
                 // FIX-174 (diagnosis, RYGT_NATIVE_WATCH_BUFFER=<hex address>+<hex size>): the
                 // shaders that bind a buffer over that range (the first ones, then now and then).
                 static const std::pair<VAddr, VAddr> watch_buffer = [] {
@@ -3624,6 +3730,8 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                                     size, frame);
                     }
                 }
+#endif
+#if !defined(NDEBUG)
                 const auto log_buffer = [&](const char* how) {
                     if (!log_watched) {
                         return;
@@ -3642,6 +3750,9 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                                                    head[2], head[3])
                                      : std::string{"unreadable"});
                 };
+#else
+                constexpr auto log_buffer = [](const char*) {};
+#endif
                 // This known shader's 12-byte arguments are CPU command parameters. Freeze
                 // them once for both the shader fallback and transfer path; GPU-backed
                 // arguments retain the normal shader path and are never read as CPU values.
@@ -3800,6 +3911,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                 sharp.LodBias(), address, custom, readable, color[0],color[1],color[2],color[3],raw));
         }
     }
+#if !defined(NDEBUG)
     // DIAG-207 (RYGT_NULL_TEXTURES=<hash>:<hex slot mask>): that program's chosen texture slots
     // are bound empty, to see which one carries a wrong colour. Recorder-side draws only.
     static const std::pair<u64, u64> null_textures = [] {
@@ -3813,10 +3925,13 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         return std::pair<u64, u64>{hash, mask};
     }();
     u32 slot = 0;
+#endif
     for (const auto& image_desc : stage.images) {
+#if !defined(NDEBUG)
         const bool null_slot = null_textures.first != 0 && stage.pgm_hash == null_textures.first &&
                                slot < 64 && ((null_textures.second >> slot) & 1);
         ++slot;
+#endif
         auto tsharp = image_desc.GetSharp(stage);
         MatchExperimentalCompositionTexture(tsharp, stage, image_desc, *registry);
         const bool cube_sampling = image_desc.post_op == Shader::SharpFetchPostOp::NativeCubeSampling;
@@ -3841,10 +3956,11 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             for (u32 i = 0; i < num_bindings; ++i) {
                 b.images.push_back({VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral});
             }
-            ++stats.null_images;
-            ++stats.null_reasons[reason];
+            NATIVE_DIAGNOSTIC(++stats.null_images);
+            NATIVE_DIAGNOSTIC(++stats.null_reasons[reason]);
             add_write();
         };
+#if !defined(NDEBUG)
         if (null_slot) {
             static std::atomic<u32> logged{};
             if (logged++ < 16) {
@@ -3854,8 +3970,9 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             bind_null(0);
             continue;
         }
+#endif
         // OPT-002: the picture and views this T# resolved to last time.
-        ++stats.texture_lookups;
+        NATIVE_DIAGNOSTIC(++stats.texture_lookups);
         TextureMemo* memo = nullptr;
         std::array<u64, 4> raw_sharp{};
         static_assert(sizeof(tsharp) == sizeof(raw_sharp));
@@ -3873,10 +3990,12 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                 memo->generation == registry->Generation() + unmap_generation) {
                 Native::ImageEntry* entry = memo->entry;
                 entry->last_use.store(frame, std::memory_order_relaxed);
+#if !defined(NDEBUG)
                 if (Native::WatchedTexture(entry->info.guest_address,
                                            entry->info.guest_address + 1)) {
                     WatchBind(*entry, tsharp, storage, true, stage.pgm_hash); // FIX-157
                 }
+#endif
                 ApplyRewrite(*entry); // NAT-120
                 if (!storage && entry->from_cpu) {
                     RefreshSources(*entry); // NAT-104
@@ -3886,7 +4005,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                 }
                 (storage ? b.stored : b.sampled).push_back(entry);
                 add_write();
-                ++stats.texture_memo_hits;
+                NATIVE_DIAGNOSTIC(++stats.texture_memo_hits);
                 continue;
             }
         }
@@ -4001,9 +4120,11 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             bind_null(7);
             continue;
         }
+#if !defined(NDEBUG)
         if (Native::WatchedTexture(desc.info.guest_address, desc.info.guest_address + 1)) {
             WatchBind(*entry, tsharp, storage, false, stage.pgm_hash); // FIX-157 (diagnosis)
         }
+#endif
         ApplyRewrite(*entry); // NAT-120 (NAT-133: textures too)
         if (!storage && r.FrameDumpCollecting()) {
             // FIX-152 (diagnosis): RYGT_FRAME_DUMP_ALL_TEXTURES=1 dumps uploaded ones too.
@@ -4130,14 +4251,14 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         };
         auto admission=check();
         if(admission==PendingDescriptorUpdates::Admission::Capacity) {
-            ++pending->overflow_draws;
+            NATIVE_DIAGNOSTIC(++pending->overflow_draws);
             pending->Flush(vk_device,PendingDescriptorUpdates::Capacity);
             admission=check(); // revalidate all rows; capacity may have stopped the first scan
         }
         deferred=admission==PendingDescriptorUpdates::Admission::Yes;
         if(!deferred) {
             const bool overflow=admission==PendingDescriptorUpdates::Admission::Capacity;
-            if(!overflow)++pending->unsupported_draws;
+            if(!overflow)NATIVE_DIAGNOSTIC(++pending->unsupported_draws);
             pending->Flush(vk_device,overflow?PendingDescriptorUpdates::Capacity:PendingDescriptorUpdates::Unsupported);
         }
         staged_before=pending->staged_rows;
@@ -4167,15 +4288,15 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         const std::span<const u64> descriptor_key{key.data(), key.size()};
         if (cacheable && key_changed) {
             prepared_key.hash = Native::Parallel::AdaptiveXXH3(key.data(), key.size() * sizeof(u64));
-            ++descriptor_hash_refreshed;
+            NATIVE_DIAGNOSTIC(++descriptor_hash_refreshed);
         } else if (cacheable) {
-            ++descriptor_hash_reused;
+            NATIVE_DIAGNOSTIC(++descriptor_hash_reused);
         }
         const u64 key_hash = cacheable ? prepared_key.hash : 0;
         if (cacheable) {
             if (const auto reused = s.descriptor_sets.Find(key_hash, descriptor_key)) {
                 sets[index] = reused;
-                ++stats.descriptor_reuses;
+                NATIVE_DIAGNOSTIC(++stats.descriptor_reuses);
                 if (alloc_diag) ++descriptor_alloc_metrics.cache_hits[alloc_kind];
                 continue;
             }
@@ -4192,7 +4313,7 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         const bool ahead_hit=bool(set);
         if(!set)set=s.descriptor_reserve.Take(layout_key);
         const bool reserve_hit=bool(set) && !ahead_hit;
-        if(reserve_hit)++stats.descriptor_reserve_hits;
+        if(reserve_hit)NATIVE_DIAGNOSTIC(++stats.descriptor_reserve_hits);
         if (alloc_diag) { if (reserve_hit) ++descriptor_alloc_metrics.reserve_hits[alloc_kind]; else if(!set) ++alloc_misses; }
         if(!set) {
         std::array<vk::DescriptorSetLayout, 32> layouts;
@@ -4211,12 +4332,15 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
                 .descriptorSetCount = allocate_count,
                 .pSetLayouts = layouts.data(),
             };
-            ++stats.descriptor_allocate_calls;
+            NATIVE_DIAGNOSTIC(++stats.descriptor_allocate_calls);
+#if !defined(NDEBUG)
             const bool sampled = alloc_diag && descriptor_alloc_metrics.NextSample();
             u64 cpu_before=0, cpu_after=0;
             const bool cpu_started = sampled && DescriptorThreadCpu100ns(cpu_before);
             const auto wall_start = sampled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+#endif
             const auto allocation_result = vk_device.allocateDescriptorSets(&alloc, allocated.data());
+#if !defined(NDEBUG)
             if (alloc_diag) {
                 u64 wall_ns=0; bool cpu_valid=false;
                 if (sampled) {
@@ -4228,9 +4352,10 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
                         ? Native::DescriptorResult::Capacity : Native::DescriptorResult::Other;
                 descriptor_alloc_metrics.Attempt(allocate_count > 1, attempt, result, sampled, wall_ns, cpu_valid, cpu_valid ? cpu_after-cpu_before : 0);
             }
+#endif
             if (allocation_result == vk::Result::eSuccess) {
                 set = allocated[0];
-                stats.descriptor_allocations += allocate_count;
+                NATIVE_DIAGNOSTIC(stats.descriptor_allocations += allocate_count);
                 if (allocate_count > 1) s.descriptor_reserve.Store(layout_key,
                     std::span<const vk::DescriptorSet>{allocated.data() + 1, allocate_count - 1});
             }
@@ -4256,15 +4381,15 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         // Keep its borrowed payload alive until all such writes have been applied.
         if(pending) {
             pending->Flush(vk_device,PendingDescriptorUpdates::Exception);
-            if(!updates.empty()) {vk_device.updateDescriptorSets(updates,{});++pending->actual_calls;}
+            if(!updates.empty()) {vk_device.updateDescriptorSets(updates,{});NATIVE_DIAGNOSTIC(++pending->actual_calls);}
         }
         throw;
     }
     if (alloc_diag) descriptor_alloc_metrics.Draw(alloc_kind, alloc_misses);
     if(parallel_binding_capture) {
-        if(deferred && pending->staged_rows!=staged_before)++pending->logical_draws;
+        if(deferred && pending->staged_rows!=staged_before)NATIVE_DIAGNOSTIC(++pending->logical_draws);
         if(!updates.empty()) {trace.Next(6);vk_device.updateDescriptorSets(updates,{});
-            if(pending){++pending->actual_calls;++pending->logical_draws;++pending->immediate_draws;}}
+            if(pending){NATIVE_DIAGNOSTIC(++pending->actual_calls);NATIVE_DIAGNOSTIC(++pending->logical_draws);NATIVE_DIAGNOSTIC(++pending->immediate_draws);}}
         parallel_binding_capture->sets=sets;
         return;
     }
@@ -4330,8 +4455,8 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
             size = sharp_size;
             found = std::pair{vk::Buffer{Handle<VkBuffer_T>(near->buffer->NativeHandle())},
                               u64{base - near->begin}};
-            ++stats.mirror_binds;
-            ++stats.vertex_near;
+            NATIVE_DIAGNOSTIC(++stats.mirror_binds);
+            NATIVE_DIAGNOSTIC(++stats.vertex_near);
         } else if (base != 0 && sharp_size > 0 && r.memory->MappedAreaEnd(base, base + 1) != 0) {
             size = r.memory->ClampRangeSize(base, sharp_size);
             found = GuestBuffer(base, size, false, MirrorKind('v')); // FIX-177
@@ -4358,6 +4483,7 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
 
 void NativeRenderer::CheckVertexReach(const GraphicsPipeline& pipeline, const AmdGpu::Regs& regs,
                                       bool is_indexed, u32 index_offset) {
+#if !defined(NDEBUG)
     // FIX-181 (diagnosis, RYGT_NATIVE_VERTEX_REACH_CHECK=<n>): every n-th draw, the highest
     // vertex it can read (its indices read from guest memory, or its vertex count) against each
     // vertex V#'s end and the mirror bound there: draws reading past a mirror's end got zeros
@@ -4408,7 +4534,7 @@ void NativeRenderer::CheckVertexReach(const GraphicsPipeline& pipeline, const Am
     } else {
         max_index = count == 0 ? 0 : count - 1;
     }
-    ++stats.reach_checks;
+    NATIVE_DIAGNOSTIC(++stats.reach_checks);
     for (u32 i = 0; i < guest_buffers.size(); ++i) {
         const auto& guest = guest_buffers[i];
         const u64 stride = guest.GetStride();
@@ -4426,10 +4552,10 @@ void NativeRenderer::CheckVertexReach(const GraphicsPipeline& pipeline, const Am
         if (reach <= sharp_end) {
             continue;
         }
-        ++stats.reach_past_sharp;
+        NATIVE_DIAGNOSTIC(++stats.reach_past_sharp);
         const Mirror* mirror = MirrorHolding(base, 1);
         const bool past_mirror = mirror && reach > mirror->end;
-        stats.reach_past_mirror += past_mirror ? 1 : 0;
+        NATIVE_DIAGNOSTIC(stats.reach_past_mirror += past_mirror ? 1 : 0);
         static std::atomic<u32> logged{};
         if (Sample(logged)) {
             LOG_WARNING(Render_Vulkan,
@@ -4446,9 +4572,11 @@ void NativeRenderer::CheckVertexReach(const GraphicsPipeline& pipeline, const Am
                                : std::string{});
         }
     }
+#endif
 }
 
 void NativeRenderer::CheckMirrorBind(Mirror& mirror, VAddr base, u64 size) {
+#if !defined(NDEBUG)
     // FIX-179 (diagnosis, RYGT_NATIVE_MIRROR_CHECK=<n>): every n-th vertex range bound from a
     // mirror, the mirror's bytes and guest memory's bytes there are copied out side by side right
     // before the draw (the GPU's view of both at that point) and compared once the GPU is done.
@@ -4475,9 +4603,9 @@ void NativeRenderer::CheckMirrorBind(Mirror& mirror, VAddr base, u64 size) {
                 ++differ;
             }
         }
-        ++stats.mirror_checks;
+        NATIVE_DIAGNOSTIC(++stats.mirror_checks);
         if (differ != 0) {
-            ++stats.mirror_check_differ;
+            NATIVE_DIAGNOSTIC(++stats.mirror_check_differ);
             static std::atomic<u32> logged{};
             if (Sample(logged)) {
                 LOG_WARNING(Render_Vulkan,
@@ -4527,6 +4655,7 @@ void NativeRenderer::CheckMirrorBind(Mirror& mirror, VAddr base, u64 size) {
     mirror_checks.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, bytes, base,
                              frame, mirror.begin, mirror.end - mirror.begin, mirror.used_frame,
                              mirror.dirty_pages.size()});
+#endif
 }
 
 bool NativeRenderer::ResolveIndices(const AmdGpu::Regs& regs, bool is_indexed, u32 index_offset,
@@ -4615,7 +4744,7 @@ void NativeRenderer::RecordVertexIndex(const VertexIndexState& v) {
             s.input_bindings.assign(v.input_bindings.begin(), v.input_bindings.end());
             s.attributes.assign(v.attributes.begin(), v.attributes.end());
         } else {
-            ++stats.vertex_skipped;
+            NATIVE_DIAGNOSTIC(++stats.vertex_skipped);
         }
     }
     if (const u32 count = static_cast<u32>(v.buffers.size()); count != 0) {
@@ -4670,10 +4799,13 @@ void NativeRenderer::Written(const Native::ImageEntry* entry, u64 at) {
         return;
     }
     auto* written = const_cast<Native::ImageEntry*>(entry);
+#if !defined(NDEBUG)
     const bool watched = Native::WatchedTexture(entry->info.guest_address,
                                                 entry->info.guest_address + 1);
     const bool first_write = watched && written->write_version.load(std::memory_order_relaxed) == 0;
+#endif
     written->write_version.store(at != 0 ? at : ++write_clock, std::memory_order_relaxed);
+#if !defined(NDEBUG)
     if (watched) {
         // FIX-159 (diagnosis, RYGT_FRAME_DUMP_ON_STORE=<seconds>): from that long after start,
         // the first write of a watched picture starts a frame dump there (the frames a
@@ -4698,6 +4830,7 @@ void NativeRenderer::Written(const Native::ImageEntry* entry, u64 at) {
                         written->write_version.load(), frame);
         }
     }
+#endif
     // NAT-111: the textures made of it copy its picture in before their next read.
     std::scoped_lock lock{written->sources_mutex};
     for (auto* texture : written->dependents) {
@@ -4830,7 +4963,7 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
         index += layers;
     }
     s.written.push_back(&texture); // read after the next barrier
-    stats.source_copies += picks.size();
+    NATIVE_DIAGNOSTIC(stats.source_copies += picks.size());
     ++s.commands;
 }
 
@@ -4914,6 +5047,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             if(PreparedSampledProofRequested()) {
                 sidecar->prepared_proof_context=prepared_proof_contexts.FindBlocking(this);
             }
+#if !defined(NDEBUG)
             if(const char* path=std::getenv("RYGT_PARALLEL_MODE_FILE");path && *path) {
                 const char* initial=std::getenv("RYGT_PARALLEL_INITIAL_MODE");
                 const bool enabled=Native::Parallel::InitialMode(path,initial);
@@ -4922,9 +5056,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             }
             if(const char* path=std::getenv("RYGT_PARALLEL_VIEW_MODE_FILE");path && *path)
                 sidecar->view_mode_controller=std::make_unique<Native::Parallel::ModeController>(std::filesystem::path(path),sidecar->view_applied_mode.Enabled());
+#endif
             sidecar->coordinator=std::make_unique<Native::Parallel::PassCoordinator>(*device,r.instance,*timeline,2,32,64*1024*1024,64);
+#if !defined(NDEBUG)
             if(const char* path=std::getenv("RYGT_PARALLEL_TRANSFER_MODE_FILE");path && *path)
                 sidecar->transfer_mode_controller=std::make_unique<Native::Parallel::ModeController>(std::filesystem::path(path),sidecar->transfer_applied_mode.Enabled());
+#endif
             std::lock_guard sidecar_lock(parallel_sidecars_mutex);
             auto [where,inserted]=parallel_sidecars.emplace(this,std::move(sidecar));
             if(inserted && where->second->prepared_proof_context)where->second->prepared_proof_context->SetMode(where->second->applied_mode.Enabled());
@@ -4936,11 +5073,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             parallel_sidecars_generation.fetch_add(1,std::memory_order_release);
         } catch(const std::exception&) {parallel_sidecar_init_failed.store(true,std::memory_order_relaxed);LOG_WARNING(Render_Vulkan,"PARALLEL-RECORD: initialization failed, using serial recorder");}
     }
+#if !defined(NDEBUG)
     const auto start = std::chrono::steady_clock::now();
     t_timed = r.FrameDumpCollecting() || (++timing_tick & 15) == 0; // F8: every draw
     SceneTrace::CpuScope scene_trace{r.FrameDumpCollecting(),frame,"draw",stats.phase_ns,stats.record_ns};
     if (SceneTrace::Id()) r.FrameDumpEvent(fmt::format("scene-pass id={} kind=draw indexed={} index_offset={}", SceneTrace::Id(),is_indexed,index_offset));
-    stats.timed_draws += t_timed ? 1 : 0;
+    NATIVE_DIAGNOSTIC(stats.timed_draws += t_timed ? 1 : 0);
     struct Timed {
         std::chrono::steady_clock::time_point start;
         Stats& stats;
@@ -4957,7 +5095,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         ~Timed() {
             const u64 elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - start).count();
-            stats.draw_ns += elapsed;
+            NATIVE_DIAGNOSTIC(stats.draw_ns += elapsed);
             if (!sampled || elapsed < 1'000'000) {
                 return;
             }
@@ -4989,6 +5127,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 parts[4], parts[5], parts[6], parts[7]);
         }
     } timed{start, stats};
+
+#endif
     r.scheduler.PopPendingOperations();
     const auto& regs = r.liverpool->DrawRegs();
     switch (Classify(regs)) {
@@ -5022,12 +5162,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 ++s.commands;
             }
         }
-        ++stats.skipped;
+        NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
     case Filter::FmaskDecompress:
     case Filter::NoPrimitive:
-        ++stats.skipped;
+        NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     case Filter::Resolve:
         ResolveDraw(regs);
@@ -5037,7 +5177,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         if (Sample(logged)) {
             LOG_WARNING(Render_Vulkan, "NAT-102: depth/stencil copy draw skipped");
         }
-        ++stats.skipped;
+        NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
     case Filter::Draw:
@@ -5052,7 +5192,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     PreparedDraw* prepared = nullptr;
     if (prepare && !r.FrameDumpCollecting() && RytyGtsInRace()) {
         prepared = TakePrepared(Rasterizer::t_draw_packet);
-        stats.prepared_missing += prepared ? 0 : 1;
+        NATIVE_DIAGNOSTIC(stats.prepared_missing += prepared ? 0 : 1);
     }
     struct GiveBack {
         NativeRenderer& n;
@@ -5083,9 +5223,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             !quad_list);
     }();
     if (!pipeline) {
-        ++stats.no_pipeline;
+        NATIVE_DIAGNOSTIC(++stats.no_pipeline);
         return;
     }
+#if !defined(NDEBUG)
     // DIAG-152 (RYGT_NATIVE_SKIP_PS=<hex,...>): draws with these pixel shaders are skipped.
     static const std::vector<u64> skip_ps = [] {
         std::vector<u64> hashes;
@@ -5103,7 +5244,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         const auto& stages = pipeline->GetStages();
         const Shader::Info* fs = stages[u32(Shader::SwStage::Fragment)];
         if (fs && std::ranges::find(skip_ps, fs->pgm_hash) != skip_ps.end()) {
-            ++stats.skipped;
+            NATIVE_DIAGNOSTIC(++stats.skipped);
             static std::atomic<u32> logged{};
             if (logged++ < 32) {
                 LOG_WARNING(Render_Vulkan, "DIAG-152: draw with ps {:#x} skipped", fs->pgm_hash);
@@ -5111,6 +5252,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             return;
         }
     }
+#endif
     if (RytyGhost::ShouldSmooth(regs) && ++smooth_ghost_draws == 1) {
         const auto& appearance = RytyGhost::GetAppearance();
         LOG_INFO(Render_Vulkan,
@@ -5195,7 +5337,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         BindStages(pipeline->GetStages(), regs, false, b);
     }
     if (b.failed) {
-        ++stats.skipped;
+        NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
     static thread_local VertexIndexState vertex_index;
@@ -5208,7 +5350,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             vertex_index = {};
             ResolveVertexBuffers(*pipeline, regs, vertex_index);
             if (!ResolveIndices(regs, is_indexed, index_offset, quad_triangles, vertex_index)) {
-                ++stats.skipped;
+                NATIVE_DIAGNOSTIC(++stats.skipped);
                 return;
             }
             CheckVertexReach(*pipeline, regs, is_indexed, index_offset); // FIX-181 (diagnosis)
@@ -5221,7 +5363,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     const bool native_fsr_composition = BeginNativeFsr(*pipeline, targets, b);
     if (native_fsr_composition) scale_composition = false;
     if (!native_fsr_composition && !PrepareUiTarget(targets, *pipeline)) {
-        ++stats.skipped;
+        NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
     Begin();
@@ -5341,7 +5483,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         } else if (pass_change && targets_in(s.attach_dirty)) {
             PassBarrier();
         } else if (pass_change) {
-            ++stats.passes_unblocked;
+            NATIVE_DIAGNOSTIC(++stats.passes_unblocked);
         }
     }
     auto* parallel=FindParallelRuntime(this);
@@ -5382,7 +5524,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     bool serial_split_prebound=false;
     const auto cancel_empty_split=[&]() noexcept {
         if(!serial_split_started || !parallel || !parallel->active || !parallel->active->draws.empty())return;
-        ++parallel->pass_closure.empty_aborts[parallel->pass_closure.origin];
+        NATIVE_DIAGNOSTIC(++parallel->pass_closure.empty_aborts[parallel->pass_closure.origin]);
         parallel->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::Abandoned);
         if(!parallel->sync_pins.CancelEmpty(parallel->pin_slot))std::terminate();
         parallel->pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;
@@ -5396,7 +5538,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     } empty_split_guard{cancel_empty_split};
     if(parallel && !parallel->closing && parallel->applied_mode.Enabled() && natural_boundary_enabled) {
         preclosed_serial_scope=Native::Parallel::CloseChangedSerialScope(true,bool(parallel->active),s.rendering,s.render,targets.state,[&]{EndRendering();});
-        if(preclosed_serial_scope)++parallel->natural_preclosed;
+        if(preclosed_serial_scope)NATIVE_DIAGNOSTIC(++parallel->natural_preclosed);
     }
     bool parallel_draw=false;
     bool parallel_index_safe=false;u64 parallel_index_bytes=0;
@@ -5424,13 +5566,18 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         parallel_bindings.ordinary_images=worker_result->ordinary_images;
     };
     if(parallel && !parallel->closing && parallel->applied_mode.Enabled()) {
+#if !defined(NDEBUG)
         static const bool whole_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_WHOLE_PREFLIGHT");return p && p[0]=='1' && p[1]=='\0';}();
         const bool whole_sample=whole_enabled && ((++parallel->whole_seq & 127u)==0);
         u64 whole_cpu_begin=0,whole_cpu_end=0;
         const bool whole_cpu_started=whole_sample && DescriptorThreadCpu100ns(whole_cpu_begin);
         const auto whole_begin=whole_sample?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+
+#else
+        constexpr bool whole_sample=false;
+#endif
         WholePhaseTimer whole_phases{parallel->whole_phases,whole_sample};
-        ++parallel->considered;
+        NATIVE_DIAGNOSTIC(++parallel->considered);
         const auto& fast_depth=targets.state.depth_stencil_attachment;
         const bool extended=ParallelExtendedEnabled();
         bool any_clear=targets.state.color_attachments[0].is_clear;
@@ -5443,7 +5590,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         const bool fast_trace=r.FrameDumpActive() || SceneTrace::Id() || Native::GpuCheckpoints::Requested();
         const bool inline_safe=bool(parallel->active) && fast_race && !fast_trace && !prohibited_clear && feedback.empty() &&
             !scale_composition && !native_fsr_composition;
+#if !defined(NDEBUG)
         static const bool serial_audit=[] {const char* p=std::getenv("RYGT_PARALLEL_SERIAL_AUDIT");return p && p[0]=='1' && p[1]=='\0';}();
+#else
+        constexpr bool serial_audit=false;
+#endif
         // Split only a matching scope whose attachments need LOAD on continuation.
         bool split_clear=fast_depth.depth_clear || fast_depth.stencil_clear;
         for(u32 i=0;i<targets.state.num_color_attachments && i<targets.state.color_attachments.size();++i)
@@ -5469,7 +5620,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
            !(from_prepared && buffer_freshness_certified && buffer_log.Seq()==buffer_freshness_seq) &&
            !buffer_log.Untouched(prepared->buffer_seq,prepared->buffer_ranges))) fast_reject=true;
         if(fast_reject) {
-            ++parallel->fast_rejected;if(no_pass_room)++parallel->no_pass_room_rejected;if(extended && any_clear)++parallel->extended_clear_rejected;if(serial_scope_bypass)++parallel->serial_scope_bypassed;
+            NATIVE_DIAGNOSTIC(++parallel->fast_rejected);if(no_pass_room)NATIVE_DIAGNOSTIC(++parallel->no_pass_room_rejected);if(extended && any_clear)NATIVE_DIAGNOSTIC(++parallel->extended_clear_rejected);if(serial_scope_bypass)NATIVE_DIAGNOSTIC(++parallel->serial_scope_bypassed);
             if(ParallelGateDiagEnabled()) {
                 // Bit 25 means deeper stage/view/alias/descriptor checks were not examined.
                 u64 mask=u64{1}<<25;if(serial_scope_bypass)mask|=u64{1}<<26;const auto fail=[&](u32 bit,bool bad){if(bad)mask|=u64{1}<<bit;};
@@ -5513,7 +5664,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
            vi->buffers.size()==vi->strides.size() && !vi->buffers.empty() &&
             vi->buffers.size()==vi->input_bindings.size() && vi->buffers.size()==vi->attributes.size()))) {
             vertex_shape_ok=true;vertex_safe=true;
-            if (known_shape) {vertex_binding_ok=worker_result->vertex_bindings;vertex_pnext_ok=worker_result->vertex_pnext;++parallel->producer_vertex_hits;}
+            if (known_shape) {vertex_binding_ok=worker_result->vertex_bindings;vertex_pnext_ok=worker_result->vertex_pnext;NATIVE_DIAGNOSTIC(++parallel->producer_vertex_hits);}
             else {
                 for(std::size_t i=0;i<vi->buffers.size();++i)
                     if(vi->input_bindings[i].binding!=i || vi->attributes[i].binding!=i)vertex_binding_ok=false;
@@ -5554,7 +5705,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                         const auto& [address,bytes]=prepared->in_place[candidate];
                         const auto next=candidate+1==prepared->in_place.size()?0:candidate+1;
                         if(bytes!=size){candidate=next;continue;}
-                        ++parallel->vertex_direct_attempts;
+                        NATIVE_DIAGNOSTIC(++parallel->vertex_direct_attempts);
                         u32 parts=0;bool exact=false;
                         const bool covered=direct->TryForEachPart(address,bytes,
                             [&] {return VideoCore::ParallelDirectViewCoherent(direct,address,bytes);},
@@ -5562,7 +5713,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                 ++parts;exact=source.Handle()==handle && source_offset==offset && part_offset==0 && length==bytes;
                             });
                         if(covered && parts==1 && exact){
-                            owned=true;++parallel->vertex_direct_matches;
+                            owned=true;NATIVE_DIAGNOSTIC(++parallel->vertex_direct_matches);
                             vertex_direct_hint=next;
                             break;
                         }
@@ -5574,17 +5725,17 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             }
         }
         if(vertex_requested && has_vertex_input) {
-            if(vertex_preflight) {native_vi_attempted=true;++parallel->native_vi_attempts;}
-            ++parallel->vertex_candidates;
+            if(vertex_preflight) {native_vi_attempted=true;NATIVE_DIAGNOSTIC(++parallel->native_vi_attempts);}
+            NATIVE_DIAGNOSTIC(++parallel->vertex_candidates);
             if(vertex_preflight) {
-                ++parallel->vertex_preflight_draws;
-                if(!vertex_shape_ok)++parallel->vertex_bad_structure;
-                else if(!vertex_binding_ok)++parallel->vertex_bad_binding;
-                else if(!vertex_pnext_ok)++parallel->vertex_bad_pnext;
-                else if(vertex_owner_missing)++parallel->vertex_unknown_backing;
-                if(prepared && !prepared->in_place.empty())++parallel->vertex_direct_ranges;
+                NATIVE_DIAGNOSTIC(++parallel->vertex_preflight_draws);
+                if(!vertex_shape_ok)NATIVE_DIAGNOSTIC(++parallel->vertex_bad_structure);
+                else if(!vertex_binding_ok)NATIVE_DIAGNOSTIC(++parallel->vertex_bad_binding);
+                else if(!vertex_pnext_ok)NATIVE_DIAGNOSTIC(++parallel->vertex_bad_pnext);
+                else if(vertex_owner_missing)NATIVE_DIAGNOSTIC(++parallel->vertex_unknown_backing);
+                if(prepared && !prepared->in_place.empty())NATIVE_DIAGNOSTIC(++parallel->vertex_direct_ranges);
             }
-            if(vertex_safe)++parallel->vertex_backing_pass;
+            if(vertex_safe)NATIVE_DIAGNOSTIC(++parallel->vertex_backing_pass);
         }
         whole_phases.Next(2);
         bool stages_safe=true,resource_key_known=true;
@@ -5607,7 +5758,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
              stage->has_storage_images || stage->uses_shader_clock ||
              std::ranges::any_of(stage->buffers,[](const auto& buffer){return buffer.is_written;})) stages_safe=false;
         }
-        if(!resource_key_known) ++parallel->unknown_resource_key;
+        if(!resource_key_known) NATIVE_DIAGNOSTIC(++parallel->unknown_resource_key);
         // Submission-window N protects only views actually tracked by the native
         // registry; the epoch token itself is not an owning image reference.
         whole_phases.Next(3);
@@ -5657,7 +5808,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             const u64 base=regs.index_base_address.Address<VAddr>();
             const u64 address=prepared->index_address;
             if(Native::Parallel::PreparedIndexRange(base,index_offset,regs.num_indices,element,address,vi->index_offset,checked_index_bytes)) {
-                if(!native_vi_attempted){native_vi_attempted=true;++parallel->native_vi_attempts;}
+                if(!native_vi_attempted){native_vi_attempted=true;NATIVE_DIAGNOSTIC(++parallel->native_vi_attempts);}
                 const auto matches=[&](const auto* value){
                     if(!value || !value->buffer || vk::Buffer{Handle<VkBuffer_T>(value->buffer->NativeHandle())}!=vi->index_buffer)return false;
                     return Native::Parallel::PreparedIndexBacking(address,checked_index_bytes,value->begin,value->end,vi->index_offset,value->buffer->Size());
@@ -5679,8 +5830,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 }
             }
         }
-        if(!b.buffers.empty())++parallel->buffer_rejected;
-        if(sampled_alias)++parallel->alias_rejected;
+        if(!b.buffers.empty())NATIVE_DIAGNOSTIC(++parallel->buffer_rejected);
+        if(sampled_alias)NATIVE_DIAGNOSTIC(++parallel->alias_rejected);
         const bool cheap_eligible=native_attachment && !sampled_alias && !EmulatorSettings.IsPatchShaders() && RytyGtsInRace() &&
             !r.FrameDumpActive() && !SceneTrace::Id() && !Native::GpuCheckpoints::Requested() &&
             !quad_list && !quad_triangles && (extended || !is_indexed) && !scale_composition && !native_fsr_composition &&
@@ -5689,11 +5840,17 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             prepared && from_prepared && prepared->pipeline==pipeline && prepared->pipeline_keepalive && stages_safe;
         bool descriptor_safe=cheap_eligible && !b.writes_buffers && b.gpu_writes.empty() && b.stored.empty();
         u32 descriptor_fail_reason=0;
+#if !defined(NDEBUG)
         const bool sample_preflight=descriptor_safe && ((++parallel->preflight_seq & 127u)==0);
         const bool phase_sample=sample_preflight && ParallelProofPhaseEnabled();
         u64 preflight_cpu_begin=0,preflight_cpu_end=0;
         const bool preflight_cpu_started=sample_preflight && DescriptorThreadCpu100ns(preflight_cpu_begin);
         const auto preflight_begin=sample_preflight?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+
+#else
+        constexpr bool sample_preflight=false;
+        constexpr bool phase_sample=false;
+#endif
         whole_phases.Next(4);
         if(descriptor_safe && !b.writes.empty()) {
             try {
@@ -5706,18 +5863,22 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 if(reuse_stage_proof)stage_proof.emplace();
                 static const bool view_proof_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_VIEW_PROOF_INDEX");return p && p[0]=='1' && !p[1];}();
                 static const bool wanted_view_filter=[] {const char* p=std::getenv("RYGT_PARALLEL_WANTED_VIEW_FILTER");return p && p[0]=='1' && !p[1];}();
+#if !defined(NDEBUG)
                 static const bool view_sample_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_VIEW_PROOF_SAMPLE");return p && p[0]=='1' && !p[1];}();
+#else
+                constexpr bool view_sample_enabled=false;
+#endif
                 const bool sample_view=view_sample_enabled && ((++parallel->view_sample.sequence & 127u)==0);
                 Native::Parallel::ViewProofStats local_view_stats{};const bool gate_view=ParallelGateDiagEnabled();
                 Native::Parallel::PerDrawViewProof<vk::ImageView> view_proof{sample_view?&local_view_stats:(gate_view?&parallel->view_proof_stats:nullptr),wanted_view_filter};
-                const auto note_view_cardinality=[&](std::size_t n) {if(sample_view)++parallel->view_sample.cardinality[n==0?0:n==1?1:n==2?2:n<=4?3:n<=8?4:n<=16?5:n<=32?6:n<=64?7:n<=128?8:9];};
+                const auto note_view_cardinality=[&](std::size_t n) {if(sample_view)NATIVE_DIAGNOSTIC(++parallel->view_sample.cardinality[n==0?0:n==1?1:n==2?2:n<=4?3:n<=8?4:n<=16?5:n<=32?6:n<=64?7:n<=128?8:9]);};
                 const bool known_structure=worker_identity && worker_result->descriptor_structure;
                 const bool image_batch=known_structure && (worker_result->image_seal_mask[0] || worker_result->image_seal_mask[1]) &&
                     worker_result->image_seal_owner==this && feedback.empty() && prepared->proof_context &&
                     prepared->proof_context==parallel->prepared_proof_context &&
                     prepared->proof_context->Valid(prepared->proof_mode_state) &&
                     sampler_cache_epoch.load(std::memory_order_acquire)==worker_result->image_seal_epoch;
-                if(!image_batch)++parallel->image_batch_fallbacks;
+                if(!image_batch)NATIVE_DIAGNOSTIC(++parallel->image_batch_fallbacks);
                 size_t image_batch_infos=0;
                 const bool known_actions=known_structure && prepared->descriptor_actions.size()==b.writes.size();
                 const auto current_stages=pipeline->GetStages();
@@ -5730,7 +5891,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 }
                 bool buffer_prefix=false;
                 if(prepared && from_prepared) {
-                    ++parallel->buffer_prefix_attempts;
+                    NATIVE_DIAGNOSTIC(++parallel->buffer_prefix_attempts);
                     if(prepared->buffer_prefix_sealed) {
                         const auto prefix=b.buffers.size();
                         buffer_prefix=trusted && known_structure && known_actions && known_stage_schema && prefix<=128 && prefix<=b.writes.size() &&
@@ -5745,13 +5906,13 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                 direct->L1Address()==prepared->buffer_prefix_l1 && direct->ZeroPageAddress()==prepared->buffer_prefix_zero;
                             if(buffer_prefix && !prepared->buffer_prefix_ranges.empty() &&
                                !VideoCore::ParallelDirectViewsCoherent(direct,std::span{prepared->buffer_prefix_ranges.data(),prepared->buffer_prefix_ranges.size()})) {
-                                ++parallel->buffer_prefix_coherence_misses;buffer_prefix=false;
+                                NATIVE_DIAGNOSTIC(++parallel->buffer_prefix_coherence_misses);buffer_prefix=false;
                             }
                         }
                         // CommitPrepared is the sole writer of these buffer infos after
                         // publication; a new list or Splice invalidates this receipt.
                         if(buffer_prefix && !prepared->uploads.empty()) {
-                            native_upload_attempted=true;++parallel->native_upload_attempts;
+                            native_upload_attempted=true;NATIVE_DIAGNOSTIC(++parallel->native_upload_attempts);
                             native_upload_receipt_used=prepared->upload_receipt_incarnation &&
                                 prepared->upload_receipt_incarnation==s.upload_incarnation;
                         }
@@ -5767,11 +5928,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                         }
                         if(!buffer_prefix)native_upload_receipt_used=false;
                     }
-                    if(buffer_prefix)++parallel->buffer_prefix_accepts;else ++parallel->buffer_prefix_fallbacks;
+                    if(buffer_prefix)NATIVE_DIAGNOSTIC(++parallel->buffer_prefix_accepts);else NATIVE_DIAGNOSTIC(++parallel->buffer_prefix_fallbacks);
                 }
-                if(known_structure)++parallel->producer_structure_hits;
-                if(known_actions)++parallel->producer_action_hits;
-                if(known_stage_schema)++parallel->producer_stage_schema_hits;
+                if(known_structure)NATIVE_DIAGNOSTIC(++parallel->producer_structure_hits);
+                if(known_actions)NATIVE_DIAGNOSTIC(++parallel->producer_action_hits);
+                if(known_stage_schema)NATIVE_DIAGNOSTIC(++parallel->producer_stage_schema_hits);
                 struct DrawTableCache {const std::byte* data{};std::size_t size{};const void* owner{};u64 l1{},zero{};};
                 std::array<DrawTableCache,Shader::MaxStageTypes-1> table_cache{};
                 whole_phases.Next(5);
@@ -5791,7 +5952,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 }
                 if(image_bitmap) {
                     image_batch_infos=worker_result->image_seal_infos;
-                    ++parallel->image_bitmap_draws;parallel->image_bitmap_rows+=worker_result->image_seal_rows;
+                    NATIVE_DIAGNOSTIC(++parallel->image_bitmap_draws);NATIVE_DIAGNOSTIC(parallel->image_bitmap_rows+=worker_result->image_seal_rows);
                 }
                 size_t linear_row=action_index, word=0;
                 const auto next_row=[&]() -> size_t {
@@ -5823,7 +5984,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                 if(!known_stage_schema || !action || write.descriptorCount!=1 ||
                                    action->stage_index>=current_stages.size() || action->stage_index>=worker_result->stages.size())return nullptr;
                                 const auto* stage=current_stages[action->stage_index];
-                                if(stage && action->stage_local<stage->buffers.size()) {++parallel->producer_stage_lookup_hits;planned_stage_value=stage;return stage;}
+                                if(stage && action->stage_local<stage->buffers.size()) {NATIVE_DIAGNOSTIC(++parallel->producer_stage_lookup_hits);planned_stage_value=stage;return stage;}
                                 return nullptr;
                             };
                             // This is the old final clip proof reached early only for a
@@ -5834,7 +5995,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                     if(const auto* stage=planned_stage()) {
                                         const auto& desc=stage->buffers[action->stage_local];
                                         if(desc.buffer_type==Shader::BufferType::ClipPlanes && !desc.is_written) {
-                                            ++parallel->descriptor_clip_nulls;++parallel->clip_fast_hits;return true;
+                                            NATIVE_DIAGNOSTIC(++parallel->descriptor_clip_nulls);NATIVE_DIAGNOSTIC(++parallel->clip_fast_hits);return true;
                                         }
                                     }
                                     return false;
@@ -5847,14 +6008,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                    stage.buffers.size()>(SIZE_MAX-16)/16 || bytes.size()!=16+stage.buffers.size()*16)return false;
                                 u32 words[4]{};std::memcpy(words,bytes.data()+16+local*16,sizeof(words));
                                 if(words[3]!=0)return false;
-                                ++parallel->absent_mode0_attempts;
+                                NATIVE_DIAGNOSTIC(++parallel->absent_mode0_attempts);
                                 const auto& desc=stage.buffers[local];const auto sharp=desc.GetSharp(stage);
                                 // The linked Instance requires and enables nullDescriptor before
                                 // exposing its logical device; see vk_instance.cpp 394-400, 687.
                                 const bool null_enabled=bool(r.instance.GetDevice());
                                 const bool accepted=Native::Parallel::IsPreparedAbsentDirectSlot(bytes,stage.buffers.size(),local,
                                     desc.IsDirectEligible(),null_enabled,!info->buffer,info->offset,info->range,sharp.base_address,sharp.GetSize());
-                                if(accepted)++parallel->absent_mode0_accepted;else ++parallel->absent_mode0_rejected;
+                                if(accepted)NATIVE_DIAGNOSTIC(++parallel->absent_mode0_accepted);else NATIVE_DIAGNOSTIC(++parallel->absent_mode0_rejected);
                                 return accepted;
                             };
                             const auto direct_slot=[&]() -> bool {
@@ -5873,7 +6034,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                         const auto expected=16+n*16;const auto& upload=prepared->uploads[schema.table_upload];
                                         auto& cached=table_cache[action->stage_index];const u64 l1=direct->L1Address(),zero=direct->ZeroPageAddress();
                                         const std::byte* data=cached.data;
-                                        if(data && cached.owner==direct && cached.size==expected && cached.l1==l1 && cached.zero==zero)++parallel->direct_table_cache_hits;
+                                        if(data && cached.owner==direct && cached.size==expected && cached.l1==l1 && cached.zero==zero)NATIVE_DIAGNOSTIC(++parallel->direct_table_cache_hits);
                                         else {
                                             if(upload.flat_stage>=0 || upload.size!=expected || upload.offset>prepared->upload_bytes.size() ||
                                                expected>prepared->upload_bytes.size()-upload.offset)return false;
@@ -5948,28 +6109,28 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                             const auto readonly_slot=[&]() -> bool {
                                 if(!ParallelReadonlyDescriptorEnabled() || write.descriptorType!=vk::DescriptorType::eStorageBuffer || !info->buffer || !info->range ||
                                    info->range==VK_WHOLE_SIZE || prepared->buffer_ranges.size()>64 || prepared->regions.size()>64)return false;
-                                ++parallel->descriptor_readonly_attempts;
+                                NATIVE_DIAGNOSTIC(++parallel->descriptor_readonly_attempts);
                                 const auto stages=pipeline->GetStages();const auto stage_count=std::min<std::size_t>(stages.size(),Shader::MaxStageTypes-1);
                                 const Shader::Info* matched=planned_stage();std::size_t local=matched?action->stage_local:0,start=0;
                                 if(!matched)for(std::size_t si=0;si<stage_count;++si){const auto* stage=stages[si];if(!stage)continue;const auto n=stage->buffers.size();
                                     if(index>=start && index-start<n){matched=stage;local=index-start;break;}start+=n;}
-                                if(!matched){++parallel->readonly_guard_failures[0];return false;}
+                                if(!matched){NATIVE_DIAGNOSTIC(++parallel->readonly_guard_failures[0]);return false;}
                                 const auto& desc=matched->buffers[local];
                                 if(desc.IsSpecial()) {
-                                    ++parallel->readonly_guard_failures[1];
+                                    NATIVE_DIAGNOSTIC(++parallel->readonly_guard_failures[1]);
                                     const auto kind=static_cast<std::size_t>(desc.buffer_type);
-                                    ++parallel->readonly_special_kinds[std::min(kind,parallel->readonly_special_kinds.size()-1)];
+                                    NATIVE_DIAGNOSTIC(++parallel->readonly_special_kinds[std::min(kind,parallel->readonly_special_kinds.size()-1)]);
                                     return false;
                                 }
-                                if(desc.is_written){++parallel->readonly_guard_failures[2];return false;}
+                                if(desc.is_written){NATIVE_DIAGNOSTIC(++parallel->readonly_guard_failures[2]);return false;}
                                 const auto sharp=desc.GetSharp(*matched);const u64 base=sharp.base_address,sharp_size=sharp.GetSize();
                                 // ClampRangeSize returns the original size below 1 GiB without a map lookup.
                                 // Larger ranges remain on the serial path; do not add a recorder map lock.
                                 constexpr u64 Limit=u64{1}<<40,NoClampLimit=u64{1}<<30;
-                                if(!base){++parallel->readonly_guard_failures[3];return false;}
-                                if(!sharp_size){++parallel->readonly_guard_failures[4];return false;}
-                                if(sharp_size>=NoClampLimit){++parallel->readonly_guard_failures[5];return false;}
-                                if(base>=Limit || sharp_size>Limit-base){++parallel->readonly_guard_failures[6];return false;}
+                                if(!base){NATIVE_DIAGNOSTIC(++parallel->readonly_guard_failures[3]);return false;}
+                                if(!sharp_size){NATIVE_DIAGNOSTIC(++parallel->readonly_guard_failures[4]);return false;}
+                                if(sharp_size>=NoClampLimit){NATIVE_DIAGNOSTIC(++parallel->readonly_guard_failures[5]);return false;}
+                                if(base>=Limit || sharp_size>Limit-base){NATIVE_DIAGNOSTIC(++parallel->readonly_guard_failures[6]);return false;}
                                 const u64 bytes=sharp_size;
                                 const auto contains=[&](const auto& range) {
                                     const auto [begin,end]=range;
@@ -5978,8 +6139,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                 bool range_hit=false;
                                 const bool contained=Native::Parallel::ReadonlyHintOrScan(prepared->buffer_ranges,
                                     action ? action->range_hint : SIZE_MAX,contains,range_hit);
-                                if(range_hit)++parallel->readonly_range_hint_hits;else ++parallel->readonly_range_hint_misses;
-                                if(!contained){++parallel->descriptor_readonly_uncontained;return false;}
+                                if(range_hit)NATIVE_DIAGNOSTIC(++parallel->readonly_range_hint_hits);else NATIVE_DIAGNOSTIC(++parallel->readonly_range_hint_misses);
+                                if(!contained){NATIVE_DIAGNOSTIC(++parallel->descriptor_readonly_uncontained);return false;}
                                 const u64 alignment=r.instance.StorageMinAlignment();if(!alignment)return false;
                                 const auto normalized=[&](u64 source_offset,u64 count) {
                                     const u64 aligned=Common::AlignDown(source_offset,alignment),adjust=source_offset-aligned;
@@ -5994,8 +6155,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                 bool region_hit=false;
                                 const bool region_match=Native::Parallel::ReadonlyHintOrScan(prepared->regions,
                                     action ? action->region_hint : SIZE_MAX,matches_region,region_hit);
-                                if(region_hit)++parallel->readonly_region_hint_hits;else ++parallel->readonly_region_hint_misses;
-                                if(region_match){++parallel->descriptor_readonly_regions;return true;}
+                                if(region_hit)NATIVE_DIAGNOSTIC(++parallel->readonly_region_hint_hits);else NATIVE_DIAGNOSTIC(++parallel->readonly_region_hint_misses);
+                                if(region_match){NATIVE_DIAGNOSTIC(++parallel->descriptor_readonly_regions);return true;}
                                 auto* direct=r.buffer_cache.GetDirectMemory();
                                 if(direct){u32 parts=0;bool exact=false;
                                     const bool covered=direct->TryForEachPart(base,bytes,
@@ -6003,9 +6164,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                         [&](const VideoCore::Buffer& source,u64 source_offset,u64 part_offset,u64 length){
                                             ++parts;exact=source.Handle()==info->buffer && part_offset==0 && length==bytes && normalized(source_offset,bytes);
                                         });
-                                    if(covered && parts==1 && exact){++parallel->descriptor_readonly_imports;return true;}
+                                    if(covered && parts==1 && exact){NATIVE_DIAGNOSTIC(++parallel->descriptor_readonly_imports);return true;}
                                 }
-                                ++parallel->descriptor_readonly_unmatched;
+                                NATIVE_DIAGNOSTIC(++parallel->descriptor_readonly_unmatched);
                                 return false;
                             };
                             const auto disabled_clip_null=[&]() -> bool {
@@ -6015,22 +6176,22 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                 if(const auto* stage=planned_stage()) {
                                     const auto& desc=stage->buffers[action->stage_local];
                                     if(desc.buffer_type!=Shader::BufferType::ClipPlanes || desc.is_written)return false;
-                                    ++parallel->descriptor_clip_nulls;return true;
+                                    NATIVE_DIAGNOSTIC(++parallel->descriptor_clip_nulls);return true;
                                 }
                                 const auto stages=pipeline->GetStages();std::size_t start=0;
                                 for(std::size_t si=0;si<std::min<std::size_t>(stages.size(),Shader::MaxStageTypes-1);++si){
                                     const auto* stage=stages[si];if(!stage)continue;const auto n=stage->buffers.size();
                                     if(index>=start && index-start<n){const auto& desc=stage->buffers[index-start];
                                         if(desc.buffer_type!=Shader::BufferType::ClipPlanes || desc.is_written)return false;
-                                        ++parallel->descriptor_clip_nulls;return true;
+                                        NATIVE_DIAGNOSTIC(++parallel->descriptor_clip_nulls);return true;
                                     }start+=n;
                                 }
                                 return false;
                             };
-                            if(!recorded || !retained){++parallel->direct_slot_attempts;const bool direct_ok=TimedProofInvoke(parallel->proof_phases[6],phase_sample,direct_slot);if(!direct_ok && !TimedProofInvoke(parallel->proof_phases[7],phase_sample,readonly_slot) && !TimedProofInvoke(parallel->proof_phases[8],phase_sample,disabled_clip_null)){
+                            if(!recorded || !retained){NATIVE_DIAGNOSTIC(++parallel->direct_slot_attempts);const bool direct_ok=TimedProofInvoke(parallel->proof_phases[6],phase_sample,direct_slot);if(!direct_ok && !TimedProofInvoke(parallel->proof_phases[7],phase_sample,readonly_slot) && !TimedProofInvoke(parallel->proof_phases[8],phase_sample,disabled_clip_null)){
                                 descriptor_fail_reason=3;
                                 if(sample_preflight && parallel->descriptor_samples<4) {
-                                    ++parallel->descriptor_samples;u32 stage_id=~u32{0},kind=~u32{0},mode=~u32{0};bool stage_direct=false,eligible=false;
+                                    NATIVE_DIAGNOSTIC(++parallel->descriptor_samples);u32 stage_id=~u32{0},kind=~u32{0},mode=~u32{0};bool stage_direct=false,eligible=false;
                                     std::size_t start=0;const auto stages=pipeline->GetStages();
                                     for(std::size_t si=0;si<std::min<std::size_t>(stages.size(),Shader::MaxStageTypes-1);++si) {
                                         const auto* stage=stages[si];if(!stage)continue;const auto n=stage->buffers.size();
@@ -6051,7 +6212,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                         index,u32(write.descriptorType),!info->buffer,info->offset,info->range,recorded,
                                         recorded ? retained : retained_scan(),stage_id,kind,stage_direct,eligible,mode);
                                 }
-                                descriptor_safe=false;break;}else if(direct_ok)++parallel->direct_slot_accepted;}
+                                descriptor_safe=false;break;}else if(direct_ok)NATIVE_DIAGNOSTIC(++parallel->direct_slot_accepted);}
                         }
                         if(!descriptor_safe)break;
                         continue;
@@ -6069,12 +6230,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                 const auto handle_key=reinterpret_cast<u64>(static_cast<VkSampler>(info.sampler));
                                 const bool diag=ParallelGateDiagEnabled();
                                 known=parallel->sampler_proof.Contains(info.sampler,handle_key);
-                                if(known) {if(diag)++parallel->sampler_proof_hits;}
+                                if(known) {if(diag)NATIVE_DIAGNOSTIC(++parallel->sampler_proof_hits);}
                                 else {
-                                    if(diag)++parallel->sampler_proof_misses;
+                                    if(diag)NATIVE_DIAGNOSTIC(++parallel->sampler_proof_misses);
                                     std::scoped_lock sampler_lock{sampler_mutex};
-                                    for(const auto& [key,value]:samplers) {if(diag)++parallel->sampler_scan_steps;if(value && value->Handle()==info.sampler) {known=true;break;}}
-                                    if(known){parallel->sampler_proof.Insert(info.sampler,handle_key);if(diag)++parallel->sampler_scan_positives;}
+                                    for(const auto& [key,value]:samplers) {if(diag)NATIVE_DIAGNOSTIC(++parallel->sampler_scan_steps);if(value && value->Handle()==info.sampler) {known=true;break;}}
+                                    if(known){parallel->sampler_proof.Insert(info.sampler,handle_key);if(diag)NATIVE_DIAGNOSTIC(++parallel->sampler_scan_positives);}
                                 }
                             } else {std::scoped_lock sampler_lock{sampler_mutex};
                                 for(const auto& [key,value]:samplers) if(value && value->Handle()==info.sampler) {known=true;break;}}
@@ -6083,15 +6244,15 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                             SampledProofTimer phase{parallel->proof_phases[2],phase_sample};
                             if(!info.imageView || info.sampler || info.imageLayout!=vk::ImageLayout::eGeneral) {
                                 if(ParallelGateDiagEnabled()) {
-                                    if(!info.imageView)++parallel->sampled_null_view;
-                                    if(info.sampler)++parallel->sampled_nonnull_sampler;
-                                    if(info.imageLayout!=vk::ImageLayout::eGeneral)++parallel->sampled_nongeneral;
-                                    if(!info.imageView && !info.sampler && info.imageLayout==vk::ImageLayout::eGeneral)++parallel->sampled_canonical_null;
+                                    if(!info.imageView)NATIVE_DIAGNOSTIC(++parallel->sampled_null_view);
+                                    if(info.sampler)NATIVE_DIAGNOSTIC(++parallel->sampled_nonnull_sampler);
+                                    if(info.imageLayout!=vk::ImageLayout::eGeneral)NATIVE_DIAGNOSTIC(++parallel->sampled_nongeneral);
+                                    if(!info.imageView && !info.sampler && info.imageLayout==vk::ImageLayout::eGeneral)NATIVE_DIAGNOSTIC(++parallel->sampled_canonical_null);
                                 }
                                 static const bool absent_sampled_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_ABSENT_SAMPLED_IMAGE");return p && p[0]=='1' && !p[1];}();
                                 bool absent_sampled=false;
                                 const bool canonical_attempt=absent_sampled_enabled && !info.imageView && !info.sampler && info.imageLayout==vk::ImageLayout::eGeneral;
-                                if(canonical_attempt && ParallelGateDiagEnabled())++parallel->absent_sampled_attempts;
+                                if(canonical_attempt && ParallelGateDiagEnabled())NATIVE_DIAGNOSTIC(++parallel->absent_sampled_attempts);
                                 if(absent_sampled_enabled && !info.imageView && !info.sampler &&
                                    info.imageLayout==vk::ImageLayout::eGeneral && r.instance.GetDevice() &&
                                    b.write_sets.size()==b.writes.size()) {
@@ -6108,8 +6269,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                             return u64(start.unified)+stage.buffers.size();
                                         });
                                 }
-                                if(absent_sampled) {if(ParallelGateDiagEnabled())++parallel->absent_sampled_accepted;continue;}
-                                if(canonical_attempt && ParallelGateDiagEnabled())++parallel->absent_sampled_rejected;
+                                if(absent_sampled) {if(ParallelGateDiagEnabled())NATIVE_DIAGNOSTIC(++parallel->absent_sampled_accepted);continue;}
+                                if(canonical_attempt && ParallelGateDiagEnabled())NATIVE_DIAGNOSTIC(++parallel->absent_sampled_rejected);
                                 descriptor_fail_reason=7;descriptor_safe=false;break;
                             }
                             const auto full_scan=[&](vk::ImageView wanted) {
@@ -6121,11 +6282,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                             bool known=false;
                             if(PreparedSampledProofRequested() && from_prepared && prepared && prepared->pipeline==pipeline &&
                                prepared->proof_context && prepared->proof_context->Valid(prepared->proof_mode_state)) {
-                                ++parallel->prepared_view_attempts;
+                                NATIVE_DIAGNOSTIC(++parallel->prepared_view_attempts);
                                 const auto slot=static_cast<std::size_t>(&info-b.images.data());
                                 known=Native::Parallel::MatchSampledViewProof(prepared->sampled_view_proofs,slot,info.imageView,
                                     sampler_cache_epoch.load(std::memory_order_acquire),b.sampled);
-                                if(known)++parallel->prepared_view_accepted;else ++parallel->prepared_view_fallbacks;
+                                if(known)NATIVE_DIAGNOSTIC(++parallel->prepared_view_accepted);else NATIVE_DIAGNOSTIC(++parallel->prepared_view_fallbacks);
                             }
                             if(!known && view_proof_enabled) {
                                 const auto hash=[](vk::ImageView h) noexcept {u64 key=reinterpret_cast<u64>(static_cast<VkImageView>(h));key^=key>>33;key*=0xff51afd7ed558ccdULL;key^=key>>33;return key;};
@@ -6177,18 +6338,18 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                           prepared->upload_receipt_incarnation==s.upload_incarnation)));
                     if(!context_valid || !image_valid || !buffer_valid) {
                         descriptor_fail_reason=10;descriptor_safe=false;
-                        if(image_batch_infos && (!context_valid || !image_valid))++parallel->image_batch_invalidations;
-                        if(buffer_prefix && (!context_valid || !buffer_valid))++parallel->buffer_prefix_invalidations;
-                    } else if(image_batch_infos) {++parallel->image_batch_draws;parallel->image_batch_infos+=image_batch_infos;}
+                        if(image_batch_infos && (!context_valid || !image_valid))NATIVE_DIAGNOSTIC(++parallel->image_batch_invalidations);
+                        if(buffer_prefix && (!context_valid || !buffer_valid))NATIVE_DIAGNOSTIC(++parallel->buffer_prefix_invalidations);
+                    } else if(image_batch_infos) {NATIVE_DIAGNOSTIC(++parallel->image_batch_draws);NATIVE_DIAGNOSTIC(parallel->image_batch_infos+=image_batch_infos);}
                 }
-                parallel->producer_upload_lookup_hits+=action_upload_lookups;
+                NATIVE_DIAGNOSTIC(parallel->producer_upload_lookup_hits+=action_upload_lookups);
                 if(sample_view) {
                     auto& v=parallel->view_sample;++v.draws;if(local_view_stats.queries)++v.queried_draws;
                     v.image_infos+=b.images.size();v.sampled_entries+=b.sampled.size();
                     const auto add=[](auto& to,const auto& from) {to.queries+=from.queries;to.first_hits+=from.first_hits;to.index_hits+=from.index_hits;to.walks+=from.walks;to.fallbacks+=from.fallbacks;to.overflows+=from.overflows;to.wanted_builds+=from.wanted_builds;to.wanted_overflows+=from.wanted_overflows;to.filtered_views+=from.filtered_views;};
                     add(v.proof,local_view_stats);if(gate_view)add(parallel->view_proof_stats,local_view_stats);
                 }
-                if(stage_proof && ParallelGateDiagEnabled()){parallel->proof_table_builds+=stage_proof->Builds();parallel->proof_table_hits+=stage_proof->Hits();}
+                if(stage_proof && ParallelGateDiagEnabled()){NATIVE_DIAGNOSTIC(parallel->proof_table_builds+=stage_proof->Builds());NATIVE_DIAGNOSTIC(parallel->proof_table_hits+=stage_proof->Hits());}
                 whole_phases.Next(6);
                 if(descriptor_safe) {
                     if(!b.groups_ready)b.PrepareWriteGroups();
@@ -6208,7 +6369,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                             auto owned=std::static_pointer_cast<DescriptorSnapshot>(std::move(worker_result->push_snapshot));
                             const auto current=std::span<const vk::DescriptorBufferInfo>{b.buffers.data(),b.buffers.size()}.subspan(worker_result->push_buffer_first,worker_result->push_buffer_count);
                             if(owned->PatchBufferBindings(current)) {
-                                parallel_push_writes=std::move(owned);++parallel->producer_snapshot_hits;
+                                parallel_push_writes=std::move(owned);NATIVE_DIAGNOSTIC(++parallel->producer_snapshot_hits);
                                 parallel_descriptor_bytes=parallel_push_writes->OwnedBytes()+128;reused_snapshot=true;
                             }
                         }
@@ -6230,22 +6391,25 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             descriptor_fail_reason=10;descriptor_safe=false;
         }
         whole_phases.Next(7);
+#if !defined(NDEBUG)
         if(sample_preflight) {
-            ++parallel->preflight_samples;
-            parallel->preflight_wall_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-preflight_begin).count();
+            NATIVE_DIAGNOSTIC(++parallel->preflight_samples);
+            NATIVE_DIAGNOSTIC(parallel->preflight_wall_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-preflight_begin).count());
             if(preflight_cpu_started && DescriptorThreadCpu100ns(preflight_cpu_end) && preflight_cpu_end>=preflight_cpu_begin) {
-                ++parallel->preflight_cpu_samples;parallel->preflight_cpu_100ns+=preflight_cpu_end-preflight_cpu_begin;
+                NATIVE_DIAGNOSTIC(++parallel->preflight_cpu_samples);NATIVE_DIAGNOSTIC(parallel->preflight_cpu_100ns+=preflight_cpu_end-preflight_cpu_begin);
             }
         }
+
+#endif
         if(native_vi_attempted) {
-            if(descriptor_safe && native_vi_receipt_used) {++parallel->native_vi_accepts;parallel->native_vi_skipped+=native_vertex_skipped;}
-            else ++parallel->native_vi_fallbacks;
+            if(descriptor_safe && native_vi_receipt_used) {NATIVE_DIAGNOSTIC(++parallel->native_vi_accepts);NATIVE_DIAGNOSTIC(parallel->native_vi_skipped+=native_vertex_skipped);}
+            else NATIVE_DIAGNOSTIC(++parallel->native_vi_fallbacks);
         }
         if(native_upload_attempted) {
-            if(descriptor_safe && native_upload_receipt_used) {++parallel->native_upload_accepts;parallel->native_upload_skipped+=prepared->uploads.size();}
-            else ++parallel->native_upload_fallbacks;
+            if(descriptor_safe && native_upload_receipt_used) {NATIVE_DIAGNOSTIC(++parallel->native_upload_accepts);NATIVE_DIAGNOSTIC(parallel->native_upload_skipped+=prepared->uploads.size());}
+            else NATIVE_DIAGNOSTIC(++parallel->native_upload_fallbacks);
         }
-        if(cheap_eligible && !descriptor_safe){++parallel->descriptor_rejected;++parallel->descriptor_fail_reasons[descriptor_fail_reason];}
+        if(cheap_eligible && !descriptor_safe){NATIVE_DIAGNOSTIC(++parallel->descriptor_rejected);NATIVE_DIAGNOSTIC(++parallel->descriptor_fail_reasons[descriptor_fail_reason]);}
         if(ParallelGateDiagEnabled()) {
             u64 mask=0;const auto fail=[&](u32 bit,bool bad){if(bad)mask|=u64{1}<<bit;};
             fail(0,!RytyGtsInRace());fail(1,EmulatorSettings.IsPatchShaders());
@@ -6269,10 +6433,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             parallel->gates.Add(mask,stable);
         }
         const bool eligible=descriptor_safe;
-        if(eligible) {++parallel->eligible;
-            if(parallel->active)++parallel->eligible_in_active_scope;
-            else if(s.rendering)++parallel->eligible_in_serial_scope;
-            else ++parallel->eligible_at_boundary;
+        if(eligible) {NATIVE_DIAGNOSTIC(++parallel->eligible);
+            if(parallel->active)NATIVE_DIAGNOSTIC(++parallel->eligible_in_active_scope);
+            else if(s.rendering)NATIVE_DIAGNOSTIC(++parallel->eligible_in_serial_scope);
+            else NATIVE_DIAGNOSTIC(++parallel->eligible_at_boundary);
         }
         if(eligible && same_serial_scope)
             parallel->NoteSerialEligible();
@@ -6290,7 +6454,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         if(eligible && !parallel->active && (!s.rendering || split_now)) {
             // Allocate every packet container before changing logical rendering.
             try {
-                if(split_now)++parallel->serial_split_attempts;
+                if(split_now)NATIVE_DIAGNOSTIC(++parallel->serial_split_attempts);
                 parallel->sync_pins.Collect(r.scheduler.GetWorkSemaphore()->KnownGpuTick(),
                     [&](auto& callback) noexcept {return Native::Rhi::TryEnqueueCompleted(*device,callback);});
                 const auto slot=parallel->sync_pins.Reserve();
@@ -6329,14 +6493,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                     if(prebind_ok) {
                         static_assert(std::is_nothrow_move_constructible_v<Native::Parallel::Pass>);
                         pass.draws.swap(parallel->scratch_draws);
-                        if(split_now) {EndRendering();PassBarrier();serial_split_started=true;++parallel->serial_split_success;serial_split_prebound=true;}
+                        if(split_now) {EndRendering();PassBarrier();serial_split_started=true;NATIVE_DIAGNOSTIC(++parallel->serial_split_success);serial_split_prebound=true;}
                         parallel->epoch=epoch;parallel->lease=std::move(lease);parallel->active.emplace(std::move(pass));
                         parallel->active_list=s.list;parallel->active_cmd=s.cmd;
-                        parallel->pass_closure.origin=split_now?0:preclosed_serial_scope?1:2;
+                        NATIVE_DIAGNOSTIC(parallel->pass_closure.origin=split_now?0:preclosed_serial_scope?1:2);
                         reserved_pin.committed=true;
-                        s.rendering=true;s.render=targets.state;++stats.passes;++parallel->passes;
+                        s.rendering=true;s.render=targets.state;NATIVE_DIAGNOSTIC(++stats.passes);NATIVE_DIAGNOSTIC(++parallel->passes);
                     }
-                } else ++parallel->owner_slot_pressure;
+                } else NATIVE_DIAGNOSTIC(++parallel->owner_slot_pressure);
             } catch(const std::bad_alloc&) {
                 if(parallel->pin_slot!=Native::Parallel::SyncOwnerPins<>::Invalid)parallel->sync_pins.CancelEmpty(parallel->pin_slot);
                 parallel->pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;parallel->active.reset();parallel->lease.reset();
@@ -6345,18 +6509,21 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         parallel_draw=parallel->active && s.rendering && s.render==targets.state && eligible;
         if(parallel_draw){parallel_index_safe=index_safe;parallel_index_bytes=checked_index_bytes;}
         }
+#if !defined(NDEBUG)
         whole_phases.Stop();
         whole_phases.phases=nullptr;
         if(whole_sample) {
             const u64 elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-whole_begin).count();
-            ++parallel->whole_samples;parallel->whole_wall_ns+=elapsed;parallel->whole_max_ns=std::max(parallel->whole_max_ns,elapsed);
+            NATIVE_DIAGNOSTIC(++parallel->whole_samples);NATIVE_DIAGNOSTIC(parallel->whole_wall_ns+=elapsed);parallel->whole_max_ns=std::max(parallel->whole_max_ns,elapsed);
             if(whole_cpu_started && DescriptorThreadCpu100ns(whole_cpu_end) && whole_cpu_end>=whole_cpu_begin){
-                ++parallel->whole_cpu_samples;parallel->whole_cpu_100ns+=whole_cpu_end-whole_cpu_begin;
+                NATIVE_DIAGNOSTIC(++parallel->whole_cpu_samples);NATIVE_DIAGNOSTIC(parallel->whole_cpu_100ns+=whole_cpu_end-whole_cpu_begin);
             }
         }
+#endif
+
     }
     // Wait for an existing non-rendering boundary: never restart a clear pass for diagnostics.
-    if(preclosed_serial_scope && !parallel_draw)++parallel->natural_serial_fallback;
+    if(preclosed_serial_scope && !parallel_draw)NATIVE_DIAGNOSTIC(++parallel->natural_serial_fallback);
     if(SceneTrace::Id() && !SceneTrace::state.attempted && !s.rendering && !preclosed_serial_scope) {
         const auto families=r.instance.GetPhysicalDevice().getQueueFamilyProperties();
         const u32 family=r.instance.GetGraphicsQueueFamilyIndex();
@@ -6477,7 +6644,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 // A fresh secondary cannot inherit a serial command buffer's old
                 // descriptor bindings. Never enqueue an incomplete packet.
                 if(parallel->active->draws.empty()) {
-                    ++parallel->pass_closure.empty_aborts[parallel->pass_closure.origin];
+                    NATIVE_DIAGNOSTIC(++parallel->pass_closure.empty_aborts[parallel->pass_closure.origin]);
                     parallel->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::Abandoned);
                     ASSERT_MSG(parallel->sync_pins.CancelEmpty(parallel->pin_slot),"parallel empty owner slot not empty");
                     parallel->pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;
@@ -6485,8 +6652,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                     parallel->active.reset();parallel->lease.reset();s.rendering=false;
                     s.dynamic.Invalidate();s.pipelines.Invalidate();s.vertex_state_known=false;
                 } else {EndRendering(CloseMissingSets);PassBarrier();}
-                if(preclosed_serial_scope)++parallel->natural_binding_skip;
-                ++parallel->missing_sets;++stats.skipped;
+                if(preclosed_serial_scope)NATIVE_DIAGNOSTIC(++parallel->natural_binding_skip);
+                NATIVE_DIAGNOSTIC(++parallel->missing_sets);NATIVE_DIAGNOSTIC(++stats.skipped);
                 return;
             }
         } else PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
@@ -6498,7 +6665,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             DrawOffsets(regs, vs_info, pipeline->GetFetchShader());
         const u32 instances = regs.num_instances.NumInstances();
         const auto* fs = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+#if !defined(NDEBUG)
         scene_trace.Programs(vs_info.pgm_hash,fs?fs->pgm_hash:0);
+#endif
         if(SceneTrace::Id()) {
             const auto& d=s.dynamic;
             r.FrameDumpEvent(fmt::format("scene-occlusion-registers id={} db_render={:08x} db_count={:08x} db_depth_view={:08x} db_override={:08x}",SceneTrace::Id(),regs.reg_array[0xA000],regs.reg_array[0xA001],regs.reg_array[0xA002],regs.reg_array[0xA003]));
@@ -6542,10 +6711,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 captured.index_type=vi->index_type;captured.vertex_offset=s32(vertex_offset);}
             ASSERT_MSG(parallel->sync_pins.Pin(parallel->pin_slot,captured.pipeline_owner),"parallel pipeline owner pin failed");
             if(ParallelGateDiagEnabled()) {const auto n=captured.vertex_buffer_count;
-                ++parallel->captured_vertex_counts[n==0?0:n==1?1:n<4?2:n<8?3:n<16?4:n<32?5:6];parallel->captured_vertex_sum+=n;}
-            unfinished_draw_guard.committed=true;pending_draw_guard.committed=true;++parallel->draws;
-            if(serial_split_started)++parallel->serial_split_first_draws;
-            if(preclosed_serial_scope)++parallel->natural_captured;
+                NATIVE_DIAGNOSTIC(++parallel->captured_vertex_counts[n==0?0:n==1?1:n<4?2:n<8?3:n<16?4:n<32?5:6]);NATIVE_DIAGNOSTIC(parallel->captured_vertex_sum+=n);}
+            unfinished_draw_guard.committed=true;pending_draw_guard.committed=true;NATIVE_DIAGNOSTIC(++parallel->draws);
+            if(serial_split_started)NATIVE_DIAGNOSTIC(++parallel->serial_split_first_draws);
+            if(preclosed_serial_scope)NATIVE_DIAGNOSTIC(++parallel->natural_captured);
         } else {
         SceneTrace::GpuBegin(s.cmd);
         Native::GpuCheckpoints::Record(static_cast<VkCommandBuffer>(s.cmd), 1, frame,
@@ -6578,6 +6747,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
 
     // DIAG-208 (RYGT_PIXEL_TRACE=1): while a frame is dumped, the scene target's traced pixels
     // are copied after each draw into it, to name the draw that first writes a wrong colour.
+#if !defined(NDEBUG)
     static const bool pixel_trace = [] {
         const char* env = std::getenv("RYGT_PIXEL_TRACE");
         return env && env[0] == '1';
@@ -6618,6 +6788,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         }
     }
 
+#endif
     if (native_fsr_composition) FinishNativeFsr(targets);
     else CaptureNativeFsr(*pipeline, targets, b);
 
@@ -6664,7 +6835,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         }
     }
 
-    ++stats.draws;
+    NATIVE_DIAGNOSTIC(++stats.draws);
     ++s.commands;
     tail_partition.Finish();
     {RecordPartitionClock chunk_partition{parallel?&parallel->record_partition[partition_mode][2]:nullptr};ChunkFlushCheck();}
@@ -6792,7 +6963,7 @@ const GraphicsPipeline* NativeRenderer::InstallPrepared(PreparedDraw& p) {
     if (!installed) {
         return nullptr;
     }
-    ++stats.prepared_installed;
+    NATIVE_DIAGNOSTIC(++stats.prepared_installed);
     return p.pipeline;
 }
 
@@ -6844,7 +7015,10 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
     AheadPrepareGuard ahead_guard{FindAhead(this)};
     auto proof_guard=PreparedSampledProofRequested()?prepared_proof_contexts.TryEnter(this):Native::Parallel::ProofProducerGuard{};
 
+#if !defined(NDEBUG)
     const auto start = std::chrono::steady_clock::now();
+
+#endif
     PreparedDraw* p = NewPrepared();
     p->proof_context=proof_guard.context;p->proof_mode_state=proof_guard.state;
     p->packet = packet;
@@ -6897,7 +7071,7 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
         }
     }
     if (!ok) {
-        ++prepare_stats.failed;
+        NATIVE_DIAGNOSTIC(++prepare_stats.failed);
         FreePrepared(p);
         return;
     }
@@ -7222,17 +7396,20 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
         if (!inserted) {
             dropped.push_back(it->second);
             it->second = p;
-            ++prepare_stats.replaced;
+            NATIVE_DIAGNOSTIC(++prepare_stats.replaced);
         }
     }
-    prepare_stats.stale += dropped.size();
+    NATIVE_DIAGNOSTIC(prepare_stats.stale += dropped.size());
     for (PreparedDraw* draw : dropped) {
         FreePrepared(draw);
     }
-    ++prepare_stats.made;
+    NATIVE_DIAGNOSTIC(++prepare_stats.made);
+#if !defined(NDEBUG)
     prepare_stats.ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - start)
                             .count();
+#endif
+
 }
 
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobGuestBuffer(VAddr address, u64 size,
@@ -7264,6 +7441,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobGuestBuffer(VAddr a
 bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs,
                                     Shader::Backend::Bindings& binding, PreparedDraw& p) {
     // As BindBuffers, without its side effects.
+#if !defined(NDEBUG)
     // DIAG-205 (RYGT_RECORDER_SHADER=<hash>): that program's draws go to the recorder, which
     // reads their buffers later (tests whether the job threads read per-frame constants early).
     static const u64 recorder_hash = [] {
@@ -7273,6 +7451,7 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
     if (recorder_hash != 0 && stage.pgm_hash == recorder_hash) {
         return false; // the recorder
     }
+#endif
     DrawBindings& b = p.bindings;
     const u64 alignment = r.instance.StorageMinAlignment();
     // Match BindBuffers: prepared and recorder-side draws must choose the same path.
@@ -7289,6 +7468,7 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
     const bool descriptor_postprocess = postprocess_descriptors &&
         stage.sw_stage == Shader::SwStage::Fragment &&
         (stage.pgm_hash == 0x184b619c || stage.pgm_hash == 0x7cd92fb8);
+#if !defined(NDEBUG)
     // Diagnostic A/B: retain shader compilation but use descriptor bindings.
     static const bool descriptor_only_a82d2fe = [] {
         const char* value = std::getenv("RYGT_A82D2FE_DESCRIPTOR_ONLY");
@@ -7299,6 +7479,9 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
     static std::atomic<bool> descriptor_diagnostic_logged{};
     if (force_descriptor && !descriptor_diagnostic_logged.exchange(true))
         LOG_WARNING(Render_Vulkan, "DIAG: 0xa82d2fe descriptor-only buffer binding active");
+#else
+    constexpr bool force_descriptor = false;
+#endif
     auto* direct = stage.uses_direct && !descriptor_composition && !force_descriptor
         ? r.buffer_cache.GetDirectMemory() : nullptr;
     static thread_local std::vector<std::array<u32, 4>> direct_entries;
@@ -7369,6 +7552,7 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
             const auto vsharp = desc.GetSharp(stage);
             const u64 base = vsharp.base_address;
             const u64 sharp_size = vsharp.GetSize();
+#if !defined(NDEBUG)
             // DIAG-204 (RYGT_PROBE_SHADER=<hash>): that program's buffers and their first bytes.
             static const u64 probe_hash = [] {
                 const char* env = std::getenv("RYGT_PROBE_SHADER");
@@ -7391,6 +7575,7 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                                      : std::string{"unreadable"});
                 }
             }
+#endif
             const bool impossible =
                 vsharp.num_records != UINT32_MAX &&
                 (sharp_size >= GpuAddressLimit || base + sharp_size > GpuAddressLimit ||
@@ -7836,7 +8021,7 @@ bool NativeRenderer::CommitPreparedVertices(PreparedDraw& p, const GraphicsPipel
                                             bool trusted) {
     // (The ranges were checked with the bindings'.)
     const auto reject = [&] {
-        ++stats.prepared_vertices_rejected;
+        NATIVE_DIAGNOSTIC(++stats.prepared_vertices_rejected);
         return false;
     };
     if (quad_triangles || p.indexed != is_indexed || p.index_offset != index_offset) {
@@ -7865,12 +8050,12 @@ bool NativeRenderer::CommitPreparedVertices(PreparedDraw& p, const GraphicsPipel
     for (Mirror* mirror : p.mirrors) {
         RefreshMirror(*mirror);
         mirror->used_frame = frame;
-        ++stats.mirror_binds;
+        NATIVE_DIAGNOSTIC(++stats.mirror_binds);
     }
     for (const auto& [address, size] : p.in_place) {
         MirrorBuffer(address, size);
     }
-    ++stats.prepared_vertices;
+    NATIVE_DIAGNOSTIC(++stats.prepared_vertices);
     return true;
 }
 
@@ -7880,7 +8065,7 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         {"stage-validation", "image-freshness", "sort-cpu-writes", "buffer-freshness",
          "refresh-regions", "upload-data", "image-rewrite-sources", "push-data"}};
     const auto reject = [&](u32 why) {
-        ++stats.prepared_rejected[why];
+        NATIVE_DIAGNOSTIC(++stats.prepared_rejected[why]);
         return false;
     };
     if (p.pipeline != &pipeline) {
@@ -7921,7 +8106,7 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     trace.Next(4);
     for (const auto& use : p.regions) {
         RefreshRegion(*use.region, use.address, use.size);
-        ++stats.region_binds;
+        NATIVE_DIAGNOSTIC(++stats.region_binds);
     }
     const u64 alignment = r.instance.StorageMinAlignment();
     trace.Next(5);
@@ -7977,8 +8162,8 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     p.bindings.push.yoffset = fresh.yoffset;
     p.bindings.push.yscale = fresh.yscale;
     p.bindings.push.quad_sample_mask = fresh.quad_sample_mask;
-    stats.null_images += p.null_images;
-    ++stats.prepared_used;
+    NATIVE_DIAGNOSTIC(stats.null_images += p.null_images);
+    NATIVE_DIAGNOSTIC(++stats.prepared_used);
     return true;
 }
 
@@ -8147,6 +8332,7 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
         return;
     }
     const auto& info = entry.info;
+#if !defined(NDEBUG)
     if (Native::WatchedTexture(info.guest_address, info.guest_address + 1) &&
         Native::WatchSample()) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: apply {} to {} {:#x} ({:#x} bytes of {:#x}, "
@@ -8157,6 +8343,7 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
                     entry.from_cpu ? "texture" : "target", info.guest_address, entry.rewrite_bytes,
                     info.guest_size, entry.rewrite_pattern[0], entry.rewrite_pattern[1]);
     }
+#endif
     const Rewrite rewrite = std::exchange(entry.rewrite, Rewrite::None);
     const bool stencil = std::exchange(entry.stencil_clear_pending, false) &&
                          info.props.has_stencil && entry.image;
@@ -8187,21 +8374,21 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
         const u32 rows = u32(std::min<u64>((entry.rewrite_bytes + row_bytes - 1) / row_bytes,
                                            info.size.height));
         if (rows != 0 && FillImage(entry, lo, hi, rows)) {
-            ++stats.rewrite_partial;
+            NATIVE_DIAGNOSTIC(++stats.rewrite_partial);
         }
     } else if (rewrite == Rewrite::Clear && !depth_value && !color_zero) {
         // NAT-132: other patterns (GT Sport fills pictures in its scratch pool with non-zero
         // values) are filled in on the GPU; uploading them from memory cost 1-3 GB a second in
         // the menus.
         if (FillImage(entry, lo, hi, 0)) {
-            ++stats.rewrite_fills;
+            NATIVE_DIAGNOSTIC(++stats.rewrite_fills);
         } else if (info.num_samples == 1) {
             registry->RequestUpload(entry); // in GPU order, before the next draw or dispatch
-            ++stats.rewrite_uploads;
+            NATIVE_DIAGNOSTIC(++stats.rewrite_uploads);
         }
     } else if (rewrite == Rewrite::Upload && info.num_samples == 1) {
         registry->RequestUpload(entry);
-        ++stats.rewrite_uploads;
+        NATIVE_DIAGNOSTIC(++stats.rewrite_uploads);
     }
     if (!depth_value && !color_zero && !stencil) {
         return;
@@ -8236,7 +8423,7 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
     Written(&entry, entry.rewrite_clock); // NAT-148
     s.buffers_written = true; // the next work waits for the clear
     ++s.commands;
-    ++stats.rewrite_clears;
+    NATIVE_DIAGNOSTIC(++stats.rewrite_clears);
 }
 
 void NativeRenderer::ReadFillShader(const Shader::Info& cs, DrawBindings& b) {
@@ -8277,7 +8464,7 @@ void NativeRenderer::ReadFillShader(const Shader::Info& cs, DrawBindings& b) {
     b.fill_pattern = std::array<u32, 2>{words[0], words[1]};
     b.fill_address = out_sharp.base_address;
     b.fill_size = std::min<u64>(u64(words[2]) * 4, out_sharp.GetSize());
-    ++stats.fill_shaders;
+    NATIVE_DIAGNOSTIC(++stats.fill_shaders);
 }
 
 bool NativeRenderer::MetaClearDispatch(const Shader::Info& cs) {
@@ -8304,12 +8491,13 @@ bool NativeRenderer::MetaClearDispatch(const Shader::Info& cs) {
             }
         }
     }
-    stats.meta_clears += cleared;
+    NATIVE_DIAGNOSTIC(stats.meta_clears += cleared);
     return cleared;
 }
 
 void NativeRenderer::DispatchDirect() {
     std::scoped_lock lock{mutex};
+#if !defined(NDEBUG)
     const auto start = std::chrono::steady_clock::now();
     struct Timed {
         std::chrono::steady_clock::time_point start;
@@ -8320,14 +8508,20 @@ void NativeRenderer::DispatchDirect() {
                          .count();
         }
     } timed{start, stats.dispatch_ns};
+
+#endif
+#if !defined(NDEBUG)
     SceneTrace::CpuScope scene_trace{r.FrameDumpCollecting(),frame,"dispatch"};
+#endif
     if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-pass id={} kind=dispatch",SceneTrace::Id()));
+#if !defined(NDEBUG)
     t_timed = false; // OPT-001: the phase timers are the draws'
+#endif
     r.scheduler.PopPendingOperations();
     const auto& cs_program = r.liverpool->DrawCsRegs();
     const ComputePipeline* pipeline = r.AcquireComputePipeline();
     if (!pipeline) {
-        ++stats.no_pipeline;
+        NATIVE_DIAGNOSTIC(++stats.no_pipeline);
         return;
     }
     const auto& regs = r.liverpool->DrawRegs();
@@ -8344,7 +8538,7 @@ void NativeRenderer::DispatchDirect() {
     b.push = UserData(regs);
     BindStages(pipeline->GetStages(), regs, true, b);
     if (b.failed) {
-        ++stats.skipped;
+        NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
     ReadFillShader(pipeline->GetStage(Shader::SwStage::Compute), b); // NAT-120
@@ -8352,6 +8546,7 @@ void NativeRenderer::DispatchDirect() {
     GlobalBarrier();
     // Intrusive opt-in diagnostic. Submit the bound input copy and wait before
     // recording this dispatch; shader and loop bounds are never modified.
+#if !defined(NDEBUG)
     const auto& diag_cs = pipeline->GetStage(Shader::SwStage::Compute);
     static const u64 capture_budget = [] {
         const char* p=std::getenv("RYGT_A82_GPU_CAPTURE");
@@ -8438,7 +8633,7 @@ void NativeRenderer::DispatchDirect() {
             b.Clear();
             b.push=UserData(regs);
             BindStages(pipeline->GetStages(),regs,true,b);
-            if (b.failed) { ++stats.skipped; return; }
+            if (b.failed) { NATIVE_DIAGNOSTIC(++stats.skipped); return; }
             PrepareImages();
             GlobalBarrier();
             const auto rebound=b.buffers.empty()?vk::DescriptorBufferInfo{}:b.buffers[0];
@@ -8464,6 +8659,7 @@ void NativeRenderer::DispatchDirect() {
             captures=capture_budget; // avoid repeating a failed diagnostic every dispatch
         }
     }
+#endif
     // Wait for an existing non-rendering boundary: never restart a clear pass for diagnostics.
     if(SceneTrace::Id() && !SceneTrace::state.attempted && !s.rendering) {
         const auto families=r.instance.GetPhysicalDevice().getQueueFamilyProperties();
@@ -8472,7 +8668,9 @@ void NativeRenderer::DispatchDirect() {
             family<families.size()?families[family].timestampValidBits:0,
             r.instance.GetPhysicalDevice().getProperties().limits.timestampPeriod);
     }
+#if !defined(NDEBUG)
     scene_trace.Programs(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash);
+#endif
     if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-compute id={} cs={:#x} groups={}x{}x{} threads={}x{}x{} host_subgroup={}",SceneTrace::Id(),pipeline->GetStage(Shader::SwStage::Compute).pgm_hash,cs_program.dim_x,cs_program.dim_y,cs_program.dim_z,cs_program.num_thread_x.full,cs_program.num_thread_y.full,cs_program.num_thread_z.full,r.instance.SubgroupSize()));
     SceneTrace::GpuBegin(s.cmd);
     const CmdBuf cmdbuf{s.cmd};
@@ -8512,6 +8710,7 @@ void NativeRenderer::DispatchDirect() {
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
         });
         // CPU guest bytes may differ from the GPU descriptor; label accordingly.
+#if !defined(NDEBUG)
         static const bool capture_a82 = [] {
             const char* p = std::getenv("RYGT_A82_INPUT_DIAG"); return p && p[0] == '1';
         }();
@@ -8605,7 +8804,8 @@ void NativeRenderer::DispatchDirect() {
                     frame,n,reinterpret_cast<u64>(static_cast<VkBuffer>(info.buffer)));
             }
         }
-        PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
+    #endif
+    PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
         Native::GpuCheckpoints::Record(static_cast<VkCommandBuffer>(s.cmd), 2, frame,
             cs.pgm_hash, cs_program.dim_x, u64(cs_program.dim_y) << 32 | cs_program.dim_z);
         cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
@@ -8613,11 +8813,13 @@ void NativeRenderer::DispatchDirect() {
     SceneTrace::GpuEnd(s.cmd);
     if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-compute-path id={} transfer_rewrite={}",SceneTrace::Id(),transferred));
     NoteWrites(nullptr, b);
+#if !defined(NDEBUG)
     if (Native::g_dump_request.exchange(false)) {
         r.StartFrameDumpNow(); // FIX-156 (diagnosis): a watched fill
     }
+#endif
     s.buffers_written = true; // what the dispatch wrote is seen after the next barrier
-    ++stats.dispatches;
+    NATIVE_DIAGNOSTIC(++stats.dispatches);
     ++s.commands;
     ChunkFlushCheck();
     Report();
@@ -8625,13 +8827,17 @@ void NativeRenderer::DispatchDirect() {
 
 void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     std::scoped_lock lock{mutex};
+#if !defined(NDEBUG)
     SceneTrace::CpuScope scene_trace{r.FrameDumpCollecting(),frame,"dispatch-indirect"};
+#endif
     if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-pass id={} kind=dispatch-indirect arguments={:#x}+{} bytes={}",SceneTrace::Id(),address,offset,size));
+#if !defined(NDEBUG)
     t_timed = false; // OPT-001
+#endif
     r.scheduler.PopPendingOperations();
     const ComputePipeline* pipeline = r.AcquireComputePipeline();
     if (!pipeline) {
-        ++stats.no_pipeline;
+        NATIVE_DIAGNOSTIC(++stats.no_pipeline);
         return;
     }
     const auto& regs = r.liverpool->DrawRegs();
@@ -8644,7 +8850,7 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     Stream& s = Begin();
     const auto args = GuestBuffer(address + offset, std::max<u32>(size, 12), false);
     if (!args) {
-        ++stats.skipped;
+        NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
     DrawBindings& b = bindings;
@@ -8667,7 +8873,9 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
             family<families.size()?families[family].timestampValidBits:0,
             r.instance.GetPhysicalDevice().getProperties().limits.timestampPeriod);
     }
+#if !defined(NDEBUG)
     scene_trace.Programs(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash);
+#endif
     if(SceneTrace::Id() && scene_indirect_args.size()<128) {
         if(!scene_indirect_buffer)scene_indirect_buffer=device->CreateBuffer({.size=128*16,.usage=Native::Rhi::BufferUsageTransferDst,.memory=Native::Rhi::MemoryKind::Readback,.name="scene indirect arguments"});
         if(scene_indirect_buffer && scene_indirect_buffer->Mapped()){
@@ -8681,7 +8889,7 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     SceneTrace::GpuEnd(s.cmd);
     NoteWrites(nullptr, b);
     s.buffers_written = true;
-    ++stats.dispatches;
+    NATIVE_DIAGNOSTIC(++stats.dispatches);
     ++s.commands;
     ChunkFlushCheck();
 }
@@ -8776,13 +8984,13 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
     const bool meta = known_meta.contains(address);
     if (meta) {
         cleared_meta.insert(address); // a CMASK/HTILE cleared by the CP
-        ++stats.meta_clears;
+        NATIVE_DIAGNOSTIC(++stats.meta_clears);
     }
     if (r.FrameDumpActive()) {
         r.FrameDumpEvent(fmt::format("fill {:#x}+{:#x} = {:#x}{}", address, num_bytes, value,
                                      meta ? " (metadata clear)" : "")); // NAT-117
     }
-    ++stats.fills;
+    NATIVE_DIAGNOSTIC(++stats.fills);
     if (const auto found = GuestBuffer(address, num_bytes, true)) {
         GlobalBarrier();
         CmdBuf{s.cmd}.fillBuffer(found->first, found->second, num_bytes, value);
@@ -8810,7 +9018,7 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
         SyncUiRange(dst, num_bytes, false);
     }
     Stream& s = Begin();
-    ++stats.copies;
+    NATIVE_DIAGNOSTIC(++stats.copies);
     if (r.FrameDumpActive()) {
         r.FrameDumpEvent(fmt::format("copy {:#x}{} <- {:#x}{} ({:#x} bytes)", dst,
                                      dst_gds ? " (GDS)" : "", src, src_gds ? " (GDS)" : "",
@@ -8889,7 +9097,7 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
     }
     s.buffers_written = true;
     ++s.commands;
-    ++stats.inline_writes;
+    NATIVE_DIAGNOSTIC(++stats.inline_writes);
     return true;
 }
 
@@ -8914,9 +9122,11 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
             }
         }
     }
+#if !defined(NDEBUG)
     if (Native::WatchedTexture(address, address + size)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: unmap {:#x}+{:#x}", address, size);
     }
+#endif
     Native::ForgetReadable(address, size); // NAT-147
     // FIX-153: the pages stop being watched (Ryty tells before it unmaps them). Memory mapped
     // there again comes writable; a watch left in place counted as one in the page manager but
@@ -8956,6 +9166,7 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
 
 void NativeRenderer::WatchBind(const Native::ImageEntry& entry, const AmdGpu::Image& tsharp,
                                bool storage, bool memo, u64 program) {
+#if !defined(NDEBUG)
     if (!Native::WatchSample()) {
         return;
     }
@@ -8972,9 +9183,11 @@ void NativeRenderer::WatchBind(const Native::ImageEntry& entry, const AmdGpu::Im
                 memo ? " (memo)" : "", program, entry.from_cpu ? "texture" : "target",
                 entry.info.size.width, entry.info.size.height, entry.info.resources.layers,
                 entry.write_version.load(), sources, frame);
+#endif
 }
 
 void NativeRenderer::ProbeWatchedPictures() {
+#if !defined(NDEBUG)
     // FIX-156 (diagnosis, RYGT_NATIVE_WATCH_TEXTURE): what the pictures at the watched address
     // hold, every half second (read back from the GPU), to see when one loses its content.
     const auto& watched_list = Native::WatchedTextures();
@@ -9168,6 +9381,7 @@ void NativeRenderer::ProbeWatchedPictures() {
             }
         });
     }
+#endif
 }
 
 void NativeRenderer::EvictImages() {
@@ -9204,7 +9418,7 @@ void NativeRenderer::EvictImages() {
     // Mirror collection keeps its original cadence. Image retirement below is
     // incremental instead of concentrating 30 frames of retirement in one frame.
     for (const auto& [address, bytes] : cold_mirrors) {
-        ++stats.mirrors_evicted;
+        NATIVE_DIAGNOSTIC(++stats.mirrors_evicted);
         DropMirrors(address, bytes); // invalidates bindings; existing GPU-safe destruction
     }
     // FIX-157: a picture the GPU wrote stays past its idle time
@@ -9267,10 +9481,12 @@ void NativeRenderer::EvictImages() {
         kept_bytes += size;
         WatchPages(address, size);
         ++newly_kept;
+#if !defined(NDEBUG)
         if (Native::WatchedTexture(address, address + 1)) {
             LOG_WARNING(Render_Vulkan, "FIX-157 watch: {:#x} kept (version {}, frame {})",
                         address, version, frame);
         }
+#endif
         return true;
     };
     trace.Next(2);
@@ -9282,6 +9498,7 @@ void NativeRenderer::EvictImages() {
         if (entry.kept.load(std::memory_order_relaxed)) {
             kept_bytes -= std::min<u64>(kept_bytes, std::max<u64>(entry.info.guest_size, 1));
         }
+#if !defined(NDEBUG)
         if (Native::WatchedTexture(entry.info.guest_address, entry.info.guest_address + 1)) {
             LOG_WARNING(Render_Vulkan, "FIX-157 watch: {} {:#x} {}x{} layers {} evicted (last "
                         "use frame {}, version {}, frame {})",
@@ -9290,6 +9507,7 @@ void NativeRenderer::EvictImages() {
                         entry.info.resources.layers, entry.last_use.load(),
                         entry.write_version.load(), frame);
         }
+#endif
         {
             std::scoped_lock lock{views_mutex};
             if (const auto it = views.find(&entry); it != views.end()) {
@@ -9324,10 +9542,12 @@ void NativeRenderer::WatchPages(VAddr address, u64 size) {
     const auto fresh = page_watches.Track(begin,end,[&](VAddr run,u64 bytes) {
         r.page_manager.UpdatePageWatchers(run,bytes,VideoCore::PageOp::Track);
     });
+#if !defined(NDEBUG)
     if (Native::WatchedTexture(begin,end)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: watch {:#x}-{:#x}, {} pages newly watched",
                     begin,end,fresh);
     }
+#endif
 }
 
 void NativeRenderer::UnwatchPages(VAddr begin, VAddr end) {
@@ -9395,10 +9615,12 @@ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
     // textures over them are uploaded again when next used (which watches them again).
     const VAddr begin = VideoCore::PageManager::GetPageAddr(address);
     const VAddr end = VideoCore::PageManager::GetNextPageAddr(address + std::max<u64>(size, 1) - 1);
+#if !defined(NDEBUG)
     if (Native::WatchedTexture(begin, end)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: CPU write fault {:#x}+{:#x} (exact {:#x}); "
                     "memory {}", address, size, exact, Native::WatchedBytes(address));
     }
+#endif
     // FIX-173: a region page holds what the GPU wrote there, which guest memory never got; a
     // CPU write to the page copies in only the bytes the CPU changed (RefreshRegion compares
     // with this copy of the page from before the write), not the whole page from guest memory.
@@ -9430,7 +9652,7 @@ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
         Native::UploadCause::ScopedCpuFault cause{address,size,exact};
         registry->CpuWrite(begin, end - begin, exact != 0 ? (address - begin) + exact : 0);
     }
-    ++stats.cpu_writes;
+    NATIVE_DIAGNOSTIC(++stats.cpu_writes);
     // NAT-114: pages of regions written by the CPU (a fault on any thread) are copied in before
     // the region's next use; the recorder sorts them to their regions.
     {
@@ -9472,7 +9694,10 @@ void NativeRenderer::Splice() {
         sidecar->sync_pins.Collect(r.scheduler.GetWorkSemaphore()->KnownGpuTick(),
             [&](auto& callback) noexcept {return Native::Rhi::TryEnqueueCompleted(*device,callback);});
         if(sidecar->coordinator->PendingNodes()) {
+#if !defined(NDEBUG)
         const auto parallel_wait_start=std::chrono::steady_clock::now();
+#endif
+
         const bool drained=sidecar->coordinator->Drain(signal,
             [&](Native::Rhi::CommandList* list,Native::Parallel::PassCoordinator::JobPtr,
                 Native::Parallel::PassCoordinator::PrefixPtr) noexcept {
@@ -9480,7 +9705,10 @@ void NativeRenderer::Splice() {
                 r.scheduler.CommandBuffer().executeCommands(cmd);
                 device->MarkExecuted(list,{timeline.get(),signal});
             });
-        sidecar->drain_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-parallel_wait_start).count();
+#if !defined(NDEBUG)
+        NATIVE_DIAGNOSTIC(sidecar->drain_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-parallel_wait_start).count());
+#endif
+
         ASSERT_MSG(drained,"parallel node preflight or submission epoch failed");
         }
     }
@@ -9522,6 +9750,7 @@ void NativeRenderer::Splice() {
     s.list = nullptr;
     s.cmd = vk::CommandBuffer{};
     s.rendering = false;
+#if !defined(NDEBUG)
     if(auto* sidecar=FindParallelRuntime(this);sidecar && sidecar->transfer_mode_controller && !sidecar->closing) {
         const auto changed=sidecar->transfer_applied_mode.Apply(sidecar->transfer_mode_controller->Requested(),true);
         if(changed || !sidecar->transfer_mode_initial_logged) {
@@ -9599,7 +9828,8 @@ void NativeRenderer::Splice() {
 #endif
         }
     }
-    ++stats.splices;
+#endif
+    NATIVE_DIAGNOSTIC(++stats.splices);
 }
 
 void NativeRenderer::CopyDisplayCrop(const Native::ImageEntry& source, Native::ImageEntry& crop,
@@ -9744,6 +9974,7 @@ u64 NativeRenderer::MirrorVerifyBudget() {
 }
 
 void NativeRenderer::VerifyMirrors() {
+#if !defined(NDEBUG)
     // FIX-176 (diagnosis, RYGT_NATIVE_MIRROR_VERIFY=<MB a frame>): guest memory under the mirrors,
     // a few MB a frame, hashed per 64 KB granule and compared with the hash taken the last time;
     // a change no CPU write fault or copy-in accounts for means the mirror went stale unseen (the
@@ -9805,7 +10036,7 @@ void NativeRenderer::VerifyMirrors() {
                     continue;
                 }
                 ++changed;
-                ++stats.mirror_untrapped;
+                NATIVE_DIAGNOSTIC(++stats.mirror_untrapped);
                 static std::atomic<u32> logged{};
                 if (Sample(logged)) {
                     LOG_WARNING(Render_Vulkan,
@@ -9832,9 +10063,11 @@ void NativeRenderer::VerifyMirrors() {
     if (changed != 0) {
         ++buffer_generation; // OPT-003: memos see the dirty pages
     }
+#endif
 }
 
 void NativeRenderer::ProbeDisplay(const Native::ImageEntry& entry) {
+#if !defined(NDEBUG)
     // FIX-175 (diagnosis, RYGT_NATIVE_WATCH_DISPLAY=x,y,w,h): a rectangle of each picture the
     // presenter shows, read back from the GPU: the mean brightness of its top, middle and bottom
     // thirds, one line per presented frame (single-frame glitches stand out against their
@@ -9926,9 +10159,11 @@ void NativeRenderer::ProbeDisplay(const Native::ImageEntry& entry) {
     display_probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1,
                               u64(rect[2]) * rect[3] * 4, frame, 0, rect[2], rect[3], true,
                               entry.info.guest_address});
+#endif
 }
 
 void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
+#if !defined(NDEBUG)
     std::scoped_lock lock{mutex};
     struct Readback {
         const Native::ImageEntry* entry;
@@ -10087,9 +10322,11 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
     SceneTrace::Save(dir,r.instance.GetDevice());
     dump_entries.clear();
     dump_textures.clear();
+#endif
 }
 
 void NativeRenderer::Report() {
+#if !defined(NDEBUG)
     const auto now = std::chrono::steady_clock::now();
     if (now - last_report < std::chrono::seconds{10}) {
         return;
@@ -10463,9 +10700,14 @@ void NativeRenderer::Report() {
     stats.null_reasons = {};
     stats.phase_ns = {};
     (void)cpu_writes;
+#endif
 }
 
 } // namespace Vulkan
 
+#undef NATIVE_DIAGNOSTIC
+
+#ifndef NDEBUG
 #include "video_core/renderer_vulkan/prt_view_selftest.h"
 #include "video_core/renderer_vulkan/prt_view_gpu_test.h"
+#endif

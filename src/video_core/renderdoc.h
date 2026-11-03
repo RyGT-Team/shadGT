@@ -10,6 +10,7 @@
 
 namespace VideoCore {
 
+#ifndef NDEBUG
 /// Loads renderdoc dynamic library module.
 void LoadRenderDoc();
 
@@ -27,6 +28,15 @@ void SetOutputDir(const std::filesystem::path& path, const std::string& prefix);
 
 /// Returns true when RenderDoc API was loaded and is usable.
 bool IsRenderDocLoaded();
+
+#else
+inline void LoadRenderDoc() noexcept {}
+inline void StartCapture() noexcept {}
+inline void EndCapture() noexcept {}
+inline void TriggerCapture() noexcept {}
+inline void SetOutputDir(const std::filesystem::path&, const std::string&) noexcept {}
+inline constexpr bool IsRenderDocLoaded() noexcept { return false; }
+#endif
 
 enum class ScreenshotRequest : u32 {
     None = 0,

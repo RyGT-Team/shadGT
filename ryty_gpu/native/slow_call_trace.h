@@ -1,8 +1,10 @@
 #pragma once
 
 #include <array>
-#include <chrono>
+#include <cstddef>
 #include <cstdint>
+#if !defined(NDEBUG)
+#include <chrono>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -13,8 +15,10 @@
 #endif
 #include <fmt/ranges.h>
 #include "common/logging/log.h"
+#endif
 
 namespace Native {
+#if !defined(NDEBUG)
 inline thread_local bool trace_guest_hash_calls{};
 struct SampleGuestHashCalls {
     explicit SampleGuestHashCalls(bool enabled) : previous{trace_guest_hash_calls} {
@@ -97,4 +101,19 @@ private:
     uint64_t context_address{}, context_size{}, longest_address{}, longest_size{};
     uint64_t cpu_start{};
 };
+#else
+inline constexpr bool trace_guest_hash_calls=false;
+struct SampleGuestHashCalls {
+    explicit constexpr SampleGuestHashCalls(bool) noexcept {}
+};
+template <size_t N>
+class SlowCallTrace {
+public:
+    constexpr SlowCallTrace(bool, const char*, std::array<const char*, N>) noexcept {}
+    constexpr void Next(size_t) noexcept {}
+    constexpr void Next(size_t, uint64_t, uint64_t) noexcept {}
+    SlowCallTrace(const SlowCallTrace&) = delete;
+    SlowCallTrace& operator=(const SlowCallTrace&) = delete;
+};
+#endif
 }

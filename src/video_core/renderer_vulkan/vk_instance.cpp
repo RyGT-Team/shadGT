@@ -622,12 +622,14 @@ bool Instance::CreateDevice() {
     // DIAG-206: the driver's report of what faulted when the device is lost.
     device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
 #ifdef RYTY_GPU
+#ifndef NDEBUG
     if (Native::GpuCheckpoints::Requested()) {
         const bool enabled = add_extension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
         Native::GpuCheckpoints::supported.store(enabled, std::memory_order_relaxed);
         if (enabled) (void)Native::GpuCheckpoints::Slots(); // Allocate diagnostics before recording begins.
         LOG_INFO(Render_Vulkan, "GPU-CHECKPOINT: diagnostic requested, supported={}", enabled);
     }
+#endif
 #endif
     // XESS-200: Intel XeSS's device extensions and features, only when it is the upscaler.
     bool xess = false;

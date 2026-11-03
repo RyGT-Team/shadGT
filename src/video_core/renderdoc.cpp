@@ -21,17 +21,20 @@
 
 namespace VideoCore {
 
+#ifndef NDEBUG
 enum class CaptureState {
     Idle,
     Triggered,
     InProgress,
 };
 static CaptureState capture_state{CaptureState::Idle};
+#endif
 static std::atomic<u32> screenshot_game_only_count{0};
 static std::atomic<u32> screenshot_with_overlays_count{0};
 static std::mutex requested_screenshot_paths_mutex;
 static std::vector<std::filesystem::path> requested_screenshot_paths;
 
+#ifndef NDEBUG
 RENDERDOC_API_1_6_0* rdoc_api{};
 
 void LoadRenderDoc() {
@@ -136,6 +139,8 @@ void SetOutputDir(const std::filesystem::path& path, const std::string& prefix) 
 bool IsRenderDocLoaded() {
     return rdoc_api != nullptr;
 }
+
+#endif
 
 void RequestScreenshot(const ScreenshotRequest request) {
     switch (request) {

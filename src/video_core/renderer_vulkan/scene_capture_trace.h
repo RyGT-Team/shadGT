@@ -11,6 +11,7 @@
 #include "common/types.h"
 
 namespace Vulkan::SceneTrace {
+#ifndef NDEBUG
 constexpr size_t Limit = 8192;
 constexpr u32 NoQuery = ~u32{};
 struct Row {
@@ -111,4 +112,19 @@ inline void Save(const std::filesystem::path& dir,vk::Device device) {
     if(state.pool)device.destroyQueryPool(state.pool);
     state={};current=Limit;
 }
+#else
+struct State { vk::QueryPool pool{}; bool attempted{}; };
+inline State state;
+inline constexpr u64 Id() noexcept { return 0; }
+class CpuScope {
+public:
+    CpuScope(bool, u64, const char*, std::span<const u64> = {}, std::span<const u64> = {}) noexcept {}
+    void Programs(u64, u64 = 0) noexcept {}
+};
+inline void Prepare(vk::Device, vk::CommandBuffer, u32, double) noexcept {}
+inline void GpuBegin(vk::CommandBuffer) noexcept {}
+inline void GpuEnd(vk::CommandBuffer) noexcept {}
+inline void Save(const std::filesystem::path&, vk::Device) noexcept {}
+#endif
+
 }

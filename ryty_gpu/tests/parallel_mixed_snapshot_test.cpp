@@ -41,7 +41,7 @@ const auto snapshot_matches=[&] {
                             auto owned=std::static_pointer_cast<DescriptorSnapshot>(std::move(worker_result->push_snapshot));
                             const auto current=std::span<const vk::DescriptorBufferInfo>{b.buffers.data(),b.buffers.size()}.subspan(worker_result->push_buffer_first,worker_result->push_buffer_count);
                             if(owned->PatchBufferBindings(current)) {
-                                parallel_push_writes=std::move(owned);++parallel->producer_snapshot_hits;
+                                parallel_push_writes=std::move(owned);NATIVE_DIAGNOSTIC(++parallel->producer_snapshot_hits);
                                 parallel_descriptor_bytes=parallel_push_writes->OwnedBytes()+128;reused_snapshot=true;
                             }
                         }

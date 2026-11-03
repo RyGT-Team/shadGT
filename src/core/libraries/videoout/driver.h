@@ -108,7 +108,9 @@ private:
         s32 index;
         bool eop;
         Common::FrameQueueTrace::Ticket trace{};
+#ifndef NDEBUG
         std::chrono::steady_clock::time_point submitted{}; // PERF-DIAG-002
+#endif
 
         operator bool() const noexcept {
             return frame != nullptr;

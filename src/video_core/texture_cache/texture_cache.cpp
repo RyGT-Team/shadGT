@@ -1,3 +1,4 @@
+#include "common/debug_environment.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -253,6 +254,7 @@ void TextureCache::CompleteReadbacks(std::span<const PendingReadback> readbacks)
                                 n, readback.address, readback.size, kept);
                 }
             }
+#ifndef NDEBUG
             if (readback.size >= 64_KB) {
                 // DIAG-038: large readbacks (GT Sport's car thumbnail) and what they carried.
                 u32 nonzero = 0;
@@ -276,6 +278,7 @@ void TextureCache::CompleteReadbacks(std::span<const PendingReadback> readbacks)
                     }
                 }
             }
+#endif
             memory->TryWriteBacking(std::bit_cast<u8*>(readback.address), merged.data(),
                                     readback.size);
             continue;
@@ -314,6 +317,7 @@ void TextureCache::ReleaseFinishedReadbacks() {
 
 std::optional<TextureCache::PendingReadback> TextureCache::RecordImageReadback(ImageId image_id) {
     Image& image = slot_images[image_id];
+#ifndef NDEBUG
     const bool large = image.info.pitch * image.info.size.height * (image.info.num_bits / 8) >= 64_KB;
     if (large && (False(image.flags & ImageFlagBits::GpuModified) ||
                   True(image.flags & ImageFlagBits::Dirty))) {
@@ -321,6 +325,7 @@ std::optional<TextureCache::PendingReadback> TextureCache::RecordImageReadback(I
                     "DIAG-038: readback of image {} at {:#x} not recorded: flags {:#x}",
                     image_id.index, image.info.guest_address, u32(image.flags));
     }
+#endif
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return std::nullopt;
     }
@@ -360,14 +365,18 @@ std::optional<TextureCache::PendingReadback> TextureCache::RecordImageReadback(I
         .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
     };
     runtime.DownloadImage(&image, download.buffer, std::span{&image_download, 1});
+#ifndef NDEBUG
     // DIAG-037: readback recorded, in the crash report's write history.
     static constexpr u32 NoData = 0;
     Core::MemoryManager::NoteEmulatorWrite(image.info.guest_address, 0, &NoData);
+#endif
     image.readback_version = image.contents_version;
+#ifndef NDEBUG
     if (download_size >= 64_KB) {
         LOG_WARNING(Render_Vulkan, "DIAG-038: readback of image {} at {:#x}+{:#x} recorded",
                     image_id.index, image.info.guest_address, download_size);
     }
+#endif
     static const bool merge_words = Common::PerfFeatureEnabled(38);
     return PendingReadback{image.info.guest_address, download, download_size,
                            HashGuestBytes(image.info.guest_address, download_size),
@@ -507,11 +516,13 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     SmallVector<ImageId, 8> image_ids;
     ForEachImageInRegion(pages_start, pages_end - pages_start,
                          [&](ImageId image_id, Image&) { image_ids.push_back(image_id); });
+#ifndef NDEBUG
     if (!image_ids.empty()) {
         // DIAG-037: a CPU write fault on image memory, in the crash report's write history.
         static constexpr u32 NoData = 0;
         Core::MemoryManager::NoteEmulatorWrite(addr, 0, &NoData);
     }
+#endif
 
     for (const auto image_id : image_ids) {
         Image& image = slot_images[image_id];
@@ -1026,7 +1037,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt, FindMemo* memo)
         // DIAG-140 (SHADGT_DIAG_FROSTED=1): the other images at the address of GT Sport's
         // frosted-glass picture when it is looked up.
         static const bool diag_frosted = [] {
-            const char* env = std::getenv("SHADGT_DIAG_FROSTED");
+            const char* env = Common::DebugEnv("SHADGT_DIAG_FROSTED");
             return env && env[0] == '1';
         }();
         if (diag_frosted && info.guest_address == 0x1009bc0000 && info.size.width == 960 &&
@@ -1089,7 +1100,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt, FindMemo* memo)
     // DIAG-074: SHADGT_LOG_IMAGES=1 logs which cached image each large lookup resolves to, once
     // per (lookup, result) pair, to find images sampled through a different image's layout.
     static const bool log_images = [] {
-        const char* env = std::getenv("SHADGT_LOG_IMAGES");
+        const char* env = Common::DebugEnv("SHADGT_LOG_IMAGES");
         return env && env[0] == '1';
     }();
     if (log_images && info.size.width >= 256 && info.size.height >= 8) {
@@ -1227,6 +1238,7 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
 
 // DIAG-036: the first time each image is queued for readback, what it is and who writes it.
 static void LogReadbackImage(ImageId image_id, const Image& image, const char* writer) {
+#ifndef NDEBUG
     static std::mutex mutex;
     static std::unordered_set<u32> seen;
     std::scoped_lock lk{mutex};
@@ -1242,6 +1254,8 @@ static void LogReadbackImage(ImageId image_id, const Image& image, const char* w
                 vk::to_string(info.pixel_format), magic_enum::enum_name(info.tile_mode),
                 magic_enum::enum_name(info.array_mode), info.resources.levels,
                 info.resources.layers, info.num_samples);
+#endif
+
 }
 
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
@@ -1265,15 +1279,21 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
     if (ShouldReadBack(image)) {
         LogReadbackImage(image_id, image, "render target");
         NoteReadbackQueued();
+#ifndef NDEBUG
         // DIAG-037: drawn into (queued for readback), in the crash report's write history.
         static constexpr u32 NoData = 0;
         Core::MemoryManager::NoteEmulatorWrite(image.info.guest_address, 0, &NoData);
+#endif
         std::unique_lock lk{download_images_mutex};
+#ifndef NDEBUG
         if (download_images.emplace(image_id).second && ImageDownloadSize(image) >= 64_KB) {
             // DIAG-038: each time a large read-back target is drawn into again.
             LOG_WARNING(Render_Vulkan, "DIAG-038: image {} at {:#x} drawn, readback queued",
                         image_id.index, image.info.guest_address);
         }
+#else
+        download_images.emplace(image_id);
+#endif
     }
     image.usage.render_target = 1u;
     UpdateImage(image_id);
@@ -1731,8 +1751,9 @@ void TextureCache::GarbageCollectUnusedImages() {
 }
 
 void TextureCache::ReportMemoryBreakdown() {
+#ifndef NDEBUG
     static const bool enabled = [] {
-        const char* value = std::getenv("RYGT_VRAM_DIAGNOSTICS");
+        const char* value = Common::DebugEnv("RYGT_VRAM_DIAGNOSTICS");
         return value && value[0] == '1';
     }();
     const auto now = std::chrono::steady_clock::now();
@@ -1792,6 +1813,7 @@ void TextureCache::ReportMemoryBreakdown() {
               direct ? direct->ImportedHostBytes() >> 20 : 0, images,
               buffer_cache.SparseFreedBytes() >> 20, Vulkan::EmptyVmaBytesFreed() >> 20,
               protected_tiled_bytes >> 20, protected_tiled_images);
+#endif
 }
 
 void TextureCache::RunGarbageCollector() {
@@ -1803,6 +1825,7 @@ void TextureCache::RunGarbageCollector() {
 }
 
 void TextureCache::NoteImageFree(ImageId image_id, u32 line) {
+#ifndef NDEBUG
     static std::mutex diag_mutex;
     static std::map<u32, std::pair<u64, std::string>> by_line;
     static auto since = std::chrono::steady_clock::now();
@@ -1825,6 +1848,7 @@ void TextureCache::NoteImageFree(ImageId image_id, u32 line) {
         by_line.clear();
         since = now;
     }
+#endif
 }
 
 void TextureCache::DeleteImage(ImageId image_id) {
@@ -1847,12 +1871,14 @@ void TextureCache::DeleteImage(ImageId image_id) {
     {
         std::unique_lock lk{download_images_mutex};
         if (download_images.contains(image_id)) {
+#ifndef NDEBUG
             const auto& image = slot_images[image_id];
             if (ImageDownloadSize(image) >= 64_KB) {
                 LOG_WARNING(Render_Vulkan,
                             "DIAG-038: image {} at {:#x} freed before its readback was recorded",
                             image_id.index, image.info.guest_address);
             }
+#endif
             download_images.erase(image_id);
         }
     }

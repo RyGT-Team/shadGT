@@ -1,3 +1,4 @@
+#ifndef NDEBUG
 #include "ryty_gpu/native/cpu_texture_staging.h"
 #include "ryty_gpu/native/region_init_gaps.h"
 #include "ryty_gpu/native/local_tiled_source.h"
@@ -886,3 +887,5 @@ extern "C" __declspec(dllexport) int RytyNativeLocalUntileBenchmark(char* report
     if(report && report_size>0){const auto n=std::min<size_t>(text.size(),size_t(report_size-1));std::memcpy(report,text.data(),n);report[n]=0;}
     return 0;
 }
+
+#endif // !NDEBUG

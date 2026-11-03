@@ -1163,6 +1163,7 @@ void Translator::EmitFetch(const GcnInst& inst) {
     ASSERT(ParseFetchShader(info, fetch_data));
     info.translated_fetch_shader = std::make_shared<const FetchShaderData>(fetch_data);
 
+#ifndef NDEBUG
     if (EmulatorSettings.IsDumpShaders()) {
         using namespace Common::FS;
         const auto dump_dir = GetUserPath(PathType::ShaderDir) / "dumps";
@@ -1174,6 +1175,7 @@ void Translator::EmitFetch(const GcnInst& inst) {
         const auto* code = GetFetchShaderCode(info, code_sgpr_base);
         file.WriteRaw<u8>(code, fetch_data.size);
     }
+#endif
 
     for (u32 semantic = 0; semantic < fetch_data.attributes.size(); ++semantic) {
         const auto& attrib = fetch_data.attributes[semantic];

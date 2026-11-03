@@ -4,19 +4,19 @@
 #pragma once
 
 // DIAG-056: NVIDIA Nsight Systems timeline ranges and marks. Built in only with the CMake option
-// SHADGT_NVTX_INCLUDE (the nvtx3 headers of an Nsight Systems install); otherwise every call is
+// SHADGT_NVTX_INCLUDE in Debug (the nvtx3 headers of an Nsight Systems install); otherwise every call is
 // empty. With the headers built in but no Nsight capture running, each call returns at once.
 
 #include <string>
 #include "common/types.h"
 
-#ifdef SHADGT_NVTX
+#if defined(SHADGT_NVTX) && !defined(NDEBUG)
 #include <nvtx3/nvToolsExt.h>
 #endif
 
 namespace Common::Nvtx {
 
-#ifdef SHADGT_NVTX
+#if defined(SHADGT_NVTX) && !defined(NDEBUG)
 constexpr bool Enabled = true;
 
 inline void Mark(const char* name) {

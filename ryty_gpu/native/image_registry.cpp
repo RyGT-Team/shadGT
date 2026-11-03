@@ -108,6 +108,7 @@ Rhi::ImageDesc DescOf(const VideoCore::ImageInfo& info, bool render_target, bool
 std::atomic<bool> g_dump_request{false};
 
 const std::vector<VAddr>& WatchedTextures() {
+#ifndef NDEBUG
     static const std::vector<VAddr> watched = [] {
         std::vector<VAddr> list;
         const char* env = std::getenv("RYGT_NATIVE_WATCH_TEXTURE");
@@ -125,9 +126,14 @@ const std::vector<VAddr>& WatchedTextures() {
         return list;
     }();
     return watched;
+#else
+    static const std::vector<VAddr> empty;
+    return empty;
+#endif
 }
 
 bool WatchedTexture(VAddr begin, VAddr end) {
+#ifndef NDEBUG
     for (const VAddr watched : WatchedTextures()) {
         if (begin <= watched && watched < std::max(end, begin + 1)) {
             return true;
@@ -135,17 +141,25 @@ bool WatchedTexture(VAddr begin, VAddr end) {
     }
 
     return false;
+#else
+    (void)begin; (void)end;
+    return false;
+#endif
 }
 
 std::atomic<bool> g_watch_window{false};
 
 bool WatchSample() {
+#ifndef NDEBUG
     if (g_watch_window.load(std::memory_order_relaxed)) {
         return true;
     }
     static std::atomic<u32> count{};
     const u32 n = count++;
     return n < 400 || n % 500 == 0;
+#else
+    return false;
+#endif
 }
 
 std::string WatchedBytes(VAddr address) {
@@ -233,7 +247,9 @@ ImageRegistry::~ImageRegistry() = default;
 ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_target, u64 frame,
                                 bool create, bool exact_format) {
     const bool require_format = exact_format || (render_target && info.num_samples > 1);
+#ifndef NDEBUG
     ++stats.lookups;
+#endif
     Shard& shard = ShardOf(info.guest_address);
     {
         std::shared_lock lock{shard.mutex};
@@ -296,9 +312,13 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                 }
             }
             if (largest) {
+#ifndef NDEBUG
                 ++stats.hits;
+#endif
                 if (largest != exact) {
+#ifndef NDEBUG
                     ++stats.reused_larger;
+#endif
                 }
                 largest->last_use.store(frame, std::memory_order_relaxed);
                 return largest;
@@ -306,7 +326,9 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         }
         // A target of the texture's own layout is read as it is.
         if (exact && (render_target || !exact->from_cpu)) {
+#ifndef NDEBUG
             ++stats.hits;
+#endif
             exact->last_use.store(frame, std::memory_order_relaxed);
             return exact;
         }
@@ -328,14 +350,18 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                       cached.size.height == info.size.height) ||
                      (cached.pitch == info.pitch && cached.size.width >= info.size.width &&
                       cached.size.height >= info.size.height))) { // NAT-113
+#ifndef NDEBUG
                     ++stats.hits;
+#endif
                     it->second->last_use.store(frame, std::memory_order_relaxed);
                     return it->second.get();
                 }
             }
         }
         if (exact) {
+#ifndef NDEBUG
             ++stats.hits;
+#endif
             exact->last_use.store(frame, std::memory_order_relaxed);
             return exact;
         }
@@ -368,8 +394,12 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                 }
             }
             if (best) {
+#ifndef NDEBUG
                 ++stats.hits;
+#endif
+#ifndef NDEBUG
                 ++stats.reused_larger;
+#endif
                 best->last_use.store(frame, std::memory_order_relaxed);
                 return best;
             }
@@ -415,7 +445,9 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                 (!require_format || it->second->info.pixel_format == info.pixel_format) &&
                 !it->second->reused.load(std::memory_order_relaxed) &&
                 (!render_target || !it->second->from_cpu)) {
+#ifndef NDEBUG
                 ++stats.hits;
+#endif
                 return it->second.get();
             }
         }
@@ -426,14 +458,18 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         NoteChanges({&range, 1}); // OPT-002, OPT-010
     }
     IndexEntry(*result);
+#ifndef NDEBUG
     if (WatchedTexture(info.guest_address, info.guest_address + 1)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: made {} {:#x} {}x{} mips {} ({:#x} bytes); "
                     "memory {}", render_target ? "target" : "texture", info.guest_address,
                     info.size.width, info.size.height, info.resources.levels, info.guest_size,
                     WatchedBytes(info.guest_address));
     }
+#endif
     if (render_target) {
+#ifndef NDEBUG
         ++stats.created_targets;
+#endif
         LinkTarget(*result);
         // NAT-127: a new target starts with what memory holds there, as on the console (a pass
         // that draws part of it leaves the rest as it was). GT Sport draws its 16x16 brightness
@@ -446,7 +482,9 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
             pending_uploads.push_back(result);
         }
     } else {
+#ifndef NDEBUG
         ++stats.created_textures;
+#endif
         LinkTexture(*result);
         result->needs_upload.store(true, std::memory_order_relaxed);
         std::scoped_lock lock{upload_mutex};
@@ -592,6 +630,7 @@ void ImageRegistry::LinkTarget(ImageEntry& target) {
             return;
         }
         const auto place = PlaceOf(target.info, entry.info);
+#ifndef NDEBUG
         if (WatchedTexture(begin, end)) {
             LOG_WARNING(Render_Vulkan, "FIX-157 watch: new target {:#x} {}x{} layers {} over "
                         "texture {:#x} {}x{} layers {}: {}", begin, target.info.size.width,
@@ -599,6 +638,7 @@ void ImageRegistry::LinkTarget(ImageEntry& target) {
                         entry.info.guest_address, entry.info.size.width, entry.info.size.height,
                         entry.info.resources.layers, place.mip >= 0 ? "linked" : "no place");
         }
+#endif
         if (place.mip >= 0) {
             {
                 std::scoped_lock sources_lock{entry.sources_mutex};
@@ -624,6 +664,7 @@ void ImageRegistry::LinkTexture(ImageEntry& texture) {
                 return;
             }
             const auto place = PlaceOf(entry->info, texture.info);
+#ifndef NDEBUG
             if (WatchedTexture(begin, end)) {
                 LOG_WARNING(Render_Vulkan, "FIX-157 watch: new texture {:#x} {}x{} layers {} "
                             "over target {:#x} {}x{} layers {}: {}", begin,
@@ -632,6 +673,7 @@ void ImageRegistry::LinkTexture(ImageEntry& texture) {
                             entry->info.size.width, entry->info.size.height,
                             entry->info.resources.layers, place.mip >= 0 ? "linked" : "no place");
             }
+#endif
             if (place.mip >= 0) {
                 {
                     std::scoped_lock sources_lock{texture.sources_mutex};
@@ -642,6 +684,7 @@ void ImageRegistry::LinkTexture(ImageEntry& texture) {
                 other.dependents.push_back(&texture);
                 return;
             }
+#ifndef NDEBUG
             const auto& a = texture.info;
             const auto& b = entry->info;
             const u64 key = (a.guest_address * 31 + b.guest_address) ^ (u64(a.size.width) << 40) ^
@@ -659,6 +702,7 @@ void ImageRegistry::LinkTexture(ImageEntry& texture) {
                             b.resources.levels, b.resources.layers, u32(b.tile_mode), b.num_bits,
                             b.props.is_depth ? " (depth)" : "");
             }
+#endif
         }
     });
 }
@@ -813,18 +857,24 @@ u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_
     for (const auto& entry : taken) {
         on_evict(*entry);
     }
+#ifndef NDEBUG
     stats.evicted += taken.size();
+#endif
     return static_cast<u32>(taken.size());
 }
 
 void ImageRegistry::MarkStale(ImageEntry& entry, Stale why) {
+#ifndef NDEBUG
     ++stats.stale[static_cast<u32>(why)];
+#endif
+#ifndef NDEBUG
     if (WatchedTexture(entry.info.guest_address, entry.info.guest_address + 1)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: {:#x} stale ({}), pending before {}; memory {}",
                     entry.info.guest_address,
                     why == Stale::CpuWrite ? "CPU write" : why == Stale::Unmap ? "unmap" : "GPU write",
                     entry.needs_upload.load(), WatchedBytes(entry.info.guest_address));
     }
+#endif
     if (why == Stale::GpuWrite) {
         entry.gpu_backing_written.store(true, std::memory_order_release);
     }
@@ -832,6 +882,7 @@ void ImageRegistry::MarkStale(ImageEntry& entry, Stale why) {
         entry.force_upload.store(true, std::memory_order_relaxed);
     }
     const bool already_dirty = entry.needs_upload.exchange(true);
+#ifndef NDEBUG
     const u32 prior_uploads = entry.total_uploads.load(std::memory_order_relaxed);
     if (!already_dirty && entry.from_cpu && entry.info.guest_size >= (4ull << 20) &&
         entry.info.size.width >= 2048 && (prior_uploads <= 3 || prior_uploads % 16 == 0)) {
@@ -843,6 +894,7 @@ void ImageRegistry::MarkStale(ImageEntry& entry, Stale why) {
                 prior_uploads,static_cast<u32>(why),entry.force_upload.load());
         }
     }
+#endif
     // All large CPU-texture invalidations wait for actual image use. In particular,
     // OnUnmap runs before guest memory is released: eagerly queuing here re-imports
     // and uploads a discarded texture while the unmapping thread waits for us.
@@ -879,9 +931,11 @@ void ImageRegistry::MarkReused(ImageEntry& entry) {
                                         entry.info.guest_address +
                                             std::max<u64>(entry.info.guest_size, 1)};
     NoteChanges({&range, 1});
+#ifndef NDEBUG
     if (WatchedTexture(entry.info.guest_address, entry.info.guest_address + 1)) {
         LOG_WARNING(Render_Vulkan, "FIX-157 watch: kept {:#x} reused", entry.info.guest_address);
     }
+#endif
 }
 
 void ImageRegistry::ForeignWrite(ImageEntry& entry, u64 size, bool exact, u64 clock) {
@@ -913,6 +967,7 @@ bool ImageRegistry::MemoryUnchanged(const ImageEntry& entry) {
 
 void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern,
                              bool exact, u64 clock) {
+#ifndef NDEBUG
     if (WatchedTexture(address, address + std::max<u64>(size, 1)) && WatchSample()) {
         static const bool dump_on_fill = std::getenv("RYGT_FRAME_DUMP_ON_FILL") != nullptr;
         if (pattern && dump_on_fill) {
@@ -922,6 +977,7 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
                     pattern ? "fill" : exact ? "copy" : "storage write", address, size,
                     pattern ? (*pattern)[0] : 0u, pattern ? (*pattern)[1] : 0u);
     }
+#endif
     ForEachOverlapping(address, address + std::max<u64>(size, 1), [&](ImageEntry& entry) {
         if (entry.from_cpu) {
             // NAT-129: a storage buffer as big as GT Sport's scratch pool would upload every
@@ -949,6 +1005,7 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
                 made_of_targets = !entry.sources.empty();
             }
             if (!made_of_targets && entry.info.num_samples == 1) {
+#ifndef NDEBUG
                 const u32 prior = entry.total_uploads.load(std::memory_order_relaxed);
                 if (!entry.needs_upload.load() && entry.info.guest_size >= (4ull << 20) &&
                     entry.info.size.width >= 2048 && (prior <= 3 || prior % 16 == 0)) {
@@ -971,7 +1028,9 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
                             exact,pattern != nullptr,clock,sequence,kind,program,stable);
                     }
                 }
+#endif
                 MarkStale(entry, Stale::GpuWrite);
+#ifndef NDEBUG
                 static std::atomic<u32> logged{};
                 if (const u32 n = logged++; n < 40 || n % 2000 == 0) {
                     LOG_WARNING(Render_Vulkan,
@@ -982,6 +1041,7 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
                                 exact ? (pattern ? "fill" : "copy") : "storage buffer", address,
                                 size, n + 1);
                 }
+#endif
             }
             return;
         }
@@ -995,6 +1055,7 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
             ForeignWrite(entry, size, exact, clock); // FIX-157
             return;
         }
+#ifndef NDEBUG
         if (WatchedTexture(entry.info.guest_address, entry.info.guest_address + 1) &&
             WatchSample()) {
             LOG_WARNING(Render_Vulkan, "FIX-153 watch: target {:#x} ({:#x} bytes, {} layers) "
@@ -1005,8 +1066,11 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
                             ? "upload"
                             : "ignored");
         }
+#endif
         if (pattern) {
+#ifndef NDEBUG
             ++stats.targets_rewritten;
+#endif
             entry.rewrite = ImageEntry::Rewrite::Clear;
             entry.rewrite_pattern = *pattern;
             entry.rewrite_bytes =
@@ -1014,10 +1078,13 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
             entry.rewrite_clock = clock;
         } else if (size >= entry.info.guest_size &&
                    (exact || size <= 2 * entry.info.guest_size)) {
+#ifndef NDEBUG
             ++stats.targets_rewritten;
+#endif
             entry.rewrite = ImageEntry::Rewrite::Upload;
             entry.rewrite_bytes = entry.info.guest_size;
             entry.rewrite_clock = clock;
+#ifndef NDEBUG
             static std::atomic<u32> logged{};
             if (const u32 n = logged++; n < 40 || n % 2000 == 0) {
                 LOG_WARNING(Render_Vulkan,
@@ -1027,6 +1094,7 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
                             entry.info.size.height, entry.info.guest_size,
                             exact ? "copy" : "storage buffer", address, size, n + 1);
             }
+#endif
         } else {
             ForeignWrite(entry, size, exact, clock); // FIX-157
         }
@@ -1034,10 +1102,12 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
 }
 
 void ImageRegistry::CpuWrite(VAddr address, u64 size, u64 exact) {
+#ifndef NDEBUG
     if (WatchedTexture(address, address + size)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: CPU write {:#x}+{:#x} (exact {:#x})", address,
                     size, exact);
     }
+#endif
     constexpr u64 HashedSize = 4ull << 20;
     const VAddr written_end = address + (exact != 0 ? exact : size);
     ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
@@ -1053,6 +1123,7 @@ void ImageRegistry::CpuWrite(VAddr address, u64 size, u64 exact) {
         // A small texture is checked by hash at its next use (its page is no longer watched,
         // so later writes there go unseen); a large one is uploaded again only when written.
         if (hit || entry.info.guest_size <= HashedSize) {
+#ifndef NDEBUG
             const auto fault = UploadCause::cpu_fault;
             const u32 prior = entry.total_uploads.load(std::memory_order_relaxed);
             if (!entry.needs_upload.load() && entry.info.guest_size >= (4ull << 20) &&
@@ -1065,6 +1136,7 @@ void ImageRegistry::CpuWrite(VAddr address, u64 size, u64 exact) {
                         prior,fault.address,fault.size,fault.exact,address,size,fault.active);
                 }
             }
+#endif
             MarkStale(entry, Stale::CpuWrite);
         }
     });
@@ -1183,9 +1255,11 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
         }
         const VideoCore::ImageInfo& info = entry->info;
         const u64 size = info.guest_size;
+#ifndef NDEBUG
         GpuCheckpoints::Record(reinterpret_cast<VkCommandBuffer>(list.NativeHandle()),
                                3, entry->last_use.load(std::memory_order_relaxed),
                                info.guest_address, size, u64(info.size.width) << 32 | info.size.height);
+#endif
         trace.Next(1, info.guest_address, size);
         if (size == 0) {
             continue;
@@ -1220,11 +1294,15 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
             // FIX-160: a safe read (see MemoryUnchanged).
             const u64 hash = Core::HashGuestBytes(info.guest_address, size) | 1;
             if (!forced && hash == entry->content_hash) {
+#ifndef NDEBUG
                 ++upload_stats.unchanged;
+#endif
+#ifndef NDEBUG
                 if (WatchedTexture(info.guest_address, info.guest_address + 1)) {
                     LOG_WARNING(Render_Vulkan, "FIX-153 watch: {:#x} unchanged ({:016x}), not "
                                 "uploaded", info.guest_address, hash);
                 }
+#endif
                 continue;
             }
             entry->content_hash = hash;
@@ -1247,11 +1325,15 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
         for (auto& keep : gpu_source.keep) {
             staging.push_back(std::move(keep));
         }
+#ifndef NDEBUG
         if (bytes) {
             if (gpu_source.kind == 4) ++upload_stats.cpu;
             else ++upload_stats.gpu;
         } else {
             ++upload_stats.cpu;
+        }
+#endif
+        if (!bytes) {
             trace.Next(5);
             source = device.CreateBuffer({.size = size,
                                           .usage = Rhi::BufferUsageStorage |
@@ -1308,19 +1390,25 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
                     .memory = Rhi::MemoryKind::DeviceLocal, .name = "shared upload untile scratch"});
                 if (larger) {
                     upload_scratch = std::move(larger);
+#ifndef NDEBUG
                     ++upload_stats.scratch_created;
+#endif
                 }
             }
             Rhi::Buffer* out = nullptr;
             if (capacity && upload_scratch && upload_scratch->Size() >= size) {
                 out = upload_scratch.get();
+#ifndef NDEBUG
                 ++upload_stats.scratch_reused;
+#endif
             } else {
                 temporary = device.CreateBuffer({.size = size,
                     .usage = Rhi::BufferUsageStorage | Rhi::BufferUsageTransferSrc,
                     .memory = Rhi::MemoryKind::DeviceLocal});
                 out = temporary.get();
+#ifndef NDEBUG
                 ++upload_stats.scratch_transient;
+#endif
             }
             if (!untile || !params_buffer || !out) {
                 continue;
@@ -1354,16 +1442,23 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
         }
         trace.Next(13);
         list.CopyBufferToImage(linear, entry->image.get(), copies);
+#ifndef NDEBUG
         const u8 kind = source ? 4 : gpu_source.kind; // FIX-153 (diagnosis)
+#endif
         if (source) {
             staging.push_back(std::move(source));
         }
+#ifndef NDEBUG
         stats.upload_bytes += size;
+#endif
+#ifndef NDEBUG
         if (WatchedTexture(info.guest_address, info.guest_address + 1)) {
             LOG_WARNING(Render_Vulkan, "FIX-153 watch: {:#x} uploaded (kind {}, forced {}, hash "
                         "{:016x}); memory {}", info.guest_address, kind,
                         forced, entry->content_hash, WatchedBytes(info.guest_address));
         }
+#endif
+#ifndef NDEBUG
         entry->upload_kind = kind;
         const u32 prior = entry->total_uploads.load(std::memory_order_relaxed);
         if (entry->from_cpu && size >= (4ull << 20) && info.size.width >= 2048 &&
@@ -1377,14 +1472,19 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
                     info.size.width,info.size.height);
             }
         }
+#endif
         ++entry->total_uploads;
+#ifndef NDEBUG
         ++entry->upload_count;
+#endif
         ++uploaded;
     }
     trace.Next(14, 0, pending.size());
     if (uploaded) {
         list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeDraw | Rhi::ScopeCompute);
+#ifndef NDEBUG
         stats.uploads += uploaded;
+#endif
     }
     // The device frees these once the submission that runs this list has finished.
     trace.Next(15);

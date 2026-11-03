@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#if !defined(NDEBUG)
 #include <windows.h>
 #include <tlhelp32.h>
 
@@ -1242,3 +1243,5 @@ extern "C" __declspec(dllexport) void RyGtDiagRecordNs(u32 zone, u64 nanos, u64 
         RyDiag::RecordElapsed(RyDiag::Zone(zone), std::chrono::nanoseconds{nanos}, arg);
     }
 }
+
+#endif // !defined(NDEBUG)

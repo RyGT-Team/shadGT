@@ -614,7 +614,37 @@ bool RunAsyncMirrorCase(Rhi::Device& device, Rhi::Fence& fence, u64& tick,
             verified += bytes;
         }
     }
-    log += fmt::format("async mirror: six worker allocations, ordered GPU copies, {} bytes verified: passed\n", verified);
+    // Two blank allocations requested for A are filled from different B inputs
+    // in one GPU submission. Reuse must never imply that A's bytes were copied.
+    constexpr u64 bytes=4096;
+    using Worker=Vulkan::AsyncMirrorBuffer<Rhi::Buffer>;
+    std::array<std::unique_ptr<Rhi::Buffer>,2> sources,mirrors,readbacks;
+    for(u64 i=0;i<2;++i) {
+        sources[i]=device.CreateBuffer({.size=bytes,.usage=Rhi::BufferUsageTransferSrc,.memory=Rhi::MemoryKind::Upload});
+        readbacks[i]=device.CreateBuffer({.size=bytes,.usage=Rhi::BufferUsageTransferDst,.memory=Rhi::MemoryKind::Readback});
+        if(!sources[i] || !readbacks[i] || !sources[i]->Mapped() || !readbacks[i]->Mapped())return false;
+        std::memset(sources[i]->Mapped(),0xa5,bytes);
+        const u64 a=0x10000+i*0x40000,b=a+0x20000;
+        if(worker.TryAcquire({a,a+bytes,3}))return false;
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        Worker::Observation observed{};
+        while(!(mirrors[i]=worker.TryAcquire({b,b+bytes,3},&observed))) {
+            if(std::chrono::steady_clock::now()>deadline)return false;
+            std::this_thread::yield();
+        }
+        if(observed!=Worker::Observation::Reused)return false;
+        // Mutate B after A's allocation is ready: copy the latest B bytes.
+        for(u64 j=0;j<bytes;++j)sources[i]->Mapped()[j]=u8((j*17+i*91+31)&255);
+    }
+    auto* list=device.AcquireCommandList();list->Begin();list->Barrier(Rhi::ScopeHost,Rhi::ScopeTransfer);
+    for(u32 i=0;i<2;++i)list->CopyBuffer(sources[i].get(),0,mirrors[i].get(),0,bytes);
+    list->Barrier(Rhi::ScopeTransfer,Rhi::ScopeTransfer);
+    for(u32 i=0;i<2;++i)list->CopyBuffer(mirrors[i].get(),0,readbacks[i].get(),0,bytes);
+    list->Barrier(Rhi::ScopeTransfer,Rhi::ScopeHost);list->End();
+    Rhi::CommandList* lists[]={list};device.GraphicsQueue().Submit(lists,{}, {&fence,++tick});
+    if(!fence.Wait(tick,5'000'000'000ULL))return false;
+    for(u32 i=0;i<2;++i) {readbacks[i]->Invalidate();if(std::memcmp(sources[i]->Mapped(),readbacks[i]->Mapped(),bytes))return false;}
+    log += fmt::format("async mirror: six exact allocations and two cross-address allocations, ordered GPU copies, {} bytes verified: passed\n", verified+2*bytes);
     return true;
 }
 

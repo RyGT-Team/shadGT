@@ -336,11 +336,14 @@ private:
     std::map<VAddr, Mirror>::iterator FirstMirror(VAddr begin);
     /// The mirror holding all of the range, if any.
     Mirror* MirrorHolding(VAddr address, u64 size);
-    bool IsDynamic(VAddr begin, VAddr end);
+    bool IsDynamic(VAddr begin, VAddr end, u64* blocked_granule = nullptr, u64* blocked_age = nullptr);
     std::optional<std::pair<vk::Buffer, u64>> MirrorBuffer(VAddr address, u64 size);
     void RefreshMirror(Mirror& mirror);
     void MakePendingMirrors();
-    void DropMirrors(VAddr address, u64 size);
+    void DropMirrors(VAddr address, u64 size, u32 diagnostic_reason = ~u32{0});
+    void NoteMirrorDiagnostic(u32 reason,u64 requested_begin,u64 requested_end,
+                              u64 expanded_begin,u64 expanded_end,u64 generation,
+                              u64 granule = ~u64{0},u64 age = ~u64{0});
     /// NAT-150: what the last GuestBuffer bound (for the NAT-142 counters).
     enum class Bound : u8 { InPlace, Region, Mirror };
     Bound last_bound = Bound::InPlace;
@@ -799,6 +802,7 @@ private:
         u64 texture_memo_hits = 0, texture_lookups = 0; ///< OPT-002
         u64 buffer_memo_hits = 0;                        ///< OPT-003
         u64 mirror_binds = 0, mirrors_made = 0, mirror_made_bytes = 0, mirrors_dropped = 0,
+            mirror_cross_address_reuses = 0,
             mirrors_evicted = 0, mirror_over_budget = 0, mirror_refresh_pages = 0; ///< NAT-150
         u64 draws = 0, dispatches = 0, skipped = 0, no_pipeline = 0, passes = 0, barriers = 0,
             splices = 0, copied_reads = 0, copied_bytes = 0, unbound = 0, null_images = 0,
@@ -813,6 +817,13 @@ private:
         std::array<u64, 8> phase_ns{};
         std::atomic<u64> cpu_writes{0}; // NAT-105 (faults come from any thread)
     } stats;
+    // Accessed only by paths holding the existing renderer mutex, including OnUnmap.
+    struct MirrorDiagnostic {
+        struct Example {u32 reason{};u64 requested_begin{},requested_end{},expanded_begin{},expanded_end{},generation{},granule{},age{};};
+        std::array<u64,21> counts{};
+        std::array<Example,16> examples{};
+        u32 example_count{};
+    } mirror_diagnostic;
     std::chrono::steady_clock::time_point last_report = std::chrono::steady_clock::now();
 };
 

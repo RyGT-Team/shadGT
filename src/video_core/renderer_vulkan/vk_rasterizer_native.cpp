@@ -114,6 +114,15 @@ vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type);
 
 namespace Vulkan {
 namespace {
+enum MirrorDiagnosticReason : u32 { MirrorCandidateNew,MirrorCandidateSameFrame,MirrorCandidateDynamic,
+    MirrorCandidateQueued,MirrorPromotionRegion,MirrorPromotionDynamic,MirrorPromotionBudget,
+    MirrorSourceNotCalled,MirrorAcquireQueued,MirrorAcquireBusy,MirrorAcquirePending,MirrorAcquireReady,
+    MirrorAcquireReused,MirrorDiscardSize,MirrorDiscardGeneration,MirrorCpuDrop,MirrorUnmapDrop,
+    MirrorPromotionSuccess,MirrorPromotionCapacity,MirrorNoDirect,MirrorAcquireInvalid };
+bool MirrorDiagnosticEnabled() {
+    static const bool enabled=[] {const char* p=std::getenv("RYGT_NATIVE_MIRROR_DIAG");return p && p[0]=='1' && !p[1];}();
+    return enabled;
+}
 struct AheadVulkanBackend {
     using Pool=vk::DescriptorPool;using Layout=vk::DescriptorSetLayout;using Set=vk::DescriptorSet;
     static constexpr std::size_t MaxSetsPerPool=256;
@@ -2151,6 +2160,7 @@ void NativeRenderer::SortRegionWrites() {
     if (!has_pending_region_writes.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
+    const bool mirror_diag=MirrorDiagnosticEnabled();
     std::vector<std::pair<VAddr, VAddr>> writes;
     {
         std::scoped_lock lock{region_dirty_mutex};
@@ -2183,10 +2193,12 @@ void NativeRenderer::SortRegionWrites() {
             const VAddr from = std::max(begin, mirror.begin);
             const VAddr to = std::min(end, mirror.end);
             bool dynamic = false;
+            u64 blocked_granule=~u64{0},blocked_age=~u64{0};
             for (u64 granule = from >> 16; granule <= (to - 1) >> 16; ++granule) {
                 const auto [written, first] = mirror_writes.try_emplace(granule, frame);
                 if (!first && written->second != frame && frame - written->second < 600) {
                     dynamic = true;
+                    if(mirror_diag && blocked_granule==~u64{0}) {blocked_granule=granule<<16;blocked_age=frame-written->second;}
                     dynamic_granules[granule] = frame;
                 }
                 written->second = frame;
@@ -2201,6 +2213,7 @@ void NativeRenderer::SortRegionWrites() {
                 dynamic = false;
             }
             if (dynamic) {
+                if(mirror_diag)NoteMirrorDiagnostic(MirrorCpuDrop,begin,end,mirror.begin,mirror.end,unmap_generation.load(),blocked_granule,blocked_age);
                 mirror_bytes -= mirror.end - mirror.begin;
                 ++stats.mirrors_dropped;
                 ++buffer_generation; // OPT-003
@@ -2238,7 +2251,20 @@ NativeRenderer::Mirror* NativeRenderer::MirrorHolding(VAddr address, u64 size) {
     return address >= mirror.begin && address + size <= mirror.end ? &mirror : nullptr;
 }
 
-bool NativeRenderer::IsDynamic(VAddr begin, VAddr end) {
+void NativeRenderer::NoteMirrorDiagnostic(u32 reason,u64 requested_begin,u64 requested_end,
+                                          u64 expanded_begin,u64 expanded_end,u64 generation,
+                                          u64 granule,u64 age) {
+    auto& d=mirror_diagnostic;
+    if(reason>=d.counts.size())return;
+    ++d.counts[reason];
+    // Preserve room for useful outcomes: common candidate insert/hit events
+    // contribute counts but do not fill the bounded example list.
+    if(reason<=MirrorCandidateSameFrame || d.example_count>=d.examples.size())return;
+    for(u32 i=0;i<d.example_count;++i)if(d.examples[i].reason==reason)return;
+    d.examples[d.example_count++]={reason,requested_begin,requested_end,expanded_begin,expanded_end,generation,granule,age};
+}
+
+bool NativeRenderer::IsDynamic(VAddr begin, VAddr end, u64* blocked_granule, u64* blocked_age) {
     constexpr u64 DynamicFrames = 600; // then the granule may be mirrored again
     if (dynamic_granules.empty()) {
         return false;
@@ -2249,6 +2275,8 @@ bool NativeRenderer::IsDynamic(VAddr begin, VAddr end) {
             continue;
         }
         if (frame - it->second < DynamicFrames) {
+            if(blocked_granule)*blocked_granule=granule << 16;
+            if(blocked_age)*blocked_age=frame-it->second;
             return true;
         }
         dynamic_granules.erase(it);
@@ -2301,18 +2329,24 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr add
     }
     const auto [it, inserted] = mirror_candidates.try_emplace(begin, MirrorCandidate{end, frame});
     MirrorCandidate& candidate = it->second;
+    const bool mirror_diag=MirrorDiagnosticEnabled();
     if (inserted) {
+        if(mirror_diag)NoteMirrorDiagnostic(MirrorCandidateNew,address,address+size,begin,end,unmap_generation.load());
         return std::nullopt;
     }
     candidate.end = std::max(candidate.end, end);
     if (candidate.frame == frame) {
+        if(mirror_diag)NoteMirrorDiagnostic(MirrorCandidateSameFrame,address,address+size,begin,candidate.end,unmap_generation.load());
         return std::nullopt;
     }
     candidate.frame = frame; // looked at again next frame at the earliest
-    if (IsDynamic(begin, candidate.end)) {
+    u64 blocked_granule=~u64{0},blocked_age=~u64{0};
+    if (IsDynamic(begin, candidate.end,mirror_diag?&blocked_granule:nullptr,mirror_diag?&blocked_age:nullptr)) {
+        if(mirror_diag)NoteMirrorDiagnostic(MirrorCandidateDynamic,address,address+size,begin,candidate.end,unmap_generation.load(),blocked_granule,blocked_age);
         return std::nullopt;
     }
     pending_mirrors.emplace_back(begin, candidate.end);
+    if(mirror_diag)NoteMirrorDiagnostic(MirrorCandidateQueued,address,address+size,begin,candidate.end,unmap_generation.load());
     mirror_candidates.erase(it);
     return std::nullopt;
 }
@@ -2360,7 +2394,9 @@ void NativeRenderer::MakePendingMirrors() {
         return;
     }
     mirror_promotion_budget.BeginFrame(frame);
+    const bool mirror_diag=MirrorDiagnosticEnabled();
     if (!mirror_promotion_budget.Available()) {
+        if(mirror_diag)NoteMirrorDiagnostic(MirrorPromotionBudget,~u64{0},~u64{0},~u64{0},~u64{0},unmap_generation.load());
         return; // Later draws still bind the original imported guest ranges.
     }
     std::vector<std::pair<VAddr, VAddr>> pending;
@@ -2390,9 +2426,14 @@ void NativeRenderer::MakePendingMirrors() {
             const char* env = std::getenv("RYGT_NATIVE_MIRROR_REGION_GAP");
             return env && *env ? std::strtoull(env, nullptr, 10) * 1024 : u64{0};
         }();
-        if (!direct || RegionOver(begin, end - begin) || IsDynamic(begin, end) ||
-            (region_gap != 0 && RegionOver(begin > region_gap ? begin - region_gap : 0,
-                                           end - begin + 2 * region_gap))) {
+        bool region_block=false,gap_block=false;
+        u64 blocked_granule=~u64{0},blocked_age=~u64{0};
+        if (!direct || (region_block=bool(RegionOver(begin, end - begin))) ||
+            IsDynamic(begin,end,mirror_diag?&blocked_granule:nullptr,mirror_diag?&blocked_age:nullptr) ||
+            (region_gap != 0 && (gap_block=bool(RegionOver(begin > region_gap ? begin - region_gap : 0,
+                                           end - begin + 2 * region_gap))))) {
+            if(mirror_diag)NoteMirrorDiagnostic(!direct?MirrorNoDirect:(region_block||gap_block)?MirrorPromotionRegion:MirrorPromotionDynamic,
+                ~u64{0},~u64{0},begin,end,unmap_generation.load(),blocked_granule,blocked_age);
             continue; // shaders write there (the region holds it), or the CPU does
         }
         // The new mirror takes in the mirrors it overlaps.
@@ -2406,6 +2447,7 @@ void NativeRenderer::MakePendingMirrors() {
             continue;
         }
         if (!mirror_promotion_budget.TryStart(end - begin)) {
+            if(mirror_diag)NoteMirrorDiagnostic(MirrorPromotionBudget,~u64{0},~u64{0},begin,end,unmap_generation.load());
             // Preserve the original ranges, not pointers into mutable mirror
             // storage. Mapping, CPU/GPU writes and overlaps are checked again
             // when a later frame has budget. Nothing incomplete is published.
@@ -2442,25 +2484,47 @@ void NativeRenderer::MakePendingMirrors() {
         }
         if (mirror_bytes - taken + (end - begin) > budget) {
             ++stats.mirror_over_budget;
+            if(mirror_diag)NoteMirrorDiagnostic(MirrorPromotionCapacity,~u64{0},~u64{0},begin,end,unmap_generation.load());
             continue;
         }
         promotion_trace.Next(1);
         std::unique_ptr<Native::Rhi::Buffer> buffer;
+        using MirrorWorker=AsyncMirrorBuffer<Native::Rhi::Buffer>;
+        MirrorWorker::Observation observation=MirrorWorker::Observation::None;
+        bool source_callback=false;
         // Source views and destination must both be ready. Neither mutex may
         // make the recorder wait; a miss preserves the imported-buffer path.
         const bool ready = direct->TryForEachPart(begin, end - begin, [&] {
+            source_callback=true;
             buffer = mirror_preparation->TryAcquire(
-                {begin, end, unmap_generation.load()});
+                {begin, end, unmap_generation.load()},&observation);
             return bool(buffer);
         }, [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset, u64 bytes) {
             const vk::Buffer dst{Handle<VkBuffer_T>(buffer->NativeHandle())};
             s.cmd.copyBuffer(view.Handle(), dst, vk::BufferCopy{
                 .srcOffset = view_offset, .dstOffset = offset, .size = bytes});
         });
+        if(mirror_diag) {
+            u32 why=MirrorAcquirePending;
+            switch(observation) {
+            case MirrorWorker::Observation::None: why=MirrorAcquireInvalid;break;
+            case MirrorWorker::Observation::Busy: why=MirrorAcquireBusy;break;
+            case MirrorWorker::Observation::Queued: why=MirrorAcquireQueued;break;
+            case MirrorWorker::Observation::Pending: why=MirrorAcquirePending;break;
+            case MirrorWorker::Observation::Ready: why=MirrorAcquireReady;break;
+            case MirrorWorker::Observation::Reused: why=MirrorAcquireReused;break;
+            case MirrorWorker::Observation::DiscardSize: why=MirrorDiscardSize;break;
+            case MirrorWorker::Observation::DiscardGeneration: why=MirrorDiscardGeneration;break;
+            }
+            if(!source_callback)why=MirrorSourceNotCalled;
+            NoteMirrorDiagnostic(why,~u64{0},~u64{0},begin,end,unmap_generation.load());
+        }
         if (!ready) {
             pending_mirrors.emplace_back(ranges[range_index]);
             continue;
         }
+        if(observation==MirrorWorker::Observation::Reused)++stats.mirror_cross_address_reuses;
+        if(mirror_diag)NoteMirrorDiagnostic(MirrorPromotionSuccess,~u64{0},~u64{0},begin,end,unmap_generation.load());
         promotion_trace.Next(3);
         ++buffer_generation; // Only actual map changes invalidate prepared draws.
         {
@@ -2494,8 +2558,10 @@ void NativeRenderer::MakePendingMirrors() {
     }
 }
 
-void NativeRenderer::DropMirrors(VAddr address, u64 size) {
+void NativeRenderer::DropMirrors(VAddr address, u64 size, u32 diagnostic_reason) {
     for (auto it = FirstMirror(address); it != mirrors.end() && it->second.begin < address + size;) {
+        if(diagnostic_reason!=~u32{0} && MirrorDiagnosticEnabled())
+            NoteMirrorDiagnostic(diagnostic_reason,address,address+size,it->second.begin,it->second.end,unmap_generation.load());
         mirror_bytes -= it->second.end - it->second.begin;
         ++buffer_generation; // OPT-003
         buffer_log.Note(it->second.begin, it->second.end); // OPT-010
@@ -8799,7 +8865,7 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
             }
         }
     }
-    DropMirrors(address, size); // NAT-150
+    DropMirrors(address, size, MirrorUnmapDrop); // NAT-150
     {
         std::scoped_lock pending_lock{region_dirty_mutex}; // FIX-173
         std::erase_if(page_snapshots, [&](const auto& snapshot) {
@@ -10074,6 +10140,19 @@ void NativeRenderer::Report() {
                  }
                  return text;
              }());
+    if(stats.mirror_cross_address_reuses)
+        LOG_INFO(Render_Vulkan,"NATIVE-MIRROR-REUSE copied_cross_address={} (complete destination copy recorded)",stats.mirror_cross_address_reuses);
+    if(MirrorDiagnosticEnabled()) {
+        const auto& d=mirror_diagnostic;
+        LOG_INFO(Render_Vulkan,"NATIVE-MIRROR-DIAG candidate_new_same_dynamic_queued_promotion_region_dynamic_budget_source_not_called_acquire_queued_busy_or_stopping_occupied_ready_reused_discard_size_generation_cpu_drop_unmap_drop_success_capacity_nodirect_invalid={} examples={} (unknown=0xffffffffffffffff; promotion original ranges are not retained; unmap examples use pre-unmap generation; examples capped at 16, one per reason)",fmt::join(d.counts,"/"),d.example_count);
+        for(u32 i=0;i<d.example_count;++i) {const auto& e=d.examples[i];
+            int outside_current_request=-1;
+            if(e.reason==MirrorCandidateDynamic && e.granule!=~u64{0} && e.requested_end>=e.requested_begin)
+                outside_current_request=(e.granule>=e.requested_end || (e.granule<=e.requested_begin && e.requested_begin-e.granule>=65536));
+            LOG_INFO(Render_Vulkan,"NATIVE-MIRROR-EXAMPLE reason={} requested_begin={:#x} requested_end={:#x} expanded_begin={:#x} expanded_end={:#x} generation={} blocked_granule={:#x} blocked_age_frames={} outside_current_request={} (-1 unknown)",e.reason,e.requested_begin,e.requested_end,e.expanded_begin,e.expanded_end,e.generation,e.granule,e.age,outside_current_request);
+        }
+        mirror_diagnostic={};
+    }
     if (in_place.frames != 0) {
         const auto mb = [&](u32 i) { return in_place.total[i] * 64.0 / 1024.0 / in_place.frames; };
         LOG_INFO(Render_Vulkan,
@@ -10300,6 +10379,7 @@ void NativeRenderer::Report() {
     stats.region_refresh_pages = stats.region_refresh_ns = 0;
     stats.guest_buffer_calls = stats.guest_buffer_ns = 0;
     stats.mirror_binds = stats.mirrors_made = stats.mirror_made_bytes = stats.mirrors_dropped = 0;
+    stats.mirror_cross_address_reuses = 0;
     stats.mirrors_evicted = stats.mirror_over_budget = stats.mirror_refresh_pages = 0;
     stats.null_reasons = {};
     stats.phase_ns = {};

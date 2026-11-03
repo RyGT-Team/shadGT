@@ -241,7 +241,7 @@ private:
                            bool is_depth);
 
     Stream& Begin();
-    void EndRendering();
+    void EndRendering(u32 reason = 0);
     void BeginRendering(const RenderState& state);
     void GlobalBarrier();
     /// NAT-140: attachment writes before it finish before attachment access after it (a pass

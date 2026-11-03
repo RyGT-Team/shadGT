@@ -260,11 +260,32 @@ struct PendingDescriptorUpdates {
         ++actual_calls;++flushes[reason];nw=nb=ni=0;
     }
 };
+// Recorder-owned interval diagnostics. Closure bits describe predicates that
+// actually caused the close; queued means accepted by the coordinator only.
+enum PassCloseReason : u32 { CloseFast=1,CloseIneligible=2,CloseNotRendering=4,
+    CloseTarget=8,CloseFull=16,CloseMissingSets=32 };
+struct PassClosureStats {
+    // origin: split, preclosed serial scope, other boundary.
+    std::array<std::array<std::array<u64,7>,2>,3> sizes{};
+    // other/default, fast, ineligible, not-rendering, target, full, missing sets.
+    std::array<std::array<u64,7>,3> reasons{};
+    std::array<u64,3> empty_aborts{};
+    u32 origin=2;
+    static std::size_t Bucket(std::size_t n) noexcept {
+        return n==0?0:n==1?1:n<4?2:n<8?3:n<32?4:n<256?5:6;
+    }
+    void Close(std::size_t draws,bool queued,u32 mask) noexcept {
+        ++sizes[origin][queued?0:1][Bucket(draws)];
+        if(!mask)++reasons[origin][0];
+        for(u32 i=0;i<6;++i)if(mask & (u32{1}<<i))++reasons[origin][i+1];
+    }
+};
 struct ParallelRuntime {
     // Mode at Draw's record-phase entry; every metric uses the existing 1/16 sample.
     std::array<std::array<RecordPartitionMetric,5>,2> record_partition{};
     Native::Parallel::RotationDiag rotation_diag{};
     std::array<u64,9> pass_size_hist{};
+    PassClosureStats pass_closure{};
     u64 small_admission_exceptions{},large_admission_exceptions{};
     u64 serial_split_attempts{},serial_split_success{},serial_split_first_draws{};
     PendingDescriptorUpdates descriptor_updates;
@@ -1539,13 +1560,14 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     return s;
 }
 
-void NativeRenderer::EndRendering() {
+void NativeRenderer::EndRendering(u32 reason) {
     RecordPartitionClock end_partition{t_record_partition_end};
     auto* sidecar=FindParallelRuntime(this);
     if(sidecar)sidecar->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::EndPass);
     if(sidecar)sidecar->FinishSerialEligibleRun();
     if (sidecar && sidecar->active) {
         auto& pass=*sidecar->active;
+        const auto captured_draws=pass.draws.size(); // transfer can swap the vector
         ++sidecar->pass_size_hist[std::min<std::size_t>(8,pass.draws.size())];
         u64 coordinator_start=0,coordinator_end=0;const bool cpu_started=ParallelGateDiagEnabled() && DescriptorThreadCpu100ns(coordinator_start);
         stream.rendering=false; // the captured pass has not begun on stream.cmd
@@ -1566,6 +1588,7 @@ void NativeRenderer::EndRendering() {
             ASSERT_MSG(sidecar->sync_pins.Tag(sidecar->pin_slot,sidecar->epoch),"parallel synchronous owner pin failed");
             stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;
         }
+        sidecar->pass_closure.Close(captured_draws,queued,reason);
         pass.draws.clear();sidecar->scratch_draws.swap(pass.draws);
         sidecar->pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;
         sidecar->active.reset();sidecar->lease.reset();
@@ -5181,6 +5204,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     bool serial_split_prebound=false;
     const auto cancel_empty_split=[&]() noexcept {
         if(!serial_split_started || !parallel || !parallel->active || !parallel->active->draws.empty())return;
+        ++parallel->pass_closure.empty_aborts[parallel->pass_closure.origin];
         parallel->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::Abandoned);
         if(!parallel->sync_pins.CancelEmpty(parallel->pin_slot))std::terminate();
         parallel->pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;
@@ -5277,7 +5301,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 fail(23,b.writes_buffers || !b.gpu_writes.empty() || !b.stored.empty());parallel->gates.Add(mask,true);
             }
             parallel->FinishSerialEligibleRun();
-            if(parallel->active){EndRendering();PassBarrier();}
+            if(parallel->active){EndRendering(CloseFast);PassBarrier();}
         } else {
         whole_phases.Next(1);
         const auto& db=targets.state.depth_stencil_attachment;
@@ -6061,8 +6085,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         if(eligible && same_serial_scope)
             parallel->NoteSerialEligible();
         else parallel->FinishSerialEligibleRun();
-        if(parallel->active && (!eligible || !s.rendering || !(s.render==targets.state) || parallel->active->draws.size()>=256)) {
-            EndRendering();PassBarrier(); // continuation uses LOAD, with an attachment dependency
+        u32 close_reason=0;
+        if(parallel->active && ((!eligible && (close_reason|=CloseIneligible,true)) ||
+           (!s.rendering && (close_reason|=CloseNotRendering,true)) ||
+           (!(s.render==targets.state) && (close_reason|=CloseTarget,true)) ||
+           (parallel->active->draws.size()>=256 && (close_reason|=CloseFull,true)))) {
+            EndRendering(close_reason);PassBarrier(); // continuation uses LOAD, with an attachment dependency
         }
         const bool split_now=split_candidate && s.rendering && !parallel->active && s.render==targets.state;
         if(eligible && !parallel->active && (!s.rendering || split_now)) {
@@ -6109,6 +6137,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                         pass.draws.swap(parallel->scratch_draws);
                         if(split_now) {EndRendering();PassBarrier();serial_split_started=true;++parallel->serial_split_success;serial_split_prebound=true;}
                         parallel->epoch=epoch;parallel->lease=std::move(lease);parallel->active.emplace(std::move(pass));
+                        parallel->pass_closure.origin=split_now?0:preclosed_serial_scope?1:2;
                         reserved_pin.committed=true;
                         s.rendering=true;s.render=targets.state;++stats.passes;++parallel->passes;
                     }
@@ -6253,13 +6282,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 // A fresh secondary cannot inherit a serial command buffer's old
                 // descriptor bindings. Never enqueue an incomplete packet.
                 if(parallel->active->draws.empty()) {
+                    ++parallel->pass_closure.empty_aborts[parallel->pass_closure.origin];
                     parallel->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::Abandoned);
                     ASSERT_MSG(parallel->sync_pins.CancelEmpty(parallel->pin_slot),"parallel empty owner slot not empty");
                     parallel->pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;
                     parallel->scratch_draws.swap(parallel->active->draws);
                     parallel->active.reset();parallel->lease.reset();s.rendering=false;
                     s.dynamic.Invalidate();s.pipelines.Invalidate();s.vertex_state_known=false;
-                } else {EndRendering();PassBarrier();}
+                } else {EndRendering(CloseMissingSets);PassBarrier();}
                 if(preclosed_serial_scope)++parallel->natural_binding_skip;
                 ++parallel->missing_sets;++stats.skipped;
                 return;
@@ -10148,6 +10178,20 @@ void NativeRenderer::Report() {
         LOG_INFO(Render_Vulkan,"PARALLEL-RECORD-DIAG absent_sampled_attempts={} absent_sampled_accepted={} absent_sampled_rejected={} sampled_null_view={} sampled_nonnull_sampler={} sampled_nongeneral={} sampled_canonical_null={} absent_mode0_attempts={} absent_mode0_accepted={} absent_mode0_rejected={} natural_preclosed={} natural_captured={} natural_serial_fallback={} natural_binding_skip={} sampler_entries={} sampler_proof_hits={} sampler_proof_misses={} sampler_scan_steps={} sampler_scan_positives={} proof_table_builds={} proof_table_hits={} extended_clear_rejected={} fast_rejected={} no_pass_room_rejected={} serial_scope_bypassed={} owner_slot_pressure={} eligible_in_serial_scope_examined={} eligible_in_active_scope={} eligible_at_boundary={} vertex_candidates={} vertex_preflight={} vertex_backing_pass={} vertex_bad_structure={} vertex_bad_binding={} vertex_bad_pnext={} vertex_unknown_backing={} vertex_direct_ranges={} vertex_direct_attempts={} vertex_direct_matches={} descriptor_readonly_attempts={} descriptor_readonly_regions={} descriptor_readonly_imports={} descriptor_readonly_uncontained={} descriptor_readonly_unmatched={} descriptor_clip_nulls={} direct_slot_attempts={} direct_slot_accepted={} considered={} eligible={} resource_key_unknown={} buffer_present={} alias_rejected={} descriptor_rejected={} missing_sets={} preflight_samples={} preflight_wall_ns={} preflight_cpu_samples={} preflight_cpu_100ns={} passes={} draws={} queued={} synchronous={} worker_jobs={} worker_wall_ns_sum={} worker_cpu_100ns={} worker_cpu_samples={} peak_workers={} worker_recorded_passes={} worker_recorded_draws={} small_groups_submitted={} small_groups_synchronous={} small_passes={} small_submitted_draws={} drain_wall_ns={} coordinator_cpu_100ns={} coordinator_cpu_samples={} pending={} inflight={}",
             sidecar->absent_sampled_attempts,sidecar->absent_sampled_accepted,sidecar->absent_sampled_rejected,sidecar->sampled_null_view,sidecar->sampled_nonnull_sampler,sidecar->sampled_nongeneral,sidecar->sampled_canonical_null,sidecar->absent_mode0_attempts,sidecar->absent_mode0_accepted,sidecar->absent_mode0_rejected,sidecar->natural_preclosed,sidecar->natural_captured,sidecar->natural_serial_fallback,sidecar->natural_binding_skip,sampler_entries,sidecar->sampler_proof_hits,sidecar->sampler_proof_misses,sidecar->sampler_scan_steps,sidecar->sampler_scan_positives,sidecar->proof_table_builds,sidecar->proof_table_hits,sidecar->extended_clear_rejected,sidecar->fast_rejected,sidecar->no_pass_room_rejected,sidecar->serial_scope_bypassed,sidecar->owner_slot_pressure,sidecar->eligible_in_serial_scope,sidecar->eligible_in_active_scope,sidecar->eligible_at_boundary,sidecar->vertex_candidates,sidecar->vertex_preflight_draws,sidecar->vertex_backing_pass,sidecar->vertex_bad_structure,sidecar->vertex_bad_binding,sidecar->vertex_bad_pnext,sidecar->vertex_unknown_backing,sidecar->vertex_direct_ranges,sidecar->vertex_direct_attempts,sidecar->vertex_direct_matches,sidecar->descriptor_readonly_attempts,sidecar->descriptor_readonly_regions,sidecar->descriptor_readonly_imports,sidecar->descriptor_readonly_uncontained,sidecar->descriptor_readonly_unmatched,sidecar->descriptor_clip_nulls,sidecar->direct_slot_attempts,sidecar->direct_slot_accepted,sidecar->considered,sidecar->eligible,sidecar->unknown_resource_key,sidecar->buffer_rejected,sidecar->alias_rejected,sidecar->descriptor_rejected,sidecar->missing_sets,sidecar->preflight_samples,sidecar->preflight_wall_ns,sidecar->preflight_cpu_samples,sidecar->preflight_cpu_100ns,sidecar->passes,sidecar->draws,sidecar->queued,sidecar->synchronous,workers.jobs,workers.wall_ns,workers.cpu_100ns,workers.cpu_samples,workers.peak,workers.recorded_passes,workers.recorded_draws,workers.small_groups_submitted,workers.small_groups_synchronous,workers.small_passes,workers.small_submitted_draws,sidecar->drain_ns,sidecar->coordinator_cpu_100ns,sidecar->coordinator_cpu_samples,
             sidecar->coordinator->PendingNodes(),sidecar->coordinator->InFlightNodes());
+        constexpr std::array<const char*,3> closure_origins{"split","preclosed","other"};
+        constexpr std::array<const char*,2> closure_outcomes{"queued","synchronous"};
+        for(u32 origin=0;origin<3;++origin) {
+            const auto& c=sidecar->pass_closure;
+            for(u32 outcome=0;outcome<2;++outcome) {
+                const auto& buckets=c.sizes[origin][outcome];
+                if(std::ranges::any_of(buckets,[](u64 n){return n!=0;}))
+                    LOG_INFO(Render_Vulkan,"PARALLEL-PASS-CLOSURE origin={} outcome={} sizes_0_1_2to3_4to7_8to31_32to255_256={} (queued means coordinator accepted)",closure_origins[origin],closure_outcomes[outcome],fmt::join(buckets,"/"));
+            }
+            const auto& reasons=c.reasons[origin];
+            if(c.empty_aborts[origin] || std::ranges::any_of(reasons,[](u64 n){return n!=0;}))
+                LOG_INFO(Render_Vulkan,"PARALLEL-PASS-REASONS origin={} other_fast_ineligible_notrendering_target_full_missing={} empty_aborts={} (first short-circuit reason)",closure_origins[origin],fmt::join(reasons,"/"),c.empty_aborts[origin]);
+        }
+        sidecar->pass_closure.sizes={};sidecar->pass_closure.reasons={};sidecar->pass_closure.empty_aborts={};
         LOG_INFO(Render_Vulkan,"PARALLEL-READONLY-HINT range_hits={} range_misses={} region_hits={} region_misses={}",
             sidecar->readonly_range_hint_hits,sidecar->readonly_range_hint_misses,sidecar->readonly_region_hint_hits,sidecar->readonly_region_hint_misses);
         sidecar->readonly_range_hint_hits=sidecar->readonly_range_hint_misses=sidecar->readonly_region_hint_hits=sidecar->readonly_region_hint_misses=0;

@@ -265,3 +265,20 @@ add_custom_command(
         "${CMAKE_CURRENT_BINARY_DIR}/descriptor-stage-under-test.inc"
     DEPENDS extract_descriptor_stage.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" VERBATIM)
 target_sources(descriptor_update_batch_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/descriptor-stage-under-test.inc")
+
+add_executable(parallel_pass_closure_test parallel_pass_closure_test.cpp)
+target_compile_features(parallel_pass_closure_test PRIVATE cxx_std_23)
+target_include_directories(parallel_pass_closure_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(parallel_pass_closure_test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(parallel_pass_closure_test PRIVATE -UNDEBUG)
+endif()
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/pass-closure-under-test.inc"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_pass_closure.py"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
+        "${CMAKE_CURRENT_BINARY_DIR}/pass-closure-under-test.inc"
+    DEPENDS extract_pass_closure.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" VERBATIM)
+target_sources(parallel_pass_closure_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/pass-closure-under-test.inc")
+add_test(NAME parallel_pass_closure COMMAND parallel_pass_closure_test)

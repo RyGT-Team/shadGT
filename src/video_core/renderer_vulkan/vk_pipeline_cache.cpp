@@ -4109,7 +4109,13 @@ bool IsWatchedShader(u64 hash) {
     }();
     return std::ranges::find(watched, hash) != watched.end();
 }
-
+#else
+// FIX-017: these shaders must retain the per-use buffer freshness path in Release.
+// The diagnostic environment override is available only in Debug.
+bool IsWatchedShader(u64 hash) {
+    return hash == 0xab6a2d10 || hash == 0xaa3822a3 ||
+           hash == 0x766d0f18 || hash == 0xae32f77f;
+}
 #endif
 
 void PipelineCache::LoadElseScopeFixed() {

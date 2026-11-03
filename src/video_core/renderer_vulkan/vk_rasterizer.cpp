@@ -4428,6 +4428,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         ExposureLogShader(stage, "old"); // FIX-153 (diagnosis)
     }
     const bool watched = IsWatchedShader(stage.pgm_hash);
+#ifndef NDEBUG
     static std::atomic<u64> watched_binds{};
     const u64 watched_bind = watched ? ++watched_binds : 0;
     const bool log_watched = watched && (watched_bind <= 12 || watched_bind % 300 == 0);
@@ -4439,6 +4440,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         LOG_WARNING(Render_Vulkan, "DIAG-150: old shader {:#x} use {}: {} dwords flattened:{}",
                     stage.pgm_hash, watched_bind, stage.flattened_ud_buf.size(), flat);
     }
+#endif
 #ifndef NDEBUG
     // DIAG-032: once, well into the session, dump the GPU copy of every buffer of a grass vertex
     // dispatch (cs 0xab6a2d10), then the vertex ranges of the grass draws that follow.

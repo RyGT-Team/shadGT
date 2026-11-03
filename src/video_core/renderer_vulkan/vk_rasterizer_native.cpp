@@ -1,4 +1,3 @@
-#include "ryty_gpu/native/cpu_stack_registry.h"
 #include "ryty_gpu/native/ahead_descriptor_pools.h"
 #include "ryty_gpu/native/per_draw_view_proof.h"
 #include "ryty_gpu/native/adaptive_xxh3.h"
@@ -2167,13 +2166,11 @@ void NativeRenderer::SortRegionWrites() {
         return;
     }
     const bool mirror_diag=MirrorDiagnosticEnabled();
-    std::vector<std::pair<VAddr, VAddr>> writes, stack_retirements;
+    std::vector<std::pair<VAddr, VAddr>> writes;
     {
         std::scoped_lock lock{region_dirty_mutex};
         writes.swap(pending_region_writes);
-        stack_retirements.swap(pending_stack_retirements);
     }
-    for (const auto& [begin, end] : stack_retirements) DropMirrors(begin, end - begin);
     for (const auto& [begin, end] : writes) {
         for (auto& [base, region] : regions) {
             if (region.begin < end && region.end > begin) {
@@ -2307,7 +2304,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr add
         mirror = MirrorHolding(address, size);
     }
     if (mirror) {
-        if (!RefreshMirror(*mirror)) return std::nullopt;
+        RefreshMirror(*mirror);
         mirror->used_frame = frame;
         ++stats.mirror_binds;
         memo_kind = MemoKind::Mirror; // OPT-003
@@ -2359,22 +2356,17 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr add
     return std::nullopt;
 }
 
-bool NativeRenderer::RefreshMirror(Mirror& mirror) {
-    { Native::CpuStackRegistry::Lease lease{Native::CpuStacks()};
-      if (!lease.Allowed(mirror.begin, mirror.end)) return false; }
+void NativeRenderer::RefreshMirror(Mirror& mirror) {
     if (mirror.dirty_pages.empty()) {
-        return true;
+        return;
     }
-    const VAddr mirror_begin = mirror.begin, mirror_end = mirror.end;
-    Mirror* const original = &mirror;
-    auto* direct = r.buffer_cache.GetDirectMemory();
-    if (!direct) return false;
-    const u64 generation = buffer_generation;
-    Stream& s = Begin();
-    if (buffer_generation != generation ||
-        MirrorHolding(mirror_begin, mirror_end - mirror_begin) != original) return false;
     std::vector<VAddr> pages;
     pages.swap(mirror.dirty_pages);
+    auto* direct = r.buffer_cache.GetDirectMemory();
+    if (!direct) {
+        return;
+    }
+    Stream& s = Begin();
     GlobalBarrier();
     const vk::Buffer dst{Handle<VkBuffer_T>(mirror.buffer->NativeHandle())};
     std::ranges::sort(pages);
@@ -2392,15 +2384,7 @@ bool NativeRenderer::RefreshMirror(Mirror& mirror) {
                                                                              offset,
                                                                 .size = bytes});
                             });
-        {
-            Native::CpuStackRegistry::Lease lease{Native::CpuStacks()};
-            if (!lease.Allowed(mirror.begin, mirror.end)) {
-                mirror.dirty_pages.insert(mirror.dirty_pages.end(), pages.begin(), pages.end());
-                s.buffers_written = true;
-                return false;
-            }
-            WatchPages(page, std::min<u64>(4096, mirror.end - page));
-        }
+        WatchPages(page, std::min<u64>(4096, mirror.end - page));
         const u64 g = (page - mirror.begin) / MirrorGranule; // FIX-176
         if (g < mirror.hashes.size()) {
             mirror.hashes[g] = 0;
@@ -2408,7 +2392,6 @@ bool NativeRenderer::RefreshMirror(Mirror& mirror) {
     }
     s.buffers_written = true;
     stats.mirror_refresh_pages += pages.size();
-    return true;
 }
 
 void NativeRenderer::MakePendingMirrors() {
@@ -2608,20 +2591,12 @@ void NativeRenderer::MakePendingMirrors() {
             }
             continue;
         }
-        // The copy is already recorded. On a stack conflict keep its destination
-        // alive through submission, but do not publish or watch the mirror.
-        std::unique_lock map_lock{buffer_map_mutex};
-        Native::CpuStackRegistry::Lease stack_lease{Native::CpuStacks()};
-        if (!stack_lease.Allowed(begin, end)) {
-            s.keep.push_back(std::move(buffer));
-            s.buffers_written = true;
-            continue;
-        }
         if(observation==MirrorWorker::Observation::Reused)++stats.mirror_cross_address_reuses;
         if(mirror_diag)NoteMirrorDiagnostic(MirrorPromotionSuccess,~u64{0},~u64{0},begin,end,unmap_generation.load());
         promotion_trace.Next(3);
         ++buffer_generation; // Only actual map changes invalidate prepared draws.
         {
+            std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
             for (auto it = FirstMirror(begin); it != mirrors.end() && it->second.begin < end;) {
                 mirror_bytes -= it->second.end - it->second.begin;
                 retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
@@ -2638,6 +2613,7 @@ void NativeRenderer::MakePendingMirrors() {
         ++stats.mirrors_made;
         stats.mirror_made_bytes += end - begin;
         promotion_trace.Next(6);
+        std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
         mirrors.emplace(begin, Mirror{.begin = begin,
                                       .end = end,
                                       .buffer = std::move(buffer),
@@ -2834,12 +2810,8 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
         if (memo.region || memo.mirror) {
             SortRegionWrites(); // CPU writes since: pages to copy in (may drop a mirror)
         }
-        const bool mirror_allowed = memo.generation == buffer_generation && (!memo.mirror || [&] {
-            Native::CpuStackRegistry::Lease lease{Native::CpuStacks()};
-            return lease.Allowed(memo.mirror->begin, memo.mirror->end);
-        }());
         const bool fresh =
-            mirror_allowed && memo.generation == buffer_generation &&
+            memo.generation == buffer_generation &&
             (!memo.region || memo.region->dirty_pages.empty()) &&
             (!memo.mirror || memo.mirror->dirty_pages.empty());
         if (fresh) {
@@ -4352,11 +4324,7 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
             const char* env = std::getenv("RYGT_NATIVE_VERTEX_NEAR");
             return !(env && env[0] == '0');
         }();
-        const bool near_allowed = near && near_generation == buffer_generation && [&] {
-            Native::CpuStackRegistry::Lease lease{Native::CpuStacks()};
-            return lease.Allowed(near->begin, near->end);
-        }();
-        if (near_on && near_allowed && !sampled && base != 0 && sharp_size > 0 &&
+        if (near_on && near && !sampled && base != 0 && sharp_size > 0 &&
             near_generation == buffer_generation && base >= near->begin &&
             base + sharp_size <= near->end && near->dirty_pages.empty()) {
             size = sharp_size;
@@ -7759,8 +7727,6 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobVertexBuffer(VAddr 
         }();
         if (mirrors_on && size <= 64_MB) {
             if (Mirror* mirror = MirrorHolding(address, size)) {
-                Native::CpuStackRegistry::Lease lease{Native::CpuStacks()};
-                if (lease.Allowed(mirror->begin, mirror->end)) {
                 if (std::ranges::find(p.mirrors, mirror) == p.mirrors.end()) {
                     p.mirrors.push_back(mirror);
                 }
@@ -7768,7 +7734,6 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobVertexBuffer(VAddr 
                 if(native_receipt)*native_receipt=valid_native(*mirror);
                 return std::pair{vk::Buffer{Handle<VkBuffer_T>(mirror->buffer->NativeHandle())},
                                  u64{address - mirror->begin}};
-                }
             }
         }
     }
@@ -7810,11 +7775,7 @@ bool NativeRenderer::PrepareVertices(PreparedDraw& p, const AmdGpu::Regs& regs,
         u64 size = 0;
         const VAddr base = guest.base_address;
         const u64 sharp_size = guest.GetSize();
-        const bool near_allowed = near && [&] {
-            Native::CpuStackRegistry::Lease lease{Native::CpuStacks()};
-            return lease.Allowed(near->begin, near->end);
-        }();
-        if (near_allowed && base != 0 && sharp_size > 0 && base >= near->begin &&
+        if (near && base != 0 && sharp_size > 0 && base >= near->begin &&
             base + sharp_size <= near->end) {
             size = sharp_size; // OPT-004 on this thread
             found = std::pair{vk::Buffer{Handle<VkBuffer_T>(near->buffer->NativeHandle())},
@@ -7902,7 +7863,7 @@ bool NativeRenderer::CommitPreparedVertices(PreparedDraw& p, const GraphicsPipel
     // The ordered part: pages the CPU wrote into the mirrors, and the ranges read in place
     // (noted as mirror candidates).
     for (Mirror* mirror : p.mirrors) {
-        if (!RefreshMirror(*mirror)) return reject();
+        RefreshMirror(*mirror);
         mirror->used_frame = frame;
         ++stats.mirror_binds;
     }
@@ -9429,17 +9390,6 @@ void NativeRenderer::ReleaseUnusedWatches() {
     }
 }
 
-void NativeRenderer::OnCpuStack(VAddr address, u64 size) {
-    // Queue forced mirror retirement before changing protection. If subsequent
-    // invalidation throws, the failed registration still leaves conservative work.
-    {
-        std::scoped_lock lock{region_dirty_mutex};
-        pending_stack_retirements.emplace_back(Common::AlignDown(address, u64{4096}),
-                                               Common::AlignUp(address + size, u64{4096}));
-    }
-    has_pending_region_writes.store(true, std::memory_order_release);
-    OnCpuWrite(address, size, 0);
-}
 void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
     // The written pages stop being watched (so they open up and the write goes on), and the
     // textures over them are uploaded again when next used (which watches them again).

@@ -18,7 +18,8 @@ struct Buffer {std::vector<unsigned char> bytes;};
 struct DirectMemory {
  struct View {u64 begin,end;std::shared_ptr<Buffer> wrapper;};
  std::map<u64,View> views;mutable std::mutex mutex;
- bool TryForEachPart(VAddr,u64,const std::function<bool()>&,const std::function<void(const Buffer&,u64,u64,u64)>&) const;
+ enum class PartOutcome { Invalid, Busy, MissingCoverage, Covered };
+ bool TryForEachPart(VAddr,u64,const std::function<bool()>&,const std::function<void(const Buffer&,u64,u64,u64)>&, PartOutcome* = nullptr) const;
 };
 #include "direct-try-parts-under-test.inc"
 struct Shared {std::atomic<unsigned> made{},destroyed{};std::mutex mutex;std::thread::id destroyed_by;};
@@ -27,6 +28,35 @@ struct Allocation {explicit Allocation(Shared& s,u64 size):shared(s),bytes(size,
 using Worker=Vulkan::AsyncMirrorBuffer<Allocation>;using Obs=Worker::Observation;
 template<class F> void Until(F fn){auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);while(!fn()){assert(std::chrono::steady_clock::now()<deadline);std::this_thread::yield();}}
 int main(){
+ // A queue-only request cannot consume or discard a ready result, even for
+ // a different address, size or generation; budget callback runs only on idle.
+ Shared queued_shared; Worker queue_only([&](auto r){++queued_shared.made;return std::make_unique<Allocation>(queued_shared,r.end-r.begin);});
+ unsigned charged=0; auto charge=[&]{++charged;return true;};
+ assert(queue_only.TryPrepare({10,18,1},charge));
+ Until([&]{return queued_shared.made.load()==1;});
+ for(unsigned i=0;i<1000;++i) assert(!queue_only.TryPrepare({20,30,2},charge));
+ assert(charged==1 && queued_shared.destroyed==0);
+ std::unique_ptr<Allocation> first; Obs first_obs=Obs::None;
+ Until([&]{first=queue_only.TryAcquire({10,18,1},&first_obs);return bool(first);});
+ assert(first_obs==Obs::Ready && charged==1);first.reset();
+ assert(!queue_only.TryPrepare({9,9,1},charge) && charged==1);
+ // Missing coverage queues warming without consuming an allocation. Once the
+ // worker installs both source parts, the original guarded pass copies all bytes.
+ DirectMemory warmed;Shared warm_shared;
+ Worker warm_worker([&](auto r){
+   auto left=std::make_shared<Buffer>();left->bytes={1,2,3,4};
+   auto right=std::make_shared<Buffer>();right->bytes={5,6,7,8};
+   {std::scoped_lock lock(warmed.mutex);warmed.views={{100,{100,104,left}},{104,{104,108,right}}};}
+   return std::make_unique<Allocation>(warm_shared,r.end-r.begin);
+ });
+ DirectMemory::PartOutcome outcome{};int unexpected=0;
+ warmed.TryForEachPart(100,8,[]{return false;},[&](const Buffer&,u64,u64,u64){++unexpected;},&outcome);
+ assert(outcome==DirectMemory::PartOutcome::MissingCoverage && unexpected==0);
+ assert(warm_worker.TryPrepare({100,108,3},[]{return true;}));
+ std::unique_ptr<Allocation> warmed_allocation;Obs warm_obs{};
+ Until([&]{return warmed.TryForEachPart(100,8,[&]{warmed_allocation=warm_worker.TryAcquire({100,108,3},&warm_obs);return bool(warmed_allocation);},
+  [&](const Buffer& src,u64 off,u64 dst,u64 count){std::copy_n(src.bytes.begin()+off,count,warmed_allocation->bytes.begin()+dst);});});
+ assert((warmed_allocation->bytes==std::vector<unsigned char>{1,2,3,4,5,6,7,8}));warmed_allocation.reset();
  Shared shared;Worker worker([&](auto r){++shared.made;return std::make_unique<Allocation>(shared,r.end-r.begin);});
  Obs obs=Obs::Reused;assert(!worker.TryAcquire({10,10,1},&obs) && obs==Obs::None);
  obs=Obs::Reused;assert(!worker.TryAcquire({~u64{0},0,1},&obs) && obs==Obs::None);

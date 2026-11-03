@@ -384,11 +384,13 @@ bool DirectMemory::ForEachPart(VAddr address, u64 size,
 
 bool DirectMemory::TryForEachPart(
     VAddr address, u64 size, const std::function<bool()>& ready,
-    const std::function<void(const Buffer&, u64, u64, u64)>& fn) const {
+    const std::function<void(const Buffer&, u64, u64, u64)>& fn, PartOutcome* outcome) const {
+    if (outcome) *outcome = PartOutcome::Invalid;
     if (address > ImportedPageCoverage<>::Limit ||
         size == 0 || size > ImportedPageCoverage<>::Limit - address) return false;
     std::unique_lock lock{mutex, std::try_to_lock};
-    if (!lock.owns_lock()) return false;
+    if (!lock.owns_lock()) { if (outcome) *outcome = PartOutcome::Busy; return false; }
+    if (outcome) *outcome = PartOutcome::MissingCoverage;
     const VAddr end = address + size;
     // Two passes: a missing suffix must not leave a partially recorded copy.
     for (VAddr cursor = address; cursor < end;) {
@@ -397,12 +399,14 @@ bool DirectMemory::TryForEachPart(
         const View& view = std::prev(it)->second;
         if (cursor < view.begin || cursor >= view.end || !view.wrapper) return false;
         if (cursor == address && end <= view.end) {
+            if (outcome) *outcome = PartOutcome::Covered;
             if (!ready()) return false;
             fn(*view.wrapper, address - view.begin, 0, size);
             return true;
         }
         cursor = std::min(end, view.end);
     }
+    if (outcome) *outcome = PartOutcome::Covered;
     if (!ready()) return false;
     for (VAddr cursor = address; cursor < end;) {
         const View& view = std::prev(views.upper_bound(cursor))->second;

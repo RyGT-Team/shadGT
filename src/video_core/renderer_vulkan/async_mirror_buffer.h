@@ -65,6 +65,18 @@ public:
         else if(observation)*observation=Observation::Pending;
         return {};
     }
+    // Queue only an idle slot. Never consume or replace an existing result.
+    // The recorder charges budget only while holding this lock and only for a new request.
+    template <class Start> bool TryPrepare(Request next, Start&& start) {
+        if (next.end <= next.begin || next.end - next.begin > (256ull << 20)) return false;
+        std::unique_lock lock(mutex, std::try_to_lock);
+        if (!lock.owns_lock() || stopping || state != State::Idle || !start()) return false;
+        request = next;
+        state = State::Queued;
+        lock.unlock();
+        cv.notify_one();
+        return true;
+    }
     AsyncMirrorBuffer(const AsyncMirrorBuffer&) = delete;
     AsyncMirrorBuffer& operator=(const AsyncMirrorBuffer&) = delete;
 private:

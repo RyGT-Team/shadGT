@@ -625,8 +625,13 @@ bool RunAsyncMirrorCase(Rhi::Device& device, Rhi::Fence& fence, u64& tick,
         if(!sources[i] || !readbacks[i] || !sources[i]->Mapped() || !readbacks[i]->Mapped())return false;
         std::memset(sources[i]->Mapped(),0xa5,bytes);
         const u64 a=0x10000+i*0x40000,b=a+0x20000;
-        if(worker.TryAcquire({a,a+bytes,3}))return false;
         const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        u32 starts=0;
+        while(!worker.TryPrepare({a,a+bytes,3},[&]{++starts;return true;})) {
+            if(std::chrono::steady_clock::now()>deadline)return false;
+            std::this_thread::yield();
+        }
+        if(starts!=1)return false;
         Worker::Observation observed{};
         while(!(mirrors[i]=worker.TryAcquire({b,b+bytes,3},&observed))) {
             if(std::chrono::steady_clock::now()>deadline)return false;
@@ -644,7 +649,7 @@ bool RunAsyncMirrorCase(Rhi::Device& device, Rhi::Fence& fence, u64& tick,
     Rhi::CommandList* lists[]={list};device.GraphicsQueue().Submit(lists,{}, {&fence,++tick});
     if(!fence.Wait(tick,5'000'000'000ULL))return false;
     for(u32 i=0;i<2;++i) {readbacks[i]->Invalidate();if(std::memcmp(sources[i]->Mapped(),readbacks[i]->Mapped(),bytes))return false;}
-    log += fmt::format("async mirror: six exact allocations and two cross-address allocations, ordered GPU copies, {} bytes verified: passed\n", verified+2*bytes);
+    log += fmt::format("async mirror: six exact allocations and two queue-only cross-address allocations, ordered GPU copies, {} bytes verified: passed\n", verified+2*bytes);
     return true;
 }
 

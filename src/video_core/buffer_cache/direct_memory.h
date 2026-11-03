@@ -75,8 +75,10 @@ public:
     // Optional copies: never wait for an importer. Validate the entire range
     // before acquiring the destination or recording any copy. Callbacks must
     // not reenter DirectMemory; views stay protected through all copies.
+    enum class PartOutcome { Invalid, Busy, MissingCoverage, Covered };
     bool TryForEachPart(VAddr address, u64 size, const std::function<bool()>& ready,
-                        const std::function<void(const Buffer&, u64, u64, u64)>& fn) const;
+                        const std::function<void(const Buffer&, u64, u64, u64)>& fn,
+                        PartOutcome* outcome = nullptr) const;
 
     /// Whether every page of the range is mapped for the GPU (no import attempted).
     bool Covered(VAddr address, u64 size) const;

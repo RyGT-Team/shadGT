@@ -329,6 +329,7 @@ private:
     u64 mirror_bytes = 0;
     std::unordered_map<VAddr, MirrorCandidate> mirror_candidates; ///< by page of the range start
     std::vector<std::pair<VAddr, VAddr>> pending_mirrors;          ///< made at a list's start
+    VAddr mirror_promotion_resume = 0; ///< fairness hint for merged pending ranges
     OptionalMirrorBudget mirror_promotion_budget; ///< shared across lists of this frame
     std::unordered_map<u64, u64> mirror_writes;    ///< granule -> frame the CPU wrote a mirror there
     std::unordered_map<u64, u64> dynamic_granules; ///< granule -> frame it was found CPU-written
@@ -823,6 +824,8 @@ private:
         std::array<u64,21> counts{};
         std::array<Example,16> examples{};
         u32 example_count{};
+        std::array<u64, 3> source_outcomes{}; // missing, busy, invalid probe
+        u64 warm_attempts{}, warm_queued{};
     } mirror_diagnostic;
     std::chrono::steady_clock::time_point last_report = std::chrono::steady_clock::now();
 };

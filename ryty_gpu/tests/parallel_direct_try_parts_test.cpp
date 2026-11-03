@@ -16,7 +16,8 @@ struct Buffer {int id;};
 struct DirectMemory {
     struct View {u64 begin,end;std::shared_ptr<Buffer> wrapper;};
     std::map<u64,View> views;mutable std::mutex mutex;
-    bool TryForEachPart(VAddr,u64,const std::function<bool()>&,const std::function<void(const Buffer&,u64,u64,u64)>&) const;
+    enum class PartOutcome { Invalid, Busy, MissingCoverage, Covered };
+ bool TryForEachPart(VAddr,u64,const std::function<bool()>&,const std::function<void(const Buffer&,u64,u64,u64)>&, PartOutcome* = nullptr) const;
     bool Original(VAddr address,u64 size,const std::function<bool()>& ready,const std::function<void(const Buffer&,u64,u64,u64)>& fn) const {
         if(address>ImportedPageCoverage<>::Limit || size==0 || size>ImportedPageCoverage<>::Limit-address)return false;
         std::unique_lock lock{mutex,std::try_to_lock};if(!lock.owns_lock())return false;
@@ -62,6 +63,16 @@ int main() {
     auto multi=Run(d,false,15,10,true);assert(multi.result && multi.ready==1 && multi.trace==Trace({{1,5,0,5},{2,0,5,5}}));
     auto gap=Run(d,false,25,20,true);assert(!gap.result && gap.ready==0 && gap.trace.empty());
     auto not_ready=Run(d,false,11,3,false);assert(!not_ready.result && not_ready.ready==1 && not_ready.trace.empty());
+    using Outcome=DirectMemory::PartOutcome;
+    auto status=Outcome::Covered;int probe_copies=0;
+    const auto no_ready=[] {return false;};
+    const auto no_copy=[&](const Buffer&,u64,u64,u64){++probe_copies;};
+    assert(!d.TryForEachPart(11,0,no_ready,no_copy,&status) && status==Outcome::Invalid);
+    assert(!d.TryForEachPart(25,20,no_ready,no_copy,&status) && status==Outcome::MissingCoverage);
+    assert(!d.TryForEachPart(15,10,no_ready,no_copy,&status) && status==Outcome::Covered && probe_copies==0);
+    {std::unique_lock held{d.mutex};std::thread t([&]{
+       assert(!d.TryForEachPart(11,3,no_ready,no_copy,&status) && status==Outcome::Busy);
+    });t.join();}
     int ready_calls=0, visits=0;
     for(bool old: {false,true}) {
         try {

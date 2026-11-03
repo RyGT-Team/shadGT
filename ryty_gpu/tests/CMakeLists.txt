@@ -310,3 +310,25 @@ else()
 endif()
 target_sources(async_mirror_buffer_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/direct-try-parts-under-test.inc")
 add_test(NAME async_mirror_buffer COMMAND async_mirror_buffer_test)
+
+add_executable(mirror_probe_test mirror_probe_test.cpp)
+target_compile_features(mirror_probe_test PRIVATE cxx_std_23)
+target_include_directories(mirror_probe_test PRIVATE "${SHADGT_ROOT}/src" "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(mirror_probe_test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(mirror_probe_test PRIVATE -UNDEBUG)
+endif()
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/mirror-resume-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-probe-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-merge-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-prepare-under-test.inc"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_mirror_probe.py"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
+        "${CMAKE_CURRENT_BINARY_DIR}/mirror-resume-under-test.inc"
+        "${CMAKE_CURRENT_BINARY_DIR}/mirror-probe-under-test.inc"
+        "${CMAKE_CURRENT_BINARY_DIR}/mirror-merge-under-test.inc"
+        "${CMAKE_CURRENT_BINARY_DIR}/mirror-prepare-under-test.inc"
+    DEPENDS extract_mirror_probe.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
+    VERBATIM)
+target_sources(mirror_probe_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/direct-try-parts-under-test.inc"
+    "${CMAKE_CURRENT_BINARY_DIR}/mirror-resume-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-probe-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-merge-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-prepare-under-test.inc")
+add_test(NAME mirror_probe COMMAND mirror_probe_test)

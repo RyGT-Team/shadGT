@@ -1253,10 +1253,15 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     mirror_preparation = std::make_unique<AsyncMirrorBuffer<Native::Rhi::Buffer>>(
         [this](auto request) -> std::unique_ptr<Native::Rhi::Buffer> {
             if (request.generation != unmap_generation.load()) return {};
-            if (auto* direct = r.buffer_cache.GetDirectMemory()) {
-                direct->WarmImported(request.begin, request.end - request.begin);
-            }
-            if (request.generation != unmap_generation.load()) return {};
+            auto* direct = r.buffer_cache.GetDirectMemory();
+            if (!direct) return {};
+            direct->WarmImported(request.begin, request.end - request.begin);
+            VideoCore::DirectMemory::PartOutcome coverage{};
+            direct->TryForEachPart(request.begin, request.end - request.begin, [] { return false; },
+                [](const VideoCore::Buffer&, u64, u64, u64) {}, &coverage);
+            // Do not park a Ready allocation when bounded warming was partial or busy.
+            if (coverage != VideoCore::DirectMemory::PartOutcome::Covered ||
+                request.generation != unmap_generation.load()) return {};
             return device->CreateBuffer({.size = request.end - request.begin,
                 .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageVertex |
                          Native::Rhi::BufferUsageIndex | Native::Rhi::BufferUsageTransferSrc |
@@ -2410,6 +2415,12 @@ void NativeRenderer::MakePendingMirrors() {
             ranges.emplace_back(begin, end);
         }
     }
+    // Resume at the saved address, including a range grown over that address.
+    auto resume = std::lower_bound(ranges.begin(), ranges.end(), mirror_promotion_resume,
+        [](const auto& range, VAddr address) { return range.first < address; });
+    if (resume != ranges.begin() && std::prev(resume)->second > mirror_promotion_resume) --resume;
+    if (resume == ranges.end()) resume = ranges.begin();
+    std::rotate(ranges.begin(), resume, ranges.end());
     static const u64 budget = [] {
         const char* env = std::getenv("RYGT_NATIVE_MIRROR_MB");
         return (env ? std::strtoull(env, nullptr, 10) : 1024) * 1_MB;
@@ -2446,11 +2457,45 @@ void NativeRenderer::MakePendingMirrors() {
         if (end - begin > 256_MB) {
             continue;
         }
+        using PartOutcome = VideoCore::DirectMemory::PartOutcome;
+        PartOutcome source_outcome = PartOutcome::Invalid;
+        const auto probe_start = std::chrono::steady_clock::now();
+        direct->TryForEachPart(begin, end - begin, [] { return false; },
+            [](const VideoCore::Buffer&, u64, u64, u64) {}, &source_outcome);
+        mirror_promotion_budget.Account(std::chrono::steady_clock::now() - probe_start);
+        if (source_outcome != PartOutcome::Covered) {
+            if (mirror_diag) {
+                NoteMirrorDiagnostic(MirrorSourceNotCalled, ~u64{0}, ~u64{0}, begin, end, unmap_generation.load());
+                ++mirror_diagnostic.source_outcomes[source_outcome == PartOutcome::Busy ? 1 :
+                                                    source_outcome == PartOutcome::MissingCoverage ? 0 : 2];
+            }
+            bool budget_denied = false;
+            if (source_outcome == PartOutcome::MissingCoverage && mirror_promotion_budget.Available()) {
+                const auto warm_start = std::chrono::steady_clock::now();
+                if (mirror_diag) ++mirror_diagnostic.warm_attempts;
+                const bool queued = mirror_preparation->TryPrepare({begin, end, unmap_generation.load()}, [&] {
+                    if (!mirror_promotion_budget.TryStart(end - begin)) { budget_denied = true; return false; }
+                    return true;
+                });
+                if (mirror_diag && queued) ++mirror_diagnostic.warm_queued;
+                mirror_promotion_budget.Account(std::chrono::steady_clock::now() - warm_start);
+            }
+            pending_mirrors.emplace_back(ranges[range_index]);
+            if (source_outcome == PartOutcome::Busy || budget_denied || !mirror_promotion_budget.Available()) {
+                const size_t next = range_index + 1;
+                mirror_promotion_resume = source_outcome == PartOutcome::Busy || budget_denied ?
+                    ranges[range_index].first : (next < ranges.size() ? ranges[next].first : ranges[0].first);
+                pending_mirrors.insert(pending_mirrors.end(), ranges.begin() + next, ranges.end());
+                break;
+            }
+            continue;
+        }
         if (!mirror_promotion_budget.TryStart(end - begin)) {
             if(mirror_diag)NoteMirrorDiagnostic(MirrorPromotionBudget,~u64{0},~u64{0},begin,end,unmap_generation.load());
             // Preserve the original ranges, not pointers into mutable mirror
             // storage. Mapping, CPU/GPU writes and overlaps are checked again
             // when a later frame has budget. Nothing incomplete is published.
+            mirror_promotion_resume = ranges[range_index].first;
             pending_mirrors.insert(pending_mirrors.end(), ranges.begin() + range_index,
                                    ranges.end());
             break;
@@ -10145,6 +10190,7 @@ void NativeRenderer::Report() {
     if(MirrorDiagnosticEnabled()) {
         const auto& d=mirror_diagnostic;
         LOG_INFO(Render_Vulkan,"NATIVE-MIRROR-DIAG candidate_new_same_dynamic_queued_promotion_region_dynamic_budget_source_not_called_acquire_queued_busy_or_stopping_occupied_ready_reused_discard_size_generation_cpu_drop_unmap_drop_success_capacity_nodirect_invalid={} examples={} (unknown=0xffffffffffffffff; promotion original ranges are not retained; unmap examples use pre-unmap generation; examples capped at 16, one per reason)",fmt::join(d.counts,"/"),d.example_count);
+        LOG_INFO(Render_Vulkan,"NATIVE-MIRROR-SOURCE-PROBE missing_busy_invalid={} warm_attempts={} warm_queued={} (probe outcomes; original source_not_called includes later copy recheck failures)", fmt::join(d.source_outcomes,"/"), d.warm_attempts, d.warm_queued);
         for(u32 i=0;i<d.example_count;++i) {const auto& e=d.examples[i];
             int outside_current_request=-1;
             if(e.reason==MirrorCandidateDynamic && e.granule!=~u64{0} && e.requested_end>=e.requested_begin)

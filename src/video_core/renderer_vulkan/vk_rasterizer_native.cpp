@@ -458,6 +458,7 @@ bool A82CaptureAfterRace() {
 }
 thread_local u64 descriptor_hash_reused = 0;
 thread_local u64 descriptor_hash_refreshed = 0;
+thread_local u64 descriptor_buffer_key_skipped = 0, descriptor_buffer_key_scanned = 0;
 
 using FlatUploadMemo = ImmutableUploadMemo<vk::DescriptorBufferInfo, Shader::MaxStageTypes>;
 std::atomic<u64> sampler_cache_epoch{1};
@@ -4092,7 +4093,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
 }
 
 void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoint bind_point,
-                                  DrawBindings& b) {
+                                  DrawBindings& b, bool prepared_buffer_keys_unchanged) {
     auto* pending_owner=FindParallelRuntime(this);
     if(!parallel_binding_capture && pending_owner)
         pending_owner->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::Serial);
@@ -4161,7 +4162,9 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         auto& prepared_key = b.descriptor_keys[index];
         // Preparation hashed the complete key. Commit changes only buffer slots;
         // recompute the same XXH3 hash only when those values actually changed.
-        const bool key_changed = prepared_key.RefreshBuffers<false>();
+        const bool key_changed = prepared_buffer_keys_unchanged ? false : prepared_key.RefreshBuffers<false>();
+        if (prepared_buffer_keys_unchanged) ++descriptor_buffer_key_skipped;
+        else ++descriptor_buffer_key_scanned;
         const auto& key = prepared_key.words;
         const bool cacheable = prepared_key.cacheable;
         const std::span<const u64> descriptor_key{key.data(), key.size()};
@@ -5302,6 +5305,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             }
         }
     }
+    // Only CommitPrepared's upload loop changes prepared buffer descriptor values.
+    const bool prepared_buffer_keys_unchanged = from_prepared && prepared->uploads.empty() && feedback.empty();
     PhaseClock record_clock{stats.phase_ns[7]};
     {
         PhaseClock part{stats.record_ns[0]}; // OPT-011
@@ -6306,7 +6311,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                         const auto prebind_cmd=s.cmd;
                         parallel_bindings.write_structure_proven=true;
                         set_count_proof();
-                        {ScopedParallelBindingCapture capture{parallel_bindings};PushBindings(*pipeline,vk::PipelineBindPoint::eGraphics,b);}
+                        {ScopedParallelBindingCapture capture{parallel_bindings};PushBindings(*pipeline,vk::PipelineBindPoint::eGraphics,b,prepared_buffer_keys_unchanged);}
                         if(!b.writes.empty())for(u32 i=0;i<b.grouped_writes.size();++i) {
                             if(i==pipeline->PushSet() || b.grouped_writes[i].empty())continue;
                             parallel_required_sets|=u32{1}<<i;
@@ -6447,7 +6452,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             if(!serial_split_prebound) {
                 parallel_bindings.write_structure_proven=true; // descriptor_safe validated every source row
                 set_count_proof();
-                {ScopedParallelBindingCapture capture{parallel_bindings};PushBindings(*pipeline,vk::PipelineBindPoint::eGraphics,b);}
+                {ScopedParallelBindingCapture capture{parallel_bindings};PushBindings(*pipeline,vk::PipelineBindPoint::eGraphics,b,prepared_buffer_keys_unchanged);}
             }
             if(parallel_bindings.ahead_used) {
                 ASSERT_MSG(ahead && ahead_slot<parallel->ahead_flights.size(),"ahead descriptor lease missing");
@@ -6479,7 +6484,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 ++parallel->missing_sets;++stats.skipped;
                 return;
             }
-        } else PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
+        } else PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b, prepared_buffer_keys_unchanged);
     }
     {
         PhaseClock part{stats.record_ns[6]};
@@ -10422,6 +10427,9 @@ void NativeRenderer::Report() {
     LOG_INFO(Render_Vulkan, "DESC-HASH: {} prepared hashes reused, {} refreshed after buffer changes",
              descriptor_hash_reused, descriptor_hash_refreshed);
     descriptor_hash_reused = descriptor_hash_refreshed = 0;
+    LOG_INFO(Render_Vulkan, "DESC-BUFFER-KEY skipped={} scanned={} (ordinary sets)",
+             descriptor_buffer_key_skipped, descriptor_buffer_key_scanned);
+    descriptor_buffer_key_skipped = descriptor_buffer_key_scanned = 0;
     const u64 cpu_writes = stats.cpu_writes.load();
     stats.draws = stats.dispatches = stats.skipped = stats.no_pipeline = stats.passes = 0;
     stats.barriers = stats.splices = stats.copied_reads = stats.copied_bytes = stats.unbound = 0;

@@ -159,9 +159,8 @@ bool PassCoordinator::TryPass(u64 epoch,const Pass& pass,std::size_t total_owned
     if(pending_epoch_ && pending_epoch_!=epoch)return reject(RejectReason::EpochMismatch);
     if(nodes_.size()+in_flight_count_>=node_cap_)return reject(RejectReason::NodeCap);
     if(!ValidatePass(pass))return reject(RejectReason::Validation);
-    std::size_t minimum_bytes{};
-    if(!MinimumPassBytes(pass,minimum_bytes))return reject(RejectReason::Overflow);
-    if(total_owned_bytes<minimum_bytes)return reject(RejectReason::Charge);
+    if(pass.draws.capacity()>(~std::size_t{0}-sizeof(Pass))/sizeof(Draw))return reject(RejectReason::Overflow);
+    if(total_owned_bytes<sizeof(Pass)+pass.draws.capacity()*sizeof(Draw))return reject(RejectReason::Charge);
     auto group=std::make_shared<Group>();
     if(group->jobs.capacity()>(~std::size_t{0}-sizeof(Group))/sizeof(JobPtr))return reject(RejectReason::Overflow);
     const auto overhead=sizeof(Group)+group->jobs.capacity()*sizeof(JobPtr);
@@ -190,9 +189,8 @@ bool PassCoordinator::TryPassTransfer(u64 epoch,Pass& pass,std::size_t total_own
     if(pending_epoch_ && pending_epoch_!=epoch)return reject(RejectReason::EpochMismatch);
     if(nodes_.size()+in_flight_count_>=node_cap_)return reject(RejectReason::NodeCap);
     if(!ValidatePass(pass))return reject(RejectReason::Validation);
-    std::size_t minimum_bytes{};
-    if(!MinimumPassBytes(pass,minimum_bytes))return reject(RejectReason::Overflow);
-    if(total_owned_bytes<minimum_bytes)return reject(RejectReason::Charge);
+    if(pass.draws.capacity()>(~std::size_t{0}-sizeof(Pass))/sizeof(Draw))return reject(RejectReason::Overflow);
+    if(total_owned_bytes<sizeof(Pass)+pass.draws.capacity()*sizeof(Draw))return reject(RejectReason::Charge);
     auto group=std::make_shared<Group>();
     if(group->jobs.capacity()>(~std::size_t{0}-sizeof(Group))/sizeof(JobPtr))return reject(RejectReason::Overflow);
     const auto overhead=sizeof(Group)+group->jobs.capacity()*sizeof(JobPtr);
@@ -220,9 +218,8 @@ bool PassCoordinator::TrySmallPass(u64 epoch,const Pass& pass,std::size_t total_
     if(nodes_.size()+in_flight_count_>=node_cap_)return reject(RejectReason::NodeCap);
     if(!ValidatePass(pass))return reject(RejectReason::Validation);
     if(pass.draws.empty() || pass.draws.size()>=8)return reject(RejectReason::Invalid);
-    std::size_t minimum_bytes{};
-    if(!MinimumPassBytes(pass,minimum_bytes))return reject(RejectReason::Overflow);
-    if(total_owned_bytes<minimum_bytes)return reject(RejectReason::Charge);
+    if(pass.draws.capacity()>(~std::size_t{0}-sizeof(Pass))/sizeof(Draw))return reject(RejectReason::Overflow);
+    if(total_owned_bytes<sizeof(Pass)+pass.draws.capacity()*sizeof(Draw))return reject(RejectReason::Charge);
     auto group=pending_small_;
     if(!group) {
         group=std::make_shared<Group>();group->is_small=true;

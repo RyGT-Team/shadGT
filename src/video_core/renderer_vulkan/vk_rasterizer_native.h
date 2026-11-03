@@ -1,4 +1,3 @@
-#include "ryty_gpu/native/parallel_pass_recording.h"
 #include "video_core/renderer_vulkan/page_coverage.h"
 #include "video_core/renderer_vulkan/page_watch_tracker.h"
 #include "video_core/renderer_vulkan/descriptor_set_reserve.h"
@@ -422,7 +421,18 @@ private:
                       DrawBindings& b);
     /// A draw's vertex and index buffers: looked up before its pass starts (a lookup may gather
     /// on the GPU, outside rendering) and bound inside it.
-    using VertexIndexState = Native::Parallel::VertexIndexState;
+    struct VertexIndexState {
+        boost::container::static_vector<vk::VertexInputAttributeDescription2EXT, 32> attributes;
+        boost::container::static_vector<vk::VertexInputBindingDescription2EXT, 32> input_bindings;
+        boost::container::static_vector<vk::Buffer, 32> buffers;
+        boost::container::static_vector<vk::DeviceSize, 32> offsets;
+        boost::container::static_vector<vk::DeviceSize, 32> sizes;
+        boost::container::static_vector<vk::DeviceSize, 32> strides;
+        vk::Buffer index_buffer{};
+        u64 index_offset = 0;
+        vk::IndexType index_type = vk::IndexType::eUint32;
+        u32 index_count = 0;
+    };
     void ResolveVertexBuffers(const GraphicsPipeline& pipeline, const AmdGpu::Regs& regs,
                               VertexIndexState& v);
     bool ResolveIndices(const AmdGpu::Regs& regs, bool is_indexed, u32 index_offset,
@@ -586,8 +596,7 @@ private:
         /// candidates, noted at commit).
         bool native_vertex_receipt = false, native_index_receipt = false;
         bool has_vertices = false;
-        std::shared_ptr<VertexIndexState> vertex_index;
-        bool vertex_index_published = false;
+        std::unique_ptr<VertexIndexState> vertex_index;
         u64 vertex_hash = 0;
         bool indexed = false;
         u32 index_offset = 0;

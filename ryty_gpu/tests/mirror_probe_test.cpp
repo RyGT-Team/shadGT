@@ -30,6 +30,8 @@ struct DirectMemory {
 using VideoCore::DirectMemory;using VideoCore::Buffer;
 #include "direct-try-parts-under-test.inc"
 struct Allocation{};
+namespace Native::Rhi { using Buffer = Allocation; }
+template<class T> using AsyncMirrorBuffer = Vulkan::AsyncMirrorBuffer<T>;
 using Worker=Vulkan::AsyncMirrorBuffer<Allocation>;
 using Clock=std::chrono::steady_clock;
 static Clock::time_point clock_value{};
@@ -52,7 +54,7 @@ struct Harness {
  Worker* mirror_preparation=worker.get();Vulkan::OptionalMirrorBudget mirror_promotion_budget;
  VAddr mirror_promotion_resume{};std::vector<std::pair<VAddr,VAddr>> pending_mirrors;
  std::atomic<u64> unmap_generation{};Diagnostic mirror_diagnostic;bool mirror_diag=false;
- unsigned copies{};bool unmap_after_probe{};
+ unsigned copies{};bool unmap_after_probe{},use_worker{};VAddr attempted{};Worker::Observation last_observation=Worker::Observation::None;
  void NoteMirrorDiagnostic(int,u64,u64,u64,u64,u64){}
  void Visit(u64 frame){
   mirror_promotion_budget.BeginFrame(frame);
@@ -60,12 +62,16 @@ struct Harness {
   auto pending=std::move(pending_mirrors);pending_mirrors.clear();
 #include "mirror-merge-under-test.inc"
 #include "mirror-resume-under-test.inc"
+#include "mirror-priority-under-test.inc"
   for(size_t range_index=0;range_index<ranges.size();++range_index){
    auto [begin,end]=ranges[range_index];
 #include "mirror-probe-under-test.inc"
    if(unmap_after_probe)storage.views.clear();
-   bool ready=direct->TryForEachPart(begin,end-begin,[]{return true;},[&](const Buffer&,u64,u64,u64){++copies;});
-   if(!ready)pending_mirrors.push_back(ranges[range_index]);
+   attempted=begin;bool source_callback=false;MirrorWorker::Observation observation=MirrorWorker::Observation::None;
+   std::unique_ptr<Allocation> allocation;
+   bool ready=direct->TryForEachPart(begin,end-begin,[&]{source_callback=true;if(!use_worker)return true;allocation=mirror_preparation->TryAcquire({begin,end,unmap_generation.load()},&observation);return bool(allocation);},[&](const Buffer&,u64,u64,u64){++copies;});
+   last_observation=observation;
+#include "mirror-requeue-under-test.inc"
   }
  }
 };
@@ -125,5 +131,26 @@ int main(){
  std::unique_ptr<Allocation> retried;
  while(!(retried=retry_worker.TryAcquire({0,8,0}))){assert(Clock::now()<deadline);std::this_thread::yield();}
  assert(retry_warms>=2 && retry.allocations==1);
- Harness changed;changed.pending_mirrors={{0,4}};changed.storage.views.emplace(0,DirectMemory::View{0,4,std::make_shared<Buffer>()});changed.unmap_after_probe=true;step={};changed.Visit(1);assert(changed.copies==0&&changed.pending_mirrors.size()==1);
+ // A is running in the single worker while differently sized B precedes it
+ // by address. The actual snapshot orders A first and Pending retains suffix.
+ Harness priority;std::mutex pm;std::condition_variable pcv;bool pstarted=false,prelease=false;
+ priority.worker=std::make_unique<Worker>([&](auto){std::unique_lock l(pm);pstarted=true;pcv.notify_all();pcv.wait(l,[&]{return prelease;});return std::make_unique<Allocation>();});priority.mirror_preparation=priority.worker.get();priority.use_worker=true;
+ assert(priority.worker->TryPrepare({50,54,0},[]{return true;}));
+ {std::unique_lock l(pm);pcv.wait(l,[&]{return pstarted;});}
+ priority.pending_mirrors={{0,8},{50,54},{80,92}};
+ priority.storage.views={{0,{0,8,std::make_shared<Buffer>()}},{50,{50,54,std::make_shared<Buffer>()}},{80,{80,92,std::make_shared<Buffer>()}}};
+ step={};priority.Visit(1);assert(priority.attempted==50 && priority.copies==0 && priority.pending_mirrors.size()==3);
+ {std::scoped_lock l(pm);prelease=true;}pcv.notify_all();
+ const auto pd=Clock::now()+std::chrono::seconds(5);
+ for(u64 frame=2;priority.copies==0;++frame){assert(Clock::now()<pd);priority.Visit(frame);std::this_thread::yield();}
+ assert(priority.copies==1);priority.worker.reset();priority.mirror_preparation=nullptr;
+ // A merged range grows past the owner's allocation: it is selected first,
+ // discarded by the existing size rule, then retried at its complete size.
+ Harness grown;grown.use_worker=true;grown.pending_mirrors={{0,8},{50,58},{80,92}};
+ grown.storage.views={{0,{0,8,std::make_shared<Buffer>()}},{50,{50,58,std::make_shared<Buffer>()}},{80,{80,92,std::make_shared<Buffer>()}}};
+ assert(grown.worker->TryPrepare({50,54,0},[]{return true;}));
+ bool saw_discard=false;const auto gd=Clock::now()+std::chrono::seconds(5);
+ for(u64 frame=1;grown.copies==0;++frame){assert(Clock::now()<gd);grown.Visit(frame);saw_discard |= grown.last_observation==Worker::Observation::DiscardSize;std::this_thread::yield();}
+ assert(saw_discard && grown.copies==1);
+ Harness changed;changed.pending_mirrors={{0,4},{10,14}};changed.storage.views.emplace(0,DirectMemory::View{0,4,std::make_shared<Buffer>()});changed.storage.views.emplace(10,DirectMemory::View{10,14,std::make_shared<Buffer>()});changed.unmap_after_probe=true;step={};changed.Visit(1);assert(changed.copies==0&&changed.attempted==0&&changed.pending_mirrors.size()==2);
 }

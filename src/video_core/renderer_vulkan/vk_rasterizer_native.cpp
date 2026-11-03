@@ -2421,6 +2421,19 @@ void NativeRenderer::MakePendingMirrors() {
     if (resume != ranges.begin() && std::prev(resume)->second > mirror_promotion_resume) --resume;
     if (resume == ranges.end()) resume = ranges.begin();
     std::rotate(ranges.begin(), resume, ranges.end());
+    using MirrorWorker = AsyncMirrorBuffer<Native::Rhi::Buffer>;
+    MirrorWorker::Request owner{};
+    const auto snapshot = mirror_preparation->TrySnapshot(owner);
+    if (snapshot == MirrorWorker::Snapshot::Busy) {
+        pending_mirrors.insert(pending_mirrors.end(), ranges.begin(), ranges.end());
+        return;
+    }
+    if (snapshot == MirrorWorker::Snapshot::Present && owner.generation == unmap_generation.load()) {
+        const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) {
+            return range.first <= owner.begin && owner.end <= range.second;
+        });
+        if (found != ranges.end()) std::rotate(ranges.begin(), found, ranges.end());
+    }
     static const u64 budget = [] {
         const char* env = std::getenv("RYGT_NATIVE_MIRROR_MB");
         return (env ? std::strtoull(env, nullptr, 10) : 1024) * 1_MB;
@@ -2470,20 +2483,21 @@ void NativeRenderer::MakePendingMirrors() {
                                                     source_outcome == PartOutcome::MissingCoverage ? 0 : 2];
             }
             bool budget_denied = false;
+            bool warm_queued = false;
             if (source_outcome == PartOutcome::MissingCoverage && mirror_promotion_budget.Available()) {
                 const auto warm_start = std::chrono::steady_clock::now();
                 if (mirror_diag) ++mirror_diagnostic.warm_attempts;
-                const bool queued = mirror_preparation->TryPrepare({begin, end, unmap_generation.load()}, [&] {
+                warm_queued = mirror_preparation->TryPrepare({begin, end, unmap_generation.load()}, [&] {
                     if (!mirror_promotion_budget.TryStart(end - begin)) { budget_denied = true; return false; }
                     return true;
                 });
-                if (mirror_diag && queued) ++mirror_diagnostic.warm_queued;
+                if (mirror_diag && warm_queued) ++mirror_diagnostic.warm_queued;
                 mirror_promotion_budget.Account(std::chrono::steady_clock::now() - warm_start);
             }
             pending_mirrors.emplace_back(ranges[range_index]);
-            if (source_outcome == PartOutcome::Busy || budget_denied || !mirror_promotion_budget.Available()) {
+            if (source_outcome == PartOutcome::Busy || warm_queued || budget_denied || !mirror_promotion_budget.Available()) {
                 const size_t next = range_index + 1;
-                mirror_promotion_resume = source_outcome == PartOutcome::Busy || budget_denied ?
+                mirror_promotion_resume = source_outcome == PartOutcome::Busy || warm_queued || budget_denied ?
                     ranges[range_index].first : (next < ranges.size() ? ranges[next].first : ranges[0].first);
                 pending_mirrors.insert(pending_mirrors.end(), ranges.begin() + next, ranges.end());
                 break;
@@ -2534,7 +2548,6 @@ void NativeRenderer::MakePendingMirrors() {
         }
         promotion_trace.Next(1);
         std::unique_ptr<Native::Rhi::Buffer> buffer;
-        using MirrorWorker=AsyncMirrorBuffer<Native::Rhi::Buffer>;
         MirrorWorker::Observation observation=MirrorWorker::Observation::None;
         bool source_callback=false;
         // Source views and destination must both be ready. Neither mutex may
@@ -2566,6 +2579,16 @@ void NativeRenderer::MakePendingMirrors() {
         }
         if (!ready) {
             pending_mirrors.emplace_back(ranges[range_index]);
+            if (!source_callback || observation == MirrorWorker::Observation::Queued ||
+                observation == MirrorWorker::Observation::Pending ||
+                observation == MirrorWorker::Observation::Busy ||
+                observation == MirrorWorker::Observation::DiscardSize ||
+                observation == MirrorWorker::Observation::DiscardGeneration) {
+                mirror_promotion_resume = ranges[range_index].first;
+                pending_mirrors.insert(pending_mirrors.end(), ranges.begin() + range_index + 1,
+                                       ranges.end());
+                break;
+            }
             continue;
         }
         if(observation==MirrorWorker::Observation::Reused)++stats.mirror_cross_address_reuses;

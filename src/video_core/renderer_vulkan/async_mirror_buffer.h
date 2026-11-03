@@ -35,6 +35,16 @@ public:
         cv.notify_one();
         worker.join();
     }
+    enum class Snapshot { Busy, Empty, Present };
+    // A copied hint only; TryAcquire still validates the live slot under its lock.
+    Snapshot TrySnapshot(Request& out) {
+        std::unique_lock lock(mutex, std::try_to_lock);
+        if (!lock.owns_lock() || stopping) return Snapshot::Busy;
+        if (state != State::Queued && state != State::Running && state != State::Ready)
+            return Snapshot::Empty;
+        out = request;
+        return Snapshot::Present;
+    }
     // No wait, allocation, driver call or buffer destruction on the caller.
     std::unique_ptr<Buffer> TryAcquire(Request next, Observation* observation = nullptr) {
         if (observation) *observation = Observation::None;

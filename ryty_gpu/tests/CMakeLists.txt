@@ -320,15 +320,17 @@ else()
     target_compile_options(mirror_probe_test PRIVATE -UNDEBUG)
 endif()
 add_custom_command(
-    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/mirror-resume-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-probe-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-merge-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-prepare-under-test.inc"
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/mirror-resume-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-probe-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-merge-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-prepare-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-priority-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-requeue-under-test.inc"
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_mirror_probe.py"
         "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
         "${CMAKE_CURRENT_BINARY_DIR}/mirror-resume-under-test.inc"
         "${CMAKE_CURRENT_BINARY_DIR}/mirror-probe-under-test.inc"
         "${CMAKE_CURRENT_BINARY_DIR}/mirror-merge-under-test.inc"
         "${CMAKE_CURRENT_BINARY_DIR}/mirror-prepare-under-test.inc"
+        "${CMAKE_CURRENT_BINARY_DIR}/mirror-priority-under-test.inc"
+        "${CMAKE_CURRENT_BINARY_DIR}/mirror-requeue-under-test.inc"
     DEPENDS extract_mirror_probe.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
     VERBATIM)
 target_sources(mirror_probe_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/direct-try-parts-under-test.inc"
-    "${CMAKE_CURRENT_BINARY_DIR}/mirror-resume-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-probe-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-merge-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-prepare-under-test.inc")
+    "${CMAKE_CURRENT_BINARY_DIR}/mirror-resume-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-probe-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-merge-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-prepare-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-priority-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/mirror-requeue-under-test.inc")
 add_test(NAME mirror_probe COMMAND mirror_probe_test)

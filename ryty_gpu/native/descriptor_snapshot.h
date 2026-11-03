@@ -12,6 +12,8 @@ class DescriptorSnapshot {
     std::vector<vk::WriteDescriptorSet> writes_;
     std::vector<vk::DescriptorBufferInfo> buffers_;
     std::vector<vk::DescriptorImageInfo> images_;
+    bool parallel_subset_supported_=true;
+    bool has_buffer_descriptors_=false;
     template<class T> static bool Inside(const T* ptr,std::size_t count,std::span<const T> source) {
         if(!ptr || count==0 || count>source.size()) return false;
         const auto base=reinterpret_cast<std::uintptr_t>(source.data()),at=reinterpret_cast<std::uintptr_t>(ptr);
@@ -28,6 +30,11 @@ public:
     static bool ImageSliceValid(const vk::DescriptorImageInfo* ptr,std::size_t count,std::span<const vk::DescriptorImageInfo> source) {return Inside(ptr,count,source);}
     static bool BufferSliceValid(const vk::DescriptorBufferInfo* ptr,std::size_t count,std::span<const vk::DescriptorBufferInfo> source) {return Inside(ptr,count,source);}
     std::span<const vk::WriteDescriptorSet> Writes() const {return writes_;}
+    // Make validates the private rows and rebases their pointers into owned storage.
+    // Patching changes only buffer values. Empty also covers moved-from snapshots.
+    bool ParallelReplaySafe(bool buffers_verified) const noexcept {
+        return writes_.empty() || (parallel_subset_supported_ && (!has_buffer_descriptors_ || buffers_verified));
+    }
     // Called only by the sole mutable owner before publishing the snapshot.
     bool PatchBufferBindings(std::span<const vk::DescriptorBufferInfo> source) noexcept {
         if (source.size() != buffers_.size()) return false;
@@ -75,6 +82,8 @@ public:
         std::size_t buffer_offset=0,image_offset=0;
         for(auto& w:out.writes_) {
             const bool is_buffer=w.descriptorType==vk::DescriptorType::eUniformBuffer || w.descriptorType==vk::DescriptorType::eStorageBuffer;
+            out.parallel_subset_supported_ &= is_buffer || w.descriptorType==vk::DescriptorType::eSampler || w.descriptorType==vk::DescriptorType::eSampledImage;
+            out.has_buffer_descriptors_ |= is_buffer;
             if(is_buffer){w.pBufferInfo=out.buffers_.data()+buffer_offset;buffer_offset+=w.descriptorCount;}
             else {w.pImageInfo=out.images_.data()+image_offset;image_offset+=w.descriptorCount;}
         }

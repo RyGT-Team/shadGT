@@ -1,6 +1,7 @@
 #include "ryty_gpu/native/parallel_pass_recording.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_command_stream.h"
+#include "video_core/renderer_vulkan/vertex_input_equal.h"
 #include <bit>
 namespace Native::Parallel {
 bool ValidatePass(const Pass& pass) {
@@ -24,23 +25,17 @@ bool ValidatePass(const Pass& pass) {
            draw.vertex_sizes.size()!=draw.vertex_buffer_count || draw.vertex_strides.size()!=draw.vertex_buffer_count)return false;
         if(draw.vertex_buffer_count!=draw.vertex_binding_count || draw.vertex_buffer_count!=draw.vertex_attribute_count)return false;
         if(draw.vertex_buffer_count && !draw.vertex_backing_verified)return false;
-        for(u32 i=0;i<draw.vertex_buffer_count;++i)
-            if(draw.vertex_bindings[i].binding!=i || draw.vertex_attributes[i].binding!=i)return false;
-        for(u32 i=0;i<draw.vertex_buffer_count;++i)if(!draw.vertex_buffers[i] || !draw.vertex_sizes[i])return false;
-        for(u32 i=0;i<draw.vertex_attribute_count;++i)if(draw.vertex_attributes[i].pNext)return false;
-        for(u32 i=0;i<draw.vertex_binding_count;++i)if(draw.vertex_bindings[i].pNext)return false;
+        for(u32 i=0;i<draw.vertex_buffer_count;++i) {
+            if(draw.vertex_bindings[i].binding!=i || draw.vertex_attributes[i].binding!=i ||
+               !draw.vertex_buffers[i] || !draw.vertex_sizes[i] ||
+               draw.vertex_attributes[i].pNext || draw.vertex_bindings[i].pNext)return false;
+        }
         static_assert(Shader::Backend::MaxDescriptorSets<=32);
         for(u32 i=0;i<draw.sets.size();++i) if((draw.required_sets_mask & (u32{1}<<i)) && !draw.sets[i])return false;
         if(draw.push_set<draw.sets.size() && (draw.required_sets_mask & (u32{1}<<draw.push_set)))return false;
         if(draw.push_writes) {
             if(draw.push_set>=draw.sets.size() || draw.sets[draw.push_set])return false;
-            for(const auto& w:draw.push_writes->Writes()) {
-                if(w.pNext || w.pTexelBufferView)return false;
-                const bool image=w.descriptorType==vk::DescriptorType::eSampler || w.descriptorType==vk::DescriptorType::eSampledImage;
-                const bool buffer=w.descriptorType==vk::DescriptorType::eUniformBuffer || w.descriptorType==vk::DescriptorType::eStorageBuffer;
-                if(image ? (w.pBufferInfo || !w.pImageInfo) :
-                   buffer ? (!draw.immutable_upload_buffers_verified || !w.pBufferInfo || w.pImageInfo) : true)return false;
-            }
+            if(!draw.push_writes->ParallelReplaySafe(draw.immutable_upload_buffers_verified))return false;
         }
     }
     return true;
@@ -67,18 +62,31 @@ static bool RecordPassImpl(vk::CommandBuffer cmd,const Vulkan::Instance& instanc
     auto& dynamic=inline_dynamic?*inline_dynamic:local_dynamic;
     dynamic.Invalidate();
     vk::Pipeline bound_pipeline{};
+    const Draw* bound_vertex = nullptr;
+    const auto same_vertex = [](const Draw& a, const Draw& b) {
+        return a.pipeline == b.pipeline &&
+               Vulkan::VertexInputBytesEqual(a.vertex_attributes, b.vertex_attributes) &&
+               Vulkan::VertexInputBytesEqual(a.vertex_bindings, b.vertex_bindings) &&
+               Vulkan::VertexInputBytesEqual(a.vertex_buffers, b.vertex_buffers) &&
+               Vulkan::VertexInputBytesEqual(a.vertex_offsets, b.vertex_offsets) &&
+               Vulkan::VertexInputBytesEqual(a.vertex_sizes, b.vertex_sizes) &&
+               Vulkan::VertexInputBytesEqual(a.vertex_strides, b.vertex_strides);
+    };
     EmitWholePass(pass,
         [&](const auto&) {cmd.beginRendering(vk::RenderingInfo{.renderArea{.offset={0,0},.extent={target.width,target.height}},
             .layerCount=target.num_layers,.colorAttachmentCount=target.num_color_attachments,.pColorAttachments=colors.data(),
             .pDepthAttachment=db.has_depth?&depth:nullptr,.pStencilAttachment=db.has_stencil?&stencil:nullptr});},
         [&](const Draw& draw) {
             ApplyDynamicSnapshot(dynamic,draw.dynamic);dynamic.Commit(instance,commands);
-            if(instance.IsVertexInputDynamicState()) {
-                commands.setVertexInputEXT(vk::ArrayProxy<const vk::VertexInputBindingDescription2EXT>{draw.vertex_binding_count,draw.vertex_bindings.data()},
-                    vk::ArrayProxy<const vk::VertexInputAttributeDescription2EXT>{draw.vertex_attribute_count,draw.vertex_attributes.data()});
-                if(draw.vertex_buffer_count) commands.bindVertexBuffers(0,draw.vertex_buffer_count,draw.vertex_buffers.data(),draw.vertex_offsets.data());
-            } else if(draw.vertex_buffer_count) {
-                commands.bindVertexBuffers2(0,draw.vertex_buffer_count,draw.vertex_buffers.data(),draw.vertex_offsets.data(),draw.vertex_sizes.data(),draw.vertex_strides.data());
+            if (!bound_vertex || !same_vertex(*bound_vertex, draw)) {
+                if(instance.IsVertexInputDynamicState()) {
+                    commands.setVertexInputEXT(vk::ArrayProxy<const vk::VertexInputBindingDescription2EXT>{draw.vertex_binding_count,draw.vertex_bindings.data()},
+                        vk::ArrayProxy<const vk::VertexInputAttributeDescription2EXT>{draw.vertex_attribute_count,draw.vertex_attributes.data()});
+                    if(draw.vertex_buffer_count) commands.bindVertexBuffers(0,draw.vertex_buffer_count,draw.vertex_buffers.data(),draw.vertex_offsets.data());
+                } else if(draw.vertex_buffer_count) {
+                    commands.bindVertexBuffers2(0,draw.vertex_buffer_count,draw.vertex_buffers.data(),draw.vertex_offsets.data(),draw.vertex_sizes.data(),draw.vertex_strides.data());
+                }
+                bound_vertex = &draw;
             }
             if(bound_pipeline!=draw.pipeline) {commands.bindPipeline(vk::PipelineBindPoint::eGraphics,draw.pipeline);bound_pipeline=draw.pipeline;}
             commands.pushConstants(draw.layout,flags,0u,sizeof(draw.push),&draw.push);

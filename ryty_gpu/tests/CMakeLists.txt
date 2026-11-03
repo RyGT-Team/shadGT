@@ -389,3 +389,41 @@ add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/fast-flip-wait-under-test
     DEPENDS extract_fast_flip_wait.py "${SHADGT_ROOT}/src/core/libraries/videoout/driver.cpp" VERBATIM)
 target_sources(fast_flip_wait_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/fast-flip-wait-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/fast-flip-eligibility-under-test.inc")
 add_test(NAME fast_flip_wait COMMAND fast_flip_wait_test)
+
+add_executable(parallel_vertex_replay_test parallel_vertex_replay_test.cpp)
+target_compile_features(parallel_vertex_replay_test PRIVATE cxx_std_23)
+target_include_directories(parallel_vertex_replay_test PRIVATE "${SHADGT_ROOT}/src" "${SHADGT_ROOT}/externals/vulkan-headers/include" "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(parallel_vertex_replay_test PRIVATE /EHsc /UNDEBUG)
+else()
+    target_compile_options(parallel_vertex_replay_test PRIVATE -UNDEBUG)
+endif()
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/vertex-same-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/vertex-record-under-test.inc"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_vertex_replay.py" "${SHADGT_ROOT}/ryty_gpu/native/parallel_pass_recording.cpp" "${CMAKE_CURRENT_BINARY_DIR}"
+    DEPENDS extract_vertex_replay.py "${SHADGT_ROOT}/ryty_gpu/native/parallel_pass_recording.cpp" VERBATIM)
+target_sources(parallel_vertex_replay_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/vertex-same-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/vertex-record-under-test.inc")
+add_test(NAME parallel_vertex_replay COMMAND parallel_vertex_replay_test)
+
+add_executable(parallel_snapshot_replay_test parallel_snapshot_replay_test.cpp)
+target_compile_features(parallel_snapshot_replay_test PRIVATE cxx_std_23)
+target_include_directories(parallel_snapshot_replay_test PRIVATE "${SHADGT_ROOT}" "${SHADGT_ROOT}/src" "${SHADGT_ROOT}/externals/vulkan-headers/include" "${SHADGT_FMT_INCLUDE}" "${SHADGT_MAGIC_ENUM_INCLUDE}")
+if(MSVC)
+    target_compile_options(parallel_snapshot_replay_test PRIVATE /EHsc /UNDEBUG)
+else()
+    target_compile_options(parallel_snapshot_replay_test PRIVATE -UNDEBUG)
+endif()
+add_test(NAME parallel_snapshot_replay COMMAND parallel_snapshot_replay_test)
+
+add_executable(parallel_vertex_validate_test parallel_vertex_validate_test.cpp)
+target_compile_features(parallel_vertex_validate_test PRIVATE cxx_std_23)
+target_include_directories(parallel_vertex_validate_test PRIVATE "${SHADGT_ROOT}/externals/vulkan-headers/include" "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(parallel_vertex_validate_test PRIVATE /EHsc /UNDEBUG)
+else()
+    target_compile_options(parallel_vertex_validate_test PRIVATE -UNDEBUG)
+endif()
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/vertex-validate-under-test.inc"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_vertex_validate.py" "${SHADGT_ROOT}/ryty_gpu/native/parallel_pass_recording.cpp" "${CMAKE_CURRENT_BINARY_DIR}/vertex-validate-under-test.inc"
+    DEPENDS extract_vertex_validate.py "${SHADGT_ROOT}/ryty_gpu/native/parallel_pass_recording.cpp" VERBATIM)
+target_sources(parallel_vertex_validate_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/vertex-validate-under-test.inc")
+add_test(NAME parallel_vertex_validate COMMAND parallel_vertex_validate_test)

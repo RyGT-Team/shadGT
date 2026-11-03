@@ -257,3 +257,20 @@ add_custom_command(
     DEPENDS extract_upload_receipt.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" VERBATIM)
 target_sources(parallel_upload_receipt_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/upload-backing-proof.inc" "${CMAKE_CURRENT_BINARY_DIR}/upload-incarnation-bump.inc" "${CMAKE_CURRENT_BINARY_DIR}/upload-commit-proof.inc")
 add_test(NAME parallel_upload_receipt COMMAND parallel_upload_receipt_test)
+
+add_executable(parallel_vertex_lease_test parallel_vertex_lease_test.cpp)
+target_compile_features(parallel_vertex_lease_test PRIVATE cxx_std_23)
+target_include_directories(parallel_vertex_lease_test PRIVATE "${SHADGT_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(parallel_vertex_lease_test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(parallel_vertex_lease_test PRIVATE -UNDEBUG)
+endif()
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/vertex-lease-producer.inc" "${CMAKE_CURRENT_BINARY_DIR}/vertex-lease-capture.inc" "${CMAKE_CURRENT_BINARY_DIR}/vertex-lease-budget.inc" "${CMAKE_CURRENT_BINARY_DIR}/descriptor-stage.inc" "${CMAKE_CURRENT_BINARY_DIR}/vertex-validate.inc" "${CMAKE_CURRENT_BINARY_DIR}/descriptor-check.inc" "${CMAKE_CURRENT_BINARY_DIR}/lease-transfer.inc" "${CMAKE_CURRENT_BINARY_DIR}/lease-eligibility.inc"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_vertex_lease.py"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" "${SHADGT_ROOT}/ryty_gpu/native/parallel_pass_recording.h"
+        "${CMAKE_CURRENT_BINARY_DIR}/vertex-lease-producer.inc" "${CMAKE_CURRENT_BINARY_DIR}/vertex-lease-capture.inc" "${CMAKE_CURRENT_BINARY_DIR}/vertex-lease-budget.inc" "${CMAKE_CURRENT_BINARY_DIR}/descriptor-stage.inc" "${SHADGT_ROOT}/ryty_gpu/native/parallel_pass_recording.cpp" "${CMAKE_CURRENT_BINARY_DIR}/vertex-validate.inc" "${CMAKE_CURRENT_BINARY_DIR}/descriptor-check.inc" "${SHADGT_ROOT}/ryty_gpu/native/parallel_pass_coordinator.cpp" "${CMAKE_CURRENT_BINARY_DIR}/lease-transfer.inc" "${CMAKE_CURRENT_BINARY_DIR}/lease-eligibility.inc"
+    DEPENDS extract_vertex_lease.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" "${SHADGT_ROOT}/ryty_gpu/native/parallel_pass_recording.h" "${SHADGT_ROOT}/ryty_gpu/native/parallel_pass_recording.cpp" "${SHADGT_ROOT}/ryty_gpu/native/parallel_pass_coordinator.cpp")
+target_sources(parallel_vertex_lease_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/vertex-lease-producer.inc" "${CMAKE_CURRENT_BINARY_DIR}/vertex-lease-capture.inc" "${CMAKE_CURRENT_BINARY_DIR}/vertex-lease-budget.inc" "${CMAKE_CURRENT_BINARY_DIR}/descriptor-stage.inc" "${CMAKE_CURRENT_BINARY_DIR}/vertex-validate.inc" "${CMAKE_CURRENT_BINARY_DIR}/descriptor-check.inc" "${CMAKE_CURRENT_BINARY_DIR}/lease-transfer.inc" "${CMAKE_CURRENT_BINARY_DIR}/lease-eligibility.inc")
+add_test(NAME parallel_vertex_lease COMMAND parallel_vertex_lease_test)

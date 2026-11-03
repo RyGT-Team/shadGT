@@ -8,6 +8,20 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Native::Parallel {
+// A published state is immutable; its pipeline owner shares the packet lifetime.
+struct VertexIndexState {
+    VertexIndexState() noexcept {}
+    boost::container::static_vector<vk::VertexInputAttributeDescription2EXT,32> attributes;
+    boost::container::static_vector<vk::VertexInputBindingDescription2EXT,32> input_bindings;
+    boost::container::static_vector<vk::Buffer,32> buffers;
+    boost::container::static_vector<vk::DeviceSize,32> offsets,sizes,strides;
+    vk::Buffer index_buffer{};
+    u64 index_offset = 0;
+    vk::IndexType index_type = vk::IndexType::eUint32;
+    u32 index_count = 0;
+    std::shared_ptr<const void> pipeline_owner;
+};
+inline constexpr std::size_t VertexLeaseCharge = sizeof(VertexIndexState) + 128;
 // Immutable worker packet. The producer proves resource provenance and ordered
 // submission-window borrowing; the epoch marker itself does not own GPU handles.
 // Production extended admission currently excludes attachment clears.
@@ -25,12 +39,7 @@ struct Draw {
     bool immutable_upload_buffers_verified{};
     std::shared_ptr<const DescriptorSnapshot> push_writes;
     std::size_t descriptor_bytes{};
-    // Complete, bounded vertex state owned by each packet. Handles are leased
-    // by the same submission window as the pass; producer proves their origin.
-    boost::container::static_vector<vk::VertexInputAttributeDescription2EXT,32> vertex_attributes{};
-    boost::container::static_vector<vk::VertexInputBindingDescription2EXT,32> vertex_bindings{};
-    boost::container::static_vector<vk::Buffer,32> vertex_buffers{};
-    boost::container::static_vector<vk::DeviceSize,32> vertex_offsets{},vertex_sizes{},vertex_strides{};
+    std::shared_ptr<const VertexIndexState> vertex_index;
     u32 vertex_attribute_count{},vertex_binding_count{},vertex_buffer_count{};
     bool vertex_backing_verified{};
     u32 vertices{}, instances{}, first_vertex{}, first_instance{};
@@ -46,6 +55,18 @@ struct Pass {
     std::shared_ptr<const void> resource_lease;
     std::vector<Draw> draws;
 };
+// In addition to the in-flight budget, synchronous completion pins can retain
+// at most 64 * 256 leases until the corresponding completion callback.
+inline bool MinimumPassBytes(const Pass& pass,std::size_t& bytes) noexcept {
+    constexpr auto max=~std::size_t{0};
+    if(pass.draws.capacity()>(max-sizeof(Pass))/sizeof(Draw))return false;
+    bytes=sizeof(Pass)+pass.draws.capacity()*sizeof(Draw);
+    for(const auto& draw:pass.draws) if(draw.vertex_index) {
+        if(bytes>max-VertexLeaseCharge)return false;
+        bytes+=VertexLeaseCharge;
+    }
+    return true;
+}
 // Reconstruct the worker-local dirty state from complete per-draw values;
 // producer dirty bits belong to another command buffer and are not reusable.
 inline void ApplyDynamicSnapshot(Vulkan::DynamicState& d,const Vulkan::DynamicState& s) {

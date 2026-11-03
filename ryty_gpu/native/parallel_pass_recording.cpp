@@ -18,17 +18,20 @@ bool ValidatePass(const Pass& pass) {
             const u64 element=draw.index_type==vk::IndexType::eUint16?2:4;
             if(draw.index_offset%element || !draw.index_size || draw.index_offset>~vk::DeviceSize{0}-draw.index_size || u64(draw.vertices)>draw.index_size/element)return false;
         }
+        if(!draw.vertex_index && (draw.vertex_attribute_count || draw.vertex_binding_count || draw.vertex_buffer_count || draw.indexed))return false;
+        const VertexIndexState empty;
+        const auto& vi=draw.vertex_index ? *draw.vertex_index : empty;
         if(draw.vertex_attribute_count>32 || draw.vertex_binding_count>32 || draw.vertex_buffer_count>32)return false;
-        if(draw.vertex_attributes.size()!=draw.vertex_attribute_count || draw.vertex_bindings.size()!=draw.vertex_binding_count ||
-           draw.vertex_buffers.size()!=draw.vertex_buffer_count || draw.vertex_offsets.size()!=draw.vertex_buffer_count ||
-           draw.vertex_sizes.size()!=draw.vertex_buffer_count || draw.vertex_strides.size()!=draw.vertex_buffer_count)return false;
+        if(vi.attributes.size()!=draw.vertex_attribute_count || vi.input_bindings.size()!=draw.vertex_binding_count ||
+           vi.buffers.size()!=draw.vertex_buffer_count || vi.offsets.size()!=draw.vertex_buffer_count ||
+           vi.sizes.size()!=draw.vertex_buffer_count || vi.strides.size()!=draw.vertex_buffer_count)return false;
         if(draw.vertex_buffer_count!=draw.vertex_binding_count || draw.vertex_buffer_count!=draw.vertex_attribute_count)return false;
         if(draw.vertex_buffer_count && !draw.vertex_backing_verified)return false;
         for(u32 i=0;i<draw.vertex_buffer_count;++i)
-            if(draw.vertex_bindings[i].binding!=i || draw.vertex_attributes[i].binding!=i)return false;
-        for(u32 i=0;i<draw.vertex_buffer_count;++i)if(!draw.vertex_buffers[i] || !draw.vertex_sizes[i])return false;
-        for(u32 i=0;i<draw.vertex_attribute_count;++i)if(draw.vertex_attributes[i].pNext)return false;
-        for(u32 i=0;i<draw.vertex_binding_count;++i)if(draw.vertex_bindings[i].pNext)return false;
+            if(vi.input_bindings[i].binding!=i || vi.attributes[i].binding!=i)return false;
+        for(u32 i=0;i<draw.vertex_buffer_count;++i)if(!vi.buffers[i] || !vi.sizes[i])return false;
+        for(u32 i=0;i<draw.vertex_attribute_count;++i)if(vi.attributes[i].pNext)return false;
+        for(u32 i=0;i<draw.vertex_binding_count;++i)if(vi.input_bindings[i].pNext)return false;
         static_assert(Shader::Backend::MaxDescriptorSets<=32);
         for(u32 i=0;i<draw.sets.size();++i) if((draw.required_sets_mask & (u32{1}<<i)) && !draw.sets[i])return false;
         if(draw.push_set<draw.sets.size() && (draw.required_sets_mask & (u32{1}<<draw.push_set)))return false;
@@ -69,13 +72,15 @@ bool RecordPass(vk::CommandBuffer cmd,const Vulkan::Instance& instance,const Pas
             .layerCount=target.num_layers,.colorAttachmentCount=target.num_color_attachments,.pColorAttachments=colors.data(),
             .pDepthAttachment=db.has_depth?&depth:nullptr,.pStencilAttachment=db.has_stencil?&stencil:nullptr});},
         [&](const Draw& draw) {
+            const VertexIndexState empty;
+            const auto& vi=draw.vertex_index ? *draw.vertex_index : empty;
             ApplyDynamicSnapshot(dynamic,draw.dynamic);dynamic.Commit(instance,commands);
             if(instance.IsVertexInputDynamicState()) {
-                commands.setVertexInputEXT(vk::ArrayProxy<const vk::VertexInputBindingDescription2EXT>{draw.vertex_binding_count,draw.vertex_bindings.data()},
-                    vk::ArrayProxy<const vk::VertexInputAttributeDescription2EXT>{draw.vertex_attribute_count,draw.vertex_attributes.data()});
-                if(draw.vertex_buffer_count) commands.bindVertexBuffers(0,draw.vertex_buffer_count,draw.vertex_buffers.data(),draw.vertex_offsets.data());
+                commands.setVertexInputEXT(vk::ArrayProxy<const vk::VertexInputBindingDescription2EXT>{draw.vertex_binding_count,vi.input_bindings.data()},
+                    vk::ArrayProxy<const vk::VertexInputAttributeDescription2EXT>{draw.vertex_attribute_count,vi.attributes.data()});
+                if(draw.vertex_buffer_count) commands.bindVertexBuffers(0,draw.vertex_buffer_count,vi.buffers.data(),vi.offsets.data());
             } else if(draw.vertex_buffer_count) {
-                commands.bindVertexBuffers2(0,draw.vertex_buffer_count,draw.vertex_buffers.data(),draw.vertex_offsets.data(),draw.vertex_sizes.data(),draw.vertex_strides.data());
+                commands.bindVertexBuffers2(0,draw.vertex_buffer_count,vi.buffers.data(),vi.offsets.data(),vi.sizes.data(),vi.strides.data());
             }
             if(bound_pipeline!=draw.pipeline) {commands.bindPipeline(vk::PipelineBindPoint::eGraphics,draw.pipeline);bound_pipeline=draw.pipeline;}
             commands.pushConstants(draw.layout,flags,0u,sizeof(draw.push),&draw.push);

@@ -114,6 +114,9 @@ vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type);
 
 namespace Vulkan {
 namespace {
+alignas(64) std::atomic<u64> vertex_lease_fresh{};
+alignas(64) std::atomic<u64> vertex_lease_replaced{};
+alignas(64) std::atomic<u64> vertex_lease_borrowed{};
 struct AheadVulkanBackend {
     using Pool=vk::DescriptorPool;using Layout=vk::DescriptorSetLayout;using Set=vk::DescriptorSet;
     static constexpr std::size_t MaxSetsPerPool=256;
@@ -248,8 +251,8 @@ struct PendingDescriptorUpdates {
     template<class Rows> void Stage(const Rows& rows,vk::DescriptorSet set) noexcept {
         for(const auto& source:rows) {
             auto row=source;row.dstSet=set;
-            if(row.pBufferInfo) {std::copy_n(row.pBufferInfo,row.descriptorCount,buffers.data()+nb);row.pBufferInfo=buffers.data()+nb;nb+=row.descriptorCount;}
-            else {std::copy_n(row.pImageInfo,row.descriptorCount,images.data()+ni);row.pImageInfo=images.data()+ni;ni+=row.descriptorCount;}
+            if(row.pBufferInfo) {if(row.descriptorCount==1)buffers[nb]=*row.pBufferInfo;else std::copy_n(row.pBufferInfo,row.descriptorCount,buffers.data()+nb);row.pBufferInfo=buffers.data()+nb;nb+=row.descriptorCount;}
+            else {if(row.descriptorCount==1)images[ni]=*row.pImageInfo;else std::copy_n(row.pImageInfo,row.descriptorCount,images.data()+ni);row.pImageInfo=images.data()+ni;ni+=row.descriptorCount;}
             writes[nw++]=row;++staged_rows;
         }
         high_rows=std::max<u64>(high_rows,nw);
@@ -1554,9 +1557,13 @@ void NativeRenderer::EndRendering() {
             const auto reset=[&]() noexcept {stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;};
             if(Native::Parallel::RotateSegment(*sidecar->coordinator,*device,sidecar->epoch,
                     stream.list,stream.cmd,sidecar->lease,64*1024,reset,&sidecar->rotation_diag)) {
-                std::size_t bytes=sizeof(pass)+pass.draws.capacity()*sizeof(Native::Parallel::Draw);
-                for(const auto& draw:pass.draws) bytes+=draw.descriptor_bytes;
-                try {queued=pass.draws.size()>=8 ? (sidecar->transfer_applied_mode.Enabled() ? sidecar->coordinator->TryPassTransfer(sidecar->epoch,pass,bytes) : sidecar->coordinator->TryPass(sidecar->epoch,pass,bytes)) : sidecar->coordinator->TrySmallPass(sidecar->epoch,pass,bytes);}
+                std::size_t bytes{};
+                bool charge_ok=Native::Parallel::MinimumPassBytes(pass,bytes);
+                for(const auto& draw:pass.draws) {
+                    if(bytes>~std::size_t{0}-draw.descriptor_bytes) {charge_ok=false;break;}
+                    bytes+=draw.descriptor_bytes;
+                }
+                try {if(charge_ok) queued=pass.draws.size()>=8 ? (sidecar->transfer_applied_mode.Enabled() ? sidecar->coordinator->TryPassTransfer(sidecar->epoch,pass,bytes) : sidecar->coordinator->TryPass(sidecar->epoch,pass,bytes)) : sidecar->coordinator->TrySmallPass(sidecar->epoch,pass,bytes);}
                 catch(const std::bad_alloc&) {if(pass.draws.size()<8)++sidecar->small_admission_exceptions;else ++sidecar->large_admission_exceptions;queued=false;}
             }
         }
@@ -5197,6 +5204,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         if(preclosed_serial_scope)++parallel->natural_preclosed;
     }
     bool parallel_draw=false;
+    bool leaseable_vi=false;
     bool parallel_index_safe=false;u64 parallel_index_bytes=0;
     ParallelBindingCapture parallel_bindings{};
     std::shared_ptr<const DescriptorSnapshot> parallel_push_writes;
@@ -6052,7 +6060,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             fail(24,cheap_eligible && !descriptor_safe && !b.writes_buffers && b.gpu_writes.empty() && b.stored.empty());
             parallel->gates.Add(mask,stable);
         }
-        const bool eligible=descriptor_safe;
+        const bool empty_vi = vi->attributes.empty() && vi->input_bindings.empty() &&
+            vi->buffers.empty() && vi->offsets.empty() && vi->sizes.empty() && vi->strides.empty() && !is_indexed;
+        leaseable_vi = !empty_vi && prepared && !prepared->vertex_index_published && prepared->vertex_index.get()==vi;
+        const bool eligible=descriptor_safe && (leaseable_vi || empty_vi);
         if(eligible) {++parallel->eligible;
             if(parallel->active)++parallel->eligible_in_active_scope;
             else if(s.rendering)++parallel->eligible_in_serial_scope;
@@ -6295,7 +6306,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             } unfinished_draw_guard{draws};
             auto& captured=draws.back();
             captured.pipeline=pipeline->Handle();captured.layout=pipeline->GetLayout();
-            captured.pipeline_owner=prepared->pipeline_keepalive;captured.dynamic=s.dynamic;captured.push=b.push;
+            captured.dynamic=s.dynamic;captured.push=b.push;
             captured.sets=parallel_bindings.sets;captured.required_sets_mask=parallel_required_sets;
             captured.immutable_upload_buffers_verified=true;captured.push_writes=std::move(parallel_push_writes);
             captured.push_set=pipeline->PushSet()<captured.sets.size()?pipeline->PushSet():static_cast<u32>(captured.sets.size());
@@ -6304,18 +6315,23 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             captured.vertex_binding_count=static_cast<u32>(vi->input_bindings.size());
             captured.vertex_buffer_count=static_cast<u32>(vi->buffers.size());
             captured.vertex_backing_verified=true;
-            captured.vertex_attributes.assign(vi->attributes.begin(),vi->attributes.end());
-            captured.vertex_bindings.assign(vi->input_bindings.begin(),vi->input_bindings.end());
-            captured.vertex_buffers.assign(vi->buffers.begin(),vi->buffers.end());
-            captured.vertex_offsets.assign(vi->offsets.begin(),vi->offsets.end());
-            captured.vertex_sizes.assign(vi->sizes.begin(),vi->sizes.end());
-            captured.vertex_strides.assign(vi->strides.begin(),vi->strides.end());
             captured.vertices=regs.num_indices;captured.instances=instances;
             captured.first_vertex=vertex_offset;captured.first_instance=instance_offset;
             if(is_indexed) {captured.indexed=true;captured.index_backing_verified=parallel_index_safe;
                 captured.index_buffer=vi->index_buffer;captured.index_offset=vi->index_offset;captured.index_size=parallel_index_bytes;
                 captured.index_type=vi->index_type;captured.vertex_offset=s32(vertex_offset);}
+            if(leaseable_vi) {
+                // Finish all potentially throwing capture work before publication.
+                prepared->vertex_index->pipeline_owner=prepared->pipeline_keepalive;
+                prepared->vertex_index_published=true;
+                captured.vertex_index=prepared->vertex_index;
+                captured.pipeline_owner=captured.vertex_index;
+                vertex_lease_borrowed.fetch_add(1,std::memory_order_relaxed);
+            } else captured.pipeline_owner=prepared->pipeline_keepalive;
             ASSERT_MSG(parallel->sync_pins.Pin(parallel->pin_slot,captured.pipeline_owner),"parallel pipeline owner pin failed");
+            // Packet and reserved completion pin now own the published VI.
+            // Do not retain its pipeline in the PreparedDraw pool.
+            if(leaseable_vi) prepared->vertex_index.reset();
             if(ParallelGateDiagEnabled()) {const auto n=captured.vertex_buffer_count;
                 ++parallel->captured_vertex_counts[n==0?0:n==1?1:n<4?2:n<8?3:n<16?4:n<32?5:6];parallel->captured_vertex_sum+=n;}
             unfinished_draw_guard.committed=true;pending_draw_guard.committed=true;++parallel->draws;
@@ -7528,8 +7544,13 @@ bool NativeRenderer::PrepareVertices(PreparedDraw& p, const AmdGpu::Regs& regs,
     if (regs.primitive_type == AmdGpu::PrimitiveType::QuadList) {
         return false; // the recorder makes their triangles
     }
-    if (!p.vertex_index) {
-        p.vertex_index = std::make_unique<VertexIndexState>();
+    // Once published, workers or completion pins may still read this object.
+    if (!p.vertex_index || p.vertex_index_published) {
+        const bool replacing=p.vertex_index_published;
+        try { p.vertex_index = std::make_shared<VertexIndexState>(); }
+        catch (const std::bad_alloc&) { return false; }
+        (replacing ? vertex_lease_replaced : vertex_lease_fresh).fetch_add(1,std::memory_order_relaxed);
+        p.vertex_index_published = false;
     }
     VertexIndexState& v = *p.vertex_index;
     v = {};
@@ -10045,6 +10066,7 @@ void NativeRenderer::Report() {
         }
         sidecar->record_partition={};
         LOG_INFO(Render_Vulkan,"PARALLEL-PRODUCER-CPU cumulative structure={} vertex={} snapshot={} actions={} upload_lookups={} stage_schemas={} stage_lookups={} clip_fast={} direct_table_cache_hits={}",sidecar->producer_structure_hits,sidecar->producer_vertex_hits,sidecar->producer_snapshot_hits,sidecar->producer_action_hits,sidecar->producer_upload_lookup_hits,sidecar->producer_stage_schema_hits,sidecar->producer_stage_lookup_hits,sidecar->clip_fast_hits,sidecar->direct_table_cache_hits);
+        LOG_INFO(Render_Vulkan,"PARALLEL-VERTEX-LEASE cumulative fresh={} replaced_published={} borrowed_packets={}",vertex_lease_fresh.load(std::memory_order_relaxed),vertex_lease_replaced.load(std::memory_order_relaxed),vertex_lease_borrowed.load(std::memory_order_relaxed));
         const auto& batch=sidecar->descriptor_updates;
         LOG_INFO(Render_Vulkan,"PARALLEL-DESCRIPTOR-BATCH cumulative logical_draws={} actual_calls={} staged_rows={} immediate_draws={} overflow_draws={} unsupported_draws={} high_rows={} pending_rows={} flush_end={} flush_serial={} flush_abandoned={} flush_capacity={} flush_unsupported={} flush_exception={}",
             batch.logical_draws,batch.actual_calls,batch.staged_rows,batch.immediate_draws,batch.overflow_draws,batch.unsupported_draws,batch.high_rows,batch.nw,batch.flushes[PendingDescriptorUpdates::EndPass],batch.flushes[PendingDescriptorUpdates::Serial],batch.flushes[PendingDescriptorUpdates::Abandoned],batch.flushes[PendingDescriptorUpdates::Capacity],batch.flushes[PendingDescriptorUpdates::Unsupported],batch.flushes[PendingDescriptorUpdates::Exception]);

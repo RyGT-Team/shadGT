@@ -348,6 +348,25 @@ private:
     std::vector<u8> data;
 };
 
+void GraphicsPipeline::SetStageInfos(std::span<const Shader::Info*, MaxShaderStages> infos) {
+    std::ranges::copy(infos, stages.begin());
+    std::ranges::copy(infos, canonical_stages.begin());
+    // Installed before pipeline publication. Draw-stage copies change user data,
+    // not this shader metadata. Unknown legacy metadata keeps the live scan.
+    parallel_stage_summary = {};
+    for (const auto* stage : GetStages()) if (stage) {
+        parallel_stage_summary.known &= stage->attribute_flags_known && stage->resource_usage_known;
+        parallel_stage_summary.safe &= stage->fmasks.empty() && !stage->translation_failed &&
+            (stage->sw_stage == Shader::SwStage::Vertex || stage->sw_stage == Shader::SwStage::Fragment) &&
+            (!stage->has_fetch_shader || stage->sw_stage == Shader::SwStage::Vertex) &&
+            !stage->uses_patches && !stage->uses_dma && !stage->has_storage_images &&
+            !stage->uses_shader_clock &&
+            !std::ranges::any_of(stage->buffers, [](const auto& buffer) { return buffer.is_written; });
+        parallel_stage_summary.vertex_fetch |= stage->has_fetch_shader;
+        parallel_stage_summary.uses_direct |= stage->uses_direct;
+    }
+}
+
 GraphicsPipeline::GraphicsPipeline(
     const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
     const Shader::Profile& profile, const GraphicsPipelineKey& key_,
@@ -361,8 +380,7 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
     const vk::Device device = instance.GetDevice();
-    std::ranges::copy(infos, stages.begin());
-    std::ranges::copy(infos, canonical_stages.begin());
+    SetStageInfos(infos);
     // PERF-038: `preloading` builds a stored pipeline in the background. Its shader infos carry no
     // user data and there are no guest buffers to read: vertex inputs and the tessellation
     // helpers come from the stored serialization data; the runtime infos are the ones stored

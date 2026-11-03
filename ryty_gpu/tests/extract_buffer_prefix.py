@@ -23,5 +23,5 @@ end = source.index("        whole_phases.Next(7);", start)
 (out / "buffer-prefix-empty-final.inc").write_text(source[start:end], encoding="utf-8")
 
 start = source.index("        const bool native_receipt_valid=trusted && from_prepared")
-end = source.index("        if(vertex_requested && has_vertex_input && vertex_preflight", start)
+end = source.index("        const bool known_shape=worker_identity", start)
 (out / "native-vi-admission.inc").write_text(source[start:end], encoding="utf-8")

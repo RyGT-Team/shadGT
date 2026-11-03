@@ -5536,15 +5536,15 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             prepared->proof_context->Valid(prepared->proof_mode_state) &&
             prepared->unmap_gen==unmap_generation.load(std::memory_order_acquire) &&
             buffer_freshness_certified && buffer_log.Seq()==buffer_freshness_seq;
+        const bool known_shape=worker_identity && worker_result->vertex_identity==vi &&
+            worker_result->vertex_buffers_data==vi->buffers.data() && worker_result->vertex_buffers_size==vi->buffers.size() && worker_result->vertex_shape;
         if(vertex_requested && has_vertex_input && vertex_preflight &&
            prepared->has_vertices && prepared->vertex_index.get()==vi &&
-           vi->buffers.size()<=32 && vi->input_bindings.size()<=32 && vi->attributes.size()<=32 &&
+            (known_shape || (vi->buffers.size()<=32 && vi->input_bindings.size()<=32 && vi->attributes.size()<=32 &&
            vi->buffers.size()==vi->offsets.size() && vi->buffers.size()==vi->sizes.size() &&
            vi->buffers.size()==vi->strides.size() && !vi->buffers.empty() &&
-           vi->buffers.size()==vi->input_bindings.size() && vi->buffers.size()==vi->attributes.size()) {
+            vi->buffers.size()==vi->input_bindings.size() && vi->buffers.size()==vi->attributes.size()))) {
             vertex_shape_ok=true;vertex_safe=true;
-            const bool known_shape=worker_identity && worker_result->vertex_identity==vi &&
-                worker_result->vertex_buffers_data==vi->buffers.data() && worker_result->vertex_buffers_size==vi->buffers.size() && worker_result->vertex_shape;
             if (known_shape) {vertex_binding_ok=worker_result->vertex_bindings;vertex_pnext_ok=worker_result->vertex_pnext;++parallel->producer_vertex_hits;}
             else {
                 for(std::size_t i=0;i<vi->buffers.size();++i)
@@ -5620,7 +5620,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         }
         whole_phases.Next(2);
         bool stages_safe=true,resource_key_known=true;
-        for(const auto* stage:pipeline->GetStages()) if(stage) {
+        const auto& stage_summary=pipeline->GetParallelStageSummary();
+        if(stage_summary.known) {
+            stages_safe=stage_summary.safe &&
+                (!stage_summary.vertex_fetch || (vertex_requested && has_vertex_input && vertex_safe)) &&
+                (!stage_summary.uses_direct || ParallelD2Enabled());
+        } else for(const auto* stage:pipeline->GetStages()) if(stage) {
             if(!stage->resource_usage_known) resource_key_known=false;
             if(!stage->fmasks.empty() || !stage->attribute_flags_known || !stage->resource_usage_known || stage->translation_failed ||
              (stage->sw_stage!=Shader::SwStage::Vertex && stage->sw_stage!=Shader::SwStage::Fragment) ||

@@ -8,6 +8,30 @@ get_filename_component(SHADGT_ROOT "../.." ABSOLUTE)
 set(SHADGT_FMT_INCLUDE "${SHADGT_ROOT}/externals/fmt/include" CACHE PATH "fmt headers")
 set(SHADGT_MAGIC_ENUM_INCLUDE "${SHADGT_ROOT}/externals/magic_enum/include" CACHE PATH "magic_enum headers")
 
+add_executable(parallel_admission_metadata_test parallel_admission_metadata_test.cpp)
+target_compile_features(parallel_admission_metadata_test PRIVATE cxx_std_23)
+target_include_directories(parallel_admission_metadata_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(parallel_admission_metadata_test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(parallel_admission_metadata_test PRIVATE -UNDEBUG)
+endif()
+set(admission_fragments admission-stage-type.inc admission-stage-build.inc admission-stage-select.inc
+    admission-worker-identity.inc admission-vertex-build.inc admission-vertex-select.inc)
+list(TRANSFORM admission_fragments PREPEND "${CMAKE_CURRENT_BINARY_DIR}/")
+add_custom_command(OUTPUT ${admission_fragments}
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_parallel_admission.py"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_graphics_pipeline.h"
+        "${CMAKE_CURRENT_BINARY_DIR}"
+    DEPENDS extract_parallel_admission.py
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_graphics_pipeline.h" VERBATIM)
+target_sources(parallel_admission_metadata_test PRIVATE ${admission_fragments})
+add_test(NAME parallel_admission_metadata COMMAND parallel_admission_metadata_test)
+
 foreach(name IN ITEMS parallel_initial_mode parallel_readonly_hint parallel_descriptor_actions parallel_producer_oom parallel_mixed_snapshot shared_pipeline_policy pipeline_retention parallel_hash_fallback parallel_descriptor_snapshot unique_upload_batch descriptor_update_batch allocation_pressure_retry dlssg_options dlssg_state ghost_smoothing texture_gc video_out_source tiling_specialization)
     add_executable(${name}_test ${name}_test.cpp)
     target_compile_features(${name}_test PRIVATE cxx_std_23)

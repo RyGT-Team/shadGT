@@ -73,6 +73,17 @@ struct GraphicsPipelineKey {
 
 class GraphicsPipeline : public Pipeline {
 public:
+    struct ParallelStageSummary {
+        bool known{true};
+        bool safe{true};
+        bool vertex_fetch{};
+        bool uses_direct{};
+    };
+
+    const ParallelStageSummary& GetParallelStageSummary() const noexcept {
+        return parallel_stage_summary;
+    }
+
     struct SerializationSupport {
         VertexInputs<vk::VertexInputAttributeDescription> vertex_attributes{};
         VertexInputs<vk::VertexInputBindingDescription> vertex_bindings{};
@@ -134,10 +145,7 @@ public:
 
     /// PERF-019: a pipeline built on a worker from copies of the shader infos points at the
     /// cached infos once it is used.
-    void SetStageInfos(std::span<const Shader::Info*, MaxShaderStages> infos) {
-        std::ranges::copy(infos, stages.begin());
-        std::ranges::copy(infos, canonical_stages.begin());
-    }
+    void SetStageInfos(std::span<const Shader::Info*, MaxShaderStages> infos);
 
 private:
     /// PERF-017: stage libraries of a runtime pipeline and the optimized link built from them.
@@ -157,6 +165,7 @@ private:
 
     GraphicsPipelineKey key;
     Shader::Gcn::FetchShaderData fetch_shader{};
+    ParallelStageSummary parallel_stage_summary;
 };
 
 struct ClipDistanceShaderKey {

@@ -211,6 +211,12 @@ target_include_directories(Dear_ImGui INTERFACE imgui/)
 
 # Tracy
 option(TRACY_ENABLE "Enable Tracy in Debug builds" ON)
+# The native renderer is unloadable: Tracy's automatic destructor waits for worker
+# threads under the Windows loader lock when the last DLL reference is released.
+# Fiber finalization can trigger that unload, so keep the automatic client disabled.
+if (SHADGT_RYTY_GPU)
+    set(TRACY_ENABLE OFF CACHE BOOL "Enable Tracy in Debug builds" FORCE)
+endif()
 option(TRACY_NO_CRASH_HANDLER "" ON) # Otherwise texture cache exceptions will be treaten as a crash
 option(TRACY_ON_DEMAND "" ON)
 option(TRACY_NO_FRAME_IMAGE "" ON)

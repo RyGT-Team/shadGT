@@ -8,6 +8,7 @@
 #include "common/polyfill_thread.h"
 #include "core/libraries/videoout/video_out.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -33,7 +34,7 @@ struct VideoOutPort {
     std::mutex port_mutex;
     std::condition_variable vo_cv;
     std::condition_variable vblank_cv;
-    int flip_rate = 0;
+    std::atomic<int> flip_rate{0};
     int prev_index = -1;
     bool is_open = false;
     bool is_hdr = false;
@@ -122,6 +123,7 @@ private:
     void PresentThread(std::stop_token token);
 
     std::mutex mutex;
+    std::condition_variable request_cv;
     VideoOutPort main_port{};
     std::jthread present_thread;
     std::queue<Request> requests;

@@ -57,7 +57,14 @@ VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
     present_thread = std::jthread([&](std::stop_token token) { PresentThread(token); });
 }
 
-VideoOutDriver::~VideoOutDriver() = default;
+VideoOutDriver::~VideoOutDriver() {
+    {
+        std::scoped_lock lock{mutex};
+        present_thread.request_stop();
+    }
+    request_cv.notify_all();
+    if (present_thread.joinable()) present_thread.join();
+}
 
 int VideoOutDriver::Open(const ServiceThreadParams* params) {
     if (main_port.is_open) {
@@ -73,7 +80,7 @@ void VideoOutDriver::Close(s32 handle) {
 
     // Mark as closed
     main_port.is_open = false;
-    main_port.flip_rate = 0;
+    main_port.flip_rate.store(0, std::memory_order_relaxed);
     main_port.prev_index = -1;
 
     // Clear port information
@@ -424,18 +431,21 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         frame = presenter->PrepareFrame(group, buffer.address_left);
     }
 
-    std::scoped_lock lock{mutex};
-    if (trace.generation)
-        Common::FrameQueueTrace::Enqueue(trace);
-    requests.push({
-        .frame = frame,
-        .port = port,
-        .flip_arg = flip_arg,
-        .index = index,
-        .eop = is_eop,
-        .trace = trace,
-        .submitted = std::chrono::steady_clock::now(),
-    });
+    {
+        std::scoped_lock lock{mutex};
+        if (trace.generation)
+            Common::FrameQueueTrace::Enqueue(trace);
+        requests.push({
+            .frame = frame,
+            .port = port,
+            .flip_arg = flip_arg,
+            .index = index,
+            .eop = is_eop,
+            .trace = trace,
+            .submitted = std::chrono::steady_clock::now(),
+        });
+    }
+    request_cv.notify_one();
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
@@ -443,8 +453,9 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                                                  EmulatorSettings.GetVblankFrequency());
     // FAST-FLIP (ryGT): a frame finished between two vblanks is flipped at once instead of at
     // the next vblank, so a 25 ms frame shows after 25 ms rather than 33 ms (GT Sport's races
-    // otherwise snap to 30 fps). The loop runs four times per vblank; the game's vblank events
-    // and status still come once per vblank. GPU.fast_flips in the game's config (the
+    // otherwise snap to 30 fps). Enqueue wakes the thread between four scheduled ticks per
+    // vblank; the game's vblank events and status still come once per vblank.
+    // GPU.fast_flips in the game's config (the
     // launcher's option) or RYGT_FAST_FLIPS=1.
     static const u32 ticks_per_vblank = [] {
         bool fast = false;
@@ -466,7 +477,24 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     Common::SetCurrentThreadName("shadGT:PresentThread");
     Common::SetCurrentThreadRealtime(tick_period);
 
-    Common::AccurateTimer timer{tick_period};
+    using Clock = std::chrono::steady_clock;
+    auto next_tick = Clock::now();
+    const auto current_flip_rate = [&] {
+        static const u32 fps_lock = [] {
+            const char* env = std::getenv("SHADGT_FPS_LOCK");
+            const u32 fps = env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0;
+            if (fps != 0) {
+                LOG_WARNING(Lib_VideoOut, "PERF-075: flips locked to at most {} per second", fps);
+            }
+            return fps;
+        }();
+        return LockedFlipRate(main_port.flip_rate.load(std::memory_order_relaxed), fps_lock,
+                              EmulatorSettings.GetVblankFrequency());
+    };
+    const auto early_allowed = [&] {
+        return ticks_per_vblank > 1 && !DebugState.IsGuestThreadsPaused() &&
+               !Common::GuestClock::IsPaused() && current_flip_rate() == 0;
+    };
 
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
@@ -481,11 +509,42 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     };
 
     while (!token.stop_requested()) {
-        timer.Start();
+        auto now = Clock::now();
+        if (now < next_tick) {
+            if (early_allowed()) {
+                std::unique_lock lock{mutex};
+                request_cv.wait_until(lock, next_tick,
+                                      [&] { return token.stop_requested() || !requests.empty(); });
+                lock.unlock();
+                if (token.stop_requested()) {
+                    break;
+                }
+                now = Clock::now();
+                if (now < next_tick && early_allowed()) {
+                    if (const auto request = receive_request()) {
+                        {
+                            std::scoped_lock stats_lock{g_flip_stats.mutex};
+                            ++g_flip_stats.early_flips;
+                        }
+                        Flip(request);
+                        FRAME_END;
+                    }
+                    continue; // early wakes do not advance the vblank deadline
+                }
+            }
+            now = Clock::now();
+            if (now < next_tick) {
+                Common::AccurateSleep(next_tick - now, nullptr, false);
+            }
+        }
+        if (token.stop_requested()) {
+            break;
+        }
+        const bool overdue = Clock::now() > next_tick;
+        next_tick += tick_period;
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();
-            timer.End();
             continue;
         }
         if (Common::GuestClock::IsPaused()) {
@@ -493,7 +552,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             // pipeline compile, as no time passes for the game. PERF-100: the last frame is
             // shown again, with the compile notice drawn over it (PERF-102: or the splash
             // screen, before the game's first frame).
-            if (timer.GetTotalWait().count() < 0) {
+            if (overdue) {
                 // Before the game's first frame a blank frame, which shows the splash screen
                 // and the precompile bar; after it the last frame (skipped while it is taken).
                 // DIAG-126 (SHADGT_NO_LAST_FRAME=1): compile pauses after the first frame keep
@@ -508,24 +567,12 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     DrawLastFrame();
                 }
             }
-            timer.End();
             continue;
         }
 
         // Check if it's time to take a request.
         auto& vblank_status = main_port.vblank_status;
-        // PERF-075: SHADGT_FPS_LOCK=<fps> (30 in Run-GTSportPerformance.ps1) paces flips evenly
-        // at that rate; GT Sport's races vary between 25 and 40 FPS, which shows as judder.
-        static const u32 fps_lock = [] {
-            const char* env = std::getenv("SHADGT_FPS_LOCK");
-            const u32 fps = env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0;
-            if (fps != 0) {
-                LOG_WARNING(Lib_VideoOut, "PERF-075: flips locked to at most {} per second", fps);
-            }
-            return fps;
-        }();
-        const int flip_rate =
-            LockedFlipRate(main_port.flip_rate, fps_lock, EmulatorSettings.GetVblankFrequency());
+        const int flip_rate = current_flip_rate();
         const bool vblank_tick = tick++ % ticks_per_vblank == 0;
         if (!vblank_tick) {
             // FAST-FLIP: between vblanks, only a ready frame is flipped.
@@ -539,7 +586,6 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     FRAME_END;
                 }
             }
-            timer.End();
             continue;
         }
         if (vblank_status.count % (flip_rate + 1) == 0) {
@@ -555,7 +601,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             }
             const auto request = receive_request();
             if (!request) {
-                if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
+                if (overdue) { // Dont draw too fast
                     if (!main_port.is_open) {
                         DrawBlankFrame();
                     } else if (ImGui::Core::MustKeepDrawing()) {
@@ -592,7 +638,6 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             main_port.vblank_cv.notify_all();
         }
 
-        timer.End();
     }
 }
 

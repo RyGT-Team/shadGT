@@ -349,3 +349,19 @@ add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/gpu-timing-flag-under-tes
     DEPENDS extract_gpu_timing_flag.py "${SHADGT_ROOT}/ryty_gpu/native/rhi/rhi_vulkan.cpp" VERBATIM)
 target_sources(gpu_timing_flag_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/gpu-timing-flag-under-test.inc")
 add_test(NAME gpu_timing_flag COMMAND gpu_timing_flag_test)
+
+add_executable(fast_flip_wait_test fast_flip_wait_test.cpp)
+target_compile_features(fast_flip_wait_test PRIVATE cxx_std_23)
+target_include_directories(fast_flip_wait_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(fast_flip_wait_test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(fast_flip_wait_test PRIVATE -UNDEBUG)
+endif()
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/fast-flip-wait-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/fast-flip-eligibility-under-test.inc"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_fast_flip_wait.py"
+      "${SHADGT_ROOT}/src/core/libraries/videoout/driver.cpp" "${CMAKE_CURRENT_BINARY_DIR}/fast-flip-wait-under-test.inc"
+      "${CMAKE_CURRENT_BINARY_DIR}/fast-flip-eligibility-under-test.inc"
+    DEPENDS extract_fast_flip_wait.py "${SHADGT_ROOT}/src/core/libraries/videoout/driver.cpp" VERBATIM)
+target_sources(fast_flip_wait_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/fast-flip-wait-under-test.inc" "${CMAKE_CURRENT_BINARY_DIR}/fast-flip-eligibility-under-test.inc")
+add_test(NAME fast_flip_wait COMMAND fast_flip_wait_test)

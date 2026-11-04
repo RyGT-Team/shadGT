@@ -49,6 +49,10 @@ public:
         for(auto& w:workers_)if(w.joinable())w.join();
     }
     ~OrderedPassWorkers() { Shutdown(); }
+    // Owner only: do not call concurrently with Shutdown or retain the handles.
+    template<class F> void ForEachWorkerHandle(F&& callback) {
+        for(auto& worker:workers_) if(worker.joinable()) callback(worker.native_handle());
+    }
     bool Submit(Packet packet,Record record) {
         if(!record) return false;
 

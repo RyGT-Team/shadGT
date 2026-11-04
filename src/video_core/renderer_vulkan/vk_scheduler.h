@@ -519,7 +519,9 @@ private:
 
     void PriorityPendingOpsThread(std::stop_token stoken);
 
+#ifndef NDEBUG
     void PerfMonitorThread(std::stop_token stoken);
+#endif
 
 private:
     const Instance& instance;
@@ -541,8 +543,10 @@ private:
     std::atomic<u64> submitted_tick{};
     std::atomic<u64> replayed_commands{};
     std::atomic<u64> replay_busy_ns{};
+#ifndef NDEBUG
     std::atomic<u64> sync_waits{};
     std::atomic<u64> sync_wait_ns{};
+#endif
     std::condition_variable_any event_cv;
     struct PendingOp {
         Common::UniqueFunction<void> callback;
@@ -557,7 +561,9 @@ private:
     RenderState render_state;
     bool is_rendering = false;
     tracy::VkCtxScope* profiler_scope{};
+#ifndef NDEBUG
     std::jthread perf_monitor_thread;
+#endif
 };
 
 } // namespace Vulkan

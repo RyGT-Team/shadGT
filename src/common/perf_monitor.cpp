@@ -23,6 +23,8 @@
 
 namespace Common {
 
+#if !defined(NDEBUG)
+
 #ifdef _WIN32
 namespace {
 
@@ -382,5 +384,7 @@ std::string TakeWorkCounters() {
                        c.upload_epochs, c.waits_skipped) +
            ";" + TakePhaseTimes();
 }
+
+#endif
 
 } // namespace Common

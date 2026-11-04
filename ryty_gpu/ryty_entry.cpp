@@ -300,6 +300,7 @@ void DrawFpsCounter() {
     draw->AddText(at, IM_COL32(235, 235, 235, 255), text);
 }
 
+#ifndef NDEBUG
 // DIAG-047 (SHADGT_HEAP_REPORT=1): every 20 s, the largest heap's busy blocks by size, with the
 // first bytes of one block of each size. The walk holds the heap's lock, so nothing it does may
 // allocate: the table is allocated before.
@@ -401,6 +402,7 @@ void StartHeapReport() {
     }).detach();
 }
 
+#endif
 } // namespace
 
 void Ryty::RytyLibraryInitialize() {
@@ -413,6 +415,7 @@ void Ryty::RytyLibraryInitialize() {
     // missing); a gamepad is only assigned to a player that exists ("User 1 not found").
     UserSettings.Load();
     InstallControllerPorts(); // before the window thread opens the controllers
+#ifndef NDEBUG
     if (std::getenv("RYTY_SELFTEST_GUARD") != nullptr) {
         // A guarded read of an inaccessible page must come back false, not end the process.
         void* page = VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
@@ -423,6 +426,7 @@ void Ryty::RytyLibraryInitialize() {
         VirtualFree(page, 0, MEM_RELEASE);
     }
 
+#endif
     std::thread(RunWindowThread).detach();
     {
         std::unique_lock lock{g_window_mutex};
@@ -438,6 +442,7 @@ void Ryty::RytyLibraryInitialize() {
     BindExports();
     StartInputBridge();
     StartFirstDrawWatcher();
+#ifndef NDEBUG
     StartHeapReport();
     // DIAG-078: SHADGT_LOG_EXCEPTIONS=1 counts every exception raised in GTSport.exe code (first
     // chance, any handler) by code and exe offset, and logs the counts every 5 seconds.
@@ -538,6 +543,7 @@ void Ryty::RytyLibraryInitialize() {
             }
         }).detach();
     }
+#endif
     Ryty::SetOverlayDraw(&DrawFpsCounter);
 #ifdef ENABLE_DISCORD_RPC
     if (EmulatorSettings.IsDiscordRPCEnabled()) {
@@ -560,9 +566,11 @@ void Ryty::RytyLibraryInitialize() {
 // memory manager would otherwise do this. Without them the renderer keeps cached GPU copies and
 // page tracking for memory the game has freed and reused, and its watcher counts go wrong.
 extern "C" __declspec(dllexport) void RytyGpuUnmapMemory(u64 address, u64 size) {
+#ifndef NDEBUG
     if (Native::WatchedTexture(address, address + size)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: Ryty unmaps {:#x}+{:#x}", address, size);
     }
+#endif
     Core::RytyMemory::NoteMappingChange(address, size);
     if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
         rasterizer->UnmapMemory(address, size);
@@ -580,10 +588,12 @@ extern "C" __declspec(dllexport) void RytyGpuMappingChanged(u64 address, u64 siz
 // which replaced the protections the renderer's page tracking had set there.
 extern "C" __declspec(dllexport) void RytyGpuProtectionChanged(u64 address, u64 size) {
     Native::ForgetReadable(address, size);
+#ifndef NDEBUG
     if (Native::WatchedTexture(address, address + size)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: game protection change {:#x}+{:#x}", address,
                     size);
     }
+#endif
     Core::RytyMemory::NoteMappingChange(address, size);
     if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
         rasterizer->GetPageManager().ReapplyProtection(address, size);
@@ -592,9 +602,11 @@ extern "C" __declspec(dllexport) void RytyGpuProtectionChanged(u64 address, u64 
 
 extern "C" __declspec(dllexport) void RytyGpuMapMemory(u64 address, u64 size) {
     Native::ForgetReadable(address, size);
+#ifndef NDEBUG
     if (Native::WatchedTexture(address, address + size)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: map {:#x}+{:#x}", address, size);
     }
+#endif
     Core::RytyMemory::NoteMappingChange(address, size);
     if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
         rasterizer->MapMemory(address, size);
@@ -663,6 +675,7 @@ extern "C" __declspec(dllexport) int RytyGpuHandleWriteFault(void* exception_poi
         return 2;
     }
     if (Core::Signals::Instance()->DispatchAccessViolation(pointers, address)) {
+#ifndef NDEBUG
         // DIAG-077: SHADGT_LOG_FAULTS=1 counts the write faults the renderer handled by the
         // code address in GTSport.exe that wrote, and logs the most frequent every 5 seconds.
         static const bool log_faults = [] {
@@ -690,6 +703,7 @@ extern "C" __declspec(dllexport) int RytyGpuHandleWriteFault(void* exception_poi
                             top.size(), line);
             }
         }
+#endif
         return 1;
     }
     return Core::RytyMemory::InGuardedRead() ? 2 : 0;
@@ -706,10 +720,12 @@ extern "C" __declspec(dllexport) u64 RytyGpuGuestTsc() {
 // Ryty calls this before the kernel writes guest memory directly (a file read into a guest
 // buffer), which would fail on a write-protected page instead of faulting.
 extern "C" __declspec(dllexport) void RytyGpuInvalidateMemory(u64 address, u64 size) {
+#ifndef NDEBUG
     if (Native::WatchedTexture(address, address + size)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: Ryty invalidates {:#x}+{:#x} (a file read)",
                     address, size);
     }
+#endif
     if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
         rasterizer->InvalidateMemory(address, size);
     }

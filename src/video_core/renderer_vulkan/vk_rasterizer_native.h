@@ -728,11 +728,17 @@ private:
         std::array<u64, 7> total{};
         u64 frames = 0;
         void Note(u32 kind, VAddr address, u64 size) {
+#if !defined(NDEBUG)
             pages[kind].Add(address, size);
+#endif
         }
     } in_place;
     bool InPlaceSampled() const {
+#if !defined(NDEBUG)
         return (frame & 7) == 0;
+#else
+        return false;
+#endif
     }
     /// NAT-150: the counter for a binding of that kind, by what GuestBuffer bound.
     u32 BoundKind(u32 kind) const {
@@ -827,7 +833,11 @@ private:
         std::array<u64, 3> source_outcomes{}; // missing, busy, invalid probe
         u64 warm_attempts{}, warm_queued{};
     } mirror_diagnostic;
+#if !defined(NDEBUG)
     std::chrono::steady_clock::time_point last_report = std::chrono::steady_clock::now();
+#else
+    std::chrono::steady_clock::time_point last_report{};
+#endif
 };
 
 } // namespace Vulkan

@@ -40,6 +40,7 @@ struct Api {
 };
 Api g_api;
 
+#ifndef NDEBUG
 // Opt-in, fixed-size trace. Never reuse queries or wait for GPU results in the frame loop.
 struct TimingTrace {
     static constexpr u32 Count = 16;
@@ -174,6 +175,19 @@ struct TimingTrace {
         }
     }
 } g_timing;
+#else
+struct TimingTrace {
+    std::atomic<bool> cpu_armed{};
+    static constexpr s64 Now() { return 0; }
+    void Cpu(const char*, s64) {}
+    int BeginExtra(vk::CommandBuffer, u64, u32) { return -1; }
+    void Create(const Instance&) {}
+    int Begin(vk::CommandBuffer, u64, bool) { return -1; }
+    void End(vk::CommandBuffer, int) {}
+    void Poll(u64) {}
+    void Destroy() {}
+} g_timing;
+#endif
 
 // Diagnostic workaround for the bundled SDK's 100 ms pacing-history timeout.
 // This constant has one code reference: the interpolation-thread reset threshold.

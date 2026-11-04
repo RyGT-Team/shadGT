@@ -211,10 +211,12 @@ struct Image : public Common::LRUNode<> {
 
     void MarkModified(std::source_location loc = std::source_location::current()) {
         contents_version = global_contents_version.Next();
+#ifndef NDEBUG
         NoteImageModification(image_uid, contents_version, loc);
         if (IsWatchedImageAddress(info.guest_address, info.guest_size)) {
             NoteWatchedImageModification(*this, loc);
         }
+#endif
     }
 
     void MarkGpuModified(ImageFlagBits modified = ImageFlagBits::GpuModified,

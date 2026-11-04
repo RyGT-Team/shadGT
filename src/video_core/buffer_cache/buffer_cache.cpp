@@ -1,3 +1,4 @@
+#include "common/debug_environment.h"
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -55,6 +56,12 @@
 namespace Vulkan {
 bool NativeModeRequested();
 }
+#endif
+
+#ifndef NDEBUG
+#define BUFFER_DIAG(...) __VA_ARGS__
+#else
+#define BUFFER_DIAG(...)
 #endif
 
 namespace VideoCore {
@@ -168,7 +175,7 @@ static std::atomic<BufferCache*> s_own_write_cache{nullptr}; // FIX-073
 // DIAG-072: SHADGT_TRACE_READBACKS=1 keeps the last readbacks written into guest memory.
 static bool TraceReadbacks() {
     static const bool enabled = [] {
-        const char* env = std::getenv("SHADGT_TRACE_READBACKS");
+        const char* env = Common::DebugEnv("SHADGT_TRACE_READBACKS");
         return env && env[0] == '1';
     }();
     return enabled;
@@ -399,6 +406,7 @@ std::vector<std::shared_ptr<BufferCache::AsyncReadback>> BufferCache::TakePendin
 void BufferCache::NoteCpuReadFault(VAddr address, u64 size, u64 exact_write_size) {
     // PERF-010: a CPU access that needed GPU-written data drains the GPU. Pages that saw such an
     // access are read back after each later GPU write, so the next access finds current data.
+#ifndef NDEBUG
     ++hot_page_stats.faults;
     // PERF-DIAG-008: does the access itself touch GPU-written bytes, or only share their page?
     constexpr u64 LineSize = 64;
@@ -423,6 +431,7 @@ void BufferCache::NoteCpuReadFault(VAddr address, u64 size, u64 exact_write_size
     page_stat.last_offset = address - fault_page;
     page_stat.last_size = exact_write_size != 0 ? exact_write_size : size;
     page_stat.touches_gpu_bytes |= touches_gpu_bytes;
+#endif
     constexpr u64 PageSize = 4_KB;
     const VAddr end = address + std::max<u64>(size, 1);
     for (VAddr page = Common::AlignDown(address, PageSize); page < end; page += PageSize) {
@@ -442,7 +451,9 @@ void BufferCache::NoteCpuReadFault(VAddr address, u64 size, u64 exact_write_size
                 hot_page_since_ns[page] = TraceNowNs();
             }
         }
+        #ifndef NDEBUG
         ++hot_page_stats.new_pages;
+        #endif
         hot_page_order.push_back(page);
         if (hot_page_order.size() > MaxHotPages) {
             hot_pages.erase(hot_page_order.front());
@@ -520,7 +531,9 @@ bool BufferCache::RecordHotPageReadbacks() {
                     .size = readback->size,
                 };
                 runtime.CopyBuffer(arena, readback->download.buffer, std::span{&copy, 1});
+                #ifndef NDEBUG
                 hot_page_stats.recorded_bytes += readback->size;
+                #endif
                 recorded.push_back(std::move(readback));
                 }, [&](VAddr s, VAddr e) { cpu_newer_parts.emplace_back(s, e); }); // FIX-069
             });
@@ -528,19 +541,21 @@ bool BufferCache::RecordHotPageReadbacks() {
     }
     for (const auto& [s, e] : cpu_newer_parts) {
         gpu_modified_ranges.Subtract(s, e - s);
-        ++writebacks_cpu_newer;
+        BUFFER_DIAG(++writebacks_cpu_newer);
     }
     for (const auto& [s, e] : cpu_rewrote_parts) {
         // FIX-073: the CPU's bytes are newer; they go to the GPU on its next use of them.
         gpu_modified_ranges.Subtract(s, e - s);
         NoteCpuChange(s, e - s);
         memory_tracker->MarkRegionAsCpuModified(s, e - s);
-        ++readbacks_cpu_rewrote;
+        BUFFER_DIAG(++readbacks_cpu_rewrote);
     }
     if (recorded.empty()) {
         return false;
     }
+    #ifndef NDEBUG
     hot_page_stats.recorded += static_cast<u32>(recorded.size());
+    #endif
     std::scoped_lock lk{async_readbacks_mutex};
     pending_async_readbacks.insert(pending_async_readbacks.end(), recorded.begin(), recorded.end());
     num_pending_async_readbacks = static_cast<u32>(pending_async_readbacks.size());
@@ -550,6 +565,7 @@ bool BufferCache::RecordHotPageReadbacks() {
 }
 
 void BufferCache::LogHotPageStats() {
+#ifndef NDEBUG
     // PERF-DIAG-006: CPU faults on GPU-written data and the readbacks recorded for them.
     auto& stats = hot_page_stats;
     const auto now = std::chrono::steady_clock::now();
@@ -657,6 +673,7 @@ void BufferCache::LogHotPageStats() {
     stats.new_pages = 0;
     stats.recorded = 0;
     stats.recorded_bytes = 0;
+#endif
 }
 
 std::string BufferCache::DescribeRecentReadbacks(VAddr address, u64 size) {
@@ -720,7 +737,9 @@ void BufferCache::CompleteAsyncReadbacks(
             completed_readback_ranges.emplace_back(readback->address, readback->size);
             num_completed_readback_ranges = static_cast<u32>(completed_readback_ranges.size());
             memory_tracker->MarkRegionAsCpuModified(readback->address, readback->size);
+            #ifndef NDEBUG
             ++hot_page_stats.cpu_overwrote;
+            #endif
         } else if (readback->valid && memory->IsValidMapping(readback->address, readback->size)) {
             readback->download.Invalidate();
             NoteWritebackOverCommands(liverpool, "async readback", readback->address,
@@ -744,9 +763,13 @@ void BufferCache::CompleteAsyncReadbacks(
             num_completed_readback_ranges = static_cast<u32>(completed_readback_ranges.size());
             // The guest copy is now current. The page stops being GPU-modified once no other
             // GPU-written bytes remain on it (ApplyCompletedReadbacks, GPU thread).
+            #ifndef NDEBUG
             ++hot_page_stats.completed;
+            #endif
         } else {
+            #ifndef NDEBUG
             ++hot_page_stats.invalidated;
+            #endif
         }
         if (readback->is_gds && readback->valid) {
             readback->valid = false;
@@ -892,7 +915,9 @@ bool BufferCache::TrySplitGdsWriteFault(VAddr address, u64 exact_write_size) {
                         readback->size);
         }
     }
+    #ifndef NDEBUG
     ++hot_page_stats.gds_split_faults;
+    #endif
     return true;
 }
 
@@ -943,7 +968,9 @@ bool BufferCache::TrySplitWriteFault(const Buffer* arena, VAddr address, u64 siz
                     recorded.push_back(std::move(readback));
                 });
         });
+    #ifndef NDEBUG
     ++hot_page_stats.split_faults;
+    #endif
     if (!recorded.empty()) {
         std::scoped_lock lk{async_readbacks_mutex};
         pending_async_readbacks.insert(pending_async_readbacks.end(), recorded.begin(),
@@ -1048,14 +1075,18 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         if (!fault) {
             return;
         }
+#ifndef NDEBUG
         const auto start = std::chrono::steady_clock::now();
+#endif
         fault->done.acquire();
+#ifndef NDEBUG
         async_fault_wait_us.fetch_add(
             static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
                                  std::chrono::steady_clock::now() - start)
                                  .count()),
             std::memory_order_relaxed);
         async_fault_flushes.fetch_add(1, std::memory_order_relaxed);
+#endif
         liverpool->SendFaultCommand([&] { FinishFaultFlush(*fault); });
         return;
     }
@@ -1272,7 +1303,7 @@ void BufferCache::SyncUnseenCpuWrites(const Buffer* arena, VAddr address, u64 si
             runtime.InlineData(arena, page + lo - arena->cpu_addr,
                                std::span<const u8>{now.data() + lo, hi - lo});
             std::memcpy(snapshot.data() + lo, now.data() + lo, hi - lo);
-            unseen_cpu_bytes_synced += hi - lo;
+            BUFFER_DIAG(unseen_cpu_bytes_synced += hi - lo);
             NoteSnapshotUpdate(page, "unseen CPU write sync");
             i = j;
         }
@@ -1505,7 +1536,7 @@ std::shared_ptr<BufferCache::FaultDownload> BufferCache::BeginFaultFlush(VAddr d
     for (const auto& [s, e] : cpu_newer) {
         // FIX-069: the CPU changed these bytes after the GPU wrote them; they are the CPU's.
         gpu_modified_ranges.Subtract(s, e - s);
-        ++writebacks_cpu_newer;
+        BUFFER_DIAG(++writebacks_cpu_newer);
     }
     for (const auto& [s, e] : dropped) {
         // On an unwatched page the CPU's bytes are the current ones now; a watched page keeps
@@ -1692,7 +1723,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             SplitWriteback(start, end, fault_addr, fault_size, page_manager, add_download,
                            [&](VAddr s, VAddr e) { kept_gpu.emplace_back(s, e); }, // FIX-063
                            [this](VAddr s, VAddr e) { return FreshGpuWrite(s, e); });
-            }, [&](VAddr, VAddr) { ++writebacks_cpu_newer; }); // FIX-069
+            }, [&](VAddr, VAddr) { BUFFER_DIAG(++writebacks_cpu_newer); }); // FIX-069
         });
         gpu_modified_ranges.Subtract(address, size);
     });
@@ -1751,7 +1782,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         }
     }
     static const bool diag_time = [] {
-        const char* env = std::getenv("SHADGT_DIAG_OBTAIN");
+        const char* env = Common::DebugEnv("SHADGT_DIAG_OBTAIN");
         return env && env[0] == '1';
     }();
     if (diag_time) {
@@ -1973,7 +2004,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u
     // D1: guest memory obtained here is imported for the GPU (coverage logged every 2 s).
     // Diagnostic only (SHADGT_DIAG_D1=1): it imports memory on every obtain.
     static const bool diag_d1 = [] {
-        const char* env = std::getenv("SHADGT_DIAG_D1");
+        const char* env = Common::DebugEnv("SHADGT_DIAG_D1");
         return env && env[0] == '1';
     }();
     if (diag_d1 && direct_memory && !is_texel_buffer) {
@@ -2077,7 +2108,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u
     // DIAG-109 (SHADGT_DIAG_OBTAIN=1): how many read-only obtains repeat a range already obtained
     // in the same upload epoch (what a per-epoch memo of obtains could skip).
     static const bool diag_obtain = [] {
-        const char* env = std::getenv("SHADGT_DIAG_OBTAIN");
+        const char* env = Common::DebugEnv("SHADGT_DIAG_OBTAIN");
         return env && env[0] == '1';
     }();
     if (diag_obtain) {
@@ -2647,13 +2678,17 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
         overlapped = true;
         *overlapped_out = true;
     } else if (size == 0 || texture_cache.AnyImageInRegion(device_addr, size)) {
+#ifndef NDEBUG
         ++ahead_refusals[1];
+#endif
+#ifndef NDEBUG
         static std::atomic<u32> logged{};
         if (size != 0 && logged.fetch_add(1) < 40) {
             LOG_WARNING(Render_Vulkan, "PERF-067: buffer {:#x}+{:#x} ({}) left to the recorder: "
                         "an image overlaps it",
                         device_addr, size, is_written ? "written" : "read");
         }
+#endif
         return std::nullopt; // Image exports and aliases are the recorder's.
     }
     if (is_written) {
@@ -2676,7 +2711,9 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
         auto& ahead_stream = AheadStream(); // R5
         const auto [data, offset] = ahead_stream.Map(size, instance.UniformMinAlignment(), false);
         if (!data) {
+#ifndef NDEBUG
             ++ahead_refusals[2];
+#endif
             return std::nullopt; // The ring would have to wait for the GPU.
         }
         memory->CopySparseMemory(device_addr, data, size);
@@ -2689,17 +2726,23 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
     const u64 first_page = first_block >> blocks_per_arena_page_shift;
     const u64 last_page = last_block >> blocks_per_arena_page_shift;
     if (is_texel_buffer && !is_written) {
+#ifndef NDEBUG
         ++ahead_refusals[0];
+#endif
         return std::nullopt; // Metadata (HTILE) is the texture cache's (arena path only).
     }
     if (!address_space[first_page] || address_space[first_page] != address_space[last_page]) {
+#ifndef NDEBUG
         ++ahead_refusals[3];
+#endif
         return std::nullopt; // A new or migrating arena records binds.
     }
     bool resident = true;
     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64, u64) { resident = false; });
     if (!resident) {
+#ifndef NDEBUG
         ++ahead_refusals[4];
+#endif
         return std::nullopt;
     }
     // The uploads' staging must not wait for the GPU either: size of everything this range
@@ -2707,7 +2750,9 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
     {
         const auto [probe, probe_offset] = AheadStaging().Map(size, 16, false);
         if (!probe) {
+#ifndef NDEBUG
             ++ahead_refusals[5];
+#endif
             return std::nullopt;
         }
     }
@@ -2978,8 +3023,8 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                 misses.push_back(i);
             }
         }
-        stage_prehash_hits += hot.size() - misses.size();
-        stage_prehash_misses += misses.size();
+        BUFFER_DIAG(stage_prehash_hits += hot.size() - misses.size());
+        BUFFER_DIAG(stage_prehash_misses += misses.size());
         for (const size_t i : misses) {
             hot_hashes[i] = Core::HashGuestBytes(hot[i].first, BYTES_PER_PAGE);
         }
@@ -3010,8 +3055,8 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                 misses.push_back(i);
             }
         }
-        ahead_hits += hot.size() - misses.size();
-        ahead_misses += misses.size();
+        BUFFER_DIAG(ahead_hits += hot.size() - misses.size());
+        BUFFER_DIAG(ahead_misses += misses.size());
         auto& miss_hashes = scratch.miss_hashes;
         miss_hashes.resize(misses.size());
         HashPages(misses.size(), [&](size_t j) { return hot[misses[j]].first; },
@@ -3030,8 +3075,8 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                 misses.push_back(i);
             }
         }
-        prehashed_hits += hot.size() - misses.size();
-        prehashed_misses += misses.size();
+        BUFFER_DIAG(prehashed_hits += hot.size() - misses.size());
+        BUFFER_DIAG(prehashed_misses += misses.size());
         auto& miss_hashes = scratch.miss_hashes;
         miss_hashes.resize(misses.size());
         HashPages(misses.size(), [&](size_t j) { return hot[misses[j]].first; },
@@ -3096,7 +3141,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             upload_range(cursor, addr + range_size - cursor);
         }
     }
-    hot_pages_unchanged += unchanged_count;
+    BUFFER_DIAG(hot_pages_unchanged += unchanged_count);
     for (const auto& [page, hash] : cool) {
         {
             std::scoped_lock streak_lk{streak_mutex}; // R3
@@ -3104,12 +3149,12 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         }
         // Clean and write-protected again: the GPU copy holds these bytes (the last upload).
         memory_tracker->CoolHotPages(page, BYTES_PER_PAGE);
-        ++hot_pages_cooled;
+        BUFFER_DIAG(++hot_pages_cooled);
         // A CPU write between the check and the protection did not fault; it is caught here.
         if (Core::HashGuestBytes(page, BYTES_PER_PAGE) != hash) {
             NoteCpuChange(page, BYTES_PER_PAGE); // FIX-069
             memory_tracker->MarkRegionAsCpuModified(page, BYTES_PER_PAGE);
-            ++hot_pages_cooled_changed;
+            BUFFER_DIAG(++hot_pages_cooled_changed);
         }
     }
     {
@@ -3148,7 +3193,9 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                             unmark.push_back(page);
                         }
                     }
+                    #ifndef NDEBUG
                     ++hot_page_stats.uploads_over_gpu_bytes;
+                    #endif
                 }
             }
             for (const VAddr page : unmark) {
@@ -3242,7 +3289,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             const auto& upload = hot_uploads[i];
             uploaded_page_contents.Record(upload.page, upload.generation, upload.hash, after[i]);
         }
-        hot_pages_uploaded += hot_uploads.size();
+        BUFFER_DIAG(hot_pages_uploaded += hot_uploads.size());
     }
     if (is_texel_buffer && !is_written) {
         return SynchronizeMetadata(arena, device_addr, size);
@@ -3623,9 +3670,13 @@ bool BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
     const u64 generation = texture_cache.RegistryGeneration();
     auto& slot =
         no_image_memo[((device_addr >> 6) ^ (device_addr >> 21) ^ size) % no_image_memo.size()];
+    #ifndef NDEBUG
     ++image_sync_stats.calls;
+    #endif
     if (memo && slot.address == device_addr && slot.size == size && slot.generation == generation) {
+        #ifndef NDEBUG
         ++image_sync_stats.exact_hits;
+        #endif
         return false;
     }
     // PERF-077: the same by 64 KB block. Constant and vertex rings put each draw's data at a new
@@ -3652,12 +3703,16 @@ bool BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
             }
         }
         if (all_free) {
+            #ifndef NDEBUG
             ++image_sync_stats.block_hits;
+            #endif
             slot = {device_addr, size, generation};
             return false;
         }
     }
+    #ifndef NDEBUG
     image_sync_stats.full_bytes += size;
+    #endif
     // PERF-086: a range with nothing to export keeps nothing to export until an image is
     // registered or unregistered or an image's GpuModified, Dirty or BufferCoherent bit changes.
     // GT Sport binds a 588 MB buffer over its ~1,100 texture-pool images with many draws, and the
@@ -3670,7 +3725,7 @@ bool BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
         quiet.generation == generation && quiet.export_state == export_state) {
         // DIAG-070: SHADGT_VERIFY_QUIET=1 checks the images anyway and logs disagreements.
         static const bool verify_quiet = [] {
-            const char* env = std::getenv("SHADGT_VERIFY_QUIET");
+            const char* env = Common::DebugEnv("SHADGT_VERIFY_QUIET");
             return env && env[0] == '1';
         }();
         if (verify_quiet) {
@@ -3699,9 +3754,15 @@ bool BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
                 }
             }
         }
+        #ifndef NDEBUG
         ++image_sync_stats.quiet_hits;
+        #endif
+        #ifndef NDEBUG
         ++image_sync_stats.with_images;
+        #endif
+        #ifndef NDEBUG
         ++image_sync_stats.nothing_to_export;
+        #endif
         return true;
     }
     // PERF-078: the images over a range stay the same until one is registered or unregistered,
@@ -3719,7 +3780,9 @@ bool BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
     if (overlap_memo_enabled && overlap.address == device_addr && overlap.size == size &&
         overlap.generation == generation) {
         first_level = &overlap.ids;
+        #ifndef NDEBUG
         ++image_sync_stats.overlap_hits;
+        #endif
     } else if (overlap_memo_enabled) {
         texture_cache.ForEachImageInRegion(device_addr, size,
                                            [&](ImageId id, Image&) { walked.push_back(id); });
@@ -3737,20 +3800,32 @@ bool BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
         });
     }
     const size_t requested_images = first_level->size();
+#ifndef NDEBUG
     if (size >= (64u << 20)) {
+        #ifndef NDEBUG
         ++image_sync_stats.large;
+        #endif
+        #ifndef NDEBUG
         image_sync_stats.large_with_images += requested_images != 0;
+        #endif
         if (image_sync_stats.large <= 3) {
+            #ifndef NDEBUG
             image_sync_stats.samples += fmt::format(" {:#x}+{:#x} ({} images)", device_addr, size,
                                                     requested_images);
+            #endif
         }
     }
+#endif
     if (requested_images == 0) {
+        #ifndef NDEBUG
         ++image_sync_stats.full_free;
+        #endif
         slot = {device_addr, size, generation};
         return false;
     }
+    #ifndef NDEBUG
     ++image_sync_stats.with_images;
+    #endif
     // PERF-078: only an image that is current on the GPU and not exported yet can be exported
     // (PlanImageAliasExports); with none over the range there is nothing to plan.
     if (overlap_memo_enabled && std::ranges::none_of(*first_level, [&](ImageId id) {
@@ -3759,7 +3834,9 @@ bool BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
                    False(flags & ImageFlagBits::Dirty) &&
                    False(flags & ImageFlagBits::BufferCoherent);
         })) {
+        #ifndef NDEBUG
         ++image_sync_stats.nothing_to_export;
+        #endif
         quiet = {device_addr, size, generation, export_state};
         return true;
     }
@@ -3835,7 +3912,9 @@ bool BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
         const auto& image = texture_cache.GetImage(id);
         const auto& info = image.info;
         const bool stale = may_be_stale(image);
+        #ifndef NDEBUG
         image_sync_stats.stale_skipped += stale;
+        #endif
         const bool exportable = !stale && info.num_samples == 1 &&
                                 image.backing->num_samples == 1 && !info.props.has_stencil &&
                                 info.guest_size <= UINT32_MAX &&
@@ -4046,3 +4125,5 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
 }
 
 } // namespace VideoCore
+
+#undef BUFFER_DIAG

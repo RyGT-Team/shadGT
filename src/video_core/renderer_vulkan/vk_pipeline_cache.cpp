@@ -315,7 +315,9 @@ private:
         ASSERT(prepared && prepared->program && job.info);
         auto& info = job.info;
         auto binding = job.start;
+#ifndef NDEBUG
         const auto start = std::chrono::steady_clock::now();
+#endif
         try {
             Common::RecoverableScope recoverable;
             job.spv = Shader::Backend::SPIRV::EmitSPIRV(
@@ -332,9 +334,11 @@ private:
             info->resource_usage_known = false;
         }
         job.module = CompileSPV(job.spv, device);
+#ifndef NDEBUG
         job.translate_ms +=
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
                 .count();
+#endif
     }
 
     const Shader::Profile& profile;
@@ -982,7 +986,15 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 #else
     const bool store_wanted = EmulatorSettings.IsPipelineCacheEnabled();
 #endif
-    if (store_wanted && Common::PerfFeatureEnabled(47)) {
+#ifndef NDEBUG
+    // Instrumented shader binaries share ordinary shader keys. Keep this Debug run
+    // out of the persistent store so later normal runs cannot load them.
+    const char* nan_trace = std::getenv("RYGT_NAN_TRACE");
+    const bool instrumenting = nan_trace && std::strtoull(nan_trace, nullptr, 16) != 0;
+#else
+    constexpr bool instrumenting = false;
+#endif
+    if (store_wanted && !instrumenting && Common::PerfFeatureEnabled(47)) {
         if (EmulatorSettings.IsPipelineCacheArchived()) {
             LOG_WARNING(Render_Vulkan, "PERF-032: the shader store is not used with an archived "
                                        "pipeline cache (pipeline_cache_archived)");
@@ -998,7 +1010,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                 if (!fallback_env || fallback_env[0] != '0') {
                     Storage::DataBase::Legacy().OpenLegacy();
                     legacy_fallback = Storage::DataBase::Legacy().IsOpened();
+#ifndef NDEBUG
                     legacy_stats.since = std::chrono::steady_clock::now();
+#endif
                     LOG_WARNING(Render_Vulkan, "D10: old-renderer shader fallback {}",
                                 legacy_fallback ? "on" : "off (no old shader store)");
                 }
@@ -1022,7 +1036,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                                                "vertex input; not available here");
                 } else {
                     prewarm_enabled = true;
+#ifndef NDEBUG
                     prewarm_stats.since = std::chrono::steady_clock::now();
+#endif
                     prewarm_reader =
                         std::jthread{[this](std::stop_token stop) { PrewarmRead(stop); }};
                 }
@@ -1032,6 +1048,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     if (CompileMode() == 1 && AsyncPipelines()) {
         static std::jthread slow_motion{SlowMotionThread}; // PERF-103
     }
+#ifndef NDEBUG
     // PB-1 (SHADGT_REPLAY_TEST=<folder of <hash>.bin programs>): translates every stored shader
     // again from its program and its stored record, and counts how many match the stored SPIR-V.
     if (const char* codes = std::getenv("SHADGT_REPLAY_TEST"); codes && *codes) {
@@ -1043,13 +1060,16 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     if (const char* dir = std::getenv("SHADGT_DUMP_STORE"); dir && *dir) {
         static std::jthread dump_store{[this, d = std::string{dir}] { DumpStore(d); }};
     }
+#endif
     // Reserve translation capacity within the combined compiler budget.
     if (const u32 count = CompilerWorkerBudget::ForLogicalThreads(
             std::thread::hardware_concurrency()).translation;
         Common::PerfFeatureEnabled(102) && count != 0) {
         translate_workers =
             std::make_unique<TranslateWorkers>(profile, instance.GetDevice(), count);
+#ifndef NDEBUG
         translate_stats.since = std::chrono::steady_clock::now();
+#endif
     }
 }
 
@@ -1072,6 +1092,10 @@ PipelineCache::~PipelineCache() {
 
 // Bounded persistence is automatic; the environment variable is a diagnostic opt-out.
 static bool DriverCacheFileEnabled() {
+#ifndef NDEBUG
+    const char* nan_trace = std::getenv("RYGT_NAN_TRACE");
+    if (nan_trace && std::strtoull(nan_trace, nullptr, 16) != 0) return false;
+#endif
 #ifdef RYTY_GPU
     const char* env = std::getenv("RYGT_DRIVER_CACHE");
     return !env || env[0] != '0';
@@ -1421,7 +1445,9 @@ std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::MakePipelineBuild()
     }
     build->modules = S().modules;
     build->done = build->promise.get_future().share();
+#ifndef NDEBUG
     build->queued = std::chrono::steady_clock::now();
+#endif
     return build;
 }
 
@@ -2190,7 +2216,9 @@ void PipelineCache::QueueBackgroundBuild(const std::shared_ptr<PipelineBuild>& b
     build_workers->PushBackground([this, build] {
         if (!build->started.load()) {
             FinishBuild(*build);
+#ifndef NDEBUG
             ++prewarm_built;
+#endif
         }
         ++g_precompile_done; // PERF-098
     }, Common::PerfFeatureEnabled(79) &&
@@ -2210,7 +2238,9 @@ void PipelineCache::ReadAheadAtBufferStart() {
 }
 
 void PipelineCache::ReadAhead(const DrawIndirectParams params, bool restore) {
+#ifndef NDEBUG
     const auto start = std::chrono::steady_clock::now();
+#endif
     u32 draws = 0;
     u32 started = 0;
     u32 evaluated = 0;
@@ -2281,6 +2311,7 @@ void PipelineCache::ReadAhead(const DrawIndirectParams params, bool restore) {
             RefreshGraphicsKey();
         }
     }
+#ifndef NDEBUG
     // One summary every 2 s instead of a line per read.
     auto& stats = read_ahead_stats;
     const auto now = std::chrono::steady_clock::now();
@@ -2301,6 +2332,7 @@ void PipelineCache::ReadAhead(const DrawIndirectParams params, bool restore) {
         stats = {};
         stats.since = now;
     }
+#endif
 }
 
 // Required-build context is local to this translation unit and restored after nested waits.
@@ -2358,7 +2390,9 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
             // build it now from this draw's state instead.
             if (pending->second->preloading && CancelBuild(*pending->second)) {
                 pending.value() = StartPipelineBuild(false);
+#ifndef NDEBUG
                 ++prewarm_stats.promoted;
+#endif
                 ++started;
             }
             continue;
@@ -2372,6 +2406,7 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
     }
     } // Scope guard restores the current draw state before any return.
     if (restore_error) std::rethrow_exception(restore_error);
+#ifndef NDEBUG
     auto& stats = queued_state_stats;
     const auto now = std::chrono::steady_clock::now();
     stats.evaluated += evaluated;
@@ -2387,6 +2422,7 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
         stats = {};
         stats.since = now;
     }
+#endif
 }
 
 void PipelineCache::WaitForBuild(PipelineBuild& build, const DrawIndirectParams params) {
@@ -2454,7 +2490,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         const bool legacy_valid = RefreshGraphicsKey() && !S().legacy_failed;
         force_legacy = false;
         const GraphicsPipeline* legacy = legacy_valid ? PipelineForCurrentKey(params) : nullptr;
+#ifndef NDEBUG
         ++(legacy ? legacy_stats.fallback_ok : legacy_stats.fallback_none);
+#endif
         ReportLegacy();
         if (legacy) {
             fallback_nested = false;
@@ -2489,7 +2527,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         // SHD-005: skipped while its shaders translate; a later draw takes them.
         deferred_miss = false;
         translation_skipped = false;
+#ifndef NDEBUG
         ++async_stats.skipped_translating;
+#endif
         NoteSkippedDraw();
         return nullptr;
     }
@@ -2521,8 +2561,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             const GraphicsPipeline* legacy =
                 legacy_valid ? PipelineForCurrentKey(params) : nullptr;
             fallback_nested = false;
+#ifndef NDEBUG
             ++(legacy ? legacy_stats.fallback_ok
                       : legacy_valid ? legacy_stats.fallback_unbuilt : legacy_stats.fallback_none);
+#endif
             ReportLegacy();
             if (legacy) {
                 return legacy;
@@ -2607,6 +2649,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
         // Do not repeat new-key diagnostics (or megabytes of logs) for those polls.
         if (!pending_builds.contains(S().graphics_key)) {
             LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
+#ifndef NDEBUG
             // DIAG-050: the parts of new keys of tessellated pipelines (GT Sport's race summary built
             // hundreds of keys for the same few programs).
             // DIAG-051: which part of a new key differs from the last key with the same stages
@@ -2704,6 +2747,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 }
             }
 
+#endif
         }
 
         GraphicsPipeline::SerializationSupport sdata{};
@@ -2724,7 +2768,9 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 stored->pipeline->SetStageInfos(S().infos);
                 sdata = stored->sdata;
                 it.value() = std::move(stored->pipeline);
+#ifndef NDEBUG
                 ++(stored->async ? async_stats.installed : prewarm_stats.hits);
+#endif
                 // Stored again, so the next session builds it among the first.
                 if (!S().key_uses_legacy) {
                     RegisterPipelineData(S().graphics_key, pipeline_hash, sdata);
@@ -2738,7 +2784,9 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 !MenusWait()) {
                 // PERF-076: still building; this draw is skipped, the next ones look again.
                 graphics_pipelines.erase(it);
+#ifndef NDEBUG
                 ++async_stats.skipped_draws;
+#endif
                 NoteSkippedDraw(); // PERF-103
                 return nullptr;
             }
@@ -2746,7 +2794,9 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 // Not started in the background yet: built now the usual way.
                 pending_builds.erase(pending);
                 pending = pending_builds.end();
+#ifndef NDEBUG
                 ++prewarm_stats.cancelled;
+#endif
             }
         }
         if (build_workers && CompileMode() != 2) {
@@ -2800,8 +2850,12 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             build->async = true;
             pending_builds[S().graphics_key] = build;
             graphics_pipelines.erase(it);
+#ifndef NDEBUG
             ++async_stats.deferred;
+#endif
+#ifndef NDEBUG
             ++async_stats.skipped_draws;
+#endif
             NoteSkippedDraw(); // PERF-103
             return nullptr;
         }
@@ -2815,7 +2869,9 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 build->urgent = true;
                 QueueBuild(build, true);
             }
+#ifndef NDEBUG
             const auto wait_start = std::chrono::steady_clock::now();
+#endif
             // Queueing a cosmetic job must not freeze input/audio clocks. Hold
             // them only while this command actually needs an unfinished build.
             std::optional<Common::GuestClock::CompilePause> hold;
@@ -2829,6 +2885,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             // completion, but never run the compiler on the GPU command/recorder thread.
             build->done.get();
             hold.reset();
+#ifndef NDEBUG
             const auto now = std::chrono::steady_clock::now();
             if (queued_states) {
                 ++queued_state_stats.waits;
@@ -2853,6 +2910,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                         std::chrono::duration<double, std::milli>(now - build->queued).count(),
                         std::chrono::duration<double, std::milli>(now - wait_start).count(),
                         why.empty() ? " ready within the quick wait" : why);
+#endif
             build->pipeline->SetStageInfos(S().infos);
             sdata = build->sdata;
             it.value() = std::move(build->pipeline);
@@ -2861,7 +2919,9 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
         if (!S().key_uses_legacy) { // D10: old translations are not in this store
             RegisterPipelineData(S().graphics_key, pipeline_hash, sdata);
         } else {
+#ifndef NDEBUG
             ++legacy_stats.pipelines;
+#endif
         }
         ++num_new_pipelines;
         MaybeSaveDriverCache();
@@ -2889,7 +2949,9 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         force_legacy = true;
         key_valid = RefreshComputeKey() && !S().legacy_failed;
         force_legacy = false;
+#ifndef NDEBUG
         ++(key_valid ? legacy_stats.fallback_ok : legacy_stats.fallback_none);
+#endif
         if (!key_valid) {
             key_valid = RefreshComputeKey();
         }
@@ -3399,7 +3461,9 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 
     Shader::Optimization::g_diag_compiling_code = code;
     Shader::Optimization::g_diag_compiling_hash = info.pgm_hash;
+#ifndef NDEBUG
     const auto translate_start = std::chrono::steady_clock::now();
+#endif
     std::vector<u32> spv;
     try {
         // FIX-034: a shader the translator cannot handle no longer stops the emulator. Its
@@ -3419,7 +3483,9 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
                                       "synchronous translation");
         return {};
     }
+#ifndef NDEBUG
     const auto translate_end = std::chrono::steady_clock::now();
+#endif
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
     last_spv_hash = XXH3_64bits(spv.data(), spv.size() * sizeof(u32));
     if (!Common::PerfFeatureEnabled(44)) {
@@ -3437,6 +3503,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     } else {
         module = CompileSPV(spv, instance.GetDevice());
     }
+#ifndef NDEBUG
     // PERF-DIAG-013: where runtime shader compile time goes.
     LOG_WARNING(
         Render_Vulkan, "Shader {} {:#x}: translate {:.1f} ms, module {:.1f} ms, {} words",
@@ -3445,6 +3512,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - translate_end)
             .count(),
         spv.size());
+#endif
 
     const auto name = GetShaderName(info.hw_stage, info.pgm_hash, perm_idx);
     Vulkan::SetObjectName(instance.GetDevice(), module, name);
@@ -3595,7 +3663,9 @@ void PipelineCache::PrewarmRead(std::stop_token stop) {
     if (const char* limit = std::getenv("SHADGT_PREWARM_LIMIT"); limit && *limit) {
         keys.resize(std::min<size_t>(keys.size(), std::strtoull(limit, nullptr, 10)));
     }
+#ifndef NDEBUG
     prewarm_total = keys.size();
+#endif
     g_precompile_total = keys.size(); // PERF-098
     g_precompile_done = 0;
     LOG_WARNING(Render_Vulkan, "PERF-038: building {} stored pipelines in the background",
@@ -3678,7 +3748,9 @@ void PipelineCache::PrewarmRead(std::stop_token stop) {
         if (!valid) return std::unique_ptr<PrewarmRecord>{};
         return record;
       }, [&](size_t, std::unique_ptr<PrewarmRecord> record) {
+#ifndef NDEBUG
         ++prewarm_read;
+#endif
         if (!record) { ++skipped; ++g_precompile_done; return; }
         std::unique_lock lk{prewarm_mutex};
         prewarm_cv.wait(lk, stop, [this] { return prewarm_records.size() < 32; });
@@ -3758,9 +3830,13 @@ void PipelineCache::InstallPrewarmed(bool force) {
         --prewarm_queued;
         prewarm_cv.notify_one();
         if (InstallPrewarmRecord(*record)) {
+#ifndef NDEBUG
             ++prewarm_stats.installed;
+#endif
         } else {
+#ifndef NDEBUG
             ++prewarm_stats.skipped;
+#endif
             ++g_precompile_done; // PERF-098
         }
     } while (std::chrono::steady_clock::now() < budget);
@@ -3769,8 +3845,10 @@ void PipelineCache::InstallPrewarmed(bool force) {
     S().modules = saved_modules;
     S().runtime_infos = saved_runtime_infos;
     S().fetch_shader = saved_fetch;
+#ifndef NDEBUG
     prewarm_stats.ms +=
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+#endif
 }
 
 bool PipelineCache::InstallPrewarmRecord(PrewarmRecord& record) {
@@ -3930,6 +4008,7 @@ bool PipelineCache::AsyncPipelines() {
 }
 
 void PipelineCache::ReportPrewarm(std::chrono::steady_clock::time_point now) {
+#ifndef NDEBUG
     auto& stats = prewarm_stats;
     if (now - stats.since < std::chrono::seconds{2}) {
         return;
@@ -3964,6 +4043,9 @@ void PipelineCache::ReportPrewarm(std::chrono::steady_clock::time_point now) {
     stats = {};
     stats.built_before = built_now;
     stats.since = now;
+#else
+    (void)now;
+#endif
 }
 
 vk::ShaderModule PipelineCache::LoadStoredModule(u64 pgm_hash, size_t perm_idx) {
@@ -4008,6 +4090,7 @@ void PipelineCache::DumpFailedShader(std::span<const u32> code, u64 hash, Shader
     std::ofstream{dir / (name + ".txt")} << Shader::ListGcnCode(code);
 }
 
+#ifndef NDEBUG
 bool IsWatchedShader(u64 hash) {
     static const std::vector<u64> watched = [] {
         // The Nurburgring grass: vertex generator, blade generator, and the pass before them.
@@ -4026,6 +4109,14 @@ bool IsWatchedShader(u64 hash) {
     }();
     return std::ranges::find(watched, hash) != watched.end();
 }
+#else
+// FIX-017: these shaders must retain the per-use buffer freshness path in Release.
+// The diagnostic environment override is available only in Debug.
+bool IsWatchedShader(u64 hash) {
+    return hash == 0xab6a2d10 || hash == 0xaa3822a3 ||
+           hash == 0x766d0f18 || hash == 0xae32f77f;
+}
+#endif
 
 void PipelineCache::LoadElseScopeFixed() {
     const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
@@ -4066,6 +4157,7 @@ void PipelineCache::SaveElseScopeFixed() const {
 // from 11 GB to 100 GB in seconds; the driver figure flickered while they built). Constants are
 // sane when they fit the 64 KB of LDS they describe; draws with others are skipped.
 // -DisablePerf 82 draws them.
+#ifndef NDEBUG
 // DIAG-063: the tessellation-constant V#s (HS user data 7..10) an indirect buffer sets, read
 // from a copy of it.
 static std::vector<VAddr> TessBasesInIb(const u32* data, u32 dwords) {
@@ -4186,6 +4278,7 @@ static void WatchIbAfterDecode(u32 n, bool sane, VAddr base) {
                     timeline, list(bases_before), list(bases_after));
     }).detach();
 }
+#endif
 
 static bool SaneTessConstants(const Shader::Info& hull, const AmdGpu::Liverpool* liverpool,
                               bool read_ahead) {
@@ -4210,6 +4303,7 @@ static bool SaneTessConstants(const Shader::Info& hull, const AmdGpu::Liverpool*
     };
     Common::CopyGuest(&c, reinterpret_cast<const void*>(base), sizeof(c));
     const bool sane = is_sane();
+#ifndef NDEBUG
     if (DrawPreparationEnabled(4)) {
         // DIAG-060: sane and garbage constants per hull program, every 5 s.
         static thread_local std::unordered_map<u64, std::pair<u32, u32>> per_hull;
@@ -4408,6 +4502,15 @@ static bool SaneTessConstants(const Shader::Info& hull, const AmdGpu::Liverpool*
                         reinterpret_cast<const u32*>(&buf)[2], reinterpret_cast<const u32*>(&buf)[3]);
         }
     }
+#else
+    if (!sane) {
+        static std::atomic<u32> logged{};
+        if (const u32 n = ++logged; n <= 60 || n % 100 == 0) {
+            LOG_WARNING(Render_Vulkan, "FIX-058: skipping tessellated {} of hs {:#x}: invalid constants at {:#x}",
+                        read_ahead ? "read-ahead state" : "draw", hull.pgm_hash, base);
+        }
+    }
+#endif
     return sane;
 }
 
@@ -4433,7 +4536,9 @@ bool PipelineCache::AsyncTranslation() const {
     // FIX-078: -DisablePerf 102 translates on the command thread as before. Dumped, collected or
     // patched shaders need their permutation index while they are translated.
     static const bool enabled = Common::PerfFeatureEnabled(102) &&
+ #ifndef NDEBUG
                                 !EmulatorSettings.IsDumpShaders() &&
+ #endif
                                 !EmulatorSettings.IsShaderCollect() &&
                                 !EmulatorSettings.IsPatchShaders();
     return enabled && translate_workers != nullptr;
@@ -4454,7 +4559,9 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
     });
     for (const auto& job : jobs) {
         if (MatchesTranslationRequest(*job, hw_stage, sw_stage, runtime_info, start)) {
+#ifndef NDEBUG
             ++translate_stats.duplicate;
+#endif
             return false;
         }
     }
@@ -4530,11 +4637,15 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
         const auto* previous_fetch = Shader::t_fetch_code_snapshots;
         SCOPE_EXIT { Shader::t_fetch_code_snapshots = previous_fetch; };
         Shader::t_fetch_code_snapshots = &job->fetch_code;
+#ifndef NDEBUG
         const auto preparation_start = std::chrono::steady_clock::now();
+#endif
         prepared->program.emplace(Shader::TranslateProgram(job->code, prepared->pools, *job->info,
                                                            prepared->compiled_runtime, profile));
+#ifndef NDEBUG
         job->translate_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - preparation_start).count();
+#endif
         job->prepared_translation = std::move(prepared);
     } catch (const Common::RecoverableFailure&) {
         return false;
@@ -4542,7 +4653,9 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
         return false;
     }
     jobs.push_back(job);
+#ifndef NDEBUG
     ++translate_stats.queued;
+#endif
     translate_workers->Queue(std::move(job));
     return true;
 }
@@ -4584,7 +4697,9 @@ bool PipelineCache::TakeReadyTranslation(HwStage hw_stage, SwStage sw_stage, u64
         program.modules[perm_idx].spv_hash = spv_hash;
         RegisterShaderBinary(std::move(job->spv), hash, perm_idx);
         ++Common::GetWorkCounters().shaders_compiled;
+#ifndef NDEBUG
         ++translate_stats.used;
+#endif
         ready.erase(job_it);
         if (ready.empty()) {
             ready_translations.erase(it);
@@ -4603,8 +4718,10 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
     }
     auto& jobs = it.value();
     if (wait) {
+#ifndef NDEBUG
         const auto wait_start = std::chrono::steady_clock::now();
         bool waited = false;
+#endif
         for (const auto& job : jobs) {
             if (MatchesTranslationRequest(*job, hw_stage, sw_stage, runtime_info, binding) &&
                 !job->done) {
@@ -4615,15 +4732,21 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
                 if (CompileCpuBatchEnabled(1)) translate_workers->Prioritize(job);
                 std::unique_lock lk{job->mutex};
                 job->cv.wait(lk, [&] { return job->done.load(); });
+#ifndef NDEBUG
                 waited = true;
+#endif
             }
         }
+#ifndef NDEBUG
         if (waited) {
+#ifndef NDEBUG
             ++translate_stats.waited;
+#endif
             translate_stats.wait_ms += std::chrono::duration<double, std::milli>(
                                            std::chrono::steady_clock::now() - wait_start)
                                            .count();
         }
+#endif
     }
     auto& ready = ready_translations[hash];
     const auto now = std::chrono::steady_clock::now();
@@ -4633,14 +4756,18 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
         }
         if (!job->info || !job->module) {
             if (!job->failure_reported) {
+#ifndef NDEBUG
                 ++translate_stats.failed;
+#endif
                 job->failure_reported = true;
             }
             // Keep a brief negative result only for optional draws. Required
             // dependencies still retry/fall back, and changed user data bypasses it.
             return !CompileCpuBatchEnabled(2) || !DelayFailedTranslationRetry(job->retry_after, now, !wait, true);
         }
+#ifndef NDEBUG
         translate_stats.translate_ms += job->translate_ms;
+#endif
         // Tessellation keys were captured on the translating worker, not from
         // whatever the guest wrote to the constant buffer before harvesting.
         // Every stage key was captured from the owned compilation inputs on the worker.
@@ -4657,9 +4784,12 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
             return false;
         }
         instance.GetDevice().destroyShaderModule(job->module);
+#ifndef NDEBUG
         ++translate_stats.expired;
+#endif
         return true;
     });
+#ifndef NDEBUG
     auto& stats = translate_stats;
     if (now - stats.since >= std::chrono::seconds{2}) {
         if (stats.queued + stats.used != 0) {
@@ -4674,6 +4804,7 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
         stats = {};
         stats.since = now;
     }
+#endif
 }
 
 std::optional<PipelineCache::Result> PipelineCache::TryLegacyProgram(
@@ -4711,7 +4842,9 @@ std::optional<PipelineCache::Result> PipelineCache::TryLegacyProgram(
             it.value()->InsertPermut({}, std::move(spec), std::move(info), entry.perm_idx);
             it.value()->modules[entry.perm_idx].stored = true;
         }
+#ifndef NDEBUG
         ++legacy_stats.programs;
+#endif
     }
     auto& program = *it.value();
     for (size_t perm_idx = 0; perm_idx < program.modules.size(); ++perm_idx) {
@@ -4749,7 +4882,9 @@ std::optional<PipelineCache::Result> PipelineCache::TryLegacyProgram(
         if (auto& fetch = permutation.spec.fetch_shader_data; !fetch.Empty()) {
             S().fetch_shader = &fetch;
         }
+#ifndef NDEBUG
         ++legacy_stats.draws;
+#endif
         ReportLegacy();
         // Its own pipeline keys: the module hashes of old translations differ from new ones.
         constexpr u64 LegacyTag = 0x4c45474143590000ULL;
@@ -4760,6 +4895,7 @@ std::optional<PipelineCache::Result> PipelineCache::TryLegacyProgram(
 }
 
 void PipelineCache::ReportLegacy() {
+#ifndef NDEBUG
     const auto now = std::chrono::steady_clock::now();
     if (now - legacy_stats.since < std::chrono::seconds{2}) {
         return;
@@ -4776,6 +4912,7 @@ void PipelineCache::ReportLegacy() {
     legacy_stats = {};
     legacy_stats.programs = programs;
     legacy_stats.since = now;
+#endif
 }
 
 PipelineCache::Result PipelineCache::GetProgramForJob(HwStage hw_stage,
@@ -4911,6 +5048,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
     // with the else running for every invocation. Translate those programs again, once; the new
     // permutations start after the stored ones, so their pipelines are new as well.
     const bool first_use = else_scope_checked.insert(params.hash).second;
+#ifndef NDEBUG
     if (first_use && IsWatchedShader(params.hash)) {
         // DIAG-031: the guest code of watched shaders, raw and as a listing, in the log folder.
         const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir);
@@ -4921,6 +5059,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         LOG_WARNING(Render_Vulkan, "DIAG-031: wrote the code of {}_{:#x} ({} dwords) to {}",
                     hw_stage, params.hash, params.code.size(), (dir / (name + ".txt")).string());
     }
+#endif
     // FIX-018/FIX-020: stored translations made before a translator fix that changes them.
     u32 needed_fixes = 0;
     if (first_use) {
@@ -5138,7 +5277,9 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         // the usual way (fallback_nested).
         if (legacy_fallback && !MenusWait() && !read_ahead && !fallback_nested) {
             if (QueueTranslation(hw_stage, sw_stage, params, runtime_info, binding, true)) {
+#ifndef NDEBUG
                 ++legacy_stats.queued;
+#endif
             }
             fallback_miss = true;
             return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
@@ -5315,6 +5456,7 @@ std::string PipelineCache::GetShaderName(Shader::HwStage stage, u64 hash,
 
 void PipelineCache::DumpShader(std::span<const u32> code, u64 hash, Shader::HwStage stage,
                                size_t perm_idx, std::string_view ext) {
+#ifndef NDEBUG
     if (!EmulatorSettings.IsDumpShaders()) {
         return;
     }
@@ -5327,6 +5469,9 @@ void PipelineCache::DumpShader(std::span<const u32> code, u64 hash, Shader::HwSt
     const auto filename = fmt::format("{}.{}", GetShaderName(stage, hash, perm_idx), ext);
     const auto file = IOFile{dump_dir / filename, FileAccessMode::Create};
     file.WriteSpan(code);
+#else
+    (void)code; (void)hash; (void)stage; (void)perm_idx; (void)ext;
+#endif
 }
 
 std::optional<std::vector<u32>> PipelineCache::GetShaderPatch(u64 hash, Shader::HwStage stage,
@@ -5375,13 +5520,17 @@ void PipelineCache::TrimUnusedPipelines() {
     if (!instance.CanReportMemoryUsage()) return;
     vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget{};
     vk::PhysicalDeviceMemoryProperties2 memory{.pNext = &budget};
+#ifndef NDEBUG
     const auto budget_query_start = steady_clock::now();
+#endif
     instance.GetPhysicalDevice().getMemoryProperties2(&memory);
+#ifndef NDEBUG
     const auto budget_query_end = steady_clock::now();
     if (budget_query_end - budget_query_start >= milliseconds{1}) {
         LOG_WARNING(Render_Vulkan, "BUDGET-QUERY: pipeline retention {:.3f} ms",
                     duration<double, std::milli>(budget_query_end - budget_query_start).count());
     }
+#endif
     u64 usage_bytes = 0;
     u64 budget_bytes = 0;
     for (u32 i = 0; i < memory.memoryProperties.memoryHeapCount; ++i) {

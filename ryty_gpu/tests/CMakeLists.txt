@@ -427,3 +427,79 @@ add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/vertex-validate-under-tes
     DEPENDS extract_vertex_validate.py "${SHADGT_ROOT}/ryty_gpu/native/parallel_pass_recording.cpp" VERBATIM)
 target_sources(parallel_vertex_validate_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/vertex-validate-under-test.inc")
 add_test(NAME parallel_vertex_validate COMMAND parallel_vertex_validate_test)
+
+# Keep NDEBUG: assertion-enabled fixtures cannot establish Release behavior.
+add_executable(frame_queue_release_test frame_queue_release_test.cpp
+    "${SHADGT_ROOT}/src/common/frame_queue_trace.cpp")
+target_compile_features(frame_queue_release_test PRIVATE cxx_std_23)
+target_compile_definitions(frame_queue_release_test PRIVATE NDEBUG)
+target_include_directories(frame_queue_release_test PRIVATE "${SHADGT_ROOT}/src")
+if(MSVC)
+    target_compile_options(frame_queue_release_test PRIVATE /EHsc)
+endif()
+add_test(NAME frame_queue_release COMMAND frame_queue_release_test
+    "${CMAKE_CURRENT_BINARY_DIR}/frame-queue-release-disabled")
+
+
+# Exercise the actual consumer under production Release preprocessing. The old
+# body differs only by the missing policy condition and must fail these cases.
+add_executable(compute_menu_policy_test compute_menu_policy_test.cpp)
+target_compile_features(compute_menu_policy_test PRIVATE cxx_std_23)
+target_compile_definitions(compute_menu_policy_test PRIVATE NDEBUG)
+target_include_directories(compute_menu_policy_test PRIVATE "${SHADGT_ROOT}/src" "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(compute_menu_policy_test PRIVATE /EHsc)
+endif()
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/compute_policy.inc"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_compute_policy.py"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer.cpp" "${CMAKE_CURRENT_BINARY_DIR}/compute_policy.inc"
+    DEPENDS extract_compute_policy.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer.cpp" VERBATIM)
+target_sources(compute_menu_policy_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/compute_policy.inc")
+add_test(NAME compute_menu_policy_release COMMAND compute_menu_policy_test)
+foreach(case IN ITEMS "--legacy-negative" "--legacy-negative-same" "--legacy-negative-null")
+    string(REPLACE "--legacy-negative" "compute_menu_policy_old" test_name "${case}")
+    add_test(NAME "${test_name}"
+        COMMAND "${Python3_EXECUTABLE}" -c
+            "import subprocess,sys; p=subprocess.run(sys.argv[1:]); sys.exit(0 if p.returncode==9 else 1)"
+            "$<TARGET_FILE:compute_menu_policy_test>" "${case}")
+endforeach()
+
+add_executable(worker_identity_defer_test worker_identity_defer_test.cpp)
+target_compile_features(worker_identity_defer_test PRIVATE cxx_std_23)
+target_compile_definitions(worker_identity_defer_test PRIVATE NDEBUG)
+target_include_directories(worker_identity_defer_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(worker_identity_defer_test PRIVATE /EHsc)
+endif()
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/worker-identity-defer.inc"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_worker_identity_defer.py"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
+        "${CMAKE_CURRENT_BINARY_DIR}/worker-identity-defer.inc"
+    DEPENDS extract_worker_identity_defer.py
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" VERBATIM)
+target_sources(worker_identity_defer_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/worker-identity-defer.inc")
+add_test(NAME worker_identity_defer_release COMMAND worker_identity_defer_test)
+add_test(NAME worker_identity_eager_negative
+    COMMAND "${Python3_EXECUTABLE}" -c
+        "import subprocess,sys; p=subprocess.run(sys.argv[1:]); sys.exit(0 if p.returncode==9 else 1)"
+        "$<TARGET_FILE:worker_identity_defer_test>" "--eager-negative")
+
+# Source-extracted functions use the production diagnostic macro, including its
+# NDEBUG branch, rather than a duplicated test-only definition.
+set(NATIVE_DIAGNOSTIC_CONTEXT "${CMAKE_CURRENT_BINARY_DIR}/native-diagnostic-context.h")
+add_custom_command(OUTPUT "${NATIVE_DIAGNOSTIC_CONTEXT}"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_native_diagnostic.py"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
+        "${NATIVE_DIAGNOSTIC_CONTEXT}"
+    DEPENDS extract_native_diagnostic.py
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
+    VERBATIM)
+get_directory_property(NATIVE_TEST_TARGETS BUILDSYSTEM_TARGETS)
+foreach(NATIVE_TEST_TARGET IN LISTS NATIVE_TEST_TARGETS)
+    target_sources(${NATIVE_TEST_TARGET} PRIVATE "${NATIVE_DIAGNOSTIC_CONTEXT}")
+    if(MSVC)
+        target_compile_options(${NATIVE_TEST_TARGET} PRIVATE "/FI${NATIVE_DIAGNOSTIC_CONTEXT}")
+    else()
+        target_compile_options(${NATIVE_TEST_TARGET} PRIVATE -include "${NATIVE_DIAGNOSTIC_CONTEXT}")
+    endif()
+endforeach()

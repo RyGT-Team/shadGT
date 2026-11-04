@@ -233,6 +233,9 @@ std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window
 }
 
 std::vector<const char*> GetInstanceLayers(bool enable_validation, bool enable_crash_diagnostic) {
+#ifdef NDEBUG
+    return {};
+#else
     const auto [properties_result, properties] = vk::enumerateInstanceLayerProperties();
     if (properties_result != vk::Result::eSuccess) {
         LOG_ERROR(Render_Vulkan, "Failed to query layer properties: {}",
@@ -264,6 +267,7 @@ std::vector<const char*> GetInstanceLayers(bool enable_validation, bool enable_c
     });
 
     return layers;
+#endif
 }
 
 vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool enable_validation,

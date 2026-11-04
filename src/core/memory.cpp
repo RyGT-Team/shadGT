@@ -175,6 +175,7 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
 }
 
 // DIAG-035: a ring of the emulator's own writes into guest memory.
+#ifndef NDEBUG
 struct BackingWrite {
     VAddr address;
     u64 size;
@@ -225,6 +226,9 @@ void MemoryManager::NoteEmulatorWrite(VAddr address, u64 size, const void* data,
     auto& w = g_backing_writes[g_backing_write_index.fetch_add(1) % BackingWriteCount];
     w = {address, size, loc.file_name(), loc.line(), first, std::chrono::steady_clock::now()};
 }
+#else
+std::string MemoryManager::DescribeBackingWrites(VAddr, u64) { return {}; }
+#endif
 
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size,
                                     std::source_location loc) {

@@ -251,6 +251,7 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
 
 // PERF-DIAG-002: flip pacing. Submit-to-flip latency, Present() time, and queued flips at each
 // vblank, reported every 2 s.
+#ifndef NDEBUG
 namespace {
 struct FlipStats {
     std::mutex mutex;
@@ -281,8 +282,10 @@ void ReportFlipStats() {
     s.window = now;
 }
 } // namespace
+#endif
 
 void VideoOutDriver::Flip(const Request& req) {
+#ifndef NDEBUG
     Common::FrameQueueTrace::Row trace{};
     trace.ticket = req.trace;
     if (trace.ticket.generation) {
@@ -293,16 +296,20 @@ void VideoOutDriver::Flip(const Request& req) {
         trace.frame_id = req.frame->id;
     }
     Common::FrameQueueTrace::Scope trace_scope{trace.ticket.generation ? &trace : nullptr};
+#endif
     // Update HDR status before presenting.
     presenter->SetHDR(req.port->is_hdr);
 
     // Present the frame.
+#ifndef NDEBUG
     const auto present_start = std::chrono::steady_clock::now();
     Common::Nvtx::Mark("flip"); // DIAG-056
+#endif
     {
         Common::Nvtx::Scope nvtx{"present"};
         presenter->Present(req.frame);
     }
+    #ifndef NDEBUG
     {
         const auto now = std::chrono::steady_clock::now();
         std::scoped_lock lk{g_flip_stats.mutex};
@@ -330,6 +337,7 @@ void VideoOutDriver::Flip(const Request& req) {
         trace.protect_bytes = work.protect_bytes.load(std::memory_order_relaxed);
         Common::FrameQueueTrace::Complete(trace);
     }
+#endif
     // Update flip status.
     auto* port = req.port;
     {
@@ -419,8 +427,10 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
                                         Common::FrameQueueTrace::Ticket trace) {
+#ifndef NDEBUG
     if (trace.generation)
         Common::FrameQueueTrace::Prepare(trace);
+#endif
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
@@ -433,8 +443,10 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
 
     {
         std::scoped_lock lock{mutex};
+#ifndef NDEBUG
         if (trace.generation)
             Common::FrameQueueTrace::Enqueue(trace);
+#endif
         requests.push({
             .frame = frame,
             .port = port,
@@ -442,7 +454,9 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
             .index = index,
             .eop = is_eop,
             .trace = trace,
+#ifndef NDEBUG
             .submitted = std::chrono::steady_clock::now(),
+#endif
         });
     }
     request_cv.notify_one();
@@ -501,8 +515,10 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         if (!requests.empty()) {
             auto request = requests.front();
             requests.pop();
+#ifndef NDEBUG
             if (request.trace.generation)
                 Common::FrameQueueTrace::Dequeue(request.trace);
+#endif
             return request;
         }
         return {};
@@ -522,10 +538,12 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 now = Clock::now();
                 if (now < next_tick && early_allowed()) {
                     if (const auto request = receive_request()) {
+#ifndef NDEBUG
                         {
                             std::scoped_lock stats_lock{g_flip_stats.mutex};
                             ++g_flip_stats.early_flips;
                         }
+#endif
                         Flip(request);
                         FRAME_END;
                     }
@@ -557,10 +575,14 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 // and the precompile bar; after it the last frame (skipped while it is taken).
                 // DIAG-126 (SHADGT_NO_LAST_FRAME=1): compile pauses after the first frame keep
                 // what is on screen instead of showing the last frame again.
+#ifndef NDEBUG
                 static const bool no_last_frame = [] {
                     const char* env = std::getenv("SHADGT_NO_LAST_FRAME");
                     return env && env[0] == '1';
                 }();
+#else
+                constexpr bool no_last_frame = false;
+#endif
                 if (!main_port.is_open || !presenter->HasLastFrame()) {
                     DrawBlankFrame();
                 } else if (!no_last_frame) {
@@ -578,10 +600,12 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             // FAST-FLIP: between vblanks, only a ready frame is flipped.
             if (flip_rate == 0) {
                 if (const auto request = receive_request()) {
+#ifndef NDEBUG
                     {
                         std::scoped_lock lk{g_flip_stats.mutex};
                         ++g_flip_stats.early_flips;
                     }
+#endif
                     Flip(request);
                     FRAME_END;
                 }
@@ -589,6 +613,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             continue;
         }
         if (vblank_status.count % (flip_rate + 1) == 0) {
+#ifndef NDEBUG
             {
                 std::scoped_lock lk{mutex, g_flip_stats.mutex};
                 ++g_flip_stats.vblanks;
@@ -599,6 +624,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 }
                 ReportFlipStats();
             }
+#endif
             const auto request = receive_request();
             if (!request) {
                 if (overdue) { // Dont draw too fast

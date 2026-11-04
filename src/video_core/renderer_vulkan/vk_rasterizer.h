@@ -339,9 +339,13 @@ public:
     /// touch guest memory in [lo, hi) are logged all run long (NAT-130 lines), as the frame dump's
     /// events. The hooks run when this or the dump wants them.
     static std::pair<VAddr, VAddr> TraceRange();
+#ifndef NDEBUG
     bool FrameDumpActive() const noexcept {
         return frame_dump_collecting || TraceRange().first != TraceRange().second;
     }
+#else
+    constexpr bool FrameDumpActive() const noexcept { return false; }
+#endif
     /// NAT-130: whether [address, address + size) meets the traced range.
     static bool Traced(VAddr address, u64 size) {
         const auto [lo, hi] = TraceRange();

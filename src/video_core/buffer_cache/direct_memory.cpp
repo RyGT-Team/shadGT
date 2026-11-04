@@ -482,16 +482,22 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
         size > ImportedPageCoverage<>::Limit - address) return false;
     const VAddr end = address + size;
     trace.Next(5);
+#ifndef NDEBUG
     static thread_local u64 coverage_hits{}, coverage_misses{};
+#endif
     if (imported_coverage.Covers(address, size)) {
+#ifndef NDEBUG
         if ((++coverage_hits & 65535) == 0) {
             LOG_INFO(Render_Vulkan,
                      "IMPORT-COVERAGE: {} completed-range hits without view lock, {} misses",
                      coverage_hits, coverage_misses);
         }
+#endif
         return true;
     }
+#ifndef NDEBUG
     ++coverage_misses;
+#endif
     trace.Next(6);
     std::scoped_lock lk{mutex};
 #ifdef RYTY_GPU

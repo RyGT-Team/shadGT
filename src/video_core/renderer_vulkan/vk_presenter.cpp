@@ -448,7 +448,7 @@ static bool WritePng(const std::filesystem::path& path, const std::span<const u8
     return stbi_write_png_to_func(callback, &file, width, height, 4, rgba.data(), 0);
 }
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(NDEBUG)
 extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int key);
 #endif
 
@@ -460,6 +460,7 @@ extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int key);
 // per-frame draw sets, SHADGT_LOG_DRAW_SET=2).
 std::atomic<u64> g_prepared_frames{0};
 
+#ifndef NDEBUG
 static int FlashWatchMode() {
     static const int mode = [] {
         const char* env = std::getenv("SHADGT_FLASH_WATCH");
@@ -571,10 +572,16 @@ static void CheckFlashFrame(const ScreenshotReadback& readback) {
     previous_mean = mean;
     previous = std::move(rgba);
 }
+#else
+static constexpr bool FlashWatchEnabled() { return false; }
+static constexpr bool FlashWatchScreen() { return false; }
+#endif
 
 static void SavePendingScreenshot(const ScreenshotReadback& readback) {
     if (readback.paths.empty()) {
+#ifndef NDEBUG
         CheckFlashFrame(readback); // DIAG-125
+#endif
         return;
     }
 
@@ -861,7 +868,9 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
     const u64 guestFrame = g_prepared_frames.fetch_add(1, std::memory_order_relaxed);
+#ifndef NDEBUG
     rasterizer->FrameDumpFlip(); // NAT-116
+#endif
 #ifdef RYTY_GPU
     if (auto* native = rasterizer->Native()) {
         return PrepareNativeFrame(*native, attribute, cpu_address);
@@ -1335,6 +1344,7 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread, Frame* frame) {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+#ifndef NDEBUG
     auto* trace = Common::FrameQueueTrace::current;
     struct TracePresentScope {
         Common::FrameQueueTrace::Row* row;
@@ -1347,6 +1357,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 row->present_end = Common::FrameQueueTrace::Now(row->ticket);
         }
     } trace_scope{trace};
+#endif
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
@@ -1617,11 +1628,15 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // PERF-084: the work the frame waits for is on the same queue, so it must be submitted
     // first (a command thread submits it after the flush that recorded it).
     if (frame->ready_scheduler) {
+#ifndef NDEBUG
         if (trace)
             trace->wait_begin = Common::FrameQueueTrace::Now(trace->ticket);
+#endif
         frame->ready_scheduler->WaitSubmitted(frame->ready_tick);
+#ifndef NDEBUG
         if (trace)
             trace->wait_end = Common::FrameQueueTrace::Now(trace->ticket);
+#endif
     }
     SubmitInfo info{};
     info.AddWait(swapchain.GetImageAcquiredSemaphore());
@@ -1633,16 +1648,22 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // Present to swapchain.
     {
         RYDIAG_SCOPE(Present);
+#ifndef NDEBUG
         if (trace)
             trace->lock_attempt = Common::FrameQueueTrace::Now(trace->ticket);
+#endif
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
+#ifndef NDEBUG
         if (trace)
             trace->lock_acquired = Common::FrameQueueTrace::Now(trace->ticket);
+#endif
         const bool presented = swapchain.Present();
+#ifndef NDEBUG
         if (trace) {
             trace->swapchain_return = Common::FrameQueueTrace::Now(trace->ticket);
             trace->present_outcome = presented ? 1 : 2;
         }
+#endif
         if (!presented) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
@@ -1657,6 +1678,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 }
 
 Frame* Presenter::GetRenderFrame() {
+#ifndef NDEBUG
     // PERF-DIAG-002: how long the GPU thread waits here for a free presentation frame.
     const auto wait_start = std::chrono::steady_clock::now();
     struct WaitStats {
@@ -1684,6 +1706,7 @@ Frame* Presenter::GetRenderFrame() {
             stats.window = now;
         }
     };
+#endif
     // Wait for free presentation frames
     Frame* frame;
     {
@@ -1713,7 +1736,9 @@ Frame* Presenter::GetRenderFrame() {
             continue;
         }
     }
+#ifndef NDEBUG
     record_wait();
+#endif
 #ifdef RYTY_GPU
     frame->framegen_scene.inputs = {}; // never reuse another scene's metadata on a blank frame
     frame->framegen_scene.hudless_scene_valid = false;

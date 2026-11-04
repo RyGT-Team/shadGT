@@ -1,6 +1,7 @@
 #pragma once
 #include "ryty_gpu/native/slow_call_trace.h"
 namespace Native {
+#ifndef NDEBUG
 template <size_t N>
 class UploadPhaseTrace {
     using Clock = std::chrono::steady_clock;
@@ -73,4 +74,16 @@ private:
     uint64_t context_address{}, context_size{}, longest_address{}, longest_size{};
     uint64_t cpu_start{};
 };
+#else
+template <size_t N>
+class UploadPhaseTrace {
+public:
+    constexpr UploadPhaseTrace(bool, const char*, std::array<const char*, N>) noexcept {}
+    constexpr void Next(size_t) noexcept {}
+    constexpr void Next(size_t, uint64_t, uint64_t) noexcept {}
+    UploadPhaseTrace(const UploadPhaseTrace&) = delete;
+    UploadPhaseTrace& operator=(const UploadPhaseTrace&) = delete;
+};
+#endif
+
 }

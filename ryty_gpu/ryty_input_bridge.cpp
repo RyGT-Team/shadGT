@@ -76,6 +76,7 @@ struct RytyPadOutputState {
     int vibrationMode = 0;
 };
 
+#ifndef NDEBUG
 // Test hook: RYTY_TEST_SCRIPT="50:shot;52:cross;65:shot" presses buttons and saves game-only
 // screenshots at the given seconds after the renderer starts, without touching the host keyboard.
 // "r2on"/"r2off" hold the accelerator (R2, fully pressed) until released.
@@ -141,6 +142,8 @@ void RunTestScript(std::string script) {
         }
     }
 }
+
+#endif
 
 // libScePad.prx: PadPublishInput (Microsoft ABI, exported by NID).
 using PublishFn = void (*)(const RytyPadInputState&);
@@ -361,6 +364,7 @@ void ForwardInput() {
                             ClampAxis(state.axes[2]), ClampAxis(state.axes[3])};
             input.analogButtonsL2 = ClampAxis(state.axes[4]);
             input.analogButtonsR2 = ClampAxis(state.axes[5]);
+#ifndef NDEBUG
             if (slot == 0) {
                 input.buttons |= g_scripted_buttons.load();
                 if (const int lx = g_scripted_lx.load(); lx >= 0) {
@@ -372,6 +376,7 @@ void ForwardInput() {
                     input.analogButtonsR2 = 255;
                 }
             }
+#endif
             if (released) {
                 input = RytyPadInputState{}; // the Controllers window is open: nothing pressed
             }
@@ -568,9 +573,11 @@ void SetControllerPortChoice(int player, const std::string& key) {
 
 void StartInputBridge() {
     std::thread(ForwardInput).detach();
+#ifndef NDEBUG
     if (const char* script = std::getenv("RYTY_TEST_SCRIPT"); script != nullptr && *script != 0) {
         std::thread(RunTestScript, std::string(script)).detach();
     }
+#endif
 }
 
 } // namespace Ryty

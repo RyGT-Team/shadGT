@@ -34,6 +34,12 @@
 
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
+#ifndef NDEBUG
+#define SHADOW_DIAG(...) __VA_ARGS__
+#else
+#define SHADOW_DIAG(...)
+#endif
+
 namespace Native {
 namespace {
 
@@ -41,10 +47,14 @@ using AmdGpu::PM4ItOpcode;
 using AmdGpu::Regs;
 using State = AmdGpu::Liverpool::RecorderState;
 
+#ifndef NDEBUG
 const bool g_compare = [] {
     const char* env = std::getenv("RYGT_NATIVE_SHADOW");
     return env && env[0] == '1';
 }();
+#else
+constexpr bool g_compare = false;
+#endif
 // OPT-010: native mode prepares each draw's bindings on the job's thread (no comparisons).
 // PERF-316: on whenever the native renderer is (launcher or RYGT_NATIVE); RYGT_NATIVE_PREPARE=0
 // turns it off. Decided at first use: the game's settings are not readable at load time.
@@ -555,10 +565,14 @@ void Snapshot(const u32* packet, const Regs& regs, u32 epoch, bool from_parent,
 
 // Records a snapshot of the state at each draw of a job.
 // NAT-030 (RYGT_NATIVE_PIPELINES=1): each draw's pipeline is looked up on the job's thread too.
+#ifndef NDEBUG
 const bool g_lookups = [] {
     const char* env = std::getenv("RYGT_NATIVE_PIPELINES");
     return env && env[0] == '1';
 }();
+#else
+constexpr bool g_lookups = false;
+#endif
 
 class SnapshotVisitor final : public JobVisitor {
 public:
@@ -576,7 +590,9 @@ public:
             state->cb_extent = extents.cb;
             state->db_extent = extents.db;
             AmdGpu::Liverpool::SetThreadDrawState(state);
+#ifndef NDEBUG
             const auto start = std::chrono::steady_clock::now();
+#endif
             auto* rasterizer = liverpool->GetRasterizer();
             const Vulkan::GraphicsPipeline* found =
                 rasterizer->LookupJobPipeline(pipeline_keepalive, &miss);
@@ -599,9 +615,9 @@ public:
                 // NAT-032: the sharps the draw reads, as this thread sees them now.
                 const auto sharps_start = std::chrono::steady_clock::now();
                 const u64 hash = Vulkan::Rasterizer::JobSharpsHash();
-                g_stats.sharps_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                SHADOW_DIAG(g_stats.sharps_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          std::chrono::steady_clock::now() - sharps_start)
-                                         .count();
+                                         .count());
                 const u64 key = reinterpret_cast<u64>(packet);
                 auto& shard = g_sharps[(key * 0x9E3779B97F4A7C15ULL) >> 58];
                 std::scoped_lock lock{shard.mutex};
@@ -612,17 +628,19 @@ public:
                 }
                 shard.map.insert_or_assign(key, SharpsEntry{hash, epoch});
             }
-            g_stats.lookup_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+#ifndef NDEBUG
+            SHADOW_DIAG(g_stats.lookup_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                                      std::chrono::steady_clock::now() - start)
-                                     .count();
-            ++g_stats.lookups;
+                                     .count());
+#endif
+            SHADOW_DIAG(++g_stats.lookups);
             AmdGpu::Liverpool::SetThreadDrawState(nullptr);
             looked_up = true;
         }
         if (g_compare) {
             Snapshot(packet, regs, epoch, from_parent, looked_up, pipeline, miss);
         } else {
-            ++g_stats.prepare_walked;
+            SHADOW_DIAG(++g_stats.prepare_walked);
         }
     }
 
@@ -635,13 +653,17 @@ private:
 // Walks a job's commands up to `until` like the command processor does (NAT-004), recording a
 // snapshot of the state at each draw.
 void WalkJobTo(Job& job, const u32* until) {
+#ifndef NDEBUG
     const auto start = std::chrono::steady_clock::now();
+#endif
     SnapshotVisitor visitor{g_epoch.load(std::memory_order_relaxed), job.from_parent,
                             job.state.get()};
     job.cursor.WalkTo(until, job.state->regs, job.extents, visitor, job.walk);
+#ifndef NDEBUG
     job.walk_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                        std::chrono::steady_clock::now() - start)
                        .count();
+#endif
 }
 
 std::mutex g_failure_mutex;
@@ -691,18 +713,19 @@ void FinishJob(Job& job) {
     if (walk.bad_packet || walk.overrun) {
         LogFailedWalk(job);
     }
-    g_stats.clear_states += walk.clear_states;
-    g_stats.packets += walk.packets;
-    g_stats.draws += walk.draws;
-    g_stats.chain_links += walk.chain_links;
-    g_stats.call_links += walk.call_links;
-    g_stats.bad_packets += walk.bad_packet;
-    g_stats.overruns += walk.overrun;
-    ++g_stats.jobs_decoded;
-    g_stats.decode_ns += job.walk_ns;
+    SHADOW_DIAG(g_stats.clear_states += walk.clear_states);
+    SHADOW_DIAG(g_stats.packets += walk.packets);
+    SHADOW_DIAG(g_stats.draws += walk.draws);
+    SHADOW_DIAG(g_stats.chain_links += walk.chain_links);
+    SHADOW_DIAG(g_stats.call_links += walk.call_links);
+    SHADOW_DIAG(g_stats.bad_packets += walk.bad_packet);
+    SHADOW_DIAG(g_stats.overruns += walk.overrun);
+    SHADOW_DIAG(++g_stats.jobs_decoded);
+    SHADOW_DIAG(g_stats.decode_ns += job.walk_ns);
     t_free_states.push_back(std::move(job.state));
 }
 
+#ifndef NDEBUG
 void ReporterLoop() {
     using namespace std::chrono_literals;
     Stats last{};
@@ -856,6 +879,8 @@ void ReporterLoop() {
 
 std::atomic<bool> g_reporter_started{false};
 
+#endif
+
 } // namespace
 
 bool ShadowEnabled() {
@@ -867,15 +892,15 @@ bool ShadowComparing() {
 }
 
 void ShadowJobBegin(const u8* dcb) {
-    ++g_stats.jobs_begun;
+    SHADOW_DIAG(++g_stats.jobs_begun);
     Job job;
     job.dcb = dcb;
     job.state = TakeState();
     if (!InitJobState(job)) {
-        ++g_stats.jobs_without_base;
+        SHADOW_DIAG(++g_stats.jobs_without_base);
         t_free_states.push_back(std::move(job.state));
     } else {
-        ++g_stats.jobs_from[job.from_parent];
+        SHADOW_DIAG(++g_stats.jobs_from[job.from_parent]);
         job.cursor.Start(DcbBegin(dcb), DcbEnd(dcb), job.walk);
     }
     if (t_jobs.size() >= 64) {
@@ -909,7 +934,7 @@ void HandOver(const Job& parent, const u8* child_context) {
     std::scoped_lock lock{g_fork_mutex};
     if (g_fork_states.size() > 20000) {
         // children that never began (should not happen): don't let them pile up
-        g_stats.fork_states_dropped += g_fork_states.size();
+        SHADOW_DIAG(g_stats.fork_states_dropped += g_fork_states.size());
         g_fork_states.clear();
     }
     g_fork_states.insert_or_assign(child_context, std::move(state));
@@ -940,7 +965,7 @@ Job* RootFor(const u8* context, const u32* slot, const u32* run_begin, const u32
         }
         CopyCompared(g_base->reg_array.data(), root->state->regs.reg_array.data());
     }
-    ++g_stats.root_restarts;
+    SHADOW_DIAG(++g_stats.root_restarts);
     root->dcb = context + kContextDcb;
     root->end = nullptr;
     root->extents = {};
@@ -955,9 +980,9 @@ Job* RootFor(const u8* context, const u32* slot, const u32* run_begin, const u32
 
 void ShadowFork(const u8* parent_context, const u32* slot, const u32* run_begin,
                 const u32* run_limit, const u8* child_context, u64 caller) {
-    ++g_stats.forks;
+    SHADOW_DIAG(++g_stats.forks);
     if (parent_context == nullptr || child_context == nullptr) {
-        ++g_stats.forks_other_context;
+        SHADOW_DIAG(++g_stats.forks_other_context);
         return;
     }
     const u8* parent_dcb = parent_context + kContextDcb;
@@ -969,10 +994,11 @@ void ShadowFork(const u8* parent_context, const u32* slot, const u32* run_begin,
         }
     }
     if (parent == nullptr && OpenElsewhere(parent_dcb)) {
-        ++g_stats.forks_job_elsewhere; // its walk lives on the other thread: not followed
+        SHADOW_DIAG(++g_stats.forks_job_elsewhere); // its walk lives on the other thread: not followed
         return;
     }
     if (parent == nullptr) {
+#ifndef NDEBUG
         if (g_stats.forks_other_logged.fetch_add(1) < 4) {
             LOG_INFO(Lib_GnmDriver,
                      "NAT-008 fork from a context that is not a job open on this thread "
@@ -981,42 +1007,43 @@ void ShadowFork(const u8* parent_context, const u32* slot, const u32* run_begin,
                      fmt::ptr(parent_context), fmt::ptr(run_begin), fmt::ptr(run_limit),
                      fmt::ptr(slot), fmt::ptr(child_context), caller, t_jobs.size());
         }
+#endif
         std::scoped_lock lock{g_roots_mutex};
         Job* root = RootFor(parent_context, slot, run_begin, run_limit);
         if (root == nullptr) {
-            ++g_stats.forks_other_context;
+            SHADOW_DIAG(++g_stats.forks_other_context);
             return;
         }
         WalkJobTo(*root, slot);
         root->cursor.SkipFork(DcbBegin(parent_dcb), DcbEnd(parent_dcb), root->walk);
         if (!root->cursor.Ok()) {
-            ++g_stats.root_walks_failed;
+            SHADOW_DIAG(++g_stats.root_walks_failed);
             LogFailedWalk(*root);
             return;
         }
-        ++g_stats.forks_root;
+        SHADOW_DIAG(++g_stats.forks_root);
         HandOver(*root, child_context);
         return;
     }
     if (!parent->state) {
-        ++g_stats.forks_other_context;
+        SHADOW_DIAG(++g_stats.forks_other_context);
         return;
     }
     // The parent's commands up to the link slot, then on where its own commands continue.
     WalkJobTo(*parent, slot);
     parent->cursor.SkipFork(DcbBegin(parent_dcb), DcbEnd(parent_dcb), parent->walk);
     if (!parent->cursor.Ok()) {
-        ++g_stats.forks_failed;
+        SHADOW_DIAG(++g_stats.forks_failed);
         return;
     }
-    ++g_stats.forks_walked;
+    SHADOW_DIAG(++g_stats.forks_walked);
     HandOver(*parent, child_context);
 }
 
 void ShadowJobEnd(const u8* current_context) {
     t_has_ended = false;
     if (t_jobs.empty()) {
-        ++g_stats.jobs_unmatched_end;
+        SHADOW_DIAG(++g_stats.jobs_unmatched_end);
         return;
     }
     // Job end ends the context current on this thread: normally the innermost job open here.
@@ -1026,10 +1053,10 @@ void ShadowJobEnd(const u8* current_context) {
         const auto found = std::find_if(t_jobs.begin(), t_jobs.end(),
                                         [dcb](const Job& job) { return job.dcb == dcb; });
         if (found == t_jobs.end()) {
-            ++(OpenElsewhere(dcb) ? g_stats.ends_job_elsewhere : g_stats.ends_unknown);
+            SHADOW_DIAG(++(OpenElsewhere(dcb) ? g_stats.ends_job_elsewhere : g_stats.ends_unknown));
             return; // not a job begun on this thread: leave this thread's jobs open
         }
-        ++g_stats.ends_out_of_order;
+        SHADOW_DIAG(++g_stats.ends_out_of_order);
         it = found;
     }
     t_ended = std::move(*it);
@@ -1053,9 +1080,11 @@ void ShadowJobDecode() {
 }
 
 void ShadowSubmitBase(const Regs& regs) {
+#ifndef NDEBUG
     if (PrepareOn() && !g_reporter_started.exchange(true)) {
         std::thread{ReporterLoop}.detach(); // OPT-010: the job walks' costs
     }
+#endif
     ++g_epoch;
     std::unique_lock lock{g_base_mutex};
     if (!g_base) {
@@ -1082,19 +1111,19 @@ thread_local LastCheck t_check{};
 void ShadowCheckPipeline(const void* cp_pipeline, bool cp_selected) {
     const LastCheck check = std::exchange(t_check, LastCheck{});
     if (!check.valid || !check.looked_up) {
-        ++g_stats.pipelines_unchecked;
+        SHADOW_DIAG(++g_stats.pipelines_unchecked);
         return;
     }
     if (!cp_selected || cp_pipeline == nullptr) {
-        ++g_stats.pipelines_cp_none;
+        SHADOW_DIAG(++g_stats.pipelines_cp_none);
     } else if (check.pipeline == nullptr) {
-        ++g_stats.pipelines_job_none;
+        SHADOW_DIAG(++g_stats.pipelines_job_none);
         std::scoped_lock lock{g_miss_mutex};
         ++g_misses[check.miss ? check.miss : "?"];
     } else if (check.pipeline == cp_pipeline) {
-        ++g_stats.pipelines_same;
+        SHADOW_DIAG(++g_stats.pipelines_same);
     } else {
-        ++g_stats.pipelines_different;
+        SHADOW_DIAG(++g_stats.pipelines_different);
     }
 }
 
@@ -1110,19 +1139,21 @@ void ShadowCheckSharps(const void* packet, u64 hash) {
         }
     }
     if (!job) {
-        ++g_stats.sharps_job_none;
+        SHADOW_DIAG(++g_stats.sharps_job_none);
     } else if (*job == hash) {
-        ++g_stats.sharps_same;
+        SHADOW_DIAG(++g_stats.sharps_same);
     } else {
-        ++g_stats.sharps_different;
+        SHADOW_DIAG(++g_stats.sharps_different);
     }
 }
 
 void ShadowCheckDraw(const void* packet, const Regs& regs) {
+#ifndef NDEBUG
     if (!g_reporter_started.exchange(true)) {
         std::thread{ReporterLoop}.detach();
     }
-    ++g_stats.checked;
+#endif
+    SHADOW_DIAG(++g_stats.checked);
     const u64 key = reinterpret_cast<u64>(packet);
     Entry entry;
     {
@@ -1130,14 +1161,14 @@ void ShadowCheckDraw(const void* packet, const Regs& regs) {
         std::scoped_lock lock{shard.mutex};
         const auto it = shard.map.find(key);
         if (it == shard.map.end()) {
-            ++g_stats.not_decoded;
+            SHADOW_DIAG(++g_stats.not_decoded);
             t_check = {};
             return;
         }
         entry = std::move(it->second);
         shard.map.erase(it);
     }
-    ++g_stats.checked_from[entry.from_parent];
+    SHADOW_DIAG(++g_stats.checked_from[entry.from_parent]);
     t_check = {true, entry.looked_up, entry.pipeline, entry.miss};
     Hashes cp;
     HashRegs(regs.reg_array.data(), cp);
@@ -1145,19 +1176,19 @@ void ShadowCheckDraw(const void* packet, const Regs& regs) {
     for (int g = 0; g < kGroups; ++g) {
         if (cp[g] != entry.hashes[g]) {
             same = false;
-            ++g_stats.group_different[g];
+            SHADOW_DIAG(++g_stats.group_different[g]);
         }
     }
     if (same) {
-        ++g_stats.identical;
+        SHADOW_DIAG(++g_stats.identical);
     }
     Mask cp_mask;
     const bool relevant_same = RelevantHash(regs, &cp_mask) == entry.relevant;
     if (relevant_same) {
-        ++g_stats.relevant_same;
-        ++g_stats.identical_from[entry.from_parent];
+        SHADOW_DIAG(++g_stats.relevant_same);
+        SHADOW_DIAG(++g_stats.identical_from[entry.from_parent]);
     } else {
-        ++g_stats.different;
+        SHADOW_DIAG(++g_stats.different);
     }
     if (!entry.sample || (same && relevant_same)) {
         return;
@@ -1166,7 +1197,7 @@ void ShadowCheckDraw(const void* packet, const Regs& regs) {
     CaptureFull(regs.reg_array.data(), now);
     const Full& job = entry.sample->values;
     if (entry.sample->mask != cp_mask) {
-        ++g_stats.masks_differ;
+        SHADOW_DIAG(++g_stats.masks_differ);
     }
     std::scoped_lock lock{g_register_mutex};
     std::array<bool, kGroups> groups{};
@@ -1190,8 +1221,10 @@ void ShadowCheckDraw(const void* packet, const Regs& regs) {
         }
     }
     for (int g = 0; g < kGroups; ++g) {
-        g_stats.relevant_group_different[g] += groups[g];
+        SHADOW_DIAG(g_stats.relevant_group_different[g] += groups[g]);
     }
 }
 
 } // namespace Native
+
+#undef SHADOW_DIAG

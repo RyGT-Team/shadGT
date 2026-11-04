@@ -33,6 +33,7 @@ using namespace Vulkan;
 Common::IncrementalIdProvider<u64> Image::global_image_uid{};
 Common::IncrementalIdProvider<u64> Image::global_contents_version{};
 
+#ifndef NDEBUG
 std::span<const VAddr> WatchedImageWindows() {
     // GT Sport's car thumbnail chain: the 800x450 car frames, their 1600x900 accumulation (later
     // reused for the 400x225 result) and the 1600x225 vertical pass.
@@ -123,6 +124,16 @@ void NoteWatchedImageModification(const Image& image, std::source_location loc) 
                                AmdGpu::NameOf(image.info.tile_mode), image.contents_version,
                                file, loc.line()));
 }
+
+#else
+std::span<const VAddr> WatchedImageWindows() { return {}; }
+bool IsWatchedImageAddress(VAddr, u64) { return false; }
+void PushDiagRecord(std::string) {}
+void FlushDiagRecords(u32) {}
+void NoteImageModification(u64, u64, std::source_location) {}
+std::vector<ImageModRecord> RecentImageModifications(u64, size_t) { return {}; }
+void NoteWatchedImageModification(const Image&, std::source_location) {}
+#endif
 
 static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance& instance,
                                            const ImageInfo& info) {

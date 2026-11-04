@@ -10,7 +10,9 @@
 #pragma once
 
 #include <chrono>
+#if !defined(NDEBUG)
 #include <intrin.h>
+#endif
 #include "common/types.h"
 
 namespace RyDiag {
@@ -49,7 +51,7 @@ enum class Zone : u32 {
     Count = 64,
 };
 
-#ifdef RYTY_DIAG
+#if defined(RYTY_DIAG) && !defined(NDEBUG)
 bool Enabled();
 #else
 // Other builds of these sources (shadGT itself, Ryty's other libraries) record nothing.
@@ -59,7 +61,11 @@ constexpr bool Enabled() {
 #endif
 
 inline u64 Now() {
+#if !defined(NDEBUG)
     return __rdtsc();
+#else
+    return 0;
+#endif
 }
 
 /// Records a finished zone on this thread.
@@ -79,7 +85,7 @@ inline void Mark(Zone zone, u64 arg = 0) {
 /// Called once per presented game frame (the screen clock).
 void FrameShown();
 
-#ifndef RYTY_DIAG
+#if !defined(RYTY_DIAG) || defined(NDEBUG)
 inline void Record(Zone, u64, u64, u64) {}
 inline void RecordElapsed(Zone, std::chrono::steady_clock::duration, u64) {}
 inline void FrameShown() {}
@@ -87,6 +93,7 @@ inline void FrameShown() {}
 
 class Scope {
 public:
+#if !defined(NDEBUG)
     explicit Scope(Zone zone_, u64 arg_ = 0) : zone{zone_}, arg{arg_} {
         if (Enabled()) {
             start = Now();
@@ -104,13 +111,24 @@ private:
     Zone zone;
     u64 arg;
     u64 start{};
+#else
+public:
+    explicit constexpr Scope(Zone, u64 = 0) noexcept {}
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+#endif
 };
 
 } // namespace RyDiag
 
 #define RYDIAG_CONCAT2(x, y) x##y
 #define RYDIAG_CONCAT(x, y) RYDIAG_CONCAT2(x, y)
+#if defined(NDEBUG)
+#define RYDIAG_SCOPE(...) ((void)0)
+#else
 #define RYDIAG_SCOPE(zone, ...)                                                                    \
     ::RyDiag::Scope RYDIAG_CONCAT(rydiag_scope_, __LINE__) {                                       \
         ::RyDiag::Zone::zone __VA_OPT__(, ) __VA_ARGS__                                            \
     }
+
+#endif

@@ -14,14 +14,14 @@ start = source.index("                const bool image_batch=known_structure")
 end = source.index("                if(!image_batch)", start)
 (out / "image-batch-start.inc").write_text(source[start:end], encoding="utf-8")
 start = source.index("                if(descriptor_safe && (image_batch_infos || buffer_prefix || native_vi_receipt_used)) {")
-end = source.index("                parallel->producer_upload_lookup_hits", start)
+end = source.index("                NATIVE_DIAGNOSTIC(parallel->producer_upload_lookup_hits", start)
 (out / "image-batch-end.inc").write_text(source[start:end], encoding="utf-8")
 skip_start = source.index("                    if(!image_bitmap && image_batch && action_index<=128")
 skip_end = source.index("                    const auto* action=", skip_start)
 (out / "image-batch-skip.inc").write_text(source[skip_start:skip_end], encoding="utf-8")
 assert skip_end < source.index("Native::Parallel::AbsentSampledImage<Shader::Info>(", skip_end) < start
 assert start < source.index("                    if(!b.groups_ready)b.PrepareWriteGroups();", start)
-worker_start = source.index("    const bool worker_identity = worker_result")
+worker_start = source.index("        worker_identity = worker_result")
 worker_end = source.index(";", worker_start)
 worker = source[worker_start:worker_end]
 for field in ("prepared_identity==prepared", "pipeline_identity==pipeline", "pipeline_layout==pipeline->GetLayout()", "writes_data==b.writes.data()", "writes_size==b.writes.size()", "images_data==b.images.data()", "images_size==b.images.size()"):

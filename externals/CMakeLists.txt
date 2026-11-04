@@ -210,10 +210,12 @@ add_library(Dear_ImGui
 target_include_directories(Dear_ImGui INTERFACE imgui/)
 
 # Tracy
-if (CMAKE_BUILD_TYPE STREQUAL "Release")
-    option(TRACY_ENABLE "" OFF)
-else()
-    option(TRACY_ENABLE "" ON)
+option(TRACY_ENABLE "Enable Tracy in Debug builds" ON)
+# The native renderer is unloadable: Tracy's automatic destructor waits for worker
+# threads under the Windows loader lock when the last DLL reference is released.
+# Fiber finalization can trigger that unload, so keep the automatic client disabled.
+if (SHADGT_RYTY_GPU)
+    set(TRACY_ENABLE OFF CACHE BOOL "Enable Tracy in Debug builds" FORCE)
 endif()
 option(TRACY_NO_CRASH_HANDLER "" ON) # Otherwise texture cache exceptions will be treaten as a crash
 option(TRACY_ON_DEMAND "" ON)
@@ -226,6 +228,16 @@ option(TRACY_NO_SAMPLING "" ON)
 option(TRACY_ONLY_LOCALHOST "" ON)
 option(TRACY_NO_CONTEXT_SWITCH "" ON)
 add_subdirectory(tracy)
+# Keep both the client and every consumer on the same per-configuration setting,
+# including multi-config generators and builds reconfigured in the same tree.
+if (TRACY_ENABLE)
+    foreach(tracy_property COMPILE_DEFINITIONS INTERFACE_COMPILE_DEFINITIONS)
+        get_property(tracy_definitions TARGET TracyClient PROPERTY ${tracy_property})
+        list(REMOVE_ITEM tracy_definitions TRACY_ENABLE)
+        set_property(TARGET TracyClient PROPERTY ${tracy_property} "${tracy_definitions}")
+    endforeach()
+    target_compile_definitions(TracyClient PUBLIC "$<$<CONFIG:Debug>:TRACY_ENABLE>")
+endif()
 
 # pugixml
 if (NOT TARGET pugixml::pugixml)

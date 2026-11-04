@@ -393,8 +393,13 @@ public:
     /// [address - margin, address + margin), oldest first, for crash reports.
     std::string DescribeBackingWrites(VAddr address, u64 margin);
     /// DIAG-035: records an emulator write into guest memory made without TryWriteBacking.
+#ifndef NDEBUG
     static void NoteEmulatorWrite(VAddr address, u64 size, const void* data,
                                   std::source_location loc = std::source_location::current());
+#else
+    static void NoteEmulatorWrite(VAddr, u64, const void*,
+                                  std::source_location = std::source_location::current()) {}
+#endif
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 

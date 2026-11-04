@@ -76,7 +76,7 @@ int main() {
     *unsupported=std::move(*rejected);Check(*unsupported);Check(*rejected);
     assert(!unsupported->ParallelReplaySafe(true));
     for(auto type:{DescriptorType::eUniformBuffer,DescriptorType::eStorageImage}) {
-        row={};row.descriptorType=type;row.descriptorCount=1;
+        row=vk::WriteDescriptorSet{};row.descriptorType=type;row.descriptorCount=1;
         if(type==DescriptorType::eUniformBuffer)row.pBufferInfo=buffers.data();
         else row.pImageInfo=images.data();
         auto self=DescriptorSnapshot::Make({&row,1},buffers,images,65536);assert(self);
@@ -84,7 +84,7 @@ int main() {
         *self=std::move(alias);Check(*self); // self-move leaves a valid, unspecified state
     }
 
-    row={};row.descriptorType=DescriptorType::eStorageBuffer;row.descriptorCount=1;row.pBufferInfo=buffers.data();
+    row=vk::WriteDescriptorSet{};row.descriptorType=DescriptorType::eStorageBuffer;row.descriptorCount=1;row.pBufferInfo=buffers.data();
     const auto valid=row;
     for(unsigned malformed=0;malformed<8;++malformed) {
         row=valid;

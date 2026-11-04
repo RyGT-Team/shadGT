@@ -76,6 +76,10 @@ public:
     PassCoordinator(Rhi::Device& device,const Vulkan::Instance& instance,Rhi::Fence& timeline,
                     std::size_t worker_count,std::size_t count_cap,std::size_t byte_cap,std::size_t node_cap);
     ~PassCoordinator();
+    // Owner only: do not call concurrently with shutdown or retain the handles.
+    template<class F> void ForEachWorkerHandle(F&& callback) {
+        workers_.ForEachWorkerHandle(std::forward<F>(callback));
+    }
     // Caller closes prefix and owns its list until Drain transfers it.
     bool PrefixPreflight(u64 epoch,Rhi::CommandList* list,const std::shared_ptr<const void>& resources,std::size_t total_owned_bytes);
     bool Prefix(u64 epoch,Rhi::CommandList* list,std::shared_ptr<const void> resources,std::size_t total_owned_bytes);

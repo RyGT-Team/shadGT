@@ -399,16 +399,22 @@ const ComputePipeline* Rasterizer::AcquireComputePipeline() {
     if (SelectsPipelinesAhead() && selected_pipeline && selected_pipeline->is_compute) {
         const auto* pipeline = selected_pipeline->compute;
         if (!pipeline) {
+#ifndef NDEBUG
             ++select_stats.compute_ahead;
+#endif
             return nullptr;
         }
         if (InstallDrawStages(pipeline, selected_pipeline->stages, true)) {
+#ifndef NDEBUG
             ++select_stats.compute_ahead;
+#endif
             static const bool verify = !Common::LeanRun();
             if (!verify || read_capture || ++select_verify_count % 64 != 0) {
                 return pipeline;
             }
+#ifndef NDEBUG
             ++select_stats.verified;
+#endif
             const ComputePipeline* own;
             {
                 // FIX-077: a check, not needed to draw: skipped while the command thread holds
@@ -422,7 +428,9 @@ const ComputePipeline* Rasterizer::AcquireComputePipeline() {
             if (own == pipeline) {
                 return pipeline;
             }
+#ifndef NDEBUG
             ++select_stats.verify_failed;
+#endif
             static u32 reports = 0;
             if (reports++ < 20) {
                 LOG_ERROR(Render_Vulkan,
@@ -431,7 +439,9 @@ const ComputePipeline* Rasterizer::AcquireComputePipeline() {
             }
             // Fall through: select here and use that one.
         } else {
+#ifndef NDEBUG
             ++select_stats.mismatched;
+#endif
         }
     }
     // Earlier race dispatches may have installed a shadow on this cached pipeline.
@@ -837,7 +847,9 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
                 const auto result = buffer_cache.ObtainBufferAhead(
                     range.begin, size, false, false, plan.uploads, &overlapped);
                 if (!result) {
+#ifndef NDEBUG
                     ++plan_refusals[2];
+#endif
                     return false;
                 }
                 plan.entries.push_back(
@@ -857,7 +869,9 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
             const auto result = buffer_cache.ObtainBufferAhead(
                 index_address, index_bytes, false, false, plan.uploads, &overlapped);
             if (!result) {
+#ifndef NDEBUG
                 ++plan_refusals[2];
+#endif
                 return false;
             }
             plan.entries.push_back({index_address, index_bytes, false, false, result->first,
@@ -880,7 +894,9 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
             continue;
         }
         if (!order_only && IsWatchedShader(info->pgm_hash)) {
+#ifndef NDEBUG
             ++plan_refusals[0];
+#endif
             return false; // Its read pages are checked again before each use (FIX-017).
         }
         const FlatView view{sel.flattened, sel.pgm_base};
@@ -903,7 +919,9 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
                 continue;
             }
             if (!order_only && written_to_recorder && desc.is_written) {
+#ifndef NDEBUG
                 ++plan_refusals[3];
+#endif
                 if (!skip_written) {
                     return false;
                 }
@@ -912,7 +930,9 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
                 if (order_only) {
                     continue;
                 }
+#ifndef NDEBUG
                 ++plan_refusals[1];
+#endif
                 return false;
             }
             const auto vsharp = desc.GetSharp(view);
@@ -955,7 +975,9 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
                 vsharp.base_address, size, desc.is_written, desc.is_formatted, plan.uploads,
                 &overlapped);
             if (!result) {
+#ifndef NDEBUG
                 ++plan_refusals[2];
+#endif
                 return false;
             }
             plan.entries.push_back({vsharp.base_address, size, desc.is_written, desc.is_formatted,
@@ -984,14 +1006,18 @@ std::optional<std::pair<const VideoCore::Buffer*, u64>> Rasterizer::TakePlannedB
     if (entry.address != address || entry.size != size || entry.written != written ||
         entry.texel != texel) {
         // The recorder binds something else than planned: it obtains the rest itself.
+#ifndef NDEBUG
         ++plan_stats.mismatched;
+#endif
         plan->next = plan->entries.size();
         return std::nullopt;
     }
     ++plan->next;
     if (liverpool->LabelWrittenOver(plan->labels_done, plan->labels_pushed, address, size)) {
         // PERF-082: a label was written into it after the stage read it.
+#ifndef NDEBUG
         ++plan_stats.redone;
+#endif
         return std::nullopt;
     }
     // MT-003: only an image registered over the range since the plan (any image change used to
@@ -1001,12 +1027,16 @@ std::optional<std::pair<const VideoCore::Buffer*, u64>> Rasterizer::TakePlannedB
         (precise_redo ? texture_cache.ImageRegisteredSince(plan->generation, address, size)
                       : texture_cache.AnyImageInRegion(address, size))) {
         // An image over the range appeared since: obtained again, with its export.
+#ifndef NDEBUG
         ++plan_stats.redone;
+#endif
         return std::nullopt;
     }
     if (entry.overlapped && buffer_cache.ExportImagesOver(address, size)) {
         // PERF-079: an image over it had to be exported first; obtained again after it.
+#ifndef NDEBUG
         ++plan_stats.redone;
+#endif
         return std::nullopt;
     }
     // R5: with several stage workers, another may have found the range dirty for a later job.
@@ -1014,7 +1044,9 @@ std::optional<std::pair<const VideoCore::Buffer*, u64>> Rasterizer::TakePlannedB
     if (settle) {
         buffer_cache.SettleAheadRange(address, size);
     }
+#ifndef NDEBUG
     ++plan_stats.used;
+#endif
     return std::pair<const VideoCore::Buffer*, u64>{entry.buffer, entry.offset};
 }
 
@@ -1099,6 +1131,7 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
         if (!InstallDrawStages(pipeline, stages, false)) return nullptr;
         return pipeline;
     }
+#ifndef NDEBUG
     auto& stats = select_stats;
     const auto now = std::chrono::steady_clock::now();
     if (now - stats.since >= std::chrono::seconds{2}) {
@@ -1132,6 +1165,7 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
         stats = {};
         stats.since = now;
     }
+#endif
     // PERF-068: a quad list's selection holds both of its pipelines.
     const bool quad_selection = selected_pipeline && selected_pipeline->is_quad_list;
     if ((selected_allowed || quad_selection) && selected_pipeline) {
@@ -1139,13 +1173,17 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
         const auto* pipeline =
             tess ? selected_pipeline->quad_tess_pipeline : selected_pipeline->pipeline;
         if (!pipeline) {
+#ifndef NDEBUG
             ++stats.ahead;
+#endif
             return nullptr;
         }
         if (InstallDrawStages(pipeline,
                               tess ? selected_pipeline->quad_tess_stages : selected_pipeline->stages,
                               true)) {
+#ifndef NDEBUG
             ++stats.ahead;
+#endif
             // Every 64th selection is checked against one made here, from the recorder's
             // registers and memory; a difference is reported and this one used.
             static const bool verify = !Common::LeanRun();
@@ -1153,7 +1191,9 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
             if (!verify || read_capture || ++select_verify_count % 64 != 0) {
                 return pipeline;
             }
+#ifndef NDEBUG
             ++stats.verified;
+#endif
             std::array<SelectedStage, Shader::MaxStageTypes> own{};
             const GraphicsPipeline* own_pipeline;
             {
@@ -1170,7 +1210,9 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
             if (own_pipeline == pipeline) {
                 return pipeline;
             }
+#ifndef NDEBUG
             ++stats.verify_failed;
+#endif
             static u32 reports = 0;
             if (reports++ < 20) {
                 LOG_ERROR(Render_Vulkan,
@@ -1188,9 +1230,13 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
         }
         // The user data now leads to other sharps than the selection read (memory written in
         // between): select here, from what the recorder sees.
+#ifndef NDEBUG
         ++stats.mismatched;
+#endif
     } else {
+#ifndef NDEBUG
         ++stats.recorder;
+#endif
     }
     std::array<SelectedStage, Shader::MaxStageTypes> stages{};
     const GraphicsPipeline* pipeline;

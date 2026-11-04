@@ -21,7 +21,7 @@ skip_end = source.index("                    const auto* action=", skip_start)
 (out / "image-batch-skip.inc").write_text(source[skip_start:skip_end], encoding="utf-8")
 assert skip_end < source.index("Native::Parallel::AbsentSampledImage<Shader::Info>(", skip_end) < start
 assert start < source.index("                    if(!b.groups_ready)b.PrepareWriteGroups();", start)
-worker_start = source.index("    const bool worker_identity = worker_result")
+worker_start = source.index("        worker_identity = worker_result")
 worker_end = source.index(";", worker_start)
 worker = source[worker_start:worker_end]
 for field in ("prepared_identity==prepared", "pipeline_identity==pipeline", "pipeline_layout==pipeline->GetLayout()", "writes_data==b.writes.data()", "writes_size==b.writes.size()", "images_data==b.images.data()", "images_size==b.images.size()"):

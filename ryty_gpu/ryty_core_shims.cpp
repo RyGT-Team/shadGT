@@ -314,6 +314,7 @@ bool InSmallView(const MEMORY_BASIC_INFORMATION& info) {
     return reinterpret_cast<VAddr>(info.BaseAddress) + info.RegionSize - allocation <= 0x4000;
 }
 
+#ifndef NDEBUG
 struct AreaStats {
     std::atomic<u64> lookups, hits, unmapped, queries, changes, stores_skipped;
     std::atomic<u64> last_report;
@@ -334,6 +335,7 @@ void ReportAreaStats() {
                 g_area_stats.changes.exchange(0), g_area_stats.stores_skipped.exchange(0));
 }
 
+#endif
 // Walks committed regions from end (the end of a committed region) towards limit, jumping over
 // intervals already known, so walks from different places in one area share their work.
 AreaAnswer ContinueWalk(VAddr end, VAddr limit, bool caching, AreaAnswer flags) {
@@ -366,7 +368,9 @@ AreaAnswer ContinueWalk(VAddr end, VAddr limit, bool caching, AreaAnswer flags) 
             }
         }
         MEMORY_BASIC_INFORMATION info;
+#ifndef NDEBUG
         g_area_stats.queries.fetch_add(1, std::memory_order_relaxed);
+#endif
         if (!VirtualQuery(reinterpret_cast<void*>(end), &info, sizeof(info)) ||
             !IsCommitted(info) || reinterpret_cast<VAddr>(info.BaseAddress) != end) {
             return {end, true, exec, views, readable};
@@ -385,7 +389,9 @@ void StoreInterval(VAddr start, AreaCache::Interval interval, u64 generation) {
     auto& cache = GetAreaCache();
     AcquireSRWLockExclusive(&cache.lock);
     if (cache.generation != generation) {
+#ifndef NDEBUG
         g_area_stats.stores_skipped.fetch_add(1, std::memory_order_relaxed);
+#endif
         ReleaseSRWLockExclusive(&cache.lock);
         return;
     }
@@ -480,8 +486,10 @@ static AreaAnswer LookupAreaWalk(VAddr virtual_addr, VAddr limit) {
             return {known.end, known.complete, known.exec, known.views, known.readable};
         }
     }
+#ifndef NDEBUG
     g_area_stats.lookups.fetch_add(1, std::memory_order_relaxed);
     ReportAreaStats();
+#endif
     VAddr start = 0;
     AreaCache::Interval found{};
     u64 generation = 0;
@@ -498,11 +506,15 @@ static AreaAnswer LookupAreaWalk(VAddr virtual_addr, VAddr limit) {
             memo = {start, found, version};
         }
         if (found.end != 0 && !found.mapped) {
+#ifndef NDEBUG
             g_area_stats.hits.fetch_add(1, std::memory_order_relaxed);
+#endif
             return {0, true};
         }
         if (found.end != 0 && (found.complete || found.end >= limit)) {
+#ifndef NDEBUG
             g_area_stats.hits.fetch_add(1, std::memory_order_relaxed);
+#endif
             return {found.end, found.complete, found.exec, found.views, found.readable};
         }
     }
@@ -512,13 +524,17 @@ static AreaAnswer LookupAreaWalk(VAddr virtual_addr, VAddr limit) {
                               {0, false, found.exec, found.views, found.readable});
     } else {
         MEMORY_BASIC_INFORMATION info;
+#ifndef NDEBUG
         g_area_stats.queries.fetch_add(1, std::memory_order_relaxed);
+#endif
         if (!VirtualQuery(reinterpret_cast<void*>(virtual_addr), &info, sizeof(info))) {
             return {0, true};
         }
         start = reinterpret_cast<VAddr>(info.BaseAddress);
         if (!IsCommitted(info)) {
+#ifndef NDEBUG
             g_area_stats.unmapped.fetch_add(1, std::memory_order_relaxed);
+#endif
             if (caching) {
                 const AreaCache::Interval unmapped{start + info.RegionSize, false, true, false,
                                                    false, false};
@@ -552,7 +568,9 @@ void NoteMappingChange(VAddr address, u64 size) {
     DropAliases(address, size); // PERF-080
     auto& cache = GetAreaCache();
     const VAddr change_end = address + std::max<u64>(size, 1);
+#ifndef NDEBUG
     g_area_stats.changes.fetch_add(1, std::memory_order_relaxed);
+#endif
     AcquireSRWLockExclusive(&cache.lock);
     ++cache.generation;
     cache.version.fetch_add(1, std::memory_order_acq_rel);

@@ -464,6 +464,26 @@ foreach(case IN ITEMS "--legacy-negative" "--legacy-negative-same" "--legacy-neg
             "$<TARGET_FILE:compute_menu_policy_test>" "${case}")
 endforeach()
 
+add_executable(worker_identity_defer_test worker_identity_defer_test.cpp)
+target_compile_features(worker_identity_defer_test PRIVATE cxx_std_23)
+target_compile_definitions(worker_identity_defer_test PRIVATE NDEBUG)
+target_include_directories(worker_identity_defer_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(worker_identity_defer_test PRIVATE /EHsc)
+endif()
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/worker-identity-defer.inc"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_worker_identity_defer.py"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
+        "${CMAKE_CURRENT_BINARY_DIR}/worker-identity-defer.inc"
+    DEPENDS extract_worker_identity_defer.py
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp" VERBATIM)
+target_sources(worker_identity_defer_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/worker-identity-defer.inc")
+add_test(NAME worker_identity_defer_release COMMAND worker_identity_defer_test)
+add_test(NAME worker_identity_eager_negative
+    COMMAND "${Python3_EXECUTABLE}" -c
+        "import subprocess,sys; p=subprocess.run(sys.argv[1:]); sys.exit(0 if p.returncode==9 else 1)"
+        "$<TARGET_FILE:worker_identity_defer_test>" "--eager-negative")
+
 # Source-extracted functions use the production diagnostic macro, including its
 # NDEBUG branch, rather than a duplicated test-only definition.
 set(NATIVE_DIAGNOSTIC_CONTEXT "${CMAKE_CURRENT_BINARY_DIR}/native-diagnostic-context.h")

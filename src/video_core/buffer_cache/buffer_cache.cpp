@@ -2678,13 +2678,17 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
         overlapped = true;
         *overlapped_out = true;
     } else if (size == 0 || texture_cache.AnyImageInRegion(device_addr, size)) {
+#ifndef NDEBUG
         ++ahead_refusals[1];
+#endif
+#ifndef NDEBUG
         static std::atomic<u32> logged{};
         if (size != 0 && logged.fetch_add(1) < 40) {
             LOG_WARNING(Render_Vulkan, "PERF-067: buffer {:#x}+{:#x} ({}) left to the recorder: "
                         "an image overlaps it",
                         device_addr, size, is_written ? "written" : "read");
         }
+#endif
         return std::nullopt; // Image exports and aliases are the recorder's.
     }
     if (is_written) {
@@ -2707,7 +2711,9 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
         auto& ahead_stream = AheadStream(); // R5
         const auto [data, offset] = ahead_stream.Map(size, instance.UniformMinAlignment(), false);
         if (!data) {
+#ifndef NDEBUG
             ++ahead_refusals[2];
+#endif
             return std::nullopt; // The ring would have to wait for the GPU.
         }
         memory->CopySparseMemory(device_addr, data, size);
@@ -2720,17 +2726,23 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
     const u64 first_page = first_block >> blocks_per_arena_page_shift;
     const u64 last_page = last_block >> blocks_per_arena_page_shift;
     if (is_texel_buffer && !is_written) {
+#ifndef NDEBUG
         ++ahead_refusals[0];
+#endif
         return std::nullopt; // Metadata (HTILE) is the texture cache's (arena path only).
     }
     if (!address_space[first_page] || address_space[first_page] != address_space[last_page]) {
+#ifndef NDEBUG
         ++ahead_refusals[3];
+#endif
         return std::nullopt; // A new or migrating arena records binds.
     }
     bool resident = true;
     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64, u64) { resident = false; });
     if (!resident) {
+#ifndef NDEBUG
         ++ahead_refusals[4];
+#endif
         return std::nullopt;
     }
     // The uploads' staging must not wait for the GPU either: size of everything this range
@@ -2738,7 +2750,9 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
     {
         const auto [probe, probe_offset] = AheadStaging().Map(size, 16, false);
         if (!probe) {
+#ifndef NDEBUG
             ++ahead_refusals[5];
+#endif
             return std::nullopt;
         }
     }

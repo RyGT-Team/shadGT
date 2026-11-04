@@ -142,7 +142,9 @@ int main(int argc, char** argv) {
         ComputePipeline old{10}, current{11}; Rasterizer r;
         r.selection.compute = &old; r.pipeline_cache.current = &current; r.reject_selected = true;
         Check(r.AcquireComputePipelineCandidate() == &current && Current(current), "in-race validation failure fallback");
-        Check(r.select_stats.mismatched == 1 && r.current_installs == 1, "validation failure accounting and fallback");
+        Check(r.select_stats.mismatched == 0, "Release selection metrics remain disabled");
+        Check(r.pipeline_cache.lookups == 1 && r.copies == 1 && r.current_installs == 1 &&
+              r.validated_installs == 1 && Current(current), "validation failure retains lookup and fresh current-stage installation");
     }
     std::puts("PASS: actual extracted Release consumer; transitions, stale shadows, null selection and race fast path");
 }

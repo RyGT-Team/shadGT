@@ -5546,12 +5546,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     std::shared_ptr<const DescriptorSnapshot> parallel_push_writes;
     std::size_t parallel_descriptor_bytes=0;
     u32 parallel_required_sets=0;
-    auto* worker_result = parallel && prepared && from_prepared && prepared->pipeline==pipeline ? &prepared->cpu_proof : nullptr;
-    const bool worker_identity = worker_result && worker_result->prepared_identity==prepared &&
-        worker_result->pipeline_identity==pipeline && worker_result->pipeline_layout==pipeline->GetLayout() &&
-        worker_result->writes_data==b.writes.data() && worker_result->writes_size==b.writes.size() &&
-        worker_result->buffers_data==b.buffers.data() && worker_result->buffers_size==b.buffers.size() &&
-        worker_result->images_data==b.images.data() && worker_result->images_size==b.images.size();
+    PreparedDraw::CpuProof* worker_result=nullptr;
+    bool worker_identity=false;
     // Producer totals cover every ordinary row, including descriptor-cache hits.
     // Match each bounded group span before using them with the live structure proof.
     // Like known_structure, this relies on published row metadata remaining immutable.
@@ -5637,6 +5633,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             }
         } else {
         whole_phases.Next(1);
+        worker_result = parallel && prepared && from_prepared && prepared->pipeline==pipeline ? &prepared->cpu_proof : nullptr;
+        worker_identity = worker_result && worker_result->prepared_identity==prepared &&
+            worker_result->pipeline_identity==pipeline && worker_result->pipeline_layout==pipeline->GetLayout() &&
+            worker_result->writes_data==b.writes.data() && worker_result->writes_size==b.writes.size() &&
+            worker_result->buffers_data==b.buffers.data() && worker_result->buffers_size==b.buffers.size() &&
+            worker_result->images_data==b.images.data() && worker_result->images_size==b.images.size();
         const auto& db=targets.state.depth_stencil_attachment;
         // These draw-local requirements are mandatory in cheap_eligible below.
         // Avoid region/mirror scans for draws that can never be admitted.

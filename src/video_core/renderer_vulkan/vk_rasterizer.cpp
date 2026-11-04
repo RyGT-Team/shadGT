@@ -396,7 +396,7 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectComputePipelineAhe
 }
 
 const ComputePipeline* Rasterizer::AcquireComputePipeline() {
-    if (selected_pipeline && selected_pipeline->is_compute) {
+    if (SelectsPipelinesAhead() && selected_pipeline && selected_pipeline->is_compute) {
         const auto* pipeline = selected_pipeline->compute;
         if (!pipeline) {
             ++select_stats.compute_ahead;

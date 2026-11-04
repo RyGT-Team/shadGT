@@ -440,6 +440,30 @@ endif()
 add_test(NAME frame_queue_release COMMAND frame_queue_release_test
     "${CMAKE_CURRENT_BINARY_DIR}/frame-queue-release-disabled")
 
+
+# Exercise the actual consumer under production Release preprocessing. The old
+# body differs only by the missing policy condition and must fail these cases.
+add_executable(compute_menu_policy_test compute_menu_policy_test.cpp)
+target_compile_features(compute_menu_policy_test PRIVATE cxx_std_23)
+target_compile_definitions(compute_menu_policy_test PRIVATE NDEBUG)
+target_include_directories(compute_menu_policy_test PRIVATE "${SHADGT_ROOT}/src" "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(compute_menu_policy_test PRIVATE /EHsc)
+endif()
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/compute_policy.inc"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_compute_policy.py"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer.cpp" "${CMAKE_CURRENT_BINARY_DIR}/compute_policy.inc"
+    DEPENDS extract_compute_policy.py "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer.cpp" VERBATIM)
+target_sources(compute_menu_policy_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/compute_policy.inc")
+add_test(NAME compute_menu_policy_release COMMAND compute_menu_policy_test)
+foreach(case IN ITEMS "--legacy-negative" "--legacy-negative-same" "--legacy-negative-null")
+    string(REPLACE "--legacy-negative" "compute_menu_policy_old" test_name "${case}")
+    add_test(NAME "${test_name}"
+        COMMAND "${Python3_EXECUTABLE}" -c
+            "import subprocess,sys; p=subprocess.run(sys.argv[1:]); sys.exit(0 if p.returncode==9 else 1)"
+            "$<TARGET_FILE:compute_menu_policy_test>" "${case}")
+endforeach()
+
 # Source-extracted functions use the production diagnostic macro, including its
 # NDEBUG branch, rather than a duplicated test-only definition.
 set(NATIVE_DIAGNOSTIC_CONTEXT "${CMAKE_CURRENT_BINARY_DIR}/native-diagnostic-context.h")

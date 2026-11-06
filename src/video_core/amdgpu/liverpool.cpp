@@ -15,6 +15,7 @@
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
+#include "common/scene_origin.h"
 #include "common/sampling_profiler.h"
 #include "common/scope_exit.h"
 #include "common/debug.h"
@@ -1710,6 +1711,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
                                            std::span<const u32> original_dcb) {
     FIBER_ENTER(dcb_task_name);
+    SCENE_SEQUENCE_DECLARE;
     if (!original_dcb.empty()) {
         RecordCmdBuffer(original_dcb.data(), original_dcb.size_bytes(), false);
         decoding_submit.fetch_add(1, std::memory_order_relaxed); // DIAG-061
@@ -2293,8 +2295,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
+                SCENE_ORIGIN_DECLARE(origin,1,0,reinterpret_cast<uintptr_t>(header),base_addr);
                 RecordDraw(
-                    [this, cmd_address] {
+                    [this, cmd_address SCENE_ORIGIN_CAPTURE(origin)] {
+                        SCENE_ORIGIN_SCOPE(origin);
                         rasterizer->ScopeMarker("gfx:{}:DispatchDirect",
                                                 fmt::make_format_args(cmd_address),
                                                 [&] { rasterizer->DispatchDirect(); });
@@ -2317,8 +2321,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 const VAddr args_addr = indirect_args_addr;
+                SCENE_ORIGIN_DECLARE(origin,1,0,reinterpret_cast<uintptr_t>(header),base_addr);
                 RecordDraw(
-                    [this, cmd_address, args_addr, offset, size] {
+                    [this, cmd_address, args_addr, offset, size SCENE_ORIGIN_CAPTURE(origin)] {
+                        SCENE_ORIGIN_SCOPE(origin);
                         rasterizer->ScopeMarker(
                             "gfx:{}:DispatchIndirect", fmt::make_format_args(cmd_address),
                             [&] { rasterizer->DispatchIndirect(args_addr, offset, size); });
@@ -2412,6 +2418,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEos: {
                 const auto event = *reinterpret_cast<const PM4CmdEventWriteEos*>(header);
+                SCENE_ORIGIN_DECLARE(origin,1,0,reinterpret_cast<uintptr_t>(header),base_addr);
+                SCENE_EVENT(origin,"event_eos",event.command==PM4CmdEventWriteEos::Command::GdsStore?"gds_decode":"decode",event.command!=PM4CmdEventWriteEos::Command::GdsStore?event.Address<VAddr>():0,event.DataDWord(),0);
                 if (draw_pipe && rasterizer &&
                     event.command != PM4CmdEventWriteEos::Command::GdsStore &&
                     (EarlyFencesActive() || EarlyFenceAllowed())) {
@@ -2420,6 +2428,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         Core::Memory::Instance()->TryWriteBacking(address, &data, num_bytes);
                     });
                     ++g_fences_early;
+                    SCENE_EVENT(origin,"event_eos","early_label",event.Address<VAddr>(),event.DataDWord(),0);
                     RecordSafe(
                         [this] { rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::GfxEos); });
                     if (early_fences_mode) {
@@ -2431,17 +2440,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 RecordLabelWrite(
                     event.command != PM4CmdEventWriteEos::Command::GdsStore ? event.Address<VAddr>()
                                                                             : 0,
-                    FenceValueBytes(DataSelect::Data32Low, event.DataDWord(), 0), [this, event] {
+                    FenceValueBytes(DataSelect::Data32Low, event.DataDWord(), 0), [this, event SCENE_ORIGIN_CAPTURE(origin)] {
                         const auto* event_eos = &event;
                         const bool deferred =
                             rasterizer &&
                             event_eos->command != PM4CmdEventWriteEos::Command::GdsStore &&
                             rasterizer->DeferFenceSignal(
                                 event_eos->Address<VAddr>(),
-                                [event] {
+                                [event SCENE_ORIGIN_CAPTURE(origin)] {
                                     event.SignalFence([](void* address, u64 data, u32 num_bytes) {
                                         WriteDeferredFence(address, &data, num_bytes);
                                     });
+                                    SCENE_EVENT(origin,"event_eos","deferred_signal_complete",event.Address<VAddr>(),event.DataDWord(),0);
                                 },
                                 false,
                                 FenceValueBytes(DataSelect::Data32Low, event_eos->DataDWord(), 0),
@@ -2454,6 +2464,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                 auto* memory = Core::Memory::Instance();
                                 ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
                             });
+                            SCENE_EVENT(origin,"event_eos","recorder_signal",event.command!=PM4CmdEventWriteEos::Command::GdsStore?event.Address<VAddr>():0,event.DataDWord(),0);
+                        } else {
+                            SCENE_EVENT(origin,"event_eos","deferred",event.Address<VAddr>(),event.DataDWord(),0);
                         }
                         if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
                             ASSERT(event_eos->size == 1);
@@ -2461,6 +2474,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                 rasterizer->FinishForGds();
                                 const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
                                 *event_eos->Address() = value;
+                                SCENE_EVENT(origin,"event_eos","gds_readback_cpu_visible",reinterpret_cast<uintptr_t>(event_eos->Address()),value,0);
                             }
                         }
                     });
@@ -2468,6 +2482,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto event = *reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+                SCENE_ORIGIN_DECLARE(origin,1,0,reinterpret_cast<uintptr_t>(header),base_addr);
+                SCENE_EVENT(origin,"event_eop","decode",reinterpret_cast<VAddr>(event.Address<u32>()),event.DataQWord(),u32(event.data_sel.Value()));
                 const u64 eop_submit = decoding_submit.load(std::memory_order_relaxed);
                 if (draw_pipe && rasterizer && (EarlyFencesActive() || EarlyFenceAllowed())) {
                     // EXP-063: signaled now; the recorder only submits at this point.
@@ -2480,6 +2496,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
                         });
                     ++g_fences_early;
+                    SCENE_EVENT(origin,"event_eop","early_label",reinterpret_cast<VAddr>(event.Address<u32>()),event.DataQWord(),u32(event.data_sel.Value()));
                     RecordSafe(
                         [this] { rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::GfxEop); });
                     if (early_fences_mode) {
@@ -2491,13 +2508,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 RecordLabelWrite(
                     reinterpret_cast<VAddr>(event.Address<u32>()),
                     FenceValueBytes(event.data_sel.Value(), event.DataDWord(), event.DataQWord()),
-                    [this, event, eop_submit] {
+                    [this, event, eop_submit SCENE_ORIGIN_CAPTURE(origin)] {
                         const auto* event_eop = &event;
                         const bool deferred =
                             rasterizer &&
                             rasterizer->DeferFenceSignal(
                                 reinterpret_cast<VAddr>(event_eop->Address<u32>()),
-                                [event, eop_submit] {
+                                [event, eop_submit SCENE_ORIGIN_CAPTURE(origin)] {
                                     event.SignalFence(
                                         [](void* address, u64 data, u32 num_bytes) {
                                             WriteDeferredFence(address, &data, num_bytes);
@@ -2510,6 +2527,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                             Platform::IrqC::Instance()->Signal(
                                                 Platform::InterruptId::GfxEop);
                                         });
+                                    SCENE_EVENT(origin,"event_eop","deferred_signal_complete",reinterpret_cast<VAddr>(event.Address<u32>()),event.DataQWord(),u32(event.data_sel.Value()));
                                 },
                                 false,
                                 FenceValueBytes(event_eop->data_sel.Value(), event_eop->DataDWord(),
@@ -2532,6 +2550,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                     Platform::IrqC::Instance()->Signal(
                                         Platform::InterruptId::GfxEop);
                                 });
+                            SCENE_EVENT(origin,"event_eop","recorder_signal",reinterpret_cast<VAddr>(event.Address<u32>()),event.DataQWord(),u32(event.data_sel.Value()));
+                        } else {
+                            SCENE_EVENT(origin,"event_eop","deferred",reinterpret_cast<VAddr>(event.Address<u32>()),event.DataQWord(),u32(event.data_sel.Value()));
                         }
                     });
                 break;
@@ -2596,9 +2617,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::WriteData: {
                 const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
+                SCENE_ORIGIN_DECLARE(origin,1,0,reinterpret_cast<uintptr_t>(header),base_addr);
                 ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
                 const u32 data_size = (header->type3.count.Value() - 2) * 4;
                 u64* address = write_data->Address<u64*>();
+#ifndef NDEBUG
+                const auto trace_write_address=reinterpret_cast<uintptr_t>(address);
+                const u64 trace_first_word=data_size>=4?write_data->data[0]:0;
+#endif
+                SCENE_EVENT(origin,"write_data","decode_first_dword",reinterpret_cast<uintptr_t>(address),data_size>=4?write_data->data[0]:0,data_size);
                 WatchWrite(reinterpret_cast<VAddr>(address), data_size, 0, "gfx WRITE_DATA");
                 if (rasterizer) {
                     if (auto* direct = rasterizer->GetBufferCache().GetDirectMemory()) {
@@ -2617,6 +2644,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (!into_commands &&
                         TryEarlyLabel(reinterpret_cast<VAddr>(address), data,
                                       u32(Vulkan::Rasterizer::DrainSource::GfxWriteData))) {
+                        SCENE_EVENT(origin,"write_data","early_label",trace_write_address,trace_first_word,data_size);
                         break; // PERF-069: written at decode
                     }
                     RecordLabelWrite(
@@ -2673,6 +2701,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::MemSemaphore: {
                 const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
+                SCENE_ORIGIN_DECLARE(origin,1,0,reinterpret_cast<uintptr_t>(header),base_addr);
+#ifndef NDEBUG
+                const auto trace_semaphore_address=mem_semaphore->Address<uintptr_t>();
+#endif
+                SCENE_EVENT(origin,"mem_semaphore",mem_semaphore->IsSignaling()?"signal_queued":"wait_decode",mem_semaphore->Address<uintptr_t>(),0,0);
                 if (mem_semaphore->IsSignaling()) {
                     Record([semaphore = *mem_semaphore] { semaphore.Signal(); }, "memory semaphore");
                 } else {
@@ -2696,6 +2729,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                            mem_semaphore->Address<uintptr_t>(), wait_start);
                     }
                     mem_semaphore->Decrement();
+                    SCENE_EVENT(origin,"mem_semaphore","wait_completed",trace_semaphore_address,0,0);
                 }
                 break;
             }
@@ -2733,6 +2767,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::WaitRegMem: {
                 const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
+                SCENE_ORIGIN_DECLARE(origin,1,0,reinterpret_cast<uintptr_t>(header),base_addr);
+#ifndef NDEBUG
+                const auto trace_wait=*wait_reg_mem;
+#endif
+                SCENE_EVENT(origin,"wait_reg_mem","decode",wait_reg_mem->mem_space==PM4CmdWaitRegMem::MemSpace::Memory?reinterpret_cast<uintptr_t>(wait_reg_mem->Address<u32*>()):0,wait_reg_mem->ref,wait_reg_mem->mask);
                 // ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
                 // Optimization: VO label waits are special because the emulator
                 // will write to the label when presentation is finished. So if
@@ -2768,6 +2807,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     }
                     if (!wait_reg_mem->Test(regs.reg_array) &&
                         PendingLabelSatisfies(*wait_reg_mem)) {
+                        SCENE_EVENT(origin,"wait_reg_mem","pending_label",trace_wait.mem_space==PM4CmdWaitRegMem::MemSpace::Memory?reinterpret_cast<uintptr_t>(trace_wait.Address<u32*>()):0,trace_wait.ref,trace_wait.mask);
                         // A queued fence writes the label: the recorder waits for it in order
                         // and decoding goes on.
                         ++waits_moved;
@@ -3136,6 +3176,7 @@ bool Liverpool::ScanAheadForPipelines(const std::function<bool(const Regs&)>& on
 template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
+    SCENE_SEQUENCE_DECLARE;
     auto& queue = asc_queues[{vqid}];
 
     struct IndirectPatch {
@@ -3325,8 +3366,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (auto it = std::ranges::find(indirect_patches, header, &IndirectPatch::header);
                 it != indirect_patches.end()) {
                 const auto size = sizeof(PM4CmdDispatchIndirect::GroupDimensions);
+                SCENE_ORIGIN_DECLARE(origin,2,vqid,reinterpret_cast<uintptr_t>(header),base_addr);
                 RecordDraw([this, args = it->indirect_addr,
-                            size] { rasterizer->DispatchIndirect(args, 0, size); },
+                            size SCENE_ORIGIN_CAPTURE(origin)] { SCENE_ORIGIN_SCOPE(origin); rasterizer->DispatchIndirect(args, 0, size); },
                            true);
                 break;
             }
@@ -3343,8 +3385,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 break;
             }
             const auto cmd_address = reinterpret_cast<const void*>(header);
+            SCENE_ORIGIN_DECLARE(origin,2,vqid,reinterpret_cast<uintptr_t>(header),base_addr);
             RecordDraw(
-                [this, vqid, cmd_address] {
+                [this, vqid, cmd_address SCENE_ORIGIN_CAPTURE(origin)] {
+                    SCENE_ORIGIN_SCOPE(origin);
                     rasterizer->ScopeMarker("asc[{}]:{}:DispatchDirect",
                                             fmt::make_format_args(vqid, cmd_address),
                                             [&] { rasterizer->DispatchDirect(); });
@@ -3367,8 +3411,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 break;
             }
             const auto cmd_address = reinterpret_cast<const void*>(header);
+            SCENE_ORIGIN_DECLARE(origin,2,vqid,reinterpret_cast<uintptr_t>(header),base_addr);
             RecordDraw(
-                [this, vqid, cmd_address, ib_address, size] {
+                [this, vqid, cmd_address, ib_address, size SCENE_ORIGIN_CAPTURE(origin)] {
+                    SCENE_ORIGIN_SCOPE(origin);
                     rasterizer->ScopeMarker(
                         "asc[{}]:{}:DispatchIndirect", fmt::make_format_args(vqid, cmd_address),
                         [&] { rasterizer->DispatchIndirect(ib_address, 0, size); });
@@ -3378,8 +3424,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::WriteData: {
             const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
+            SCENE_ORIGIN_DECLARE(origin,2,vqid,reinterpret_cast<uintptr_t>(header),base_addr);
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
+#ifndef NDEBUG
+            const auto trace_write_address=write_data->Address<VAddr>();
+            const u64 trace_first_word=data_size>=4?write_data->data[0]:0;
+#endif
+            SCENE_EVENT(origin,"write_data","decode_first_dword",write_data->Address<VAddr>(),data_size>=4?write_data->data[0]:0,data_size);
             WatchWrite(write_data->Address<VAddr>(), data_size, 0, "compute WRITE_DATA");
             if (rasterizer) {
                 if (auto* direct = rasterizer->GetBufferCache().GetDirectMemory()) {
@@ -3392,11 +3444,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 std::vector<u8> label = data;
                 if (TryEarlyLabel(write_data->Address<VAddr>(), data,
                                   u32(Vulkan::Rasterizer::DrainSource::AscWriteData))) {
+                    SCENE_EVENT(origin,"write_data","early_label",trace_write_address,trace_first_word,data_size);
                     break; // PERF-069: written at decode
                 }
                 RecordLabelWrite(
                     write_data->Address<VAddr>(), std::move(label),
-                    [this, address = write_data->Address<VAddr>(), data = std::move(data)] {
+                    [this, address = write_data->Address<VAddr>(), data = std::move(data) SCENE_ORIGIN_CAPTURE(origin)] {
+                        SCENE_EVENT(origin,"write_data","recorder",address,0,0);
 #ifdef RYTY_GPU
                         // NAT-100: native mode writes it on the GPU in command order.
                         if (rasterizer && rasterizer->NativeInlineWrite(address, data)) {
@@ -3436,6 +3490,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::MemSemaphore: {
             const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
+            SCENE_ORIGIN_DECLARE(origin,2,vqid,reinterpret_cast<uintptr_t>(header),base_addr);
+#ifndef NDEBUG
+            const auto trace_semaphore_address=mem_semaphore->Address<uintptr_t>();
+#endif
+            SCENE_EVENT(origin,"mem_semaphore",mem_semaphore->IsSignaling()?"signal_queued":"wait_decode",mem_semaphore->Address<uintptr_t>(),0,0);
             if (mem_semaphore->IsSignaling()) {
                 Record([semaphore = *mem_semaphore] { semaphore.Signal(); }, "memory semaphore");
             } else {
@@ -3452,11 +3511,17 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                                        mem_semaphore->Address<uintptr_t>(), wait_start);
                 }
                 mem_semaphore->Decrement();
+                SCENE_EVENT(origin,"mem_semaphore","wait_completed",trace_semaphore_address,0,0);
             }
             break;
         }
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
+            SCENE_ORIGIN_DECLARE(origin,2,vqid,reinterpret_cast<uintptr_t>(header),base_addr);
+#ifndef NDEBUG
+            const auto trace_wait=*wait_reg_mem;
+#endif
+            SCENE_EVENT(origin,"wait_reg_mem","decode",wait_reg_mem->mem_space==PM4CmdWaitRegMem::MemSpace::Memory?reinterpret_cast<uintptr_t>(wait_reg_mem->Address<u32*>()):0,wait_reg_mem->ref,wait_reg_mem->mask);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             const auto wait_start = FrontendWaitNow();
             // PERF-048: as for graphics waits, the other queues decode first.
@@ -3469,10 +3534,15 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 YIELD_ASC(vqid);
             }
             if (!wait_reg_mem->Test(regs.reg_array) && PendingLabelSatisfies(*wait_reg_mem)) {
+                SCENE_EVENT(origin,"wait_reg_mem","pending_label",trace_wait.mem_space==PM4CmdWaitRegMem::MemSpace::Memory?reinterpret_cast<uintptr_t>(trace_wait.Address<u32*>()):0,trace_wait.ref,trace_wait.mask);
                 // PERF-031: a queued fence writes the label; the recorder waits for it in order.
                 ++waits_moved;
                 waits_moved_after_turns += yielded;
-                RecordSafe([this, wait = *wait_reg_mem] { RecorderWaitRegMem(wait); });
+                RecordSafe([this, wait = *wait_reg_mem SCENE_ORIGIN_CAPTURE(origin)] {
+                    SCENE_EVENT(origin,"wait_reg_mem","recorder_begin",wait.mem_space==PM4CmdWaitRegMem::MemSpace::Memory?reinterpret_cast<uintptr_t>(wait.Address<u32*>()):0,wait.ref,wait.mask);
+                    RecorderWaitRegMem(wait);
+                    SCENE_EVENT(origin,"wait_reg_mem","recorder_complete_or_pending_fence",wait.mem_space==PM4CmdWaitRegMem::MemSpace::Memory?reinterpret_cast<uintptr_t>(wait.Address<u32*>()):0,wait.ref,wait.mask);
+                });
                 break;
             }
             // PERF-031: what is waited on may be written by recorded work; the pending-fence
@@ -3494,11 +3564,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                                    reinterpret_cast<uintptr_t>(wait_reg_mem->Address<u64*>()),
                                    wait_start);
             }
+            SCENE_EVENT(origin,"wait_reg_mem",waited?"wait_completed":"already_satisfied_or_pending_fence",trace_wait.mem_space==PM4CmdWaitRegMem::MemSpace::Memory?reinterpret_cast<uintptr_t>(trace_wait.Address<u32*>()):0,trace_wait.ref,trace_wait.mask);
             break;
         }
         case PM4ItOpcode::ReleaseMem: {
             // Signaling the fence can allow the guest to reuse the containing command buffer.
             const auto release = *reinterpret_cast<const PM4CmdReleaseMem*>(header);
+            SCENE_ORIGIN_DECLARE(origin,2,vqid,reinterpret_cast<uintptr_t>(header),base_addr);
+            SCENE_EVENT(origin,"release_mem",release.data_sel==DataSelect::GdsMemStore?"gds_decode":"decode",release.data_sel!=DataSelect::GdsMemStore?release.Address<VAddr>():0,release.DataQWord(),u32(release.data_sel.Value()));
             // PERF-010: when GPU-written pages the CPU read before are being read back, write
             // this fence once the GPU has executed the work and the data is in guest memory,
             // instead of letting the CPU access drain the GPU.
@@ -3510,6 +3583,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 if (TryEarlyLabel(release.Address<VAddr>(), bytes,
                                   u32(Vulkan::Rasterizer::DrainSource::AscReleaseMem),
                                   release.int_sel != InterruptSelect::None ? int(pipe_id) : -1)) {
+                    SCENE_EVENT(origin,"release_mem","early_label",release.Address<VAddr>(),release.DataQWord(),u32(release.data_sel.Value()));
                     break; // PERF-069: signaled at decode
                 }
             }
@@ -3517,13 +3591,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             RecordLabelWrite(
                 release.data_sel != DataSelect::GdsMemStore ? release.Address<VAddr>() : 0,
                 FenceValueBytes(release.data_sel.Value(), release.DataDWord(), release.DataQWord()),
-                [this, release, pipe_id] {
+                [this, release, pipe_id SCENE_ORIGIN_CAPTURE(origin)] {
                     const auto* release_mem = &release;
                     const bool deferred =
                         rasterizer && release.data_sel != DataSelect::GdsMemStore &&
                         rasterizer->DeferFenceSignal(
                             release.Address<VAddr>(),
-                            [release, pipe_id] {
+                            [release, pipe_id SCENE_ORIGIN_CAPTURE(origin)] {
                                 u64 value{};
                                 u32 num_bytes = sizeof(u64);
                                 switch (release.data_sel.Value()) {
@@ -3553,11 +3627,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                                     Platform::IrqC::Instance()->Signal(
                                         static_cast<Platform::InterruptId>(pipe_id));
                                 }
+                                SCENE_EVENT(origin,"release_mem","deferred_signal_complete",release.Address<VAddr>(),release.DataQWord(),u32(release.data_sel.Value()));
                             },
                             true,
                             FenceValueBytes(release.data_sel.Value(), release.DataDWord(),
                                             release.DataQWord()));
                     if (deferred) {
+                        SCENE_EVENT(origin,"release_mem","deferred",release.Address<VAddr>(),release.DataQWord(),u32(release.data_sel.Value()));
                         return;
                     }
                     if (rasterizer) {
@@ -3583,6 +3659,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                                 std::memcpy(address, &data, num_bytes);
                             }
                         });
+                    SCENE_EVENT(origin,"release_mem",release.data_sel==DataSelect::GdsMemStore?"gds_copy_recorded":"recorder_signal",release.Address<VAddr>(),release.DataQWord(),u32(release.data_sel.Value()));
                 });
             break;
         }

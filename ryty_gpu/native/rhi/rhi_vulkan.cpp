@@ -2590,4 +2590,199 @@ extern "C" __declspec(dllexport) int RytyNativeDescriptorBatchSelfTest(char* rep
 
 #endif
 
+#ifndef NDEBUG
+// The two queues, timelines and every resource below belong solely to this test.
+// In particular, neither queue signals the production scheduler's timeline.
+extern "C" __declspec(dllexport) int RytyNativeAsyncComputeSelfTest(char* report, int report_size) {
+    std::string detail;
+    int status = 1;
+    vk::detail::DynamicLoader loader;
+    const auto get_instance_proc_addr = loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
+    if (!get_instance_proc_addr) {
+        constexpr std::string_view error = "Vulkan loader unavailable";
+        if (report && report_size > 0) { const auto n = std::min(error.size(), size_t(report_size - 1)); std::memcpy(report, error.data(), n); report[n] = 0; }
+        return 1;
+    }
+    vk::detail::DispatchLoaderDynamic dispatch;
+    dispatch.init(get_instance_proc_addr);
+    vk::Instance instance{};
+    vk::Device device{};
+    std::array<vk::Buffer, 5> buffers{};
+    std::array<vk::DeviceMemory, 5> memory{};
+    std::array<vk::DescriptorSetLayout, 4> layouts{};
+    vk::PipelineLayout pipeline_layout{};
+    vk::ShaderModule shader{};
+    vk::Pipeline pipeline{};
+    vk::DescriptorPool descriptors{};
+    vk::CommandPool commands{};
+    std::array<vk::Semaphore, 2> timelines{};
+    void* mapped{};
+    bool submitted = false;
+    // Cleanup is unconditional, and waits before destroying any potentially in-flight object.
+    struct Cleanup {
+        std::function<void()> run;
+        ~Cleanup() { run(); }
+    };
+    {
+        Cleanup cleanup{[&] {
+            if (device) {
+                if (submitted) {
+                    const auto result = device.waitIdle(dispatch);
+                    if (result != vk::Result::eSuccess) {
+                        status = 1;
+                        detail += " deviceWaitIdle failed: " + vk::to_string(result);
+                    }
+                }
+                if (mapped) device.unmapMemory(memory[4], dispatch);
+                for (auto semaphore : timelines) if (semaphore) device.destroySemaphore(semaphore, nullptr, dispatch);
+                if (commands) device.destroyCommandPool(commands, nullptr, dispatch);
+                if (descriptors) device.destroyDescriptorPool(descriptors, nullptr, dispatch);
+                if (pipeline) device.destroyPipeline(pipeline, nullptr, dispatch);
+                if (shader) device.destroyShaderModule(shader, nullptr, dispatch);
+                if (pipeline_layout) device.destroyPipelineLayout(pipeline_layout, nullptr, dispatch);
+                for (auto layout : layouts) if (layout) device.destroyDescriptorSetLayout(layout, nullptr, dispatch);
+                for (auto buffer : buffers) if (buffer) device.destroyBuffer(buffer, nullptr, dispatch);
+                for (auto allocation : memory) if (allocation) device.freeMemory(allocation, nullptr, dispatch);
+                device.destroy(nullptr, dispatch);
+            }
+            if (instance) instance.destroy(nullptr, dispatch);
+        }};
+        const auto run = [&]() -> bool {
+            const vk::ApplicationInfo app{.pApplicationName = "RyGT async queue self-test", .apiVersion = VK_API_VERSION_1_2};
+            const auto [ir, created_instance] = vk::createInstance(vk::InstanceCreateInfo{.pApplicationInfo = &app}, nullptr, dispatch);
+            if (ir != vk::Result::eSuccess) { detail = "create instance: " + vk::to_string(ir); return false; }
+            instance = created_instance;
+            dispatch.init(instance);
+            const auto [er, physical_devices] = instance.enumeratePhysicalDevices(dispatch);
+            if (er != vk::Result::eSuccess) { detail = "enumerate devices: " + vk::to_string(er); return false; }
+            vk::PhysicalDevice physical{};
+            u32 family = ~0u;
+            // Prefer discrete hardware, as the existing standalone test does.
+            for (int pass = 0; pass != 2 && !physical; ++pass) for (auto candidate : physical_devices) {
+                const auto props = candidate.getProperties(dispatch);
+                if (props.apiVersion < VK_API_VERSION_1_2 || (pass == 0 && props.deviceType != vk::PhysicalDeviceType::eDiscreteGpu)) continue;
+                const auto families = candidate.getQueueFamilyProperties(dispatch);
+                for (u32 i = 0; i < families.size(); ++i) {
+                    if (families[i].queueCount >= 2 && (families[i].queueFlags & vk::QueueFlagBits::eGraphics) &&
+                        (families[i].queueFlags & vk::QueueFlagBits::eCompute)) { physical = candidate; family = i; break; }
+                }
+                if (physical) break;
+            }
+            if (!physical) { status = 2; detail = "unsupported: no Vulkan 1.2 graphics+compute family with two queues"; return false; }
+            vk::PhysicalDeviceTimelineSemaphoreFeatures timeline_support{};
+            vk::PhysicalDeviceFeatures2 supported{.pNext = &timeline_support};
+            physical.getFeatures2(&supported, dispatch);
+            if (!timeline_support.timelineSemaphore) { status = 2; detail = "unsupported: timeline semaphores"; return false; }
+            const float priorities[] = {1.0f, 1.0f};
+            const vk::DeviceQueueCreateInfo queue_info{.queueFamilyIndex = family, .queueCount = 2, .pQueuePriorities = priorities};
+            const vk::PhysicalDeviceTimelineSemaphoreFeatures timeline_feature{.timelineSemaphore = true};
+            const auto [dr, created_device] = physical.createDevice(vk::DeviceCreateInfo{.pNext = &timeline_feature,
+                .queueCreateInfoCount = 1, .pQueueCreateInfos = &queue_info}, nullptr, dispatch);
+            if (dr != vk::Result::eSuccess) { detail = "create device: " + vk::to_string(dr); return false; }
+            device = created_device;
+            dispatch.init(device);
+            const auto graphics = device.getQueue(family, 0, dispatch);
+            const auto compute = device.getQueue(family, 1, dispatch);
+            const auto memory_properties = physical.getMemoryProperties(dispatch);
+            for (u32 i = 0; i != buffers.size(); ++i) {
+                const auto [br, buffer] = device.createBuffer(vk::BufferCreateInfo{.size = 32,
+                    .usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc |
+                             vk::BufferUsageFlagBits::eTransferDst, .sharingMode = vk::SharingMode::eExclusive}, nullptr, dispatch);
+                if (br != vk::Result::eSuccess) { detail = "create buffer: " + vk::to_string(br); return false; }
+                buffers[i] = buffer;
+                const auto requirements = device.getBufferMemoryRequirements(buffer, dispatch);
+                u32 type = ~0u;
+                for (u32 j = 0; j < memory_properties.memoryTypeCount; ++j) {
+                    const auto flags = memory_properties.memoryTypes[j].propertyFlags;
+                    if ((requirements.memoryTypeBits & (1u << j)) &&
+                        (flags & (vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)) ==
+                            (vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)) { type = j; break; }
+                }
+                if (type == ~0u) { status = 2; detail = "unsupported: host coherent buffer memory"; return false; }
+                const auto [ar, allocation] = device.allocateMemory(vk::MemoryAllocateInfo{.allocationSize = requirements.size, .memoryTypeIndex = type}, nullptr, dispatch);
+                if (ar != vk::Result::eSuccess) { detail = "allocate buffer: " + vk::to_string(ar); return false; }
+                memory[i] = allocation;
+                if (device.bindBufferMemory(buffer, allocation, 0, dispatch) != vk::Result::eSuccess) { detail = "bind buffer memory failed"; return false; }
+            }
+            const auto [map_result, ptr] = device.mapMemory(memory[4], 0, 32, {}, dispatch);
+            if (map_result != vk::Result::eSuccess) { detail = "map readback: " + vk::to_string(map_result); return false; }
+            mapped = ptr;
+            std::memset(mapped, 0, 32);
+            const vk::DescriptorSetLayoutBinding binding{.binding = 0, .descriptorType = vk::DescriptorType::eStorageBuffer,
+                .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute};
+            for (auto& layout : layouts) {
+                const auto [result, value] = device.createDescriptorSetLayout(vk::DescriptorSetLayoutCreateInfo{.bindingCount = 1, .pBindings = &binding}, nullptr, dispatch);
+                if (result != vk::Result::eSuccess) { detail = "create set layout: " + vk::to_string(result); return false; }
+                layout = value;
+            }
+            const auto [lr, pl] = device.createPipelineLayout(vk::PipelineLayoutCreateInfo{.setLayoutCount = 4, .pSetLayouts = layouts.data()}, nullptr, dispatch);
+            if (lr != vk::Result::eSuccess) { detail = "create pipeline layout: " + vk::to_string(lr); return false; } pipeline_layout = pl;
+            const auto [sr, sm] = device.createShaderModule(vk::ShaderModuleCreateInfo{.codeSize = sizeof(kDescriptorBatchTestSpv), .pCode = kDescriptorBatchTestSpv}, nullptr, dispatch);
+            if (sr != vk::Result::eSuccess) { detail = "create shader: " + vk::to_string(sr); return false; } shader = sm;
+            const auto [pr, pp] = device.createComputePipeline({}, vk::ComputePipelineCreateInfo{.stage = {.stage = vk::ShaderStageFlagBits::eCompute, .module = shader, .pName = "main"}, .layout = pipeline_layout}, nullptr, dispatch);
+            pipeline = pp;
+            if (pr != vk::Result::eSuccess) { detail = "create pipeline: " + vk::to_string(pr); return false; }
+            const vk::DescriptorPoolSize pool_size{vk::DescriptorType::eStorageBuffer, 4};
+            const auto [dpr, dp] = device.createDescriptorPool(vk::DescriptorPoolCreateInfo{.maxSets = 4, .poolSizeCount = 1, .pPoolSizes = &pool_size}, nullptr, dispatch);
+            if (dpr != vk::Result::eSuccess) { detail = "create descriptor pool: " + vk::to_string(dpr); return false; } descriptors = dp;
+            const auto [asr, sets] = device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo{.descriptorPool = descriptors, .descriptorSetCount = 4, .pSetLayouts = layouts.data()}, dispatch);
+            if (asr != vk::Result::eSuccess) { detail = "allocate sets: " + vk::to_string(asr); return false; }
+            std::array<vk::DescriptorBufferInfo, 4> infos{};
+            std::array<vk::WriteDescriptorSet, 4> writes{};
+            for (u32 i = 0; i != 4; ++i) {
+                infos[i] = vk::DescriptorBufferInfo{.buffer = buffers[i], .offset = 0, .range = 32};
+                writes[i] = vk::WriteDescriptorSet{.dstSet = sets[i], .dstBinding = 0, .descriptorCount = 1,
+                    .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &infos[i]};
+            }
+            device.updateDescriptorSets(writes, {}, dispatch);
+            const auto [cpr, cp] = device.createCommandPool(vk::CommandPoolCreateInfo{.queueFamilyIndex = family}, nullptr, dispatch);
+            if (cpr != vk::Result::eSuccess) { detail = "create command pool: " + vk::to_string(cpr); return false; } commands = cp;
+            const auto [acr, cmd] = device.allocateCommandBuffers(vk::CommandBufferAllocateInfo{.commandPool = commands, .level = vk::CommandBufferLevel::ePrimary, .commandBufferCount = 3}, dispatch);
+            if (acr != vk::Result::eSuccess) { detail = "allocate commands: " + vk::to_string(acr); return false; }
+            for (auto& semaphore : timelines) {
+                const vk::SemaphoreTypeCreateInfo type{.semaphoreType = vk::SemaphoreType::eTimeline, .initialValue = 0};
+                const auto [result, value] = device.createSemaphore(vk::SemaphoreCreateInfo{.pNext = &type}, nullptr, dispatch);
+                if (result != vk::Result::eSuccess) { detail = "create timeline: " + vk::to_string(result); return false; } semaphore = value;
+            }
+            for (auto buffer : cmd) if (buffer.begin(vk::CommandBufferBeginInfo{.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit}, dispatch) != vk::Result::eSuccess) { detail = "begin command buffer failed"; return false; }
+            for (u32 i = 0; i != 3; ++i) cmd[0].fillBuffer(buffers[i], 0, 32, i + 1, dispatch);
+            cmd[1].bindPipeline(vk::PipelineBindPoint::eCompute, pipeline, dispatch);
+            cmd[1].bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout, 0, sets, {}, dispatch);
+            cmd[1].dispatch(1, 1, 1, dispatch);
+            cmd[2].copyBuffer(buffers[3], buffers[4], vk::BufferCopy{.size = 32}, dispatch);
+            const vk::BufferMemoryBarrier host_barrier{.srcAccessMask = vk::AccessFlagBits::eTransferWrite, .dstAccessMask = vk::AccessFlagBits::eHostRead,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .buffer = buffers[4], .offset = 0, .size = 32};
+            cmd[2].pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, {}, host_barrier, {}, dispatch);
+            for (auto buffer : cmd) if (buffer.end(dispatch) != vk::Result::eSuccess) { detail = "end command buffer failed"; return false; }
+            const u64 one = 1, two = 2;
+            const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eAllCommands;
+            const auto submit = [&](vk::Queue queue, vk::CommandBuffer buffer, const vk::Semaphore* wait, const vk::Semaphore* signal) {
+                const vk::TimelineSemaphoreSubmitInfo values{.waitSemaphoreValueCount = wait ? 1u : 0u, .pWaitSemaphoreValues = wait ? &one : nullptr,
+                    .signalSemaphoreValueCount = signal ? 1u : 0u, .pSignalSemaphoreValues = signal ? (wait && signal == &timelines[0] ? &two : &one) : nullptr};
+                const vk::SubmitInfo info{.pNext = &values, .waitSemaphoreCount = wait ? 1u : 0u, .pWaitSemaphores = wait,
+                    .pWaitDstStageMask = wait ? &wait_stage : nullptr, .commandBufferCount = 1, .pCommandBuffers = &buffer,
+                    .signalSemaphoreCount = signal ? 1u : 0u, .pSignalSemaphores = signal};
+                const auto result = queue.submit(info, {}, dispatch);
+                if (result != vk::Result::eSuccess) { detail = "queue submit: " + vk::to_string(result); return false; }
+                submitted = true; return true;
+            };
+            if (!submit(graphics, cmd[0], nullptr, &timelines[0]) || !submit(compute, cmd[1], &timelines[0], &timelines[1]) ||
+                !submit(graphics, cmd[2], &timelines[1], &timelines[0])) return false;
+            const auto wait_result = device.waitSemaphores(vk::SemaphoreWaitInfo{.semaphoreCount = 1,
+                .pSemaphores = &timelines[0], .pValues = &two}, 5'000'000'000ULL, dispatch);
+            if (wait_result != vk::Result::eSuccess) { detail = "final timeline wait: " + vk::to_string(wait_result); return false; }
+            const u32 expected = 1u ^ (2u * 1664525u + 3u);
+            const auto* values = static_cast<const u32*>(mapped);
+            for (u32 i = 0; i != 8; ++i) if (values[i] != expected) { detail = fmt::format("mismatch at {}: {} expected {}", i, values[i], expected); return false; }
+            status = 0;
+            detail = "passed: graphics producer -> compute dispatch -> graphics readback, eight values; basic queue bridge only (not guest lifetime, unmap, or frame performance)";
+            return true;
+        };
+        run();
+    }
+    if (report && report_size > 0) { const auto n = std::min(detail.size(), size_t(report_size - 1)); std::memcpy(report, detail.data(), n); report[n] = 0; }
+    return status;
+}
+#endif
+
 } // namespace Native::Rhi

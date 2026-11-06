@@ -15,6 +15,7 @@
 #include <boost/container/small_vector.hpp>
 #include <fmt/ranges.h>
 #include "common/debug.h"
+#include "common/scene_origin.h"
 #include "common/path_util.h"
 #include "common/perf_monitor.h"
 #include "ryty_gpu/native/slow_call_trace.h"
@@ -3202,6 +3203,9 @@ void Rasterizer::StartFrameDumpNow() {
     // FIX-156 (diagnosis): the dump collects from here to the next flip.
     if (!frame_dump_collecting && !frame_dump_done) {
         frame_dump_collecting = true;
+#ifndef NDEBUG
+        SceneOrigin::Begin();
+#endif
         frame_dump_old.clear();
         FrameDumpEvent("---- dump started here (watched fill) ----");
     }
@@ -3412,6 +3416,9 @@ void Rasterizer::FrameDumpFlip() {
     if (!frame_dump_collecting) {
         if ((dump_at >= 0 && now >= dump_at) || exposure_dump_requested || debug_frame_dump_active) {
             frame_dump_collecting = true; // the next frame's targets are noted
+#ifndef NDEBUG
+            SceneOrigin::Begin();
+#endif
             frame_dump_old.clear();
             frames_seen = 0;
 #ifdef RYTY_GPU
@@ -3437,6 +3444,9 @@ void Rasterizer::FrameDumpFlip() {
                                                         : std::string{"exp"});
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
+#ifndef NDEBUG
+    SceneOrigin::Save(dir);
+#endif
     FrameDumpWriteEvents(dir);
     frame_dump_mem_dir = dir; // FIX-153 (diagnosis)
     frame_dump_mem_wait = 0;

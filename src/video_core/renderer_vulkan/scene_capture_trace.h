@@ -9,6 +9,7 @@
 #include <vector>
 #include <vulkan/vulkan.hpp>
 #include "common/types.h"
+#include "common/scene_origin.h"
 
 namespace Vulkan::SceneTrace {
 #ifndef NDEBUG
@@ -20,6 +21,8 @@ struct Row {
     u32 first_query = NoQuery;
     std::array<u64, 8> phases{}, record{};
     bool phases_measured{}, phases_valid{};
+    SceneOrigin::Origin origin{};
+    u64 host_begin_ns{},host_end_ns{};
 };
 struct State {
     std::vector<Row> rows;
@@ -43,6 +46,8 @@ public:
         if (state.rows.empty()) state.rows.reserve(Limit);
         current = index = state.rows.size();
         state.rows.push_back(Row{.frame=frame, .kind=kind});
+        state.rows[index].origin=SceneOrigin::current;
+        state.rows[index].host_begin_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         state.rows[index].phases_measured = reset_generation && !phases.empty() && !record.empty();
         if (reset_generation) generation_before = *reset_generation;
         for (size_t i=0; i<std::min(phases.size(),before.size()); ++i) before[i]=phases[i];
@@ -52,6 +57,7 @@ public:
     ~CpuScope() {
         if (index < state.rows.size()) {
             auto& row=state.rows[index];
+            row.host_end_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
             row.cpu_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now()-start).count();
             row.phases_valid = row.phases_measured && *reset_generation == generation_before;
@@ -106,7 +112,7 @@ inline void Save(const std::filesystem::path& dir,vk::Device device) {
         results.size()*sizeof(results[0]),results.data(),sizeof(results[0]),
         vk::QueryResultFlagBits::e64|vk::QueryResultFlagBits::eWithAvailability);
     if(auto* f=std::fopen((dir/"pass-profile.csv").string().c_str(),"w")) {
-        std::fprintf(f,"id,frame,kind,program,companion,cpu_ns,gpu_span_ns,gpu_available,phase_pipeline_ns,phase_targets_ns,phase_buffers_ns,phase_textures_ns,phase_sources_ns,phase_vertices_ns,phase_prepare_ns,phase_record_ns,record_barrier_ns,record_begin_ns,record_dynamic_ns,record_vertex_ns,record_pipeline_ns,record_bindings_ns,record_draw_ns,record_notes_ns,phases_valid\n");
+        std::fprintf(f,"id,frame,kind,program,companion,cpu_ns,gpu_span_ns,gpu_available,phase_pipeline_ns,phase_targets_ns,phase_buffers_ns,phase_textures_ns,phase_sources_ns,phase_vertices_ns,phase_prepare_ns,phase_record_ns,record_barrier_ns,record_begin_ns,record_dynamic_ns,record_vertex_ns,record_pipeline_ns,record_bindings_ns,record_draw_ns,record_notes_ns,phases_valid,origin_engine,origin_vqid,origin_packet,origin_buffer,origin_buffer_sequence,graphics_submission,host_begin_ns,host_end_ns,gpu_begin_tick,gpu_end_tick,host_queue_index\n");
         for(size_t i=0;i<state.rows.size();++i){const auto& row=state.rows[i];double ns=0;bool available=false;
             if(row.first_query!=NoQuery && (result==vk::Result::eSuccess || result==vk::Result::eNotReady)){
                 auto a=results[row.first_query],b=results[row.first_query+1];available=a[1]&&b[1];
@@ -117,6 +123,9 @@ inline void Save(const std::filesystem::path& dir,vk::Device device) {
             for(auto x:row.phases) { if(row.phases_valid) std::fprintf(f,",%llu",x); else std::fputc(',',f); }
             for(auto x:row.record) { if(row.phases_valid) std::fprintf(f,",%llu",x); else std::fputc(',',f); }
             std::fprintf(f,",%u",unsigned(row.phases_valid));
+            std::fprintf(f,",%u,%u,0x%llx,0x%llx,%llu,%llu,%llu,%llu",row.origin.engine,row.origin.vqid,row.origin.packet,row.origin.buffer,row.origin.sequence,row.origin.submission,row.host_begin_ns,row.host_end_ns);
+            if(available)std::fprintf(f,",%llu,%llu,0",results[row.first_query][0],results[row.first_query+1][0]);
+            else std::fprintf(f,",,,");
             std::fputc('\n',f);
         }std::fclose(f);
     }

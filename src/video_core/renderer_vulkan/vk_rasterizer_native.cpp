@@ -3676,6 +3676,9 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
     for (const auto& desc : stage.buffers) {
         const u32 buffer_index = index++;
         vk::DescriptorBufferInfo info{VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
+#ifndef NDEBUG
+        u64 trace_guest_base=0,trace_guest_size=0;bool trace_guest_known=false;
+#endif
         if (desc.IsSpecial()) {
             switch (desc.buffer_type) {
             case Shader::BufferType::GdsBuffer:
@@ -3758,6 +3761,10 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
             const auto vsharp = desc.GetSharp(stage);
             const u64 base = vsharp.base_address;
             const u64 sharp_size = vsharp.GetSize();
+#ifndef NDEBUG
+            trace_guest_base=base;trace_guest_size=sharp_size;
+            trace_guest_known=base && sharp_size && base<=~u64{0}-sharp_size && !stage.uses_direct;
+#endif
 #if !defined(NDEBUG)
             // DIAG-204 (RYGT_PROBE_SHADER=<hash>): that program's buffers and their first bytes.
             static const u64 probe_hash = [] {
@@ -3939,7 +3946,9 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                 }
             }
         }
-        if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-buffer id={} stage={} program={:#x} binding={} descriptor={} special={} written={} handle={:#x} offset={} range={} direct={}",SceneTrace::Id(),u32(stage.sw_stage),stage.pgm_hash,binding.unified,buffer_index,desc.IsSpecial(),desc.is_written,reinterpret_cast<u64>(static_cast<VkBuffer>(info.buffer)),info.offset,info.range,stage.uses_direct));
+#ifndef NDEBUG
+        if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-buffer id={} stage={} program={:#x} binding={} descriptor={} special={} written={} handle={:#x} offset={} range={} direct={} guest_known={} guest_base={:#x} guest_size={} host_range_known={}",SceneTrace::Id(),u32(stage.sw_stage),stage.pgm_hash,binding.unified,buffer_index,desc.IsSpecial(),desc.is_written,reinterpret_cast<u64>(static_cast<VkBuffer>(info.buffer)),info.offset,info.range,stage.uses_direct,trace_guest_known,trace_guest_base,trace_guest_size,bool(info.buffer)&&info.range && info.range!=VK_WHOLE_SIZE && info.offset<=~u64{0}-info.range));
+#endif
         b.buffers.push_back(info);
         b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
         b.writes.push_back(vk::WriteDescriptorSet{
@@ -4246,6 +4255,9 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                                                : cube_sampling ? ViewUse::CubeSampled
                                                            : ViewUse::Sampled);
             if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-image id={} stage={} program={:#x} binding={} element={} storage={} comparison={} requested={:#x} actual={:#x} format={} size={}x{} levels={} layers={} view_mip={}+{} view_layer={}+{} min_lod={} fallback={} version={} dirty={} from_cpu={}",SceneTrace::Id(),u32(stage.sw_stage),stage.pgm_hash,binding.unified,i,storage,image_desc.is_depth,desc.info.guest_address,entry->info.guest_address,u32(entry->info.pixel_format),entry->info.size.width,entry->info.size.height,entry->info.resources.levels,entry->info.resources.layers,view_info.range.base.level,view_info.range.extent.levels,view_info.range.base.layer,view_info.range.extent.layers,view_info.min_lod,u32(fallback),entry->write_version.load(),entry->needs_upload.load(),entry->from_cpu));
+#ifndef NDEBUG
+            if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-image-identity id={} binding={} host_image={:#x} guest_base={:#x} guest_size={} guest_allocation_known={} accessed_subrange_known=0",SceneTrace::Id(),binding.unified,entry->image?entry->image->NativeHandle():0,entry->info.guest_address,entry->info.guest_size,entry->info.guest_address && entry->info.guest_size && entry->info.guest_address<=~u64{0}-entry->info.guest_size));
+#endif
             if (trace_cascade) {
                 r.FrameDumpEvent(fmt::format(
                     "cascade-view ps {:#x} requested {:#x} {}x{} mips {} layers {} "

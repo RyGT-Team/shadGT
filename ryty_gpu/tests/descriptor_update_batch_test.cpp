@@ -26,6 +26,20 @@ struct Write {
     bool operator==(const Write&)const=default;
 };
 int main(){
+    for(unsigned n:{0u,2u,6u,16u,32u,64u}) {
+        std::array<unsigned,64> payload{};
+        std::vector<Write> input;
+        for(unsigned i=0;i<n;++i)input.push_back({0,i,1,&payload[i],&payload[0]});
+        const auto original=input;
+        std::vector<Write> output{{77,99,1,&payload[0],&payload[1]}};
+        const auto prefix=output.front();
+        for(unsigned group=0;group<3;++group)Native::AppendDescriptorUpdates(input,11+group,output);
+        assert(output.size()==1+3*n && output.front()==prefix && input==original);
+        for(unsigned group=0;group<3;++group)for(unsigned i=0;i<n;++i) {
+            auto expected=input[i];expected.dstSet=11+group;
+            assert(output[1+group*n+i]==expected && output[1+group*n+i].info==&payload[i]);
+        }
+    }
     std::array<int,3> source{11,22,33};const auto original_source=source;
     std::array<StageRow,4> rows{{{0,1,source.data(),nullptr},{0,2,source.data()+1,nullptr},
                                   {0,1,nullptr,source.data()},{0,2,nullptr,source.data()+1}}};

@@ -9,9 +9,9 @@ constexpr bool DescriptorCountsFit(std::size_t w,std::size_t b,std::size_t i,
 // until this draw returns. No destination is ever left in the original records.
 template<class Writes,class Set,class Updates>
 void AppendDescriptorUpdates(const Writes& writes,Set set,Updates& updates) {
-    for (const auto& original:writes) {
-        auto copy=original;copy.dstSet=set;updates.push_back(copy);
-    }
+    const auto first=updates.size();
+    updates.insert(updates.end(),writes.begin(),writes.end());
+    for(auto i=first;i<updates.size();++i)updates[i].dstSet=set;
 }
 // All new sets are updated before recording any bind. Updating a set after it
 // was bound would invalidate a command buffer without UPDATE_AFTER_BIND.

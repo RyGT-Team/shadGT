@@ -120,6 +120,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
             end_session();
         }
         buffer_cache.SubmitPendingArenaBinds(info);
+        if (native) {
+            native->AddComputeWait(info);
+        }
     });
 
     // PERF-084: Vulkan calls on a command thread. -DisablePerf 97 makes them here as before.
@@ -3427,7 +3430,8 @@ void Rasterizer::FrameDumpFlip() {
         }
         return;
     }
-    if (++frames_seen < (debug_frame_dump_active ? 1u : dump_frames)) {
+    // F8 remains one frame by default; explicit multi-frame traces are bounded.
+    if (++frames_seen < (debug_frame_dump_active ? std::min(dump_frames,4u) : dump_frames)) {
         FrameDumpEvent(fmt::format("---- flip {} ----", frames_seen));
         return;
     }

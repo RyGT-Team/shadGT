@@ -3174,7 +3174,11 @@ bool Liverpool::ScanAheadForPipelines(const std::function<bool(const Regs&)>& on
 }
 
 template <bool is_indirect>
-Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
+Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid
+#ifndef NDEBUG
+                                         , u64 scene_submission
+#endif
+                                         ) {
     FIBER_ENTER(acb_task_name[vqid]);
     SCENE_SEQUENCE_DECLARE;
     auto& queue = asc_queues[{vqid}];
@@ -3241,7 +3245,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::IndirectBuffer: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
             auto task = ProcessCompute<true>(
-                {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, vqid);
+                {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, vqid
+#ifndef NDEBUG
+                , scene_submission
+#endif
+                );
             RESUME_ASC(task, vqid);
 
             while (!task.handle.done()) {
@@ -3366,7 +3374,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (auto it = std::ranges::find(indirect_patches, header, &IndirectPatch::header);
                 it != indirect_patches.end()) {
                 const auto size = sizeof(PM4CmdDispatchIndirect::GroupDimensions);
-                SCENE_ORIGIN_DECLARE(origin,2,vqid,reinterpret_cast<uintptr_t>(header),base_addr);
+                SCENE_ASC_ORIGIN_DECLARE(origin,vqid,reinterpret_cast<uintptr_t>(header),base_addr);
                 RecordDraw([this, args = it->indirect_addr,
                             size SCENE_ORIGIN_CAPTURE(origin)] { SCENE_ORIGIN_SCOPE(origin); rasterizer->DispatchIndirect(args, 0, size); },
                            true);
@@ -3385,7 +3393,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 break;
             }
             const auto cmd_address = reinterpret_cast<const void*>(header);
-            SCENE_ORIGIN_DECLARE(origin,2,vqid,reinterpret_cast<uintptr_t>(header),base_addr);
+            SCENE_ASC_ORIGIN_DECLARE(origin,vqid,reinterpret_cast<uintptr_t>(header),base_addr);
             RecordDraw(
                 [this, vqid, cmd_address SCENE_ORIGIN_CAPTURE(origin)] {
                     SCENE_ORIGIN_SCOPE(origin);
@@ -3411,7 +3419,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 break;
             }
             const auto cmd_address = reinterpret_cast<const void*>(header);
-            SCENE_ORIGIN_DECLARE(origin,2,vqid,reinterpret_cast<uintptr_t>(header),base_addr);
+            SCENE_ASC_ORIGIN_DECLARE(origin,vqid,reinterpret_cast<uintptr_t>(header),base_addr);
             RecordDraw(
                 [this, vqid, cmd_address, ib_address, size SCENE_ORIGIN_CAPTURE(origin)] {
                     SCENE_ORIGIN_SCOPE(origin);
@@ -3424,7 +3432,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::WriteData: {
             const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
-            SCENE_ORIGIN_DECLARE(origin,2,vqid,reinterpret_cast<uintptr_t>(header),base_addr);
+            SCENE_ASC_ORIGIN_DECLARE(origin,vqid,reinterpret_cast<uintptr_t>(header),base_addr);
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
 #ifndef NDEBUG
@@ -3490,7 +3498,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::MemSemaphore: {
             const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
-            SCENE_ORIGIN_DECLARE(origin,2,vqid,reinterpret_cast<uintptr_t>(header),base_addr);
+            SCENE_ASC_ORIGIN_DECLARE(origin,vqid,reinterpret_cast<uintptr_t>(header),base_addr);
 #ifndef NDEBUG
             const auto trace_semaphore_address=mem_semaphore->Address<uintptr_t>();
 #endif
@@ -3517,7 +3525,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
-            SCENE_ORIGIN_DECLARE(origin,2,vqid,reinterpret_cast<uintptr_t>(header),base_addr);
+            SCENE_ASC_ORIGIN_DECLARE(origin,vqid,reinterpret_cast<uintptr_t>(header),base_addr);
 #ifndef NDEBUG
             const auto trace_wait=*wait_reg_mem;
 #endif
@@ -3570,7 +3578,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::ReleaseMem: {
             // Signaling the fence can allow the guest to reuse the containing command buffer.
             const auto release = *reinterpret_cast<const PM4CmdReleaseMem*>(header);
-            SCENE_ORIGIN_DECLARE(origin,2,vqid,reinterpret_cast<uintptr_t>(header),base_addr);
+            SCENE_ASC_ORIGIN_DECLARE(origin,vqid,reinterpret_cast<uintptr_t>(header),base_addr);
             SCENE_EVENT(origin,"release_mem",release.data_sel==DataSelect::GdsMemStore?"gds_decode":"decode",release.data_sel!=DataSelect::GdsMemStore?release.Address<VAddr>():0,release.DataQWord(),u32(release.data_sel.Value()));
             // PERF-010: when GPU-written pages the CPU read before are being read back, write
             // this fence once the GPU has executed the work and the data is in guest memory,
@@ -4071,7 +4079,11 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
 
     const auto vqid = gnm_vqid - 1;
     NoteAscEpoch(); // PERF-095
-    const auto& task = ProcessCompute(acb, vqid);
+    const auto& task = ProcessCompute(acb, vqid
+#ifndef NDEBUG
+        , SceneOrigin::next_asc_submission.fetch_add(1,std::memory_order_relaxed)
+#endif
+        );
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);

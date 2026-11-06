@@ -81,6 +81,8 @@ class ComputePipeline;
 /// NAT-100: whether native mode was asked for (RYGT_NATIVE=1).
 bool NativeModeRequested();
 
+class NativeAsyncFill;
+
 class NativeRenderer {
 public:
     explicit NativeRenderer(Rasterizer& rasterizer);
@@ -108,6 +110,7 @@ public:
     /// Ends the command list recorded so far and runs it in the scheduler's current command
     /// buffer (called before anything else is recorded there or it is submitted).
     void Splice();
+    void AddComputeWait(Vulkan::SubmitInfo& info);
 
     /// The picture at a display buffer, for the presenter (none when nothing drew there).
     struct Display {
@@ -711,6 +714,7 @@ private:
     std::unique_ptr<Native::Rhi::Device> device;
     std::unique_ptr<AsyncMirrorBuffer<Native::Rhi::Buffer>> mirror_preparation;
     std::unique_ptr<Native::Rhi::Fence> timeline;
+    std::unique_ptr<NativeAsyncFill> async_fill;
     std::unique_ptr<Native::ImageRegistry> registry;
     std::unique_ptr<Native::Rhi::Buffer> gds;
     std::unique_ptr<Native::Rhi::Buffer> lds;

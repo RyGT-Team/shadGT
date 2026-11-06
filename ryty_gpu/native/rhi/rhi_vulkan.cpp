@@ -41,6 +41,10 @@
 #undef far
 #endif
 
+#ifndef NDEBUG
+#include "video_core/renderer_vulkan/native_async_fill.h"
+#endif
+
 namespace Native::Rhi {
 namespace {
 
@@ -366,6 +370,9 @@ public:
         };
         return device.waitSemaphores(info, timeout_ns) == vk::Result::eSuccess;
     }
+    u64 NativeHandle() const override {
+        return reinterpret_cast<u64>(static_cast<VkSemaphore>(semaphore));
+    }
     vk::Device device;
     vk::Semaphore semaphore;
     bool owned;
@@ -462,10 +469,14 @@ struct ThreadPool {
 
 class VulkanQueue final : public Queue {
 public:
-    explicit VulkanQueue(VulkanDevice& device) : device{device} {}
+    explicit VulkanQueue(VulkanDevice& device, vk::Queue queue, std::mutex* submit_mutex, bool async = false)
+        : device{device}, queue{queue}, submit_mutex{submit_mutex}, async{async} {}
     void Submit(std::span<CommandList* const> lists, std::span<const FenceValue> waits,
                 FenceValue signal) override;
     VulkanDevice& device;
+    vk::Queue queue;
+    std::mutex* submit_mutex;
+    bool async;
 };
 
 // The Vulkan objects a device runs on: the renderer's own (shared with the presenter), or ones
@@ -476,8 +487,11 @@ struct VulkanContext {
     vk::Device device;
     VmaAllocator allocator = nullptr;
     u32 queue_family = 0;
+    u32 compute_queue_family = 0;
     vk::Queue queue;
+    vk::Queue compute_queue;
     std::mutex* submit_mutex = nullptr;
+    std::mutex* compute_submit_mutex = nullptr;
     bool external_memory_host = false;
     bool geometry = false;
     bool tessellation = false;
@@ -521,12 +535,17 @@ public:
     std::unique_ptr<Fence> CreateFence(u64 initial) override;
     std::unique_ptr<Fence> ImportFence(u64 native_handle) override;
     CommandList* AcquireCommandList(CommandListLevel level) override;
+    CommandList* AcquireComputeCommandList(CommandListLevel level) override;
     std::unique_ptr<CommandList> WrapCommandBuffer(u64 native_cmdbuf) override;
     void ReleaseUnsubmitted(CommandList* list) override;
     void MarkExecuted(CommandList* list, FenceValue retire) override;
     Queue& GraphicsQueue() override {
         return queue;
     }
+    Queue& ComputeQueue() override {
+        return compute_queue;
+    }
+    bool HasAsyncCompute() const override { return bool(ctx.compute_queue); }
     void Collect() override;
     void UseExternalTimeline(Fence* fence, std::function<u64()> current) override;
     void RecordPendingImageInit(CommandList& list) override;
@@ -574,7 +593,12 @@ public:
     vk::Device device;
     VmaAllocator allocator;
     DeviceCaps caps{};
-    VulkanQueue queue{*this};
+    VulkanQueue queue{*this, ctx.queue, ctx.submit_mutex};
+    std::mutex async_submit_mutex;
+    VulkanQueue compute_queue{*this, ctx.compute_queue, &async_submit_mutex, true};
+    vk::Semaphore async_timeline{};
+    std::unique_ptr<VulkanFence> async_timeline_fence;
+    u64 async_submitted = 0;
     vk::Semaphore timeline;           // one tick per submission
     std::unique_ptr<VulkanFence> timeline_fence;
     std::atomic<u64> submitted{0};    // ticks handed out
@@ -709,6 +733,14 @@ VulkanDevice::VulkanDevice(VulkanContext context, bool timing_enabled)
     });
     ASSERT_MSG(pool_result == vk::Result::eSuccess, "NAT-011: command pool failed");
     init_pool = pool;
+
+    if (ctx.compute_queue) {
+        const auto [async_result, async_semaphore] =
+            device.createSemaphore(vk::SemaphoreCreateInfo{.pNext = &timeline_info});
+        ASSERT_MSG(async_result == vk::Result::eSuccess, "NAT-011: async timeline failed");
+        async_timeline = async_semaphore;
+        async_timeline_fence = std::make_unique<VulkanFence>(device, async_semaphore, false);
+    }
 #ifndef NDEBUG
     if (gpu_timing_enabled) {
         const auto queues = ctx.physical_device.getQueueFamilyProperties();
@@ -756,6 +788,7 @@ VulkanDevice::~VulkanDevice() {
     for (u32 i = 0; i < gpu_timing_count; ++i) device.destroyQueryPool(gpu_timings[i].queries);
 #endif
     device.destroyCommandPool(init_pool);
+    if (async_timeline) device.destroySemaphore(async_timeline);
     device.destroySemaphore(timeline);
     if (ctx.destroy) {
         ctx.destroy();
@@ -1572,6 +1605,12 @@ CommandList* VulkanDevice::AcquireCommandList(CommandListLevel level) {
     return list;
 }
 
+CommandList* VulkanDevice::AcquireComputeCommandList(CommandListLevel level) {
+    ASSERT_MSG(ctx.compute_queue && level == CommandListLevel::Primary,
+               "NAT-011: async compute requires an available queue and primary command list");
+    return AcquireCommandList(level);
+}
+
 std::unique_ptr<CommandList> VulkanDevice::WrapCommandBuffer(u64 native_cmdbuf) {
     vk::CommandBuffer cmdbuf{reinterpret_cast<VkCommandBuffer>(native_cmdbuf)};
     return std::make_unique<VulkanCommandList>(*this, nullptr, cmdbuf, CommandListLevel::Primary);
@@ -1679,7 +1718,7 @@ void VulkanQueue::Submit(std::span<CommandList* const> lists, std::span<const Fe
     buffers.reserve(lists.size() + 1);
     std::unique_lock init_lock{device.init_mutex};
     vk::CommandBuffer init_cmd{};
-    if (!device.pending_init.empty()) {
+    if (!async && !device.pending_init.empty()) {
         const u64 completed = device.CompletedTick();
         if (!device.init_used.empty() && device.init_used.front().first <= completed) {
             init_cmd = device.init_used.front().second;
@@ -1702,8 +1741,12 @@ void VulkanQueue::Submit(std::span<CommandList* const> lists, std::span<const Fe
         std::ignore = init_cmd.end();
         buffers.push_back(init_cmd);
     }
+    ASSERT_MSG(queue, "NAT-011: queue unavailable");
     for (CommandList* list : lists) {
-        buffers.push_back(static_cast<VulkanCommandList*>(list)->cmd);
+        auto* vk_list = static_cast<VulkanCommandList*>(list);
+        ASSERT_MSG(vk_list && vk_list->level == CommandListLevel::Primary,
+                   "NAT-011: only primary command lists can be submitted");
+        buffers.push_back(vk_list->cmd);
     }
     std::vector<vk::Semaphore> wait_semaphores;
     std::vector<u64> wait_values;
@@ -1713,13 +1756,12 @@ void VulkanQueue::Submit(std::span<CommandList* const> lists, std::span<const Fe
         wait_values.push_back(wait.value);
         wait_stages.push_back(vk::PipelineStageFlagBits::eAllCommands);
     }
-    std::scoped_lock submit_lock{*device.ctx.submit_mutex};
-    const u64 tick = device.submitted.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (init_cmd) {
-        device.init_used.emplace_back(tick, init_cmd);
-    }
-    init_lock.unlock();
-    std::array<vk::Semaphore, 2> signal_semaphores{device.timeline};
+    std::scoped_lock submit_lock{*submit_mutex};
+    const u64 tick = async ? device.async_submitted + 1 :
+        device.submitted.load(std::memory_order_relaxed) + 1;
+    const vk::Semaphore queue_timeline = async ? device.async_timeline : device.timeline;
+    auto* queue_fence = async ? device.async_timeline_fence.get() : device.timeline_fence.get();
+    std::array<vk::Semaphore, 2> signal_semaphores{queue_timeline};
     std::array<u64, 2> signal_values{tick};
     u32 signal_count = 1;
     if (signal.fence) {
@@ -1743,14 +1785,18 @@ void VulkanQueue::Submit(std::span<CommandList* const> lists, std::span<const Fe
         .signalSemaphoreCount = signal_count,
         .pSignalSemaphores = signal_semaphores.data(),
     };
-    const vk::Result result = device.ctx.queue.submit(submit);
+    const vk::Result result = queue.submit(submit);
     ASSERT_MSG(result == vk::Result::eSuccess, "NAT-011: queue submit failed: {}",
                vk::to_string(result));
+    if (async) device.async_submitted = tick;
+    else device.submitted.store(tick, std::memory_order_relaxed);
+    if (init_cmd) device.init_used.emplace_back(tick, init_cmd);
+    init_lock.unlock();
     for (CommandList* list : lists) {
         auto* vulkan_list = static_cast<VulkanCommandList*>(list);
-        vulkan_list->retire_fence.store(device.timeline_fence.get(), std::memory_order_relaxed);
+        vulkan_list->retire_fence.store(queue_fence, std::memory_order_relaxed);
 #ifndef NDEBUG
-        device.PublishGpuTiming(vulkan_list->timing, device.timeline, tick);
+        device.PublishGpuTiming(vulkan_list->timing, queue_timeline, tick);
         vulkan_list->timing = nullptr;
 #endif
         // The owning worker may recycle immediately after this release.
@@ -2210,8 +2256,11 @@ std::unique_ptr<Device> CreateVulkanDevice(const Vulkan::Instance& instance) {
         .device = instance.GetDevice(),
         .allocator = instance.GetAllocator(),
         .queue_family = instance.GetGraphicsQueueFamilyIndex(),
+        .compute_queue_family = instance.GetComputeQueueFamilyIndex(),
         .queue = instance.GetGraphicsQueue(),
+        .compute_queue = instance.GetComputeQueue(),
         .submit_mutex = &Vulkan::Scheduler::submit_mutex,
+        .compute_submit_mutex = &Vulkan::Scheduler::submit_mutex,
         .external_memory_host = instance.IsExternalMemoryHostSupported(),
         .geometry = instance.IsGeometryStageSupported(),
         .tessellation = instance.IsTessellationSupported(),
@@ -2327,11 +2376,14 @@ static std::unique_ptr<Device> CreateStandaloneVulkanDeviceImpl(std::string* err
             .shaderInt16 = features.shaderInt16,
         },
     };
-    const float priority = 1.0f;
+    const char* async_env = std::getenv("RYGT_NATIVE_ASYNC_CS");
+    const bool async_compute = async_env && std::string_view{async_env} == "1" &&
+                               families[family].queueCount >= 2;
+    constexpr std::array priorities{1.0f, 1.0f};
     const vk::DeviceQueueCreateInfo queue_info{
         .queueFamilyIndex = family,
-        .queueCount = 1,
-        .pQueuePriorities = &priority,
+        .queueCount = async_compute ? 2u : 1u,
+        .pQueuePriorities = priorities.data(),
     };
     const auto [device_result, device] = physical.createDevice(vk::DeviceCreateInfo{
         .pNext = &features2,
@@ -2373,7 +2425,9 @@ static std::unique_ptr<Device> CreateStandaloneVulkanDeviceImpl(std::string* err
         .device = device,
         .allocator = allocator,
         .queue_family = family,
+        .compute_queue_family = family,
         .queue = device.getQueue(family, 0),
+        .compute_queue = async_compute ? device.getQueue(family, 1) : vk::Queue{},
         .submit_mutex = &standalone_submit_mutex,
         .external_memory_host = host_import,
         .geometry = features.geometryShader != 0,
@@ -2403,6 +2457,112 @@ std::unique_ptr<Device> CreateStandaloneVulkanDevice(std::string* error) {
 }
 
 #ifndef NDEBUG
+// Exercises the real RHI async queue and private fill kernel; no guest dispatch routing.
+extern "C" __declspec(dllexport) int RytyNativeAsyncFillSelfTest(char* report, int report_size) {
+    std::string detail;
+    const auto run = [&]() -> bool {
+        std::string error;
+        u64 current_tick = 2; // Outlives the standalone device and its retirement callback.
+        auto base = CreateStandaloneVulkanDeviceImpl(&error, false);
+        if (!base) { detail = "device: " + error; return false; }
+        auto& owner = static_cast<VulkanDevice&>(*base);
+        if (!owner.HasAsyncCompute()) { detail = "async queue unavailable (set RYGT_NATIVE_ASYNC_CS=1)"; return false; }
+        auto graphics = owner.CreateFence(0);
+        auto gate = owner.CreateFence(0);
+        if (!graphics || !gate) { detail = "create fences"; return false; }
+        auto fill = Vulkan::NativeAsyncFill::Create(owner, owner.device, *graphics);
+        if (!fill) { detail = "create fill pipeline"; return false; }
+        std::unique_ptr<Buffer> read;
+        struct GateGuard {
+            vk::Device device; VulkanDevice* owner; Fence* gate; bool pending{};
+            ~GateGuard() {
+                if (pending) {
+                    auto sem = vk::Semaphore{reinterpret_cast<VkSemaphore>(gate->NativeHandle())};
+                    const auto result = device.signalSemaphore({.semaphore=sem,.value=1});
+                    if (result != vk::Result::eSuccess) std::terminate();
+                }
+                if (device.waitIdle() != vk::Result::eSuccess) std::terminate();
+                owner->UseExternalTimeline(nullptr, {});
+            }
+        } guard{owner.device, &owner, gate.get()};
+        FenceValue gate_wait{gate.get(), 1};
+        owner.ComputeQueue().Submit({}, std::span{&gate_wait, 1}, {});
+        guard.pending = true;
+        constexpr u64 bytes = 516; // 129 words: exercises a partial last workgroup.
+        constexpr u32 even = 0x1735a9cdu, odd = 0xe3014b67u;
+        std::array<Vulkan::NativeAsyncFill::Dispatch, Vulkan::NativeAsyncFill::SlotCount> jobs{};
+        if (fill->TryDispatch(0, even, odd) || fill->TryDispatch(3, even, odd) ||
+            fill->TryDispatch(Vulkan::NativeAsyncFill::MaxBytes+4, even, odd)) {
+            detail = "invalid byte count accepted"; return false;
+        }
+        for (auto& job : jobs) {
+            auto value=fill->TryDispatch(bytes, even, odd);
+            if (!value) { detail="slot allocation"; return false; }
+            job=*value;
+        }
+        if (fill->TryDispatch(bytes, even, odd) || fill->ActiveBytes()!=bytes*jobs.size()) {
+            detail="slot capacity or byte accounting"; return false;
+        }
+        owner.GraphicsQueue().Submit({}, {}, {graphics.get(),1});
+        if (!graphics->Wait(1,5'000'000'000ULL)) { detail="independent graphics timeout"; return false; }
+        fill->Collect();
+        if (fill->Fence().Completed()!=0 || fill->ActiveBytes()!=bytes*jobs.size()) {
+            detail="graphics progress retired gated compute"; return false;
+        }
+        const auto gate_sem=vk::Semaphore{reinterpret_cast<VkSemaphore>(gate->NativeHandle())};
+        if(owner.device.signalSemaphore({.semaphore=gate_sem,.value=1})!=vk::Result::eSuccess) {
+            detail="host gate signal"; return false;
+        }
+        guard.pending=false;
+        read=owner.CreateBuffer({.size=bytes*jobs.size(),.usage=BufferUsageTransferDst,
+                                     .memory=MemoryKind::Readback});
+        if (!read || !read->Mapped()) { detail="readback allocation"; return false; }
+        auto* list=owner.AcquireCommandList(CommandListLevel::Primary);
+        list->Begin();
+        const vk::CommandBuffer cmd{reinterpret_cast<VkCommandBuffer>(list->NativeHandle())};
+        auto intermediate=owner.CreateBuffer({.size=bytes*jobs.size(),
+            .usage=BufferUsageTransferSrc|BufferUsageTransferDst,.memory=MemoryKind::DeviceLocal});
+        if (!intermediate) { detail="intermediate allocation"; return false; }
+        const auto destination=vk::Buffer{reinterpret_cast<VkBuffer>(read->NativeHandle())};
+        const auto middle=vk::Buffer{reinterpret_cast<VkBuffer>(intermediate->NativeHandle())};
+        for (size_t n=0;n<jobs.size();++n)
+            cmd.copyBuffer(jobs[n].buffer,middle,vk::BufferCopy{.dstOffset=n*bytes,.size=bytes});
+        list->Barrier(ScopeTransfer,ScopeTransfer);
+        cmd.copyBuffer(middle,destination,vk::BufferCopy{.size=bytes*jobs.size()});
+        list->Barrier(ScopeTransfer,ScopeHost);
+        list->End();
+        owner.UseExternalTimeline(graphics.get(), [&current_tick] { return current_tick; });
+        intermediate.reset(); // Model removal of an owned region before its queued graphics use.
+        owner.Collect(); // G=1; the backing must remain alive until G=2.
+        CommandList* lists[]{list};
+        FenceValue wait{&fill->Fence(), jobs.back().value};
+        owner.GraphicsQueue().Submit(lists,std::span{&wait,1},{graphics.get(),2});
+        fill->MarkGraphicsTick(2);
+        fill->ConsumeWait(jobs.back().value);
+        if (!graphics->Wait(2,5'000'000'000ULL)) { detail="joined graphics timeout"; return false; }
+        read->Invalidate();
+        const auto* words=reinterpret_cast<const u32*>(read->Mapped());
+        for(size_t n=0;n<jobs.size();++n) for(size_t w=0;w<bytes/4;++w)
+            if(words[n*(bytes/4)+w] != (w%2 ? odd : even)) { detail="readback mismatch"; return false; }
+        fill->Collect();
+        if(fill->ActiveBytes()!=0 || fill->PendingWait()!=0) {detail="slot retirement";return false;}
+        current_tick=3;
+        auto again=fill->TryDispatch(bytes,odd,even);
+        if (!again || again->value!=jobs.back().value+1) {detail="slot reuse";return false;}
+        FenceValue reuse_wait{&fill->Fence(),again->value};
+        owner.GraphicsQueue().Submit({},std::span{&reuse_wait,1},{graphics.get(),3});
+        fill->MarkGraphicsTick(3);
+        if(!graphics->Wait(3,5'000'000'000ULL)) {detail="reuse join";return false;}
+        fill->Collect();
+        if(fill->ActiveBytes()!=0) {detail="reuse retirement";return false;}
+        detail="passed: RHI queues, gated compute, 8 slots, 129-word alternating readback and reuse";
+        return true;
+    };
+    const bool ok=run();
+    if(report && report_size>0) std::snprintf(report,size_t(report_size),"%s",detail.c_str());
+    return ok ? 0 : 1;
+}
+
 // Diagnostic harness uses the same backend, lease protocol and reader as gameplay.
 extern "C" __declspec(dllexport) int RytyNativeGpuTimingSelfTest(char* report, int report_size) {
     std::string error;
@@ -2615,9 +2775,11 @@ extern "C" __declspec(dllexport) int RytyNativeAsyncComputeSelfTest(char* report
     vk::Pipeline pipeline{};
     vk::DescriptorPool descriptors{};
     vk::CommandPool commands{};
-    std::array<vk::Semaphore, 2> timelines{};
+    // Graphics progress, compute completion, and a host-controlled compute gate.
+    std::array<vk::Semaphore, 3> timelines{};
     void* mapped{};
     bool submitted = false;
+    u64 pending_gate = 0;
     // Cleanup is unconditional, and waits before destroying any potentially in-flight object.
     struct Cleanup {
         std::function<void()> run;
@@ -2626,6 +2788,16 @@ extern "C" __declspec(dllexport) int RytyNativeAsyncComputeSelfTest(char* report
     {
         Cleanup cleanup{[&] {
             if (device) {
+                if (pending_gate) {
+                    const auto result=device.signalSemaphore(vk::SemaphoreSignalInfo{.semaphore=timelines[2],.value=pending_gate},dispatch);
+                    if(result!=vk::Result::eSuccess) {
+                        status=1;detail+=" cleanup gate signal failed: "+vk::to_string(result);
+                        // An in-flight queue may still wait on the gate. Do not hang
+                        // or destroy live GPU objects; the test process will exit.
+                        return;
+                    }
+                    pending_gate=0;
+                }
                 if (submitted) {
                     const auto result = device.waitIdle(dispatch);
                     if (result != vk::Result::eSuccess) {
@@ -2735,47 +2907,61 @@ extern "C" __declspec(dllexport) int RytyNativeAsyncComputeSelfTest(char* report
                     .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &infos[i]};
             }
             device.updateDescriptorSets(writes, {}, dispatch);
-            const auto [cpr, cp] = device.createCommandPool(vk::CommandPoolCreateInfo{.queueFamilyIndex = family}, nullptr, dispatch);
+            const auto [cpr, cp] = device.createCommandPool(vk::CommandPoolCreateInfo{.flags=vk::CommandPoolCreateFlagBits::eResetCommandBuffer,.queueFamilyIndex = family}, nullptr, dispatch);
             if (cpr != vk::Result::eSuccess) { detail = "create command pool: " + vk::to_string(cpr); return false; } commands = cp;
-            const auto [acr, cmd] = device.allocateCommandBuffers(vk::CommandBufferAllocateInfo{.commandPool = commands, .level = vk::CommandBufferLevel::ePrimary, .commandBufferCount = 3}, dispatch);
+            const auto [acr, cmd] = device.allocateCommandBuffers(vk::CommandBufferAllocateInfo{.commandPool = commands, .level = vk::CommandBufferLevel::ePrimary, .commandBufferCount = 4}, dispatch);
             if (acr != vk::Result::eSuccess) { detail = "allocate commands: " + vk::to_string(acr); return false; }
             for (auto& semaphore : timelines) {
                 const vk::SemaphoreTypeCreateInfo type{.semaphoreType = vk::SemaphoreType::eTimeline, .initialValue = 0};
                 const auto [result, value] = device.createSemaphore(vk::SemaphoreCreateInfo{.pNext = &type}, nullptr, dispatch);
                 if (result != vk::Result::eSuccess) { detail = "create timeline: " + vk::to_string(result); return false; } semaphore = value;
             }
-            for (auto buffer : cmd) if (buffer.begin(vk::CommandBufferBeginInfo{.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit}, dispatch) != vk::Result::eSuccess) { detail = "begin command buffer failed"; return false; }
-            for (u32 i = 0; i != 3; ++i) cmd[0].fillBuffer(buffers[i], 0, 32, i + 1, dispatch);
-            cmd[1].bindPipeline(vk::PipelineBindPoint::eCompute, pipeline, dispatch);
-            cmd[1].bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout, 0, sets, {}, dispatch);
-            cmd[1].dispatch(1, 1, 1, dispatch);
-            cmd[2].copyBuffer(buffers[3], buffers[4], vk::BufferCopy{.size = 32}, dispatch);
-            const vk::BufferMemoryBarrier host_barrier{.srcAccessMask = vk::AccessFlagBits::eTransferWrite, .dstAccessMask = vk::AccessFlagBits::eHostRead,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .buffer = buffers[4], .offset = 0, .size = 32};
-            cmd[2].pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, {}, host_barrier, {}, dispatch);
-            for (auto buffer : cmd) if (buffer.end(dispatch) != vk::Result::eSuccess) { detail = "end command buffer failed"; return false; }
-            const u64 one = 1, two = 2;
             const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eAllCommands;
-            const auto submit = [&](vk::Queue queue, vk::CommandBuffer buffer, const vk::Semaphore* wait, const vk::Semaphore* signal) {
-                const vk::TimelineSemaphoreSubmitInfo values{.waitSemaphoreValueCount = wait ? 1u : 0u, .pWaitSemaphoreValues = wait ? &one : nullptr,
-                    .signalSemaphoreValueCount = signal ? 1u : 0u, .pSignalSemaphoreValues = signal ? (wait && signal == &timelines[0] ? &two : &one) : nullptr};
-                const vk::SubmitInfo info{.pNext = &values, .waitSemaphoreCount = wait ? 1u : 0u, .pWaitSemaphores = wait,
-                    .pWaitDstStageMask = wait ? &wait_stage : nullptr, .commandBufferCount = 1, .pCommandBuffers = &buffer,
-                    .signalSemaphoreCount = signal ? 1u : 0u, .pSignalSemaphores = signal};
+            const auto submit = [&](vk::Queue queue,vk::CommandBuffer buffer,std::span<const vk::Semaphore> waits,std::span<const u64> wait_values,vk::Semaphore signal,u64 signal_value) {
+                const std::array<vk::PipelineStageFlags,2> stages{wait_stage,wait_stage};
+                const vk::TimelineSemaphoreSubmitInfo values{.waitSemaphoreValueCount=u32(wait_values.size()),.pWaitSemaphoreValues=wait_values.data(),.signalSemaphoreValueCount=1,.pSignalSemaphoreValues=&signal_value};
+                const vk::SubmitInfo info{.pNext=&values,.waitSemaphoreCount=u32(waits.size()),.pWaitSemaphores=waits.data(),.pWaitDstStageMask=stages.data(),.commandBufferCount=1,.pCommandBuffers=&buffer,.signalSemaphoreCount=1,.pSignalSemaphores=&signal};
                 const auto result = queue.submit(info, {}, dispatch);
                 if (result != vk::Result::eSuccess) { detail = "queue submit: " + vk::to_string(result); return false; }
                 submitted = true; return true;
             };
-            if (!submit(graphics, cmd[0], nullptr, &timelines[0]) || !submit(compute, cmd[1], &timelines[0], &timelines[1]) ||
-                !submit(graphics, cmd[2], &timelines[1], &timelines[0])) return false;
-            const auto wait_result = device.waitSemaphores(vk::SemaphoreWaitInfo{.semaphoreCount = 1,
-                .pSemaphores = &timelines[0], .pValues = &two}, 5'000'000'000ULL, dispatch);
-            if (wait_result != vk::Result::eSuccess) { detail = "final timeline wait: " + vk::to_string(wait_result); return false; }
-            const u32 expected = 1u ^ (2u * 1664525u + 3u);
-            const auto* values = static_cast<const u32*>(mapped);
-            for (u32 i = 0; i != 8; ++i) if (values[i] != expected) { detail = fmt::format("mismatch at {}: {} expected {}", i, values[i], expected); return false; }
+            const auto wait_for=[&](vk::Semaphore semaphore,u64 value) {
+                const auto result=device.waitSemaphores(vk::SemaphoreWaitInfo{.semaphoreCount=1,.pSemaphores=&semaphore,.pValues=&value},5'000'000'000ULL,dispatch);
+                if(result!=vk::Result::eSuccess){detail="timeline wait: "+vk::to_string(result);return false;}return true;
+            };
+            for(u64 generation=0;generation<3;++generation) {
+                for(auto buffer:cmd) {
+                    if(generation && buffer.reset({},dispatch)!=vk::Result::eSuccess){detail="reset command buffer failed";return false;}
+                    if(buffer.begin(vk::CommandBufferBeginInfo{.flags=vk::CommandBufferUsageFlagBits::eOneTimeSubmit},dispatch)!=vk::Result::eSuccess){detail="begin command buffer failed";return false;}
+                }
+                std::memset(mapped,0,32);
+                for(u32 i=0;i<3;++i)cmd[0].fillBuffer(buffers[i],0,32,u32(generation)+i+1,dispatch);
+                cmd[1].bindPipeline(vk::PipelineBindPoint::eCompute,pipeline,dispatch);
+                cmd[1].bindDescriptorSets(vk::PipelineBindPoint::eCompute,pipeline_layout,0,sets,{},dispatch);
+                cmd[1].dispatch(1,1,1,dispatch);
+                cmd[2].copyBuffer(buffers[3],buffers[4],vk::BufferCopy{.size=32},dispatch);
+                const vk::BufferMemoryBarrier host_barrier{.srcAccessMask=vk::AccessFlagBits::eTransferWrite,.dstAccessMask=vk::AccessFlagBits::eHostRead,.srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.buffer=buffers[4],.offset=0,.size=32};
+                cmd[2].pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,vk::PipelineStageFlagBits::eHost,{}, {},host_barrier,{},dispatch);
+                // cmd[3] is independent and accesses none of the compute resources.
+                for(auto buffer:cmd)if(buffer.end(dispatch)!=vk::Result::eSuccess){detail="end command buffer failed";return false;}
+                const u64 producer=3*generation+1,independent=producer+1,joined=producer+2,compute_value=generation+1;
+                const std::array<vk::Semaphore,2> compute_waits{timelines[0],timelines[2]};const std::array<u64,2> compute_values{producer,compute_value};
+                if(!submit(graphics,cmd[0],{}, {},timelines[0],producer))return false;
+                if(!submit(compute,cmd[1],compute_waits,compute_values,timelines[1],compute_value))return false;
+                pending_gate=compute_value;
+                if(!submit(graphics,cmd[3],{}, {},timelines[0],independent) || !wait_for(timelines[0],independent))return false;
+                const auto [counter_result,completed]=device.getSemaphoreCounterValue(timelines[1],dispatch);
+                if(counter_result!=vk::Result::eSuccess || completed!=generation){detail="graphics progress incorrectly implies compute completion";return false;}
+                const auto gate_result=device.signalSemaphore(vk::SemaphoreSignalInfo{.semaphore=timelines[2],.value=compute_value},dispatch);
+                if(gate_result!=vk::Result::eSuccess){detail="host gate signal: "+vk::to_string(gate_result);return false;}pending_gate=0;
+                const std::array<vk::Semaphore,1> async_wait{timelines[1]};const std::array<u64,1> async_value{compute_value};
+                if(!submit(graphics,cmd[2],async_wait,async_value,timelines[0],joined) || !wait_for(timelines[0],joined))return false;
+                const u32 expected=u32(generation+1)^(u32(generation+2)*1664525u+u32(generation+3));
+                const auto* values=static_cast<const u32*>(mapped);
+                for(u32 i=0;i<8;++i)if(values[i]!=expected){detail=fmt::format("generation {} mismatch at {}: {} expected {}",generation,i,values[i],expected);return false;}
+            }
             status = 0;
-            detail = "passed: graphics producer -> compute dispatch -> graphics readback, eight values; basic queue bridge only (not guest lifetime, unmap, or frame performance)";
+            detail = "passed: three graphics->compute->graphics generations, 24 readback values; independent graphics completes while gated compute remains pending; standalone only, not guest lifetime, unmap, or frame performance";
             return true;
         };
         run();

@@ -473,6 +473,8 @@ public:
     virtual u64 Completed() const = 0;
     /// Waits until the fence reaches `value` or `timeout_ns` passes; true when reached.
     virtual bool Wait(u64 value, u64 timeout_ns) const = 0;
+    /// Returns the native handle (Vulkan: VkSemaphore) for cross-queue synchronization.
+    virtual u64 NativeHandle() const = 0;
 };
 
 struct FenceValue {
@@ -532,6 +534,8 @@ public:
     /// pool once the GPU has run the submission it was part of (or when Release is called on a
     /// list that was never submitted).
     virtual CommandList* AcquireCommandList(CommandListLevel level = CommandListLevel::Primary) = 0;
+    /// A command list from the calling thread's compute queue pool, ready for Begin.
+    virtual CommandList* AcquireComputeCommandList(CommandListLevel level = CommandListLevel::Primary) = 0;
     /// Wraps an externally managed command buffer (e.g. from the scheduler's primary session).
     virtual std::unique_ptr<CommandList> WrapCommandBuffer(u64 native_cmdbuf) { return nullptr; }
     virtual void ReleaseUnsubmitted(CommandList* list) = 0;
@@ -539,6 +543,10 @@ public:
     /// `retire` is reached.
     virtual void MarkExecuted(CommandList* list, FenceValue retire) = 0;
     virtual Queue& GraphicsQueue() = 0;
+    /// Queue for compute dispatches (async compute). Falls back to GraphicsQueue() when no
+    /// dedicated compute queue family is available.
+    virtual Queue& ComputeQueue() = 0;
+    virtual bool HasAsyncCompute() const = 0;
 
     /// Recycles command lists and frees objects the GPU has finished with.
     virtual void Collect() = 0;

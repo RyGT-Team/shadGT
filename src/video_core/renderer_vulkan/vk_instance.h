@@ -90,6 +90,16 @@ public:
         return index < framegen_queues.size() ? framegen_queues[index] : vk::Queue{};
     }
 
+    /// Optional spare queue from the graphics family; null when unavailable or disabled.
+    vk::Queue GetComputeQueue() const {
+        return compute_queue;
+    }
+
+    /// ryGT: compute queue family index
+    u32 GetComputeQueueFamilyIndex() const {
+        return compute_queue_family_index;
+    }
+
     TracyVkCtx GetProfilerContext() const {
         return profiler_context;
     }
@@ -582,12 +592,14 @@ private:
     VmaAllocator allocator{};
     vk::Queue present_queue;
     vk::Queue graphics_queue;
+    vk::Queue compute_queue;
     std::vector<vk::Queue> framegen_queues;
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
     TracyVkCtx profiler_context{};
     u32 queue_family_index{0};
+    u32 compute_queue_family_index{0};
     bool custom_border_color{};
     bool fragment_shader_barycentric{};
     bool amd_shader_explicit_vertex_parameter{};

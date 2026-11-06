@@ -650,6 +650,8 @@ bool Instance::CreateDevice() {
     }
 
     bool graphics_queue_found = false;
+
+    // First pass: find graphics queue family
     for (std::size_t i = 0; i < family_properties.size(); i++) {
         const u32 index = static_cast<u32>(i);
         if (family_properties[i].queueFlags & vk::QueueFlagBits::eGraphics) {
@@ -665,24 +667,35 @@ bool Instance::CreateDevice() {
 
     // ryGT: with frame generation on, three more queues of the graphics family for its
     // swapchain's own threads (async compute, present, image acquire), when the family has them.
-    static constexpr std::array queue_priorities = {1.0f, 1.0f, 1.0f, 1.0f};
+    static constexpr std::array queue_priorities = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
     const u32 num_queues = EmulatorSettings.IsFrameGenEnabled() &&
                                    family_properties[queue_family_index].queueCount >= 4
                                ? 4u
                                : 1u;
-    const vk::DeviceQueueCreateInfo queue_info = {
+
+    // Reserve the existing frame-generation slots first. Only opt in with a spare
+    // queue from the same family, so no queue-family ownership transfer is needed.
+    const char* async_env = std::getenv("RYGT_NATIVE_ASYNC_CS");
+    const bool async_compute = async_env && std::string_view{async_env} == "1" &&
+        bool(family_properties[queue_family_index].queueFlags & vk::QueueFlagBits::eCompute) &&
+        family_properties[queue_family_index].queueCount > num_queues;
+    compute_queue_family_index = queue_family_index;
+    std::vector<vk::DeviceQueueCreateInfo> queue_infos;
+    queue_infos.push_back(vk::DeviceQueueCreateInfo{
         .queueFamilyIndex = queue_family_index,
-        .queueCount = num_queues,
+        .queueCount = num_queues + (async_compute ? 1u : 0u),
         .pQueuePriorities = queue_priorities.data(),
-    };
+    });
+
+    const vk::DeviceQueueCreateInfo* queue_info_ptr = queue_infos.data();
 
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
-            .queueCreateInfoCount = 1u,
-            .pQueueCreateInfos = &queue_info,
+            .queueCreateInfoCount = static_cast<u32>(queue_infos.size()),
+            .pQueueCreateInfos = queue_info_ptr,
             .enabledExtensionCount = static_cast<u32>(enabled_extensions.size()),
             .ppEnabledExtensionNames = enabled_extensions.data(),
         },
@@ -967,6 +980,9 @@ bool Instance::CreateDevice() {
     for (u32 i = 1; i < num_queues; ++i) {
         framegen_queues.push_back(device->getQueue(queue_family_index, i));
     }
+
+    // Get compute queue (separate family if available, otherwise graphics family)
+    compute_queue = async_compute ? device->getQueue(queue_family_index, num_queues) : vk::Queue{};
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =

@@ -9,6 +9,7 @@
 #include <thread>
 #include <queue>
 
+#include "common/assert.h"
 #include "common/interval_set.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
@@ -60,8 +61,8 @@ struct RenderState {
 static_assert(std::has_unique_object_representations_v<RenderState>);
 
 struct SubmitInfo {
-    std::array<vk::Semaphore, 4> wait_semas;
-    std::array<u64, 4> wait_ticks;
+    std::array<vk::Semaphore, 5> wait_semas;
+    std::array<u64, 5> wait_ticks;
     std::array<vk::Semaphore, 4> signal_semas;
     std::array<u64, 4> signal_ticks;
     vk::Fence fence;
@@ -69,6 +70,7 @@ struct SubmitInfo {
     u32 num_signal_semas;
 
     void AddWait(vk::Semaphore semaphore, u64 tick = 1) {
+        ASSERT_MSG(num_wait_semas < wait_semas.size(), "GPU submission wait capacity exceeded");
         wait_semas[num_wait_semas] = semaphore;
         wait_ticks[num_wait_semas++] = tick;
     }

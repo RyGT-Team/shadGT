@@ -51,6 +51,7 @@
 // own threads with this code (ryty_gpu/native/DESIGN.md, N4).
 
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
+#include "video_core/renderer_vulkan/native_async_fill.h"
 #include "video_core/renderer_vulkan/scene_region_scale.h"
 #include "video_core/renderer_vulkan/upload_chunk_tail.h"
 #include "video_core/renderer_vulkan/upload_chunk_cache.h"
@@ -1115,6 +1116,11 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     const VkSemaphore semaphore = r.scheduler.GetWorkSemaphore()->Handle();
     timeline = device->ImportFence(reinterpret_cast<u64>(semaphore));
     device->UseExternalTimeline(timeline.get(), [this] { return r.scheduler.CurrentTick(); });
+    if (device->HasAsyncCompute() && !r.instance.IsIntel()) {
+        async_fill=NativeAsyncFill::Create(*device,r.instance.GetDevice(),*timeline);
+        LOG_INFO(Render_Vulkan,"ASYNC-CS: private-output compute fill {} (other dispatches retain ordered recording)",async_fill?"enabled":"unavailable");
+    }
+
     LOG_INFO(Render_Vulkan, "DRAW-PREP: mask {} (1 range union, 2 region dedup, 4 thread-local stats, 8 batched diagnostic polling)", DrawPreparationMask());
     registry = std::make_unique<Native::ImageRegistry>(*device);
     registry->SetImageFactory([this](const VideoCore::ImageInfo& info, bool render_target) {
@@ -1378,6 +1384,12 @@ NativeRenderer::~NativeRenderer() {
     mirror_preparation.reset(); // Join before any device or direct-memory teardown.
     sampler_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
     std::scoped_lock lock{mutex};
+    if (async_fill) {
+        Splice();
+        r.scheduler.Finish(); // Teardown only: close copybacks before their owners die.
+        async_fill.reset();
+    }
+
     if (auto* sidecar=FindParallelRuntime(this)) {
         sidecar->closing=true;
         EndRendering();Splice();
@@ -1668,6 +1680,15 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     GlobalBarrier();
     MakePendingMirrors(); // NAT-150: behind the barrier the list starts with anyway
     return s;
+}
+
+void NativeRenderer::AddComputeWait(Vulkan::SubmitInfo& info) {
+    std::scoped_lock lock{mutex};
+    if (!async_fill) return;
+    const u64 value=async_fill->PendingWait();
+    if (!value) return;
+    info.AddWait(vk::Semaphore{reinterpret_cast<VkSemaphore>(async_fill->Fence().NativeHandle())},value);
+    async_fill->ConsumeWait(value);
 }
 
 void NativeRenderer::EndRendering(u32 reason) {
@@ -8908,10 +8929,27 @@ void NativeRenderer::DispatchDirect() {
             (b.fill_address & 3) == 0 && RegionOver(b.fill_address, b.fill_size)) {
             if (const auto target = GuestBuffer(b.fill_address, b.fill_size, true);
                 target && (target->second & 3) == 0) {
-                if (words[0] == words[1]) {
+                // Only the already-proven complete fill can run without a GPU input.
+                // Private output is copied at this exact ordered position; its graphics
+                // submission joins compute, while earlier submitted graphics can overlap.
+                if (async_fill) {
+                    const auto* region=RegionOver(b.fill_address,b.fill_size);
+                    const bool owned=region && region->buffer && b.fill_address>=region->begin &&
+                        b.fill_address<=region->end && b.fill_size<=region->end-b.fill_address &&
+                        target->first==vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())} &&
+                        target->second==b.fill_address-region->begin;
+                    if (owned) if (auto result=async_fill->TryDispatch(b.fill_size,words[0],words[1])) {
+                        cmdbuf.copyBuffer(result->buffer,target->first,
+                            vk::BufferCopy{.srcOffset=0,.dstOffset=target->second,.size=b.fill_size});
+                        transferred=true;
+                        if(result->value==1)LOG_INFO(Render_Vulkan,
+                            "ASYNC-CS: first private compute fill submitted, {} bytes; GPU wait at ordered copyback",b.fill_size);
+                    }
+                }
+                if (!transferred && words[0] == words[1]) {
                     cmdbuf.fillBuffer(target->first, target->second, b.fill_size, words[0]);
                     transferred = true;
-                } else if (const auto* pattern = PatternBuffer(words[0], words[1], b.fill_size);
+                } else if (!transferred) if (const auto* pattern = PatternBuffer(words[0], words[1], b.fill_size);
                            pattern && pattern->Size() >= b.fill_size) {
                     cmdbuf.copyBuffer(vk::Buffer{Handle<VkBuffer_T>(pattern->NativeHandle())},
                                      target->first, vk::BufferCopy{.srcOffset = 0,
@@ -9945,6 +9983,7 @@ void NativeRenderer::Splice() {
         r.scheduler.CommandBuffer().executeCommands(secondary);
     }
     const u64 tick = r.scheduler.CurrentTick();
+    if (async_fill) async_fill->MarkGraphicsTick(std::max(tick,boundary_signal));
     if (!wrapped) {
         device->MarkExecuted(s.list, {timeline.get(), tick});
     }

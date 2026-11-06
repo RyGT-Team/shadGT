@@ -19,6 +19,29 @@ void EmitWholePass(const Pass& pass,Begin&& begin,Emit&& emit,End&& end){
 }
 using namespace Native::Parallel;
 int main(){
+    // The production batch policy publishes the first draw, groups of four,
+    // and the final partial group before sealing.
+    for (int total : {1,2,3,4,5,7,8,64}) {
+        std::vector<Draw> draws; draws.reserve(64);
+        draws.push_back({1,13}); const Draw* storage=draws.data();
+        DrawPublication publication; assert(publication.Publish(1));
+        auto worker=std::async(std::launch::async,[&] {
+            std::vector<int> values; std::size_t consumed=0;
+            for (;;) {
+                auto ready=publication.Wait(consumed);
+                while(consumed<ready.count) { assert(ValidateDraw(storage[consumed],true)); values.push_back(storage[consumed++].value); }
+                if(ready.sealed) return values;
+            }
+        });
+        for(int i=2;i<=total;++i) {
+            draws.push_back({i,i*13}); assert(draws.data()==storage);
+            if(PublishDrawBatch(draws.size())) assert(publication.Publish(draws.size()));
+        }
+        assert(publication.Publish(draws.size())); publication.Seal();
+        assert(worker.wait_for(2s)==std::future_status::ready);
+        auto values=worker.get(); assert(values.size()==static_cast<std::size_t>(total));
+        for(int i=0;i<total;++i) assert(values[i]==i+1);
+    }
     // Stable element addresses, complete slots, incremental consumption before
     // sealing, then a metadata-only vector transfer to the retained job.
     for(int repeat=0;repeat<100;++repeat){

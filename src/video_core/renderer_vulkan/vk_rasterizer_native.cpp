@@ -1685,6 +1685,8 @@ void NativeRenderer::EndRendering(u32 reason) {
             // CPU recording may already be underway, but all draw preparation
             // stays in this prefix until the complete rendering scope is sealed.
             auto ticket=std::move(sidecar->draw_stream);
+            ASSERT_MSG(sidecar->coordinator->PublishStream(ticket,pass.draws.size()),
+                       "parallel draw tail publication failed");
             sidecar->coordinator->FinishStream(ticket);
             stream.list=sidecar->coordinator->StreamReplacement(ticket);
             ASSERT_MSG(stream.list,"stream replacement command list missing");
@@ -6897,8 +6899,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             if(parallel->draw_stream || !parallel->stream_attempted) {
                 parallel->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::EndPass);
                 if(parallel->draw_stream) {
-                    ASSERT_MSG(parallel->coordinator->PublishStream(parallel->draw_stream,draws.size()),
-                               "parallel draw publication failed");
+                    if(Native::Parallel::PublishDrawBatch(draws.size())) {
+                        ASSERT_MSG(parallel->coordinator->PublishStream(parallel->draw_stream,draws.size()),
+                                   "parallel draw publication failed");
+                    }
                 } else {
                     parallel->stream_attempted=true;
                     parallel->draw_stream=parallel->coordinator->BeginStream(parallel->epoch,parallel->active,

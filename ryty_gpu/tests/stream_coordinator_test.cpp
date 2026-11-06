@@ -107,6 +107,25 @@ static auto Accept(std::vector<Native::Rhi::CommandList*>& lists){
     return [&lists](Native::Rhi::CommandList* list,PassCoordinator::JobPtr,PassCoordinator::PrefixPtr)noexcept{lists.push_back(list);};
 }
 int main(){
+    // Exercise the production batch schedule and closure tail with a live
+    // blocked consumer and the coordinator's real publication methods.
+    for(std::size_t total:{1,2,3,4,5,7,8,64}) {
+     Native::Rhi::Device device;Vulkan::Instance instance;Native::Rhi::Fence fence;Native::Rhi::CommandList prefix{1};
+     PassCoordinator coordinator(device,instance,fence);auto source=Source(64,1);const Draw* storage=source->draws.data();
+     std::weak_ptr<int> owner=source->draws[0].owner;
+     auto ticket=coordinator.BeginStream(7,source,&prefix,source->resource_lease);CHECK(ticket);
+     WaitFor(instance.emitted,1);
+     for(std::size_t count=2;count<=total;++count) {
+        source->draws.push_back({int(count),16,source->draws[0].owner});CHECK(source->draws.data()==storage);
+        if(PublishDrawBatch(count)) CHECK(coordinator.PublishStream(ticket,count));
+     }
+     CHECK(coordinator.PublishStream(ticket,total));coordinator.FinishStream(ticket);
+     std::vector<Native::Rhi::CommandList*> accepted;CHECK(coordinator.Drain(7,Accept(accepted)));
+     CHECK(accepted.size()==2 && accepted[0]==&prefix && instance.emitted==total && instance.fallbacks==0);
+     auto* replacement=coordinator.StreamReplacement(ticket);source.reset();ticket.reset();
+     coordinator.Collect(6);CHECK(!owner.expired());coordinator.Collect(7);CHECK(owner.expired());
+     device.ReleaseUnsubmitted(replacement);
+    }
     // Starting with fewer than eight draws still runs the worker while the
     // producer is open. Each subsequent slot is published individually.
     for(std::size_t initial:{1,2,7}){Native::Rhi::Device device;Vulkan::Instance instance;Native::Rhi::Fence fence;Native::Rhi::CommandList prefix{1};

@@ -4,6 +4,11 @@
 #include <cstdint>
 
 namespace Native::Parallel {
+// The first packet is published immediately; subsequent groups contain four.
+// The owner publishes any shorter tail before sealing.
+constexpr bool PublishDrawBatch(std::size_t count) noexcept {
+    return count > 1 && (count - 1) % 4 == 0;
+}
 // One producer publishes completed, immutable slots in stable storage. One
 // recording callback consumes them; the storage remains owned through retirement.
 class DrawPublication {

@@ -616,8 +616,11 @@ bool RunEvictionBudgetCase(Rhi::Device& device, std::string& log) {
         return false;
     }, 16);
     ok = grew && selected == 1 && duplicate_retired == 1 && duplicates.Count() == 81 && ok;
-    ok = duplicates.FindExisting(base, [&](const ImageEntry& entry) { return &entry == target; }) == target && ok;
-    ok = duplicates.Evict(2000, [](ImageEntry&) {}) == 81 && duplicates.Count() == 0 && ok;
+    u32 retained_target = 0;
+    const u32 final_duplicates = duplicates.Evict(2000, [&](ImageEntry& entry) {
+        if (&entry == target) ++retained_target;
+    });
+    ok = final_duplicates == 81 && retained_target == 1 && duplicates.Count() == 0 && ok;
     log += fmt::format("image retirement bounded scans, duplicate address, rehash and raced touch: {}\n",
                        ok ? "passed" : "FAILED");
     log += fmt::format("incremental image retirement: {} images plus 64 in one shard, 16-per-pass cap, kept/recent/raced-use preservation, full drain: {}\n",

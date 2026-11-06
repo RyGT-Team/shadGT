@@ -3,12 +3,41 @@
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <initializer_list>
+#include <string>
 #include <mutex>
 #include <thread>
 #include <vector>
 #include "video_core/renderer_vulkan/shared_creation_cache.h"
 #include "video_core/renderer_vulkan/compiler_worker_budget.h"
 int main(){
+ const char* original_heavy_limit=std::getenv("RYGT_HEAVY_PIPELINE_LIMIT");
+ const std::string saved_heavy_limit=original_heavy_limit?original_heavy_limit:"";
+ const bool had_heavy_limit=original_heavy_limit!=nullptr;
+ auto set_heavy_limit_env=[](const char* value){
+#if defined(_WIN32)
+  _putenv_s("RYGT_HEAVY_PIPELINE_LIMIT",value);
+#else
+  if(*value)setenv("RYGT_HEAVY_PIPELINE_LIMIT",value,1);
+  else unsetenv("RYGT_HEAVY_PIPELINE_LIMIT");
+#endif
+ };
+ using Vulkan::CompilerWorkerBudget;
+ set_heavy_limit_env("");
+ for(unsigned logical:{1u,4u,8u,64u}){
+  CompilerWorkerBudget::SelectHeavyLimit(0x1002,logical);
+  assert(CompilerWorkerBudget::HeavyLimit()==std::clamp(logical/4,1u,4u));
+ }
+ CompilerWorkerBudget::SelectHeavyLimit(0x10de,64);
+ assert(CompilerWorkerBudget::HeavyLimit()==CompilerWorkerBudget::HeavyPipelineLimit);
+ set_heavy_limit_env("99");
+ CompilerWorkerBudget::SelectHeavyLimit(0x10de,64);
+ assert(CompilerWorkerBudget::HeavyLimit()==16);
+ set_heavy_limit_env("0");
+ CompilerWorkerBudget::SelectHeavyLimit(0x1002,64);
+ assert(CompilerWorkerBudget::HeavyLimit()==1);
+ set_heavy_limit_env(had_heavy_limit?saved_heavy_limit.c_str():"");
  constexpr unsigned workers=Vulkan::CompilerWorkerBudget::ForLogicalThreads(16).pipeline;
  Vulkan::SharedCreationCache<unsigned,unsigned> cache;
  std::atomic<unsigned> active=0,peak=0,created=0,completed=0;

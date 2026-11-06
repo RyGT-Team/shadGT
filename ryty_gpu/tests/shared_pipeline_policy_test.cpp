@@ -3,6 +3,11 @@
 #include <initializer_list>
 int main() {
     using Vulkan::SharedPipelinePolicy;
+    for (bool supported : {false, true}) for (bool force_whole : {false, true}) {
+        const auto policy = SharedPipelinePolicy::SelectAmd(supported, force_whole);
+        assert(policy.libraries == (supported && !force_whole));
+        assert(!policy.disable_optimization && !policy.background_optimization);
+    }
     for (bool supported : {false, true}) for (bool tess : {false, true})
         for (bool whole_guard : {false, true}) for (bool shared_tess : {false, true})
             for (bool optimize : {false, true}) {

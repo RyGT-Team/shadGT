@@ -15,6 +15,18 @@ inline bool SharedPipelineLibrariesEnabled(bool supported, bool preloading) {
     static const bool whole_prewarm = [] {const char* p=std::getenv("RYGT_PREWARM_WHOLE_PIPELINES");return p&&p[0]=='1';}();
     return supported && !no_libraries && !(preloading && whole_prewarm);
 }
+// AMD-320: the same libraries and fast link as above, but AMD's compiler gets its optimizer
+// back for tessellated libraries. AMD-322: no link-time data and no second, optimized link:
+// on an RX 7600 they made each menu pipeline take 0.4-0.7 s and filled pipeline memory
+// (4.4 GB, then trimming and rebuilding pipelines in a loop). RYGT_AMD_PIPELINE_POLICY=0
+// uses the shared policy.
+inline bool AmdPipelinePolicyEnabled(unsigned vendor_id) {
+    static const bool allowed = [] {
+        const char* env=std::getenv("RYGT_AMD_PIPELINE_POLICY");
+        return !(env && env[0]=='0');
+    }();
+    return allowed && vendor_id == 0x1002;
+}
 // Relax only splash-screen dispatch admission. The driver-call semaphore remains
 // mandatory for every tessellated pre-raster library, including direct builds.
 constexpr bool QueueWholeTessellation(bool tessellated, bool preloading, bool startup,
@@ -31,6 +43,10 @@ struct SharedPipelinePolicy {
         const bool libraries = supported && !force_whole;
         return {libraries, tessellated,
                 libraries && !tessellated && !emulated_tessellation && optimize};
+    }
+    // AMD-320/322: optimizer kept, and no pipeline keeps link-time data.
+    static constexpr SharedPipelinePolicy SelectAmd(bool supported, bool force_whole) {
+        return {supported && !force_whole, false, false};
     }
 };
 }

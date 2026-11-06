@@ -487,7 +487,7 @@ public:
             }
             LOG_INFO(Render_Vulkan, "PRECOMPILE-CPU: {} startup workers (was {}); "
                      "{} gameplay pipeline workers; heavy limit {}",
-                     threads.size(), previous, NumWorkers(), CompilerWorkerBudget::HeavyPipelineLimit);
+                     threads.size(), previous, NumWorkers(), CompilerWorkerBudget::HeavyLimit());
         }
         queue.SetBoost(on);
     }
@@ -876,6 +876,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     if (liverpool) {
         liverpool->on_command_buffer_start = [this] { ReadAheadAtBufferStart(); };
     }
+    // AMD-321: chosen before any build worker takes a heavy compile.
+    CompilerWorkerBudget::SelectHeavyLimit(instance.GetVendorID(),
+                                           std::thread::hardware_concurrency());
+    LOG_INFO(Render_Vulkan, "AMD-321: {} tessellated pipeline compiles at once",
+             CompilerWorkerBudget::HeavyLimit());
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),

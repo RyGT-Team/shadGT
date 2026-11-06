@@ -230,7 +230,8 @@ public:
 
 private:
     static std::counting_semaphore<64>& Semaphore() {
-        static std::counting_semaphore<64> semaphore{CompilerWorkerBudget::HeavyPipelineLimit};
+        static std::counting_semaphore<64> semaphore{
+            static_cast<std::ptrdiff_t>(CompilerWorkerBudget::HeavyLimit())};
         return semaphore;
     }
     bool held = false;
@@ -785,7 +786,8 @@ GraphicsPipeline::GraphicsPipeline(
     constexpr vk::PipelineDepthStencilStateCreateInfo depth_stencil_info = {};
 
     // Protect both library and whole-pipeline tessellation builds from the optimizer.
-    const bool plain_tessellated = tessellated;
+    const bool amd_policy = AmdPipelinePolicyEnabled(instance.GetVendorID()); // AMD-320
+    const bool plain_tessellated = tessellated && !amd_policy;
     const vk::GraphicsPipelineCreateInfo pipeline_info = {
         .pNext = &pipeline_rendering_ci,
         .flags = tessellated && plain_tessellated ? vk::PipelineCreateFlagBits::eDisableOptimization
@@ -809,10 +811,14 @@ GraphicsPipeline::GraphicsPipeline(
     // Stored ordinary pipelines use the same shared stage libraries and fast link as draws.
     // Whole-pipeline prewarm recompiles both stages for every target/blend permutation and
     // does not populate the stage-library cache used when new runtime permutations appear.
-    const auto compile_policy = SharedPipelinePolicy::Select(
-        SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(),preloading),
-        tessellated && (Common::PerfFeatureEnabled(80) || !Mr14SharedTessellationEnabled(LinkTimeOptimization())),
-        tessellated, LinkTimeOptimization(), is_rect_list || is_quad_list);
+    const auto compile_policy = amd_policy
+        ? SharedPipelinePolicy::SelectAmd(
+              SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(),preloading),
+              tessellated && (Common::PerfFeatureEnabled(80) || !Mr14SharedTessellationEnabled(false)))
+        : SharedPipelinePolicy::Select(
+              SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(),preloading),
+              tessellated && (Common::PerfFeatureEnabled(80) || !Mr14SharedTessellationEnabled(LinkTimeOptimization())),
+              tessellated, LinkTimeOptimization(), is_rect_list || is_quad_list);
     if (compile_policy.libraries) {
         // PERF-017: a pipeline first needed during play is built from four separately compiled
         // libraries and linked without cross-stage optimization, which the driver does in a

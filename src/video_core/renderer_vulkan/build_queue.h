@@ -181,7 +181,7 @@ private:
     // Keep queued heavy jobs out of worker threads until memory capacity is available.
     std::deque<Entry>::iterator Runnable(std::deque<Entry>& entries) {
         return std::find_if(entries.begin(), entries.end(), [this](const Entry& entry) {
-            return !entry.heavy || running_heavy < CompilerWorkerBudget::HeavyPipelineLimit;
+            return !entry.heavy || running_heavy < CompilerWorkerBudget::HeavyLimit();
         });
     }
     // PERF-109 (WillScarlettOhara, PERF-GT7-025): preserve priority while allowing

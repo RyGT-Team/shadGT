@@ -297,6 +297,9 @@ public:
                         u64 out_offset = 0);
 
     struct Stats {
+#ifndef NDEBUG
+        std::atomic<u64> eviction_scan_visits{}, eviction_lookup_visits{};
+#endif
         std::atomic<u64> lookups, hits, created_textures, created_targets, uploads, upload_bytes;
         std::atomic<u64> evicted;
         std::atomic<u64> reused_larger; ///< NAT-113

@@ -568,6 +568,58 @@ bool RunEvictionBudgetCase(Rhi::Device& device, std::string& log) {
         hot_removed += removed;
     }
     ok = hot_removed == 64 && concentrated.Count() == 0 && ok;
+    // Two populated shards prove a full keep scan remains linear, while a full
+    // first-shard retirement budget stops before scanning the next shard.
+    ImageRegistry scan{device};
+    std::array<u32, 2> filled{};
+    for (VAddr address = base; filled[0] < 64 || filled[1] < 64; address += 65536) {
+        const u32 shard = u32((address >> 12) * 0x9E3779B97F4A7C15ULL >> 58);
+        if (shard > 1 || filled[shard] == 64) continue;
+        if (!scan.Find(MakeInfo(AmdGpu::TileMode::DisplayLinearAligned, 16, 16, 1, address), false, 1)) return false;
+        ++filled[shard];
+    }
+    u32 keep_calls = 0;
+    auto before_scan = scan.GetStats().eviction_scan_visits.load();
+    ok = scan.Evict(100, [](ImageEntry&) {}, [&](ImageEntry&) { ++keep_calls; return true; }, 16) == 0 && ok;
+    ok = keep_calls == 128 && scan.GetStats().eviction_scan_visits.load() - before_scan == 128 && ok;
+    before_scan = scan.GetStats().eviction_scan_visits.load();
+    const auto before_lookup = scan.GetStats().eviction_lookup_visits.load();
+    ok = scan.Evict(100, [](ImageEntry&) {}, {}, 16) == 16 && ok;
+    ok = scan.GetStats().eviction_scan_visits.load() - before_scan == 64 &&
+         scan.GetStats().eviction_lookup_visits.load() - before_lookup == 16 && ok;
+    ok = scan.Evict(100, [](ImageEntry&) {}) == 112 && scan.Count() == 0 && ok;
+
+    // A keep callback runs outside shard locks. Grow its shard (rehashing the
+    // multimap), preserve a concurrently touched duplicate, and retire the other.
+    ImageRegistry duplicates{device};
+    auto info = MakeInfo(AmdGpu::TileMode::DisplayLinearAligned, 16, 16, 1, base);
+    auto* target = duplicates.Find(info, true, 1);
+    if (!target) return false;
+    duplicates.Invalidate(info.guest_address + 1, 1, ImageRegistry::Stale::Unmap);
+    auto* texture = duplicates.Find(info, false, 2);
+    if (!texture || texture == target) return false;
+    bool grew = false; u32 duplicate_retired = 0;
+    const u32 selected = duplicates.Evict(100, [&](ImageEntry& entry) {
+        if (&entry == texture) ++duplicate_retired;
+    }, [&](ImageEntry& entry) {
+        if (!grew) {
+            grew = true; u32 added = 0;
+            for (VAddr address = base + 65536; added < 80; address += 65536) {
+                if (((address >> 12) * 0x9E3779B97F4A7C15ULL >> 58) !=
+                    ((base >> 12) * 0x9E3779B97F4A7C15ULL >> 58)) continue;
+                if (!duplicates.Find(MakeInfo(AmdGpu::TileMode::DisplayLinearAligned,
+                                              16, 16, 1, address), false, 1000)) return true;
+                ++added;
+            }
+        }
+        if (&entry == target) entry.last_use.store(1000);
+        return false;
+    }, 16);
+    ok = grew && selected == 1 && duplicate_retired == 1 && duplicates.Count() == 81 && ok;
+    ok = duplicates.FindExisting(base, [&](const ImageEntry& entry) { return &entry == target; }) == target && ok;
+    ok = duplicates.Evict(2000, [](ImageEntry&) {}) == 81 && duplicates.Count() == 0 && ok;
+    log += fmt::format("image retirement bounded scans, duplicate address, rehash and raced touch: {}\n",
+                       ok ? "passed" : "FAILED");
     log += fmt::format("incremental image retirement: {} images plus 64 in one shard, 16-per-pass cap, kept/recent/raced-use preservation, full drain: {}\n",
                        count, ok ? "passed" : "FAILED");
     return ok;

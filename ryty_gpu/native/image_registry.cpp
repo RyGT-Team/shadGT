@@ -767,50 +767,76 @@ u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_
                          const std::function<bool(ImageEntry&)>& keep, u32 max_retired) {
     if (max_retired == 0) return 0;
     std::unordered_set<const ImageEntry*> gone;
-    std::vector<ImageEntry*> candidates;
+    struct Candidate { u32 shard; VAddr base; ImageEntry* entry; };
+    std::vector<Candidate> selected;
+#ifndef NDEBUG
+    u64 scan_visits = 0, lookup_visits = 0;
+#endif
     const bool bounded = max_retired != ~u32{0};
     const u32 first = bounded ? eviction_shard_cursor : 0;
-    // Scan metadata in every shard: a heavily populated single shard must still
-    // be able to retire a full budget every frame, rather than once per rotation.
-    // Rotate the selection order so a busy shard cannot starve the others.
+    // Continue across shards until the budget is filled; a concentrated shard
+    // can still retire a full budget. Run keep without a shard lock held.
     const u32 visits = NumShards;
     if (bounded) eviction_shard_cursor = (first + 1) % NumShards;
+    std::vector<Candidate> candidates;
     for (u32 i = 0; i < visits; ++i) {
-        Shard& shard = shards[(first + i) % NumShards];
-        std::shared_lock lock{shard.mutex};
-        for (const auto& [base, entry] : shard.images) {
-            if (entry->last_use.load(std::memory_order_relaxed) < before) {
-                candidates.push_back(entry.get());
+        const u32 shard_index = (first + i) % NumShards;
+        Shard& shard = shards[shard_index];
+        candidates.clear();
+        {
+            std::shared_lock lock{shard.mutex};
+            for (const auto& [base, entry] : shard.images) {
+#ifndef NDEBUG
+                ++scan_visits;
+#endif
+                if (entry->last_use.load(std::memory_order_relaxed) < before) {
+                    candidates.push_back({shard_index, base, entry.get()});
+                }
             }
         }
-    }
-    // FIX-157: pictures the caller keeps stay (asked with no lock held: it looks around).
-    for (ImageEntry* entry : candidates) {
-        if (gone.size() >= max_retired) break;
-        if (!keep || !keep(*entry)) {
-            gone.insert(entry);
+        // FIX-157: pictures the caller keeps stay (asked with no shard lock held).
+        for (const Candidate& candidate : candidates) {
+            if (gone.size() >= max_retired) break;
+            if (!keep || !keep(*candidate.entry)) {
+                gone.insert(candidate.entry);
+                selected.push_back(candidate);
+            }
         }
+        if (gone.size() >= max_retired) break;
     }
+#ifndef NDEBUG
+    stats.eviction_scan_visits.fetch_add(scan_visits, std::memory_order_relaxed);
+#endif
     if (gone.empty()) {
         return 0;
     }
     // Out of the shards first: from then on nothing finds them (a CPU write fault on another
     // thread queues the textures it finds for upload while holding a shard's lock).
     std::vector<std::unique_ptr<ImageEntry>> taken;
-    for (u32 i = 0; i < visits; ++i) {
-        Shard& shard = shards[(first + i) % NumShards];
+    for (size_t i = 0; i < selected.size();) {
+        Shard& shard = shards[selected[i].shard];
         std::unique_lock lock{shard.mutex};
-        for (auto it = shard.images.begin(); it != shard.images.end();) {
-            // OPT-010: one a job thread found since the scan stays.
-            if (gone.contains(it->second.get()) &&
-                it->second->last_use.load(std::memory_order_relaxed) < before) {
-                taken.push_back(std::move(it->second));
-                it = shard.images.erase(it);
-            } else {
-                ++it;
+        const u32 shard_index = selected[i].shard;
+        for (; i < selected.size() && selected[i].shard == shard_index; ++i) {
+            const Candidate& candidate = selected[i];
+            const auto [begin, end] = shard.images.equal_range(candidate.base);
+            for (auto it = begin; it != end; ++it) {
+#ifndef NDEBUG
+                ++lookup_visits;
+#endif
+                // OPT-010: one a job thread found since the scan stays.
+                if (it->second.get() == candidate.entry &&
+                    it->second->last_use.load(std::memory_order_relaxed) < before) {
+                    taken.push_back(std::move(it->second));
+                    shard.images.erase(it);
+                    break;
+                }
             }
         }
     }
+#ifndef NDEBUG
+    stats.eviction_lookup_visits.fetch_add(lookup_visits, std::memory_order_relaxed);
+#endif
     gone.clear();
     for (const auto& entry : taken) {
         gone.insert(entry.get());

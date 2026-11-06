@@ -10,9 +10,12 @@
 // Isolated worker-packet prototype: copies and rebases descriptors, never retains
 // DrawBindings pointers. It does not pin GPU objects or perform descriptor updates.
 class DescriptorSnapshot {
+    struct OrdinaryRow {std::size_t source_offset;std::uint32_t set;bool buffer;};
     std::vector<vk::WriteDescriptorSet> writes_;
     std::vector<vk::DescriptorBufferInfo> buffers_;
     std::vector<vk::DescriptorImageInfo> images_;
+    std::vector<OrdinaryRow> ordinary_rows_;
+    bool ordinary_ready_=false;
     bool parallel_subset_supported_=true;
     bool has_buffer_descriptors_=false;
     template<class T> static bool Inside(const T* ptr,std::size_t count,std::span<const T> source) {
@@ -42,7 +45,52 @@ public:
         std::copy(source.begin(), source.end(), buffers_.begin());
         return true;
     }
-    std::size_t OwnedBytes() const noexcept {return sizeof(*this)+writes_.capacity()*sizeof(vk::WriteDescriptorSet)+buffers_.capacity()*sizeof(vk::DescriptorBufferInfo)+images_.capacity()*sizeof(vk::DescriptorImageInfo);}
+    std::size_t OwnedBytes() const noexcept {return sizeof(*this)+writes_.capacity()*sizeof(vk::WriteDescriptorSet)+buffers_.capacity()*sizeof(vk::DescriptorBufferInfo)+images_.capacity()*sizeof(vk::DescriptorImageInfo)+ordinary_rows_.capacity()*sizeof(OrdinaryRow);}
+    template<class Groups>
+    static std::optional<DescriptorSnapshot> MakeOrdinary(const Groups& groups,std::size_t push,
+        std::span<const vk::DescriptorBufferInfo> buffers,std::span<const vk::DescriptorImageInfo> images,std::size_t budget) {
+        if(push>groups.size())return std::nullopt;
+        std::vector<vk::WriteDescriptorSet> rows;std::vector<OrdinaryRow> mapping;
+        for(std::size_t set=0;set<groups.size();++set)if(set!=push)for(const auto& w:groups[set]) {
+            if(rows.size()>=budget/(sizeof(vk::WriteDescriptorSet)+sizeof(OrdinaryRow)))return std::nullopt;
+            const bool buffer=w.pBufferInfo!=nullptr;
+            if(buffer ? !BufferSliceValid(w.pBufferInfo,w.descriptorCount,buffers) : !ImageSliceValid(w.pImageInfo,w.descriptorCount,images))return std::nullopt;
+            const auto offset=buffer?std::size_t(w.pBufferInfo-buffers.data()):std::size_t(w.pImageInfo-images.data());
+            rows.push_back(w);mapping.push_back({offset,static_cast<std::uint32_t>(set),buffer});
+        }
+        if(mapping.capacity()>budget/sizeof(OrdinaryRow))return std::nullopt;
+        const auto map_bytes=mapping.capacity()*sizeof(OrdinaryRow);
+        auto result=Make(rows,buffers,images,budget-map_bytes);if(!result)return std::nullopt;
+        result->ordinary_rows_=std::move(mapping);
+        result->ordinary_ready_=true;
+        if(result->OwnedBytes()>budget)return std::nullopt;
+        return result;
+    }
+    template<class Groups,class Sets>
+    bool PatchOrdinary(const Groups& groups,std::size_t push,const Sets& misses,
+        std::span<const vk::DescriptorBufferInfo> buffers,std::span<const vk::DescriptorImageInfo> images) noexcept {
+        if(!ordinary_ready_ || writes_.size()!=ordinary_rows_.size() || misses.size()<groups.size() || push>groups.size())return false;
+        std::size_t n=0;
+        // Validate the complete live mapping before modifying any payload.
+        for(std::size_t set=0;set<groups.size();++set)if(set!=push)for(const auto& row:groups[set]) {
+            if(n>=ordinary_rows_.size())return false;
+            const auto& map=ordinary_rows_[n];const auto& old=writes_[n++];
+            if(map.set!=set || map.set>=misses.size() || old.dstBinding!=row.dstBinding || old.dstArrayElement!=row.dstArrayElement ||
+               old.descriptorCount!=row.descriptorCount || old.descriptorType!=row.descriptorType || row.pNext || row.pTexelBufferView)return false;
+            if(map.buffer) {if(row.pImageInfo || !BufferSliceValid(row.pBufferInfo,row.descriptorCount,buffers) || std::size_t(row.pBufferInfo-buffers.data())!=map.source_offset)return false;}
+            else {if(row.pBufferInfo || !ImageSliceValid(row.pImageInfo,row.descriptorCount,images) || std::size_t(row.pImageInfo-images.data())!=map.source_offset)return false;}
+        }
+        if(n!=ordinary_rows_.size())return false;
+        std::size_t output=0;
+        for(std::size_t i=0;i<n;++i) {
+            const auto& map=ordinary_rows_[i];auto row=writes_[i];
+            if(!misses[map.set])continue;
+            if(map.buffer)std::copy_n(buffers.data()+map.source_offset,row.descriptorCount,const_cast<vk::DescriptorBufferInfo*>(row.pBufferInfo));
+            else std::copy_n(images.data()+map.source_offset,row.descriptorCount,const_cast<vk::DescriptorImageInfo*>(row.pImageInfo));
+            row.dstSet=misses[map.set];writes_[output++]=row;
+        }
+        writes_.resize(output);ordinary_ready_=false;return true;
+    }
     static std::optional<DescriptorSnapshot> Make(std::span<const vk::WriteDescriptorSet> writes,
         std::span<const vk::DescriptorBufferInfo> buffers,std::span<const vk::DescriptorImageInfo> images, std::size_t max_payload_bytes) {
         DescriptorSnapshot out;

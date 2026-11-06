@@ -201,6 +201,7 @@ namespace {
 struct ParallelBindingCapture {
     std::array<vk::DescriptorSet,Shader::Backend::MaxDescriptorSets> sets{};
     std::shared_ptr<OwnedDescriptorUpdates> ordinary_updates;
+    std::shared_ptr<OwnedDescriptorUpdates> prepared_updates;
     std::size_t descriptor_bytes{};
     AheadLease* ahead{};bool ahead_used{},write_structure_proven{},counts_proven{};
     std::size_t ordinary_writes{},ordinary_buffers{},ordinary_images{};
@@ -324,6 +325,9 @@ struct ParallelRuntime {
     u64 serial_split_attempts{},serial_split_success{},serial_split_first_draws{};
     PendingDescriptorUpdates descriptor_updates;
     u64 producer_structure_hits{},producer_vertex_hits{},producer_snapshot_hits{};
+#ifndef NDEBUG
+    u64 producer_ordinary_snapshot_hits{};
+#endif
     u64 producer_action_hits{},producer_upload_lookup_hits{},producer_stage_schema_hits{},producer_stage_lookup_hits{},clip_fast_hits{},direct_table_cache_hits{};
     std::unique_ptr<Native::Parallel::PassCoordinator> coordinator;
     std::unique_ptr<Native::Parallel::ModeController> mode_controller;
@@ -4327,6 +4331,7 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     static thread_local boost::container::small_vector<vk::WriteDescriptorSet, 64> updates;
     updates.clear();
     std::array<vk::DescriptorSet, Shader::Backend::MaxDescriptorSets> sets{};
+    std::array<vk::DescriptorSet, Shader::Backend::MaxDescriptorSets> worker_misses{};
     PendingDescriptorUpdates* pending=parallel_binding_capture && pending_owner ? &pending_owner->descriptor_updates : nullptr;
     bool deferred=false;u64 staged_before=0;
     const bool worker_updates=parallel_binding_capture!=nullptr;
@@ -4463,6 +4468,7 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         // writes directly; never leave a destination handle in per-draw storage.
         trace.Next(5);
         if(deferred)pending->Stage(writes,set);
+        else if(worker_updates && parallel_binding_capture->prepared_updates)worker_misses[index]=set;
         else Native::AppendDescriptorUpdates(writes,set,updates);
         trace.Next(7);
         if (cacheable && !worker_updates) s.descriptor_sets.Store(key_hash, descriptor_key, set);
@@ -4478,6 +4484,22 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     }
     if (alloc_diag) descriptor_alloc_metrics.Draw(alloc_kind, alloc_misses);
     if(parallel_binding_capture) {
+        if(auto prepared=std::move(parallel_binding_capture->prepared_updates)) {
+            const auto limit=Native::Parallel::PassCoordinator::StreamDescriptorBytesPerDraw;
+            const auto used=parallel_binding_capture->descriptor_bytes;
+            const auto bytes=prepared->snapshot.OwnedBytes()+128+sizeof(OwnedDescriptorUpdates);
+            const bool has_miss=std::ranges::any_of(worker_misses,[](auto set){return bool(set);});
+            if(has_miss && used<=limit && bytes<=limit-used && prepared->snapshot.PatchOrdinary(by_set,pipeline.PushSet(),worker_misses,
+                {b.buffers.data(),b.buffers.size()},{b.images.data(),b.images.size()})) {
+                parallel_binding_capture->descriptor_bytes+=bytes;
+                parallel_binding_capture->ordinary_updates=std::move(prepared);
+#ifndef NDEBUG
+                if(pending_owner)++pending_owner->producer_ordinary_snapshot_hits;
+#endif
+            } else if(has_miss) {
+                for(u32 i=0;i<worker_misses.size();++i)if(worker_misses[i])Native::AppendDescriptorUpdates(by_set[i],worker_misses[i],updates);
+            }
+        }
         if(worker_updates && !updates.empty()) {
             try {
                 const auto limit=Native::Parallel::PassCoordinator::StreamDescriptorBytesPerDraw;
@@ -5748,6 +5770,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         parallel_bindings.ordinary_writes=worker_result->ordinary_writes;
         parallel_bindings.ordinary_buffers=worker_result->ordinary_buffers;
         parallel_bindings.ordinary_images=worker_result->ordinary_images;
+        if(worker_result->ordinary_snapshot && worker_result->ordinary_snapshot.use_count()==1)
+            parallel_bindings.prepared_updates=std::static_pointer_cast<OwnedDescriptorUpdates>(std::move(worker_result->ordinary_snapshot));
     };
     if(parallel && !parallel->closing && parallel->applied_mode.Enabled()) {
 #if !defined(NDEBUG)
@@ -7406,6 +7430,12 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
                 if(candidate->ordinary_writes==SIZE_MAX || row.descriptorCount>SIZE_MAX-count) {candidate->counts_valid=false;break;}
                 ++candidate->ordinary_writes;count+=row.descriptorCount;
             }
+        }
+        if(candidate->counts_valid && candidate->ordinary_writes && ahead_guard.context &&
+           ahead_guard.context->mode.load(std::memory_order_acquire)) {
+            if(auto snap=DescriptorSnapshot::MakeOrdinary(b.grouped_writes,pipeline.PushSet(),buffers,images,
+                Native::Parallel::PassCoordinator::StreamDescriptorBytesPerDraw-128-sizeof(OwnedDescriptorUpdates)))
+                candidate->ordinary_snapshot=std::make_shared<OwnedDescriptorUpdates>(std::move(*snap));
         }
         const u32 push=pipeline.PushSet();
         if(candidate->descriptor_structure && push<b.grouped_writes.size() && !b.grouped_writes[push].empty()) {
@@ -10867,6 +10897,9 @@ void NativeRenderer::Report() {
         }
         sidecar->record_partition={};
         LOG_INFO(Render_Vulkan,"PARALLEL-PRODUCER-CPU cumulative structure={} vertex={} snapshot={} actions={} upload_lookups={} stage_schemas={} stage_lookups={} clip_fast={} direct_table_cache_hits={}",sidecar->producer_structure_hits,sidecar->producer_vertex_hits,sidecar->producer_snapshot_hits,sidecar->producer_action_hits,sidecar->producer_upload_lookup_hits,sidecar->producer_stage_schema_hits,sidecar->producer_stage_lookup_hits,sidecar->clip_fast_hits,sidecar->direct_table_cache_hits);
+#ifndef NDEBUG
+        LOG_INFO(Render_Vulkan,"PARALLEL-PRODUCER-ORDINARY cumulative consumed={}",sidecar->producer_ordinary_snapshot_hits);
+#endif
         const auto& batch=sidecar->descriptor_updates;
         LOG_INFO(Render_Vulkan,"PARALLEL-DESCRIPTOR-BATCH cumulative logical_draws={} actual_calls={} staged_rows={} immediate_draws={} overflow_draws={} unsupported_draws={} high_rows={} pending_rows={} flush_end={} flush_serial={} flush_abandoned={} flush_capacity={} flush_unsupported={} flush_exception={}",
             batch.logical_draws,batch.actual_calls,batch.staged_rows,batch.immediate_draws,batch.overflow_draws,batch.unsupported_draws,batch.high_rows,batch.nw,batch.flushes[PendingDescriptorUpdates::EndPass],batch.flushes[PendingDescriptorUpdates::Serial],batch.flushes[PendingDescriptorUpdates::Abandoned],batch.flushes[PendingDescriptorUpdates::Capacity],batch.flushes[PendingDescriptorUpdates::Unsupported],batch.flushes[PendingDescriptorUpdates::Exception]);

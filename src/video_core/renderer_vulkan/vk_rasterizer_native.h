@@ -552,6 +552,7 @@ private:
             u32 counts_push{}; bool counts_valid{};
             u32 push_index{}; const void* push_data{}; size_t push_size{}, push_buffer_first{}, push_buffer_count{};
             std::shared_ptr<void> push_snapshot;
+            std::shared_ptr<void> ordinary_snapshot;
         } cpu_proof;
         // Bounded producer action plan; capacity is retained when the draw is recycled.
         struct DescriptorAction {

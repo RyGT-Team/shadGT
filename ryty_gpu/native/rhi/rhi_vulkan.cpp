@@ -2570,7 +2570,12 @@ extern "C" __declspec(dllexport) int RytyNativeDescriptorBatchSelfTest(char* rep
             }
         }else{
             for(u32 i=0;i<4;++i)if(i!=1&&!(i==0&&hit))Native::AppendDescriptorUpdates(groups[i],sets[i],updates);
-            auto snapshot=DescriptorSnapshot::Make(updates,infos,{},65536);if(!snapshot)return 12;
+            const auto final_infos=infos;
+            infos[0].offset=0;infos[2].offset=0;infos[3].offset=0;
+            auto snapshot=DescriptorSnapshot::MakeOrdinary(groups,1,infos,{},65536);if(!snapshot)return 12;
+            infos=final_infos;
+            auto misses=sets;if(hit)misses[0]=nullptr;
+            if(!snapshot->PatchOrdinary(groups,1,misses,infos,{}))return 13;
             OwnedDescriptorUpdates owned{std::move(*snapshot)};
             // Source rows and their arrays may be recycled before the worker runs.
             infos[0]={};infos[2]={};infos[3]={};

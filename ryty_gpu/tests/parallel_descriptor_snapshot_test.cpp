@@ -35,5 +35,27 @@ int main(){
   for(unsigned i=0;i<3;++i)replay(i);
   for(auto count:counts)assert(count==1);
  }
+ // Repeated buffer slices and image rows survive patching; a cache hit is
+ // removed without moving the backing storage referenced by the miss rows.
+ std::array<std::vector<WriteDescriptorSet>,3> groups;
+ groups[0]={rows[0],rows[2]};groups[1]={rows[1]};groups[2]={rows[0],rows[1]};
+ auto skeleton=DescriptorSnapshot::MakeOrdinary(groups,groups.size(),infos,images,65536);assert(skeleton);
+ assert(!DescriptorSnapshot::MakeOrdinary(groups,groups.size(),infos,images,1));
+ auto changed=groups;changed[0][0].descriptorCount=2;
+ std::array<DescriptorSet,3> misses{DescriptorSet{reinterpret_cast<VkDescriptorSet>(1)},DescriptorSet{},DescriptorSet{reinterpret_cast<VkDescriptorSet>(3)}};
+ assert(!skeleton->PatchOrdinary(changed,groups.size(),misses,infos,images));assert(skeleton->Writes().size()==5);
+ changed=groups;changed[2].back().descriptorCount=2;
+ assert(!skeleton->PatchOrdinary(changed,groups.size(),misses,infos,images));assert(skeleton->Writes().size()==5);
+ assert(!skeleton->PatchOrdinary(groups,groups.size(),std::array<DescriptorSet,2>{},infos,images));
+ infos[0].offset=123;images[0].imageView=ImageView{reinterpret_cast<VkImageView>(7)};
+ assert(skeleton->PatchOrdinary(groups,groups.size(),misses,infos,images));assert(skeleton->Writes().size()==4);
+ assert(skeleton->Writes()[0].pBufferInfo->offset==123 && skeleton->Writes()[2].pBufferInfo->offset==123);
+ assert(skeleton->Writes()[3].pImageInfo->imageView==images[0].imageView && skeleton->Writes()[3].dstSet==misses[2]);
+ assert(!skeleton->PatchOrdinary(groups,groups.size(),misses,infos,images));assert(skeleton->Writes().size()==4 && skeleton->Writes()[0].pBufferInfo->offset==123);
+ std::array<std::vector<WriteDescriptorSet>,2> aliases;aliases[0]={multi[0],multi[0]};aliases[1]={rows[1]};
+ auto repeated=DescriptorSnapshot::MakeOrdinary(aliases,aliases.size(),infos,images,65536);assert(repeated);
+ std::array<DescriptorSet,2> alias_sets{misses[0],misses[2]};infos[1].offset=321;
+ assert(repeated->PatchOrdinary(aliases,aliases.size(),alias_sets,infos,images));
+ assert(repeated->Writes().size()==3 && repeated->Writes()[0].pBufferInfo[1].offset==321 && repeated->Writes()[1].pBufferInfo[1].offset==321);
  puts("PASS real Snapshot patch: mixed, multidraw rows, null buffer, mismatch no mutation and zero buffers");
 }

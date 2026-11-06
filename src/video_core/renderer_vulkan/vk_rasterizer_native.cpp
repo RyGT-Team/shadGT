@@ -200,6 +200,8 @@ namespace {
 // consume immutable pass packets and RHI device/instance handles.
 struct ParallelBindingCapture {
     std::array<vk::DescriptorSet,Shader::Backend::MaxDescriptorSets> sets{};
+    std::shared_ptr<OwnedDescriptorUpdates> ordinary_updates;
+    std::size_t descriptor_bytes{};
     AheadLease* ahead{};bool ahead_used{},write_structure_proven{},counts_proven{};
     std::size_t ordinary_writes{},ordinary_buffers{},ordinary_images{};
 };
@@ -4327,7 +4329,8 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     std::array<vk::DescriptorSet, Shader::Backend::MaxDescriptorSets> sets{};
     PendingDescriptorUpdates* pending=parallel_binding_capture && pending_owner ? &pending_owner->descriptor_updates : nullptr;
     bool deferred=false;u64 staged_before=0;
-    if(pending) {
+    const bool worker_updates=parallel_binding_capture!=nullptr;
+    if(pending && !worker_updates) {
         const auto check=[&] {
             const auto buffers=std::span<const vk::DescriptorBufferInfo>{b.buffers.data(),b.buffers.size()};
             const auto images=std::span<const vk::DescriptorImageInfo>{b.images.data(),b.images.size()};
@@ -4462,7 +4465,7 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         if(deferred)pending->Stage(writes,set);
         else Native::AppendDescriptorUpdates(writes,set,updates);
         trace.Next(7);
-        if (cacheable) s.descriptor_sets.Store(key_hash, descriptor_key, set);
+        if (cacheable && !worker_updates) s.descriptor_sets.Store(key_hash, descriptor_key, set);
         sets[index] = set;
     }} catch(...) {
         // A partially built immediate draw may already have published earlier sets.
@@ -4475,6 +4478,22 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     }
     if (alloc_diag) descriptor_alloc_metrics.Draw(alloc_kind, alloc_misses);
     if(parallel_binding_capture) {
+        if(worker_updates && !updates.empty()) {
+            try {
+                const auto limit=Native::Parallel::PassCoordinator::StreamDescriptorBytesPerDraw;
+                const auto used=parallel_binding_capture->descriptor_bytes;
+                if(used<=limit && limit-used>=128+sizeof(OwnedDescriptorUpdates)) {
+                    auto snapshot=DescriptorSnapshot::Make(updates,
+                        {b.buffers.data(),b.buffers.size()},{b.images.data(),b.images.size()},limit-used-128-sizeof(OwnedDescriptorUpdates));
+                    if(snapshot && snapshot->OwnedBytes()<=limit-used-128-sizeof(OwnedDescriptorUpdates)) {
+                        const auto bytes=snapshot->OwnedBytes()+128+sizeof(OwnedDescriptorUpdates);
+                        parallel_binding_capture->ordinary_updates=std::make_shared<OwnedDescriptorUpdates>(std::move(*snapshot));
+                        parallel_binding_capture->descriptor_bytes+=bytes;
+                        updates.clear();
+                    }
+                }
+            } catch(const std::bad_alloc&) { /* original host update below */ }
+        }
         if(deferred && pending->staged_rows!=staged_before)NATIVE_DIAGNOSTIC(++pending->logical_draws);
         if(!updates.empty()) {trace.Next(6);vk_device.updateDescriptorSets(updates,{});
             if(pending){NATIVE_DIAGNOSTIC(++pending->actual_calls);NATIVE_DIAGNOSTIC(++pending->logical_draws);NATIVE_DIAGNOSTIC(++pending->immediate_draws);}}
@@ -6656,6 +6675,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                         const auto prebind_cmd=s.cmd;
                         parallel_bindings.write_structure_proven=true;
                         set_count_proof();
+                        parallel_bindings.descriptor_bytes=parallel_descriptor_bytes;
                         {ScopedParallelBindingCapture capture{parallel_bindings};PushBindings(*pipeline,vk::PipelineBindPoint::eGraphics,b);}
                         if(!b.writes.empty())for(u32 i=0;i<b.grouped_writes.size();++i) {
                             if(i==pipeline->PushSet() || b.grouped_writes[i].empty())continue;
@@ -6802,6 +6822,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             if(!serial_split_prebound) {
                 parallel_bindings.write_structure_proven=true; // descriptor_safe validated every source row
                 set_count_proof();
+                parallel_bindings.descriptor_bytes=parallel_descriptor_bytes;
                 {ScopedParallelBindingCapture capture{parallel_bindings};PushBindings(*pipeline,vk::PipelineBindPoint::eGraphics,b);}
             }
             if(parallel_bindings.ahead_used) {
@@ -6870,8 +6891,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             captured.pipeline_owner=prepared->pipeline_keepalive;captured.dynamic=s.dynamic;captured.push=b.push;
             captured.sets=parallel_bindings.sets;captured.required_sets_mask=parallel_required_sets;
             captured.immutable_upload_buffers_verified=true;captured.push_writes=std::move(parallel_push_writes);
+            captured.ordinary_updates=std::move(parallel_bindings.ordinary_updates);
             captured.push_set=pipeline->PushSet()<captured.sets.size()?pipeline->PushSet():static_cast<u32>(captured.sets.size());
-            captured.descriptor_bytes=parallel_descriptor_bytes;
+            captured.descriptor_bytes=parallel_bindings.descriptor_bytes;
             captured.vertex_attribute_count=static_cast<u32>(vi->attributes.size());
             captured.vertex_binding_count=static_cast<u32>(vi->input_bindings.size());
             captured.vertex_buffer_count=static_cast<u32>(vi->buffers.size());

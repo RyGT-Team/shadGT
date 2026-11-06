@@ -170,6 +170,9 @@ static bool RecordPassImpl(vk::CommandBuffer cmd,const Vulkan::Instance& instanc
             .layerCount=target.num_layers,.colorAttachmentCount=target.num_color_attachments,.pColorAttachments=colors.data(),
             .pDepthAttachment=db.has_depth?&depth:nullptr,.pStencilAttachment=db.has_stencil?&stencil:nullptr});},
         [&](const Draw& draw) {
+            if(draw.ordinary_updates)draw.ordinary_updates->Ensure([&](auto writes) {
+                instance.GetDevice().updateDescriptorSets(vk::ArrayProxy<const vk::WriteDescriptorSet>{static_cast<u32>(writes.size()),writes.data()},{});
+            });
             ApplyDynamicSnapshot(dynamic,draw.dynamic);dynamic.Commit(instance,commands);
             if (!bound_vertex || !same_vertex(*bound_vertex, draw)) {
 #if !defined(NDEBUG)

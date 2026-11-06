@@ -25,6 +25,7 @@ struct Draw {
     u32 required_sets_mask{};
     bool immutable_upload_buffers_verified{};
     std::shared_ptr<const DescriptorSnapshot> push_writes;
+    std::shared_ptr<OwnedDescriptorUpdates> ordinary_updates;
     std::size_t descriptor_bytes{};
     // Complete, bounded vertex state owned by each packet. Handles are leased
     // by the same submission window as the pass; producer proves their origin.

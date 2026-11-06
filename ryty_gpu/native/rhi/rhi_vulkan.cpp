@@ -1,5 +1,9 @@
 #include "ryty_gpu/native/rhi/completed_owner_release.h"
 #include "ryty_gpu/native/descriptor_update_batch.h"
+#ifndef NDEBUG
+#include "ryty_gpu/native/descriptor_snapshot.h"
+#include <thread>
+#endif
 #include "ryty_gpu/native/rhi/descriptor_batch_test_spv.h"
 #include "ryty_gpu/native/rhi/gpu_timing_lease.h"
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
@@ -2534,7 +2538,7 @@ extern "C" __declspec(dllexport) int RytyNativeDescriptorBatchSelfTest(char* rep
     auto fence=owner.CreateFence(0);auto* list=owner.AcquireCommandList(CommandListLevel::Primary);list->Begin();
     const vk::CommandBuffer cmd{reinterpret_cast<VkCommandBuffer>(list->NativeHandle())};
     list->Barrier(ScopeHost,ScopeCompute);cmd.bindPipeline(vk::PipelineBindPoint::eCompute,pipeline);
-    std::array<vk::DescriptorSet,2> cached_a{};u32 old_calls=0,batch_calls=0;
+    std::array<vk::DescriptorSet,2> cached_a{};u32 old_calls=0,batch_calls=0,worker_calls=0;
     for(u32 pass=0;pass<passes;++pass){
         const u32 block=pass/2,mode=pass%2;const bool hit=(block%2)!=0;
         std::array<vk::DescriptorBufferInfo,4> infos;
@@ -2566,8 +2570,17 @@ extern "C" __declspec(dllexport) int RytyNativeDescriptorBatchSelfTest(char* rep
             }
         }else{
             for(u32 i=0;i<4;++i)if(i!=1&&!(i==0&&hit))Native::AppendDescriptorUpdates(groups[i],sets[i],updates);
-            Native::CommitDescriptorBatch(updates,sets,1,groups,
-                [&](const auto& writes){device.updateDescriptorSets(writes,{});++batch_calls;},push,bind);
+            auto snapshot=DescriptorSnapshot::Make(updates,infos,{},65536);if(!snapshot)return 12;
+            OwnedDescriptorUpdates owned{std::move(*snapshot)};
+            // Source rows and their arrays may be recycled before the worker runs.
+            infos[0]={};infos[2]={};infos[3]={};
+            std::thread worker([&]{owned.Ensure([&](auto writes){
+                device.updateDescriptorSets(vk::ArrayProxy<const vk::WriteDescriptorSet>{u32(writes.size()),writes.data()},{});++worker_calls;});});
+            worker.join();
+            owned.Ensure([&](auto){++worker_calls;}); // completed worker followed by serial replay
+            ++batch_calls;
+            Native::CommitDescriptorBatch(std::vector<vk::WriteDescriptorSet>{},sets,1,groups,
+                [&](const auto&){std::terminate();},push,bind);
         }
         // Original write destinations and info-array addresses must remain untouched.
         for(u32 i=0;i<4;++i)if(groups[i][0].dstSet||groups[i][0].pBufferInfo!=&infos[i])return 9;
@@ -2583,9 +2596,9 @@ extern "C" __declspec(dllexport) int RytyNativeDescriptorBatchSelfTest(char* rep
     }
     device.destroyDescriptorPool(pool);device.destroyPipeline(pipeline);device.destroyShaderModule(module);
     device.destroyPipelineLayout(layout);for(auto set_layout:layouts)device.destroyDescriptorSetLayout(set_layout);
-    const auto text=fmt::format("descriptor update batching: {} NVIDIA values checked, {} wrong; {} baseline calls vs {} batched calls; cached sets and middle push set verified\n",checked,wrong,old_calls,batch_calls);
+    const auto text=fmt::format("descriptor update batching: {} NVIDIA values checked, {} wrong; {} baseline calls vs {} worker calls; cached sets and middle push set verified\n",checked,wrong,old_calls,worker_calls);
     if(report&&report_size>0){const auto n=std::min(text.size(),size_t(report_size-1));std::memcpy(report,text.data(),n);report[n]=0;}
-    return wrong==0&&old_calls==160&&batch_calls==64?0:11;
+    return wrong==0&&old_calls==160&&batch_calls==64&&worker_calls==64?0:11;
 }
 
 #endif

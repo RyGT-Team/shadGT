@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 // Isolated worker-packet prototype: copies and rebases descriptors, never retains
@@ -88,5 +89,17 @@ public:
             else {w.pImageInfo=out.images_.data()+image_offset;image_offset+=w.descriptorCount;}
         }
         return out;
+    }
+};
+
+// Only the recording worker, or its serial fallback after worker completion,
+// may initialize these fresh sets. The producer never accesses this state
+// after publishing the draw.
+struct OwnedDescriptorUpdates {
+    DescriptorSnapshot snapshot;
+    bool initialized=false;
+    explicit OwnedDescriptorUpdates(DescriptorSnapshot&& s):snapshot(std::move(s)) {}
+    template<class Update> void Ensure(Update&& update) {
+        if(!initialized) { update(snapshot.Writes()); initialized=true; }
     }
 };

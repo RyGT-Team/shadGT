@@ -62,8 +62,9 @@ function(ryty_add_library target output)
     if (WIN32)
         target_link_libraries(${target} PRIVATE mincore wbemuuid)
         target_link_options(${target} PRIVATE /errorlimit:0)
-        # Line tables and a PDB, so crash and assertion stacks (module+offset) can be symbolized.
-        target_compile_options(${target} PRIVATE /clang:-gline-tables-only /Z7)
+        # Diagnostics explicitly request full debug info; keep the existing Release flags.
+        target_compile_options(${target} PRIVATE
+            "$<IF:$<OR:$<CONFIG:Debug>,$<CONFIG:RelWithDebInfo>>,/clang:-g,/clang:-gline-tables-only>" /Z7)
         target_link_options(${target} PRIVATE /DEBUG:FULL)
         if (MSVC)
             target_link_libraries(${target} PRIVATE clang_rt.builtins-x86_64.lib)

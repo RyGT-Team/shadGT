@@ -530,7 +530,11 @@ private:
     } pipe_read_ahead_stats{};
     /// Queues the state of the graphics draw being decoded when its pipeline registers
     /// changed, and reads ahead while new pipelines keep appearing.
-    void OfferDrawState();
+    void OfferDrawState(
+#ifndef NDEBUG
+        ReadAheadPair::Metadata metadata = {}
+#endif
+    );
     /// Reads the commands ahead of the command thread and queues the new draw states found.
     void PipeReadAhead();
 

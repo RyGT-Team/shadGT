@@ -33,7 +33,11 @@ u64 ReadAheadStates::PipelineStateHash(std::span<const u32> regs) {
 
 ReadAheadStates::ReadAheadStates(size_t capacity_) : capacity{capacity_} {}
 
-bool ReadAheadStates::Offer(std::span<const u32> regs) {
+bool ReadAheadStates::Offer(std::span<const u32> regs
+#ifndef NDEBUG
+                            , ReadAheadPair::Metadata metadata
+#endif
+                            ) {
     if (Space() == 0 || regs.size() < RegisterFileDwords) {
         return false;
     }
@@ -59,14 +63,22 @@ bool ReadAheadStates::Offer(std::span<const u32> regs) {
     }
     {
         std::scoped_lock lk{mutex};
+#ifndef NDEBUG
+        queue.push_back({std::move(state), metadata});
+#else
         queue.push_back(std::move(state));
+#endif
     }
     size.fetch_add(1, std::memory_order_release);
     offered.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
-bool ReadAheadStates::Take(std::span<u32> regs) {
+bool ReadAheadStates::Take(std::span<u32> regs
+#ifndef NDEBUG
+                           , ReadAheadPair::Metadata* metadata
+#endif
+                           ) {
     if (regs.size() < RegisterFileDwords) {
         return false;
     }
@@ -76,7 +88,12 @@ bool ReadAheadStates::Take(std::span<u32> regs) {
         if (queue.empty()) {
             return false;
         }
+#ifndef NDEBUG
+        if (metadata) *metadata = queue.front().metadata;
+        state = std::move(queue.front().registers);
+#else
         state = std::move(queue.front());
+#endif
         queue.pop_front();
     }
     u32 at = 0;

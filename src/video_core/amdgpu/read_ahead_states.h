@@ -15,6 +15,9 @@
 #include <vector>
 
 #include "common/types.h"
+#ifndef NDEBUG
+#include "video_core/amdgpu/read_ahead_pair_trace.h"
+#endif
 
 namespace AmdGpu {
 
@@ -113,7 +116,11 @@ public:
 
     /// Command thread: queues the state unless a state with the same hash was queued before
     /// (or the queue is full). Returns whether it was queued.
-    bool Offer(std::span<const u32> regs);
+    bool Offer(std::span<const u32> regs
+#ifndef NDEBUG
+               , ReadAheadPair::Metadata metadata = {}
+#endif
+               );
 
     /// How many more states fit. Exact on the command thread, the only one that adds.
     size_t Space() const {
@@ -127,7 +134,11 @@ public:
 
     /// Recorder thread: writes the oldest queued state into `regs` (registers outside the
     /// ranges keep their values). False when nothing is queued.
-    bool Take(std::span<u32> regs);
+    bool Take(std::span<u32> regs
+#ifndef NDEBUG
+              , ReadAheadPair::Metadata* metadata = nullptr
+#endif
+              );
 
     /// Recorder thread: a draw needed a pipeline that was not built yet.
     void NoteMiss() {
@@ -165,7 +176,12 @@ private:
     u64 misses_seen{};
 
     std::mutex mutex;
+#ifndef NDEBUG
+    struct QueuedState { std::vector<u32> registers; ReadAheadPair::Metadata metadata; };
+    std::deque<QueuedState> queue;
+#else
     std::deque<std::vector<u32>> queue;
+#endif
     std::vector<std::vector<u32>> free_states;
     std::atomic<size_t> size{};
     std::atomic<u64> offered{};

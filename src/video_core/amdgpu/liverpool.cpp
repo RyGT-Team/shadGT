@@ -819,6 +819,8 @@ static bool FilteredDraw(const Regs& state);
 void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bool direct_draw,
                            std::optional<IndirectSgprs> indirect) {
 #ifndef NDEBUG
+    const auto pair_token = !compute ? ReadAheadPair::NewToken() : 0;
+    ReadAheadPair::Scope pair_scope{pair_token, false};
     GeometryTrace::PollFlush();
     const auto trace_id = GeometryTrace::Enabled() && GeometryTrace::Get().armed.load()
         ? GeometryTrace::Get().next.fetch_add(1) : 0;
@@ -991,11 +993,13 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
                      selected = std::move(selected), draw = std::move(draw),
                      decode_epoch, capture = std::move(capture), staged, indirect_selected
 #ifndef NDEBUG
-                     , trace_id
+                     , trace_id, pair_token
 #endif
                      ]() mutable {
 #ifndef NDEBUG
         GeometryTrace::Scope trace_scope{trace_id};
+        ReadAheadPair::Scope pair_scope{pair_token, true};
+        if (pair_token) ReadAheadPair::NoteRecorderStarted(pair_token);
         if (trace_id) GeometryTrace::Record("recorder_begin", trace_id);
 #endif
         auto& sel = staged ? staged->selected : selected;
@@ -1032,7 +1036,11 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         }
     }, kind, std::move(prepare), std::move(order));
     if (read_ahead_states && !compute) {
-        OfferDrawState();
+        OfferDrawState(
+#ifndef NDEBUG
+            ReadAheadPair::Metadata{pair_token, indirect.has_value()}
+#endif
+        );
     }
     ReportDrawPipe();
     ReportEarlyFences();
@@ -1058,13 +1066,21 @@ static bool FilteredDraw(const Regs& state) {
            mode == OperationMode::Resolve;
 }
 
-void Liverpool::OfferDrawState() {
+void Liverpool::OfferDrawState(
+#ifndef NDEBUG
+    ReadAheadPair::Metadata metadata
+#endif
+) {
     // The draw being decoded is still ahead of the recorder. Its state is hashed only when a
     // register its pipeline key comes from was written since the previous draw.
     if (pipeline_regs_written && read_ahead_states->Space() > 0) {
         pipeline_regs_written = false;
         if (!FilteredDraw(regs)) {
-            read_ahead_states->Offer(regs.reg_array);
+            read_ahead_states->Offer(regs.reg_array
+#ifndef NDEBUG
+                                     , metadata
+#endif
+                                     );
         }
     }
     // A pipeline miss on the recorder: new pipelines are appearing, so the draws after this

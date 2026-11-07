@@ -1,5 +1,9 @@
 #include <exception>
 #include "ryty_gpu/native/cpu_stack_registry.h"
+#ifndef NDEBUG
+#include "ryty_gpu/native/snapshot_source_trace.h"
+#include "video_core/buffer_cache/proto_import.h"
+#endif
 #include "ryty_gpu/native/cube_view_policy.h"
 #include "ryty_gpu/native/readable_binding.h"
 #include "ryty_gpu/native/ahead_descriptor_pools.h"
@@ -4519,6 +4523,63 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
     NATIVE_DIAGNOSTIC(++stats.copied_reads);
     NATIVE_DIAGNOSTIC(stats.copied_bytes += size);
     if (stream.list && size > 4_KB && size <= SnapshotMemoMaxBytes) {
+#ifndef NDEBUG
+        using namespace Native::SnapshotSourceTrace;
+        if (Enabled() && table.Select()) {
+            Classification c{};
+#ifdef _WIN32
+            // Observation only: never reset the write-watch bitmap or change protection.
+            const DWORD previous_error = GetLastError();
+            try {
+            if (address <= UINT64_MAX - size) {
+                const u64 end = address + size;
+                u64 at = address; unsigned regions = 0; DWORD first_type = 0;
+                while (at < end && regions++ < 16) {
+                    MEMORY_BASIC_INFORMATION mbi{};
+                    if (!VirtualQuery(reinterpret_cast<const void*>(at), &mbi, sizeof(mbi)) ||
+                        mbi.State != MEM_COMMIT) break;
+                    const u64 begin = reinterpret_cast<u64>(mbi.BaseAddress);
+                    if (begin > at || mbi.RegionSize > UINT64_MAX - begin || begin + mbi.RegionSize <= at) break;
+                    if (!first_type) first_type = mbi.Type;
+                    else if (first_type != mbi.Type) c.memory = 4;
+                    at = std::min<u64>(end, begin + mbi.RegionSize);
+                }
+                if (at == end && c.memory != 4)
+                    c.memory = first_type == MEM_PRIVATE ? 1 : first_type == MEM_MAPPED ? 2 : first_type == MEM_IMAGE ? 3 : 0;
+                else if (at != end) c.memory = 0;
+                if (c.memory == 1) {
+                    SYSTEM_INFO si{}; GetSystemInfo(&si);
+                    const u64 page = si.dwPageSize, start = address - address % page;
+                    if (end <= UINT64_MAX - (page - 1)) {
+                        const u64 last = (end + page - 1) / page * page;
+                        if ((last - start) / page > 256) c.watch = 3;
+                        else {
+                            void* pages[256]{}; ULONG_PTR count = 256; DWORD granularity = 0;
+                            const UINT result = GetWriteWatch(0, reinterpret_cast<void*>(start),
+                                                              last - start, pages, &count, &granularity);
+                            c.watch = result != 0 ? 2 : 1;
+                        }
+                    }
+                }
+                {
+                    Native::CpuStackRegistry::Lease lease{Native::CpuStacks()};
+                    c.stack = lease.Allowed(address, end) ? 1 : 2; // 2 includes a busy registry.
+                }
+                if (auto* direct = r.buffer_cache.GetDirectMemory()) c.direct = direct->Covered(address, size) ? 1 : 2;
+                if (VideoCore::g_imported_count.load(std::memory_order_acquire)) {
+                    u64 not_imported = 0;
+                    VideoCore::ForEachNotImported(address, size, [&](VAddr, u64 n) { not_imported += n; });
+                    c.imported = not_imported == size ? 1 : not_imported == 0 ? 3 : 2;
+                } else c.imported = 1;
+            }
+            } catch (...) {
+                c = {}; // A diagnostic failure must not change snapshot behavior.
+            }
+            SetLastError(previous_error);
+#endif
+            table.Add(address, size, frame, current, c);
+        }
+#endif
         if (!snapshot_upload_memo) snapshot_upload_memo = std::make_unique<SnapshotUploadMemo>();
         auto& cache = *snapshot_upload_memo;
         static const bool direct_compare = [] {
@@ -5226,6 +5287,10 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
     u32 index = 0;
     for (const auto& desc : stage.buffers) {
         const u32 buffer_index = index++;
+#ifndef NDEBUG
+        Native::SnapshotSourceTrace::Scope snapshot_source_scope{{stage.pgm_hash, buffer_index,
+            binding.unified, desc.post_op == Shader::SharpFetchPostOp::ReadConstPointer, true}};
+#endif
         vk::DescriptorBufferInfo info{VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
         if (desc.IsSpecial()) {
             switch (desc.buffer_type) {
@@ -13432,6 +13497,34 @@ void NativeRenderer::Report() {
     }
     const double seconds = std::chrono::duration<double>(now - last_report).count();
     last_report = now;
+    if (Native::SnapshotSourceTrace::Enabled()) {
+        auto& trace = Native::SnapshotSourceTrace::table;
+        LOG_INFO(Render_Vulkan, "DIAG-348 snapshot source samples: calls={} selected={} overflow={} collisions={} (1/256; memory 1=private 2=mapped 3=image 4=mixed 0=unknown; watch 1=supported 2=query-failed-or-unsupported 3=capacity-skipped; stack 1=allowed 2=excluded-or-busy; direct 1=covered 2=not-fully-covered; imported 1=none 2=partial 3=full; row classifications are latest sample)",
+                 trace.calls, trace.samples, trace.overflow, trace.collision);
+        auto totals = [](const char* name, const auto& calls, const auto& bytes) {
+            for (size_t i = 0; i < calls.size(); ++i)
+                LOG_INFO(Render_Vulkan, "DIAG-348 class={} value={} calls={} bytes={}", name, i, calls[i], bytes[i]);
+        };
+        totals("memory", trace.memory_calls, trace.memory_bytes);
+        totals("watch", trace.watch_calls, trace.watch_bytes);
+        totals("stack", trace.stack_calls, trace.stack_bytes);
+        totals("direct", trace.direct_calls, trace.direct_bytes);
+        totals("imported", trace.imported_calls, trace.imported_bytes);
+        totals("scalar", trace.scalar_calls, trace.scalar_bytes);
+        for (auto& row : trace.rows) {
+            if (!row.occupied || !row.calls) continue;
+            const u64 tag = (row.address ^ (row.address >> 29) ^ row.size) * 0x9e3779b97f4a7c15ULL;
+            LOG_INFO(Render_Vulkan, "DIAG-348 source tag={:#x} size={} program={:#x} index={} binding={} context={} scalar={} calls={} bytes={} first_frame={} last_frame={} total_hits={} memory={} watch={} stack={} direct={} imported={}",
+                     tag, row.size, row.context.program, row.context.index, row.context.binding,
+                     row.context.valid, row.context.scalar_pointer, row.calls, row.bytes,
+                     row.first_frame, row.last_frame, row.total_hits, row.classification.memory,
+                     row.classification.watch, row.classification.stack, row.classification.direct,
+                     row.classification.imported);
+            row.calls = row.bytes = 0;
+        }
+        // Rows describe this interval; tag + size + context can be joined across reports.
+        trace.ResetInterval();
+    }
     const auto& registry_stats = registry->GetStats();
     const u64 uploads = registry_stats.uploads.load();
     const u64 upload_bytes = registry_stats.upload_bytes.load();

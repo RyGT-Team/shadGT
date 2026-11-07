@@ -1162,7 +1162,7 @@ void NativeRenderer::FinishNativeFsr(const Targets& targets) {
 }
 
 NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
-    SnapshotLease::BackingProtocol::Initialize();
+    SnapshotLease::BackingProtocol::Initialize(r.instance.GetVendorID());
     sampler_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
     if(PreparedSampledProofRequested())try {prepared_proof_contexts.Register(this);} catch(...) {}
     device = Native::Rhi::CreateVulkanDevice(r.instance);

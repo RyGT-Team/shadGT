@@ -51,9 +51,13 @@ using UnmapAliasFn = void (*)(void*);
 
 MapAliasFn MapAlias() {
 #ifdef _WIN32
+    const auto& protocol = Vulkan::SnapshotLease::BackingProtocol::Get();
+    // Alias bridge capability is distinct from snapshot admission. A cold
+    // driver prerequisite must not permanently select the legacy alias that
+    // poisons every future range. All actual reuse still checks the full gate.
+    if (protocol.AliasBridgeAvailable())
+        return reinterpret_cast<MapAliasFn>(protocol.renderer_alias);
     static const auto fn = [] {
-        const auto& protocol = Vulkan::SnapshotLease::BackingProtocol::Get();
-        if (protocol.Available()) return reinterpret_cast<MapAliasFn>(protocol.renderer_alias);
         HMODULE libc = GetModuleHandleA("libc.prx");
         return libc ? reinterpret_cast<MapAliasFn>(GetProcAddress(libc, "TXQU8CpoEtI")) : nullptr;
     }();

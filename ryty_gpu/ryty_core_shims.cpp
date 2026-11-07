@@ -5,6 +5,7 @@
 #include "ryty_gpu/ryty_diag.h"
 #include "ryty_gpu/ryty_pro_mode.h"
 #include "ryty_gpu/ryty_alias_cache.h"
+#include "ryty_gpu/native/snapshot_simd_compare.h"
 #include <windows.h>
 #include <intrin.h>
 #include <algorithm>
@@ -738,7 +739,7 @@ using HashFn = XXH64_hash_t (*)(const void*, size_t);
 using CompareFn = int (*)(const void*, const void*, size_t);
 static CopyFn volatile g_guarded_copy = &std::memcpy;
 static HashFn volatile g_guarded_hash = &XXH3_64bits;
-static CompareFn volatile g_guarded_compare = &std::memcmp;
+static CompareFn volatile g_guarded_compare = Native::SelectSnapshotCompare();
 
 static bool GuardedCopyRaw(void* dest, const void* source, size_t size) {
     __try {
@@ -768,6 +769,10 @@ static bool GuardedEqualRaw(const void* guest, const void* stable, size_t size, 
 }
 
 bool GuardedEqual(const void* guest, const void* stable, size_t size, bool& equal) {
+    if (size == 0) {
+        equal = true;
+        return true;
+    }
     equal = false;
     ++g_guarded_reads;
     const bool ok = GuardedEqualRaw(guest, stable, size, &equal);

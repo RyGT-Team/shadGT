@@ -6,6 +6,7 @@
 #include "ryty_gpu/ryty_pro_mode.h"
 #include "ryty_gpu/ryty_alias_cache.h"
 #include "ryty_gpu/native/snapshot_simd_compare.h"
+#include "ryty_gpu/native/snapshot_backing_protocol.h"
 #include <windows.h>
 #include <intrin.h>
 #include <algorithm>
@@ -58,6 +59,12 @@ T RytyFunction(const char* module, const char* name) {
 // libc.prx: GuestArenaMapAlias / GuestArenaUnmapAlias (Microsoft ABI, exported by NID).
 using MapAliasFn = void* (*)(std::uintptr_t, std::size_t);
 using UnmapAliasFn = void (*)(void*);
+
+MapAliasFn RendererMapAlias() {
+    const auto& protocol = Vulkan::SnapshotLease::BackingProtocol::Get();
+    if (protocol.Available()) return reinterpret_cast<MapAliasFn>(protocol.renderer_alias);
+    return RytyFunction<MapAliasFn>("libc.prx", "TXQU8CpoEtI");
+}
 
 bool IsCommitted(const MEMORY_BASIC_INFORMATION& info) {
     return info.State == MEM_COMMIT;
@@ -126,7 +133,7 @@ void DropAliases(VAddr address, u64 size) {
 // recorder in a 20-car race). Pages without an alias (not Ryty shared memory) are remembered as
 // such (a null view) and return false, so the caller takes the usual path.
 bool WriteThroughCachedAlias(VAddr address, const void* source, u64 size) {
-    static const auto map_alias = RytyFunction<MapAliasFn>("libc.prx", "TXQU8CpoEtI");
+    static const auto map_alias = RendererMapAlias();
     static const auto unmap_alias = RytyFunction<UnmapAliasFn>("libc.prx", "674-w6lwWXI");
     static const bool cache_views = [] {
         const char* env = std::getenv("SHADGT_ALIAS_CACHE");
@@ -162,7 +169,7 @@ bool WriteThroughCachedAlias(VAddr address, const void* source, u64 size) {
 }
 
 bool CopyThroughAlias(VAddr address, void* dest, const void* source, u64 size) {
-    static const auto map_alias = RytyFunction<MapAliasFn>("libc.prx", "TXQU8CpoEtI");
+    static const auto map_alias = RendererMapAlias();
     static const auto unmap_alias = RytyFunction<UnmapAliasFn>("libc.prx", "674-w6lwWXI");
     if (map_alias == nullptr || unmap_alias == nullptr) {
         return false;
@@ -890,6 +897,7 @@ void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms)
     // next, so protect each committed region of the range on its own. When the range is known to
     // be mapped, try it whole and then in 16 KB pieces (Ryty's view size) before asking Windows
     // where each region ends.
+    if (write) Vulkan::SnapshotLease::MarkUnsafe(virtual_addr, size);
     RytyMemory::NoteReadable(virtual_addr, size, read || execute);
     VAddr address = virtual_addr;
     const VAddr end = virtual_addr + size;
@@ -1051,6 +1059,9 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size,
     if (!RytyMemory::IsValidMapping(virtual_addr, size)) {
         return false;
     }
+    // Aliases bypass protection on the original guest view. Invalidate before
+    // any branch can copy, including the cached-alias fast path.
+    Vulkan::SnapshotLease::MarkUnsafe(virtual_addr, size);
 #ifndef NDEBUG
     RecordBackingWrite(virtual_addr, size, loc); // DIAG-071
 #endif

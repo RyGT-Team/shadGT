@@ -35,6 +35,8 @@ bool IsGuestReadable(VAddr virtual_addr, u64 size);
 /// FIX-072: whether the range is committed memory the renderer may write, guest or not.
 bool IsWritableTarget(VAddr virtual_addr, u64 size);
 bool GuardedCopy(void* dest, const void* source, size_t size);
+/// False means a read fault; on success `equal` reports full-byte equality.
+bool GuardedEqual(const void* guest, const void* stable, size_t size, bool& equal);
 bool IsValidMapping(VAddr virtual_addr, u64 size);
 /// FIX-073: told of each renderer write into guest memory, after it was made.
 using OwnWriteObserver = void (*)(VAddr address, u64 size);

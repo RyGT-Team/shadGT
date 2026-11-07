@@ -902,6 +902,10 @@ constexpr size_t SnapshotMemoMaxBytes = 1_MB;
 struct NativeRenderer::SnapshotUploadMemo {
     ImmutableUploadMemo<std::pair<vk::Buffer, u64>, 1, 8, SnapshotMemoMaxBytes> memo;
     std::unique_ptr<u8[]> scratch;
+    VAddr last_address{};
+    u64 last_size{};
+    bool last_valid{};
+    void Clear() { memo.Clear(); last_valid = false; }
 };
 
 bool NativeModeRequested() {
@@ -1996,7 +2000,7 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     // Zero permanently disables receipts after incarnation overflow.
     s.upload_incarnation=s.upload_incarnation && s.upload_incarnation!=UINT64_MAX ? s.upload_incarnation+1 : 0;
     UploadMemoFor(this).Clear(); // new list: old upload-buffer bindings cannot be reused
-    if (snapshot_upload_memo) snapshot_upload_memo->memo.Clear();
+    if (snapshot_upload_memo) snapshot_upload_memo->Clear();
     if (r.instance.IsIntel()) {
         // FIX-188: Intel Arc (#65) records into the scheduler's own command buffer.
         r.scheduler.EndRendering();
@@ -4518,9 +4522,31 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
     if (stream.list && size > 4_KB && size <= SnapshotMemoMaxBytes) {
         if (!snapshot_upload_memo) snapshot_upload_memo = std::make_unique<SnapshotUploadMemo>();
         auto& cache = *snapshot_upload_memo;
+        static const bool direct_compare = [] {
+            const char* value = std::getenv("RYGT_NATIVE_SNAPSHOT_DIRECT_COMPARE");
+            return !value || value[0] != '0';
+        }();
+        const u64 readable = Native::ReadablePrefix(reinterpret_cast<const void*>(address), size);
+        if (direct_compare && cache.last_valid && cache.last_address == address &&
+            cache.last_size == size && readable == size) {
+            const auto hit = cache.memo.WithLast(0, size, [&](std::span<const u8> previous) {
+                NATIVE_DIAGNOSTIC(++stats.snapshot_direct_attempts);
+                bool equal = false;
+                const bool ok = Core::RytyMemory::GuardedEqual(
+                    reinterpret_cast<const void*>(address), previous.data(), size, equal);
+                NATIVE_DIAGNOSTIC(if (!ok) ++stats.snapshot_direct_faults);
+                return ok && equal;
+            });
+            if (hit) {
+                NATIVE_DIAGNOSTIC(++stats.snapshot_direct_hits);
+                NATIVE_DIAGNOSTIC(stats.snapshot_direct_bytes += size);
+                NATIVE_DIAGNOSTIC(++stats.snapshot_memo_hits);
+                NATIVE_DIAGNOSTIC(stats.snapshot_upload_bytes_saved += size);
+                return *hit;
+            }
+        }
         if (!cache.scratch) cache.scratch = std::make_unique_for_overwrite<u8[]>(SnapshotMemoMaxBytes);
         u8* const captured = cache.scratch.get();
-        const u64 readable = Native::ReadablePrefix(reinterpret_cast<const void*>(address), size);
         if (readable != 0 && !Core::RytyMemory::GuardedCopy(
                                  captured, reinterpret_cast<const void*>(address), readable)) {
             r.memory->CopySparseMemory(address, captured, readable);
@@ -4531,6 +4557,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
             return Native::Parallel::AdaptiveXXH3(data, length);
         });
         if (lookup.binding) {
+            cache.last_address = address; cache.last_size = size; cache.last_valid = true;
             NATIVE_DIAGNOSTIC(++stats.snapshot_memo_hits);
             NATIVE_DIAGNOSTIC(stats.snapshot_upload_bytes_saved += size);
             return *lookup.binding;
@@ -4539,7 +4566,10 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
         const auto [buffer, offset, data] = Allocate(size, r.instance.StorageMinAlignment());
         std::memcpy(data, captured, size);
         const std::pair binding{buffer, offset};
-        cache.memo.Store(lookup, 0, bytes, binding);
+        cache.last_valid = false;
+        if (cache.memo.Store(lookup, 0, bytes, binding)) {
+            cache.last_address = address; cache.last_size = size; cache.last_valid = true;
+        }
         return binding;
     }
     const auto [buffer, offset, data] = Allocate(size, r.instance.StorageMinAlignment());
@@ -12653,7 +12683,7 @@ void NativeRenderer::Splice() {
         }
     }
     UploadMemoFor(this).Clear(); // bindings expire before upload chunks can be recycled
-    if (snapshot_upload_memo) snapshot_upload_memo->memo.Clear();
+    if (snapshot_upload_memo) snapshot_upload_memo->Clear();
     for (auto& upload : s.flat_uploads) {
         upload.bytes.clear();
         upload.binding = {};
@@ -13769,6 +13799,10 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
     ++stats_reset_generation;
     LOG_INFO(Render_Vulkan, "Snapshot upload memo: {} hits, {} misses, {} bytes saved",
              stats.snapshot_memo_hits, stats.snapshot_memo_misses, stats.snapshot_upload_bytes_saved);
+    LOG_INFO(Render_Vulkan, "Snapshot direct compare: {} attempts, {} hits, {} faults, {} copy bytes avoided",
+             stats.snapshot_direct_attempts, stats.snapshot_direct_hits, stats.snapshot_direct_faults,
+             stats.snapshot_direct_bytes);
+    stats.snapshot_direct_attempts = stats.snapshot_direct_hits = stats.snapshot_direct_faults = stats.snapshot_direct_bytes = 0;
     stats.snapshot_memo_hits = stats.snapshot_memo_misses = stats.snapshot_upload_bytes_saved = 0;
     stats.record_ns = {};
     prepare_stats.made = 0;

@@ -994,6 +994,7 @@ private:
     struct Stats {
 #ifndef NDEBUG
         u64 snapshot_memo_hits = 0, snapshot_memo_misses = 0, snapshot_upload_bytes_saved = 0;
+        u64 snapshot_direct_attempts = 0, snapshot_direct_hits = 0, snapshot_direct_faults = 0, snapshot_direct_bytes = 0;
 #endif
         u64 rewrite_clears = 0, rewrite_uploads = 0, fill_shaders = 0; ///< NAT-120
         u64 rewrite_partial = 0; ///< NAT-124

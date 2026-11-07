@@ -735,8 +735,10 @@ bool TrackingMadeUnreadable(VAddr address) {
 // fault in it went unhandled).
 using CopyFn = void* (*)(void*, const void*, size_t);
 using HashFn = XXH64_hash_t (*)(const void*, size_t);
+using CompareFn = int (*)(const void*, const void*, size_t);
 static CopyFn volatile g_guarded_copy = &std::memcpy;
 static HashFn volatile g_guarded_hash = &XXH3_64bits;
+static CompareFn volatile g_guarded_compare = &std::memcmp;
 
 static bool GuardedCopyRaw(void* dest, const void* source, size_t size) {
     __try {
@@ -755,6 +757,27 @@ static bool GuardedHashRaw(const void* source, size_t size, u64* hash) {
     }
     return true;
 }
+
+static bool GuardedEqualRaw(const void* guest, const void* stable, size_t size, bool* equal) {
+    __try {
+        *equal = g_guarded_compare(guest, stable, size) == 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return true;
+}
+
+bool GuardedEqual(const void* guest, const void* stable, size_t size, bool& equal) {
+    equal = false;
+    ++g_guarded_reads;
+    const bool ok = GuardedEqualRaw(guest, stable, size, &equal);
+    --g_guarded_reads;
+    return ok;
+}
+
+#ifndef NDEBUG
+#include "ryty_gpu/tests/guarded_equal_selftest.h"
+#endif
 
 bool GuardedCopy(void* dest, const void* source, size_t size) {
     ++g_guarded_reads;

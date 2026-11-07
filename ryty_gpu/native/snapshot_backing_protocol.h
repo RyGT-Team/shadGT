@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <atomic>
+#include <cstddef>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -34,6 +35,23 @@ inline bool PoisonTraceRequested() {
 inline constinit std::atomic<bool> protocol_initialized{false};
 inline constinit std::atomic<bool> early_unsafe{false};
 inline constinit std::atomic<bool> modules_changed{false};
+#if defined(_WIN32) && !defined(NDEBUG)
+// LDR_DLL_NOTIFICATION_DATA has identical loaded/unloaded member layouts.
+struct ModuleNoticeString { USHORT length; USHORT maximum_length; const wchar_t* buffer; };
+struct ModuleNoticeData { ULONG flags; const ModuleNoticeString* full_name; const ModuleNoticeString* base_name; void* base; ULONG size; };
+static_assert(offsetof(ModuleNoticeString, buffer) == sizeof(void*));
+static_assert(offsetof(ModuleNoticeData, base) == 3 * sizeof(void*));
+static_assert(offsetof(ModuleNoticeData, size) == 4 * sizeof(void*));
+struct FirstModuleNotice { ULONG reason{}; std::uintptr_t base{}; ULONG size{}; wchar_t name[128]{}; };
+inline constinit std::atomic<unsigned> first_module_state{0}; // 0 empty, 1 writing, 2 published
+inline constinit FirstModuleNotice first_module_notice{};
+static_assert(std::atomic<unsigned>::is_always_lock_free);
+inline bool ReadFirstModuleNotice(FirstModuleNotice& out) noexcept {
+    if (first_module_state.load(std::memory_order_acquire) != 2) return false;
+    out = first_module_notice;
+    return true;
+}
+#endif
 static_assert(std::atomic<bool>::is_always_lock_free);
 static_assert(std::atomic<UnsafeCallback>::is_always_lock_free);
 
@@ -186,10 +204,29 @@ struct BackingProtocol {
     }
 
 #ifdef _WIN32
-    static void CALLBACK ModuleNotification(ULONG, const void*, void*) {
+    static void CALLBACK ModuleNotification(ULONG reason, const void* data, void*) {
         // Loader callback: no allocations, locks, logging or calls into another
         // DLL. Any module change permanently returns this experiment to copying.
         modules_changed.store(true, std::memory_order_seq_cst);
+#ifndef NDEBUG
+        unsigned expected = 0;
+        if (first_module_state.compare_exchange_strong(expected, 1, std::memory_order_relaxed)) {
+            first_module_notice.reason = reason;
+            if (data) {
+                const auto* notice = static_cast<const ModuleNoticeData*>(data);
+                first_module_notice.base = reinterpret_cast<std::uintptr_t>(notice->base);
+                first_module_notice.size = notice->size;
+                if (notice->base_name && notice->base_name->buffer) {
+                    const auto count = notice->base_name->length / sizeof(wchar_t);
+                    for (unsigned i = 0; i < count && i < 127; ++i)
+                        first_module_notice.name[i] = notice->base_name->buffer[i];
+                }
+            }
+            first_module_state.store(2, std::memory_order_release);
+        }
+#else
+        (void)reason; (void)data;
+#endif
     }
 #endif
 

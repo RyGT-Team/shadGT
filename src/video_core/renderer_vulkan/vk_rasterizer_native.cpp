@@ -14170,6 +14170,18 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
              stats.snapshot_direct_bytes);
     if (SnapshotLease::Requested() && snapshot_upload_memo) {
         auto& cache = *snapshot_upload_memo;
+#ifdef _WIN32
+        static bool module_notice_reported = false;
+        SnapshotLease::FirstModuleNotice notice{};
+        if (!module_notice_reported && SnapshotLease::ReadFirstModuleNotice(notice)) {
+            char name[512]{};
+            WideCharToMultiByte(CP_UTF8, 0, notice.name, -1, name, sizeof(name), nullptr, nullptr);
+            LOG_INFO(Render_Vulkan,
+                "DIAG-353 snapshot module revocation: reason={} name={} base={:#x} size={}",
+                notice.reason, name, notice.base, notice.size);
+            module_notice_reported = true;
+        }
+#endif
         LOG_INFO(Render_Vulkan,
             "PERF-349 snapshot leases: hits={} bytes={} armed={} rejected={} unavailable={} "
             "poisoned={} mapping={} stack={} protection={} capacity={} first-use={} early-write={} module-change={}",

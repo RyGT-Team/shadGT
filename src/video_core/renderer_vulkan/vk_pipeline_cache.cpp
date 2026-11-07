@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <new>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -63,6 +64,9 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/info.h"
 #ifndef NDEBUG
+#include "video_core/renderer_vulkan/read_ahead_key_trace.h"
+#endif
+#ifndef NDEBUG
 #include "shader_recompiler/srt_arena_trace.h"
 #endif
 #include "shader_recompiler/frontend/decode.h"
@@ -100,6 +104,40 @@ extern thread_local std::span<const u32> g_diag_compiling_code;
 extern thread_local u64 g_diag_compiling_hash;
 } // namespace Shader::Optimization
 namespace Vulkan {
+#ifndef NDEBUG
+// Used under the pipeline lookup lock. The allocation and all tracing are opt-in.
+ReadAheadKeyTrace* PipelineCache::KeyTrace() noexcept {
+    if (!read_ahead_key_trace_initialized) {
+        read_ahead_key_trace_initialized = true;
+        const char* value = std::getenv("RYGT_READ_AHEAD_KEY_TRACE");
+        if (value && value[0] == '1' && value[1] == '\0')
+            read_ahead_key_trace.reset(new (std::nothrow) ReadAheadKeyTrace);
+    }
+    return read_ahead_key_trace.get();
+}
+void PipelineCache::ReportKeyTrace() noexcept {
+    try {
+        auto* trace = KeyTrace();
+        if (!trace) return;
+        const auto s = trace->Take();
+        if (!s.ahead && !s.actual_observations) return;
+        std::string fields, stages;
+        for (size_t i = 0; i < s.fields.size(); ++i)
+            fields += fmt::format(" {}={}", ReadAheadKeyTrace::FieldNames[i], s.fields[i]);
+        for (size_t i = 0; i < s.stage_mismatch.size(); ++i)
+            stages += fmt::format(" {}={}", i, s.stage_mismatch[i]);
+        LOG_WARNING(Render_Vulkan, "AHEAD-KEY-TRACE bounded interval: ahead={} actual_hook_observations={} retained_ahead_first_demand={} evicted_undemanded={} evicted_demanded={}; first_diff:{}; no_same_stages_vs_latest:{}",
+                    s.ahead, s.actual_observations, s.exact_later, s.evicted_undemanded, s.evicted_demanded, fields, stages);
+        for (size_t i = 0; i < s.example_count; ++i) {
+            const auto& e = s.examples[i];
+            LOG_WARNING(Render_Vulkan, "AHEAD-KEY-TRACE example first_diff={} ahead_key={:#x} actual_key={:#x} stages={:#x}/{:#x}/{:#x}/{:#x}/{:#x}",
+                        ReadAheadKeyTrace::FieldNames[e.field], std::hash<GraphicsPipelineKey>{}(e.ahead),
+                        std::hash<GraphicsPipelineKey>{}(e.actual), e.ahead.stage_hashes[0],
+                        e.ahead.stage_hashes[1], e.ahead.stage_hashes[2], e.ahead.stage_hashes[3], e.ahead.stage_hashes[4]);
+        }
+    } catch (...) { /* Diagnostics cannot affect rendering. */ }
+}
+#endif
 u32 TessLdsEmulation(const AmdGpu::Regs& regs) {
     static const u32 mode = [] {
         const char* env = std::getenv("RYGT_TESS_LDS_EMULATION");
@@ -2591,6 +2629,9 @@ void PipelineCache::ReadAhead(const DrawIndirectParams params, bool restore) {
             return false;
         }
         pending_builds.emplace(S().graphics_key, StartPipelineBuild(false));
+#ifndef NDEBUG
+        if (auto* trace = KeyTrace()) trace->Ahead(S().graphics_key);
+#endif
         ++started;
         return true;
     });
@@ -2798,6 +2839,9 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
             return true;
         }
         pending_builds.emplace(S().graphics_key, StartPipelineBuild(false));
+#ifndef NDEBUG
+        if (auto* trace = KeyTrace()) trace->Ahead(S().graphics_key);
+#endif
         ++started;
         return true;
     };
@@ -2864,6 +2908,7 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
                     std::chrono::duration<double>(now - stats.since).count(), stats.evaluated,
                     stats.started, stats.ms, stats.waits, stats.wait_ms, pending_builds.size(),
                     stats.retry_retained, stats.retry_unproven, stats.new_shader_deferred);
+        ReportKeyTrace();
         stats = {};
         stats.since = now;
     }
@@ -3036,6 +3081,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (!key_valid) {
         return nullptr;
     }
+#ifndef NDEBUG
+    // A normal key may be replaced by a legacy fallback before PipelineForCurrentKey.
+    if (!regs_override) if (auto* trace = KeyTrace()) trace->Actual(S().graphics_key);
+#endif
     if (regs_override == nullptr) {
         const auto now = std::chrono::steady_clock::now();
         if (now - stale_ahead_checked >= std::chrono::seconds{2}) {
@@ -3128,6 +3177,9 @@ Shader::Info& PipelineCache::MatchInfo(const Shader::Info& cached) {
 }
 
 const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectParams params) {
+#ifndef NDEBUG
+    if (!regs_override) if (auto* trace = KeyTrace()) trace->Actual(S().graphics_key);
+#endif
     if (S().graphics_key.num_color_attachments > AmdGpu::NUM_COLOR_BUFFERS) {
         LOG_WARNING(Render_Vulkan, "Skipping draw with {} color attachments (MRT mask={:#x})",
                     S().graphics_key.num_color_attachments, S().graphics_key.mrt_mask);

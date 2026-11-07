@@ -61,6 +61,9 @@ class DataBase;
 }
 
 namespace Vulkan {
+#ifndef NDEBUG
+class ReadAheadKeyTrace;
+#endif
 bool SaveDriverCacheAtExit();
 
 /// FIX-227: the hull shader LDS emulation mode for the current draw (0: off).
@@ -467,6 +470,12 @@ private:
     bool CaptureBlockedAheadInputs(const AmdGpu::Regs& regs, BlockedAheadState& state);
     bool DirectOnlyRetryProgram(u64 hash) const;
     bool read_ahead_blocked{}; // lookup mutex held
+#ifndef NDEBUG
+    ReadAheadKeyTrace* KeyTrace() noexcept;
+    void ReportKeyTrace() noexcept;
+    std::unique_ptr<ReadAheadKeyTrace> read_ahead_key_trace;
+    bool read_ahead_key_trace_initialized{};
+#endif
     struct QueuedStateStats {
         u32 evaluated{};
         u32 started{};

@@ -13,7 +13,13 @@
 
 namespace Vulkan::SnapshotLease {
 using UnsafeCallback = void (*)(std::uint64_t, std::uint64_t);
+using ProtectionBeginCallback = int (*)();
+using ProtectionEndCallback = void (*)();
+using ClampedProtectionCallback = int (*)(std::uint64_t, std::uint64_t, std::uint32_t);
 inline constinit std::atomic<UnsafeCallback> published_unsafe{nullptr};
+inline constinit std::atomic<ProtectionBeginCallback> published_protection_begin{nullptr};
+inline constinit std::atomic<ProtectionEndCallback> published_protection_end{nullptr};
+inline constinit std::atomic<ClampedProtectionCallback> published_clamped_protection{nullptr};
 #ifndef NDEBUG
 using TaggedUnsafeCallback = void (*)(std::uint64_t, std::uint64_t, std::uint32_t);
 inline constinit std::atomic<TaggedUnsafeCallback> published_tagged_unsafe{nullptr};
@@ -42,6 +48,16 @@ inline bool Requested() {
     return requested;
 }
 
+inline bool PrototypeCompatible() {
+    static const bool compatible = [] {
+        const char* inplace = std::getenv("SHADGT_PROTO_INPLACE");
+        const char* import = std::getenv("SHADGT_PROTO_IMPORT");
+        return !(inplace && inplace[0] == '1') &&
+               !(import && (import[0] == '1' || import[0] == '2' || import[0] == '3'));
+    }();
+    return compatible;
+}
+
 struct BackingProtocol {
     using VersionFn = std::uint32_t (*)();
     using StateFn = int (*)(std::uint64_t*, std::uint64_t*);
@@ -49,6 +65,9 @@ struct BackingProtocol {
     using MarkFn = void (*)(std::uint64_t, std::uint64_t);
     using SafeFn = int (*)(std::uint64_t, std::uint64_t);
     using AliasFn = void* (*)(std::uint64_t, std::uint64_t);
+    using PinFn = void* (*)(std::uint64_t, std::uint64_t);
+    using ReleasePinFn = void (*)(void*);
+    using ProtectFn = ClampedProtectionCallback;
 
     VersionFn version{};
     StateFn state{};
@@ -56,6 +75,11 @@ struct BackingProtocol {
     MarkFn mark{};
     SafeFn safe{};
     AliasFn renderer_alias{};
+    ProtectionBeginCallback protection_begin{};
+    ProtectionEndCallback protection_end{};
+    PinFn pin{};
+    ReleasePinFn release_pin{};
+    ProtectFn protect_clamped{};
 #ifndef NDEBUG
     TaggedUnsafeCallback tagged_mark{};
     using CausesFn = std::uint32_t (*)(std::uint64_t, std::uint64_t);
@@ -82,6 +106,16 @@ struct BackingProtocol {
                 result.mark = reinterpret_cast<MarkFn>(Export(module, "RytySnapshotMarkUnsafe", "hZxVJ2Jdlec"));
                 result.safe = reinterpret_cast<SafeFn>(Export(module, "RytySnapshotRangeSafe", "BBa3HIGOhMQ"));
                 result.renderer_alias = reinterpret_cast<AliasFn>(Export(module, "RytySnapshotMapRendererAlias", "KY9dH6tnK5g"));
+                result.protection_begin = reinterpret_cast<ProtectionBeginCallback>(
+                    Export(module, "RytySnapshotProtectionBegin", "uvy9PZ1vPHI"));
+                result.protection_end = reinterpret_cast<ProtectionEndCallback>(
+                    Export(module, "RytySnapshotProtectionEnd", "fU9xS-eB9Aw"));
+                result.pin = reinterpret_cast<PinFn>(
+                    Export(module, "RytySnapshotTryPinReadable", "4R1RYPejFqU"));
+                result.release_pin = reinterpret_cast<ReleasePinFn>(
+                    Export(module, "RytySnapshotReleasePin", "8vcYjOrVMFM"));
+                result.protect_clamped = reinterpret_cast<ProtectFn>(
+                    Export(module, "RytySnapshotProtectClamped", "YGext8tkAkY"));
 #ifndef NDEBUG
                 result.tagged_mark = reinterpret_cast<TaggedUnsafeCallback>(
                     Export(module, "RytySnapshotMarkUnsafeTagged", "zTrmAFyR-+A"));
@@ -104,7 +138,7 @@ struct BackingProtocol {
         const auto supports = [](const char* module_name, const char* name, const char* nid) {
             const HMODULE module = GetModuleHandleA(module_name);
             const auto fn = reinterpret_cast<VersionFn>(Export(module, name, nid));
-            return fn && fn() == 1;
+            return !module || (fn && fn() == 1);
         };
         const bool supported =
             supports("libkernel.prx", "RytySnapshotHostWritesKernelV1", "xrVbTBGMO98") &&
@@ -123,7 +157,8 @@ struct BackingProtocol {
         return protocol_initialized.load(std::memory_order_acquire) &&
                !early_unsafe.load(std::memory_order_seq_cst) &&
                !modules_changed.load(std::memory_order_seq_cst) &&
-               Requested() && version && state && query && mark && safe && renderer_alias && version() == 1;
+               Requested() && PrototypeCompatible() && version && state && query && mark && safe && renderer_alias &&
+               protection_begin && protection_end && pin && release_pin && protect_clamped && version() == 2;
     }
 
     static void Initialize() {
@@ -135,6 +170,12 @@ struct BackingProtocol {
             // handling, even when the optional protocol is not yet supported.
             std::uint64_t epoch{}, active{};
             if (api.state) api.state(&epoch, &active);
+            if (api.protection_begin && api.protection_end) {
+                published_protection_begin.store(api.protection_begin, std::memory_order_release);
+                published_protection_end.store(api.protection_end, std::memory_order_release);
+            }
+            if (api.version && api.version() == 2 && api.protect_clamped)
+                published_clamped_protection.store(api.protect_clamped, std::memory_order_release);
 #ifndef NDEBUG
             if (PoisonTraceRequested())
                 published_tagged_unsafe.store(api.tagged_mark, std::memory_order_release);
@@ -174,7 +215,10 @@ struct BackingProtocol {
             // must also revoke the proof, before that module is initialized.
             for (const char* name : {"libc.prx", "libkernel.prx", "libSceNet.prx",
                                      "libSceSaveData.prx", "libSceSaveData.native.prx"}) {
-                if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_PIN, name, &pinned))
+                // Absent writers cannot run; any later DLL load revokes the
+                // protocol before dynamic linking, including audited writers.
+                if (GetModuleHandleA(name) &&
+                    !GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_PIN, name, &pinned))
                     return false;
             }
             return WriterCapabilities() &&
@@ -224,5 +268,19 @@ struct RuntimePoison {
 inline void MarkUnsafe(std::uint64_t address, std::uint64_t size, std::uint32_t cause = 64) {
     RuntimePoison{}.MarkUnsafe({address, size}, cause);
 }
+
+class ProtectionTransition {
+    ProtectionEndCallback end{};
+public:
+    ProtectionTransition(std::uint64_t address, std::uint64_t size) {
+        const auto begin = published_protection_begin.load(std::memory_order_acquire);
+        const auto finish = published_protection_end.load(std::memory_order_acquire);
+        if (begin && finish && begin()) end = finish;
+        else MarkUnsafe(address, size, 4);
+    }
+    ~ProtectionTransition() { if (end) end(); }
+    ProtectionTransition(const ProtectionTransition&) = delete;
+    ProtectionTransition& operator=(const ProtectionTransition&) = delete;
+};
 
 } // namespace Vulkan::SnapshotLease

@@ -100,13 +100,16 @@ public:
     }
     // Reclaim metadata only. The caller must serialize this with watch-owner
     // reconciliation and retire the returned ranges through the normal path.
-    OwnedRanges ReleaseUnsafe() {
+    // poison=false requires caller-owned reconciliation and a protocol that
+    // advances the mapping epoch before any page is opened for writing.
+    OwnedRanges ReleaseUnsafe(bool poison_on_release = true) {
         std::lock_guard lock(mutex);
         OwnedRanges result;
         for (auto& lease : leases) {
             if (lease.state == State::Empty || poison.Safe(lease.pages))
                 continue;
-            poison.MarkUnsafe(lease.pages);
+            if (poison_on_release)
+                poison.MarkUnsafe(lease.pages);
             result.ranges[result.count++] = lease.pages;
             owned -= lease.pages.size;
             lease.state = State::Empty;
@@ -175,9 +178,9 @@ public:
         l.state = State::Valid;
         return Id{id.slot, l.generation};
     }
-    // Must occur before the caller removes protection; permanent poisoning
-    // also invalidates overlapping leases without having to find them here.
-    std::optional<Range> Release(Id id) {
+    // Default poisoning invalidates overlapping leases. With poison=false the
+    // caller must retain other owners and advance the epoch before opening pages.
+    std::optional<Range> Release(Id id, bool poison_on_release = true) {
         std::lock_guard lock(mutex);
         if (id.slot >= leases.size())
             return {};
@@ -185,7 +188,8 @@ public:
         if (!Same(id, l) || l.state == State::Empty)
             return {};
         auto p = l.pages;
-        poison.MarkUnsafe(p);
+        if (poison_on_release)
+            poison.MarkUnsafe(p);
         owned -= p.size;
         l.state = State::Empty;
         return p;

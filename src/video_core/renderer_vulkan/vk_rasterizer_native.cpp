@@ -49,6 +49,7 @@
 #include "video_core/renderer_vulkan/upload_bytes_equal.h"
 #include "video_core/renderer_vulkan/immutable_upload_memo.h"
 #include "ryty_gpu/native/snapshot_backing_protocol.h"
+#include "video_core/renderer_vulkan/snapshot_protection_receipt.h"
 #include "common/scope_exit.h"
 #include "video_core/renderer_vulkan/snapshot_source_hints.h"
 #include "video_core/renderer_vulkan/freshness_range_search.h"
@@ -4610,19 +4611,22 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
         const SnapshotLease::Range source{address, size};
         const auto source_pages = SnapshotLease::Pages(source);
         const auto& protocol = SnapshotLease::BackingProtocol::Get();
+        std::unique_ptr<void, SnapshotLease::BackingProtocol::ReleasePinFn> source_pin{
+            nullptr, protocol.release_pin};
         std::optional<Native::CpuStackRegistry::Lease> source_stack;
         std::optional<SnapshotLease::Id> capture_lease;
         SnapshotLease::Mapping capture_before{};
         bool new_lease = false, protected_source = false;
         bool capture_committed = false;
         SCOPE_EXIT {
+            source_pin.reset();
             if (capture_lease && new_lease && !capture_committed) {
                 // Failed/abandoned arming must not exhaust the bounded owner
                 // table. Release only metadata here; reconcile OS watches with
                 // every other live owner through the normal retirement path.
                 try {
                     std::scoped_lock watch_lock{fill_watch_mutex};
-                    if (const auto pages = cache.leases.Release(*capture_lease)) {
+                    if (const auto pages = cache.leases.Release(*capture_lease, false)) {
                         retired_watch_ranges.emplace_back(pages->address, pages->address + pages->size);
                     }
                 } catch (...) {
@@ -4677,55 +4681,89 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
                            item.address == address && item.size == size;
                 });
                 if (state.idle && !failed_before) {
-                    capture_before = protocol.Query(source);
-                    if (SnapshotLease::Good(capture_before)) {
+                    const auto eligible = protocol.Query(source);
+                    source_pin.reset(SnapshotLease::Good(eligible) ?
+                        protocol.pin(source_pages->address, source_pages->size) : nullptr);
+                    if (source_pin) {
                         // Synchronize owner insertion and page protection with watch
                         // retirement. Metadata locks never span OS calls or copying.
                         std::scoped_lock watch_lock{fill_watch_mutex};
                         // Reserve before registering a new owner, so abandonment
                         // cannot allocate from the scope-exit path.
                         retired_watch_ranges.reserve(retired_watch_ranges.size() + 1);
-                        if (const auto owned = cache.leases.FindOwned(source)) {
-                            capture_lease = owned->id;
-                        } else {
-                            capture_lease = cache.leases.Begin(source, capture_before);
-                            new_lease = capture_lease.has_value();
-                        }
-                        if (capture_lease) {
+                        const auto previous_owner = cache.leases.FindOwned(source);
+                        bool touched_watch = false;
                             try {
-                                WatchPages(source_pages->address, source_pages->size);
 #ifdef _WIN32
                                 const DWORD previous_error = GetLastError();
-                                VAddr cursor = source_pages->address;
-                                const VAddr end = cursor + source_pages->size;
-                                unsigned count = 0;
-                                while (cursor < end && count++ < 512) {
-                                    MEMORY_BASIC_INFORMATION mbi{};
-                                    if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &mbi,
-                                                      sizeof(mbi)) ||
-                                        mbi.State != MEM_COMMIT || mbi.Type != MEM_MAPPED ||
-                                        (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) break;
-                                    const DWORD access = mbi.Protect & 0xff;
-                                    if (access != PAGE_READONLY && access != PAGE_EXECUTE_READ) break;
-                                    const VAddr begin = reinterpret_cast<VAddr>(mbi.BaseAddress);
-                                    if (begin > cursor || mbi.RegionSize > UINT64_MAX - begin ||
-                                        begin + mbi.RegionSize <= cursor) break;
-                                    cursor = std::min<VAddr>(end, begin + mbi.RegionSize);
-                                }
-                                protected_source = cursor == end;
+                                protected_source = SnapshotLease::ProtectAndVerify(
+                                    source_pages->address, source_pages->size,
+                                    [](u64 at, SnapshotLease::ReceiptRegion& region) {
+                                        MEMORY_BASIC_INFORMATION mbi{};
+                                        if (!VirtualQuery(reinterpret_cast<const void*>(at), &mbi, sizeof(mbi)))
+                                            return false;
+                                        region.begin = reinterpret_cast<u64>(mbi.BaseAddress);
+                                        region.size = mbi.RegionSize;
+                                        region.committed_mapped = mbi.State == MEM_COMMIT &&
+                                            mbi.Type == MEM_MAPPED && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS));
+                                        const auto access = mbi.Protect & 0xff;
+                                        region.access = access == PAGE_READONLY ? SnapshotLease::ReceiptAccess::ReadOnly :
+                                            access == PAGE_READWRITE ? SnapshotLease::ReceiptAccess::ReadWrite :
+                                            SnapshotLease::ReceiptAccess::Other;
+                                        return true;
+                                    },
+                                    [&](u64 begin, u64 bytes) {
+                                        u64 covered = 0; bool non_exec = true;
+                                        r.memory->ForEachExecRange(begin, bytes, [&](VAddr at, u64 count, bool exec) {
+                                            if (exec || covered > bytes || count > bytes - covered ||
+                                                at != begin + covered) non_exec = false;
+                                            if (count <= bytes - std::min(covered, bytes)) covered += count;
+                                        });
+                                        return non_exec && covered == bytes;
+                                    },
+                                    [](u64, u64) {
+                                        // All P1/P2 import entry points are disabled by these
+                                        // immutable startup modes. A later DLL load revokes leases.
+#ifndef NDEBUG
+                                        if (VideoCore::g_imported_count.load(std::memory_order_acquire) != 0)
+                                            return false;
+#endif
+                                        return SnapshotLease::PrototypeCompatible();
+                                    },
+                                    [&](u64 begin, u64 bytes) {
+                                        touched_watch = true;
+                                        WatchPages(begin, bytes);
+                                        return true;
+                                    },
+                                    [&](u64 begin, u64 bytes) {
+                                        r.page_manager.ReapplyProtection(begin, bytes);
+                                        return true;
+                                    });
                                 SetLastError(previous_error);
 #endif
                             } catch (...) {
                                 protected_source = false;
                             }
-                            if (!protected_source) {
-                                cache.leases.Invalidate(*capture_lease);
-                                reject_mapping(capture_before.epoch);
+                            // Re-protection changes the epoch itself. Establish the
+                            // capture checkpoint afterward, while the pin still
+                            // excludes guest remap and semantic permission changes.
+                            capture_before = protected_source ? protocol.Query(source) : SnapshotLease::Mapping{};
+                            if (SnapshotLease::Good(capture_before)) {
+                                if (previous_owner) capture_lease = previous_owner->id;
+                                else {
+                                    capture_lease = cache.leases.Begin(source, capture_before);
+                                    new_lease = capture_lease.has_value();
+                                }
+                            }
+                            if (!capture_lease) {
+                                if (previous_owner) cache.leases.Invalidate(previous_owner->id);
+                                else if (touched_watch)
+                                    retired_watch_ranges.emplace_back(source_pages->address,
+                                        source_pages->address + source_pages->size);
+                                source_pin.reset();
+                                reject_mapping(state.epoch);
                                 NATIVE_DIAGNOSTIC(++cache.lease_protection_rejected);
                             }
-                        } else {
-                            reject_mapping(capture_before.epoch);
-                        }
                     } else {
                         reject_mapping(state.epoch);
                         NATIVE_DIAGNOSTIC(++cache.lease_mapping_rejected);
@@ -4737,28 +4775,40 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
         }
         // This callback runs only after an exact comparison/capture established
         // the current memo bytes. The upload binding remains owned by this list.
-        const auto certify = [&](size_t slot, bool exact) {
-            cache.tokens.Forget(static_cast<unsigned>(slot));
+        bool capture_finished = false;
+        std::optional<SnapshotLease::Id> certified_lease;
+        SnapshotLease::Mapping capture_after{};
+        const auto finish_capture = [&](bool exact) {
+            if (capture_finished) return;
+            capture_finished = true;
             if (!capture_lease || !protected_source || !exact) {
                 if (capture_lease) cache.leases.Invalidate(*capture_lease);
+                source_pin.reset();
                 return;
             }
             const auto after = protocol.ReadMapping(true);
-            std::optional<SnapshotLease::Id> id;
+            capture_after = after;
             if (new_lease) {
                 if (cache.leases.Commit(*capture_lease, capture_before, after, true, true))
-                    id = capture_lease;
+                    certified_lease = capture_lease;
             } else {
-                id = cache.leases.Renew(*capture_lease, capture_before, after, true, true);
+                certified_lease = cache.leases.Renew(*capture_lease, capture_before, after, true, true);
             }
-            if (!id) {
+            capture_committed = certified_lease.has_value();
+            source_pin.reset(); // Never retain a registry pin across Allocate/Splice/GPU waits.
+            if (!certified_lease) {
                 NATIVE_DIAGNOSTIC(++cache.lease_rejected);
                 return;
             }
-            cache.tokens.Set(static_cast<unsigned>(slot),
-                cache.leases.Bind(*id, cache.tokens.Epoch(), source, capture_before, after, true, true));
-            capture_committed = true;
             NATIVE_DIAGNOSTIC(++cache.lease_armed);
+        };
+        const auto certify = [&](size_t slot, bool exact) {
+            cache.tokens.Forget(static_cast<unsigned>(slot));
+            finish_capture(exact);
+            if (!certified_lease) return;
+            const auto now = protocol.ReadMapping(true);
+            cache.tokens.Set(static_cast<unsigned>(slot),
+                cache.leases.Bind(*certified_lease, cache.tokens.Epoch(), source, capture_after, now, true, true));
         };
         if (candidate) {
             const auto hit = cache.memo.WithSlot(0, *candidate, size, [&](std::span<const u8> previous) {
@@ -4784,6 +4834,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
         if (readable != 0 && !Core::RytyMemory::GuardedCopy(
                                  captured, reinterpret_cast<const void*>(address), readable)) {
             exact_capture = false;
+            finish_capture(false);
             r.memory->CopySparseMemory(address, captured, readable);
         }
         if (readable < size) std::memset(captured + readable, 0, size - readable);
@@ -4799,6 +4850,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
             return *lookup.binding;
         }
         NATIVE_DIAGNOSTIC(++stats.snapshot_memo_misses);
+        finish_capture(exact_capture);
         const auto [buffer, offset, data] = Allocate(size, r.instance.StorageMinAlignment());
         std::memcpy(data, captured, size);
         const std::pair binding{buffer, offset};
@@ -12679,8 +12731,7 @@ void NativeRenderer::WatchPages(VAddr address, u64 size) {
 }
 
 void NativeRenderer::UnwatchPages(VAddr begin, VAddr end) {
-    // Invalidate before any owner opens the original view.
-    if (end > begin) SnapshotLease::MarkUnsafe(begin, end - begin, 4);
+    SnapshotLease::ProtectionTransition protection_transition{begin, end > begin ? end - begin : 0};
     page_watches.Untrack(begin,end,[&](VAddr run,u64 bytes) {
         r.page_manager.UpdatePageWatchers(run,bytes,VideoCore::PageOp::Untrack);
     });
@@ -12690,7 +12741,11 @@ void NativeRenderer::ReleaseUnusedWatches() {
     std::scoped_lock watch_lock{fill_watch_mutex};
     Native::SlowCallTrace<2> trace{true, "retired-page-watches", {"live-ranges", "unwatch"}};
     if (snapshot_upload_memo && SnapshotLease::Requested()) {
-        const auto released = snapshot_upload_memo->leases.ReleaseUnsafe();
+        // Reserve before removing ownership: an allocation failure must leave
+        // every existing watch represented in the lease table.
+        retired_watch_ranges.reserve(retired_watch_ranges.size() +
+            SnapshotLease::OwnedRanges{}.ranges.size());
+        const auto released = snapshot_upload_memo->leases.ReleaseUnsafe(false);
         for (size_t i = 0; i < released.count; ++i) {
             const auto range = released.ranges[i];
             retired_watch_ranges.emplace_back(range.address, range.address + range.size);
@@ -12803,7 +12858,7 @@ void NativeRenderer::FaultAhead(VAddr begin, VAddr end) {
                 ahead_pages.insert(page);
                 return true;
             }, [&](VAddr address, u64 bytes) {
-                SnapshotLease::MarkUnsafe(address, bytes, 4);
+                SnapshotLease::ProtectionTransition protection_transition{address, bytes};
                 r.page_manager.UpdatePageWatchers(address, bytes, VideoCore::PageOp::Untrack);
                 std::scoped_lock lock{region_dirty_mutex};
                 pending_region_writes.emplace_back(address, address + bytes);

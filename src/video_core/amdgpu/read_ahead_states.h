@@ -9,6 +9,7 @@
 #include <chrono>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <unordered_set>
 #include <utility>
@@ -112,15 +113,31 @@ public:
     /// context registers and the primitive registers, without the per-draw packet registers.
     static u64 PipelineStateHash(std::span<const u32> regs);
 
-    explicit ReadAheadStates(size_t capacity = 512);
+    explicit ReadAheadStates(size_t capacity = 512, std::optional<bool> drop_reached_override = std::nullopt);
 
     /// Command thread: queues the state unless a state with the same hash was queued before
     /// (or the queue is full). Returns whether it was queued.
-    bool Offer(std::span<const u32> regs
+    bool Offer(std::span<const u32> regs, u64 sequence = 0
 #ifndef NDEBUG
                , ReadAheadPair::Metadata metadata = {}
 #endif
                );
+
+    /// Producer only. Zero means unsequenced (including forward-scanned states).
+    u64 NextDrawSequence() noexcept {
+        if (next_draw_sequence == ~u64{0}) return 0;
+        return ++next_draw_sequence;
+    }
+    /// Recorder callback, before applying the draw's register delta.
+    void NoteRecorderStarted(u64 sequence) noexcept {
+        auto started = recorder_started.load(std::memory_order_relaxed);
+        while (started < sequence && !recorder_started.compare_exchange_weak(
+                   started, sequence, std::memory_order_release, std::memory_order_relaxed)) {}
+    }
+#ifndef NDEBUG
+    struct DropStats { u64 dropped{}, returned_decoded{}, returned_scan{}; };
+    DropStats TakeDropStats() noexcept { return std::exchange(drop_stats, {}); }
+#endif
 
     /// How many more states fit. Exact on the command thread, the only one that adds.
     size_t Space() const {
@@ -171,16 +188,28 @@ private:
 
     static constexpr size_t MaxSeen = size_t{1} << 16;
     const size_t capacity;
+    const bool drop_reached;
+    u64 next_draw_sequence{}; // producer only
+    std::atomic<u64> recorder_started{};
     // Command thread only.
     std::unordered_set<u64> seen;
+    u64 seen_epoch{1};
+    bool dedup_enabled{true};
     u64 misses_seen{};
 
     std::mutex mutex;
+    struct RetiredHash { u64 hash{}, epoch{}; };
+    std::vector<RetiredHash> retired_hashes; // bounded, consumer writes; producer drains
+    std::vector<RetiredHash> retired_scratch; // producer only; exchanged under mutex
+    bool retired_overflow{}; // rare bounded fallback, guarded by mutex
+    struct QueuedState { std::vector<u32> registers; u64 sequence{}, hash{}, epoch{};
 #ifndef NDEBUG
-    struct QueuedState { std::vector<u32> registers; ReadAheadPair::Metadata metadata; };
+        ReadAheadPair::Metadata metadata;
+#endif
+    };
     std::deque<QueuedState> queue;
-#else
-    std::deque<std::vector<u32>> queue;
+#ifndef NDEBUG
+    DropStats drop_stats{}; // consumer only
 #endif
     std::vector<std::vector<u32>> free_states;
     std::atomic<size_t> size{};

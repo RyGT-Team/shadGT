@@ -2977,13 +2977,15 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
     stats.started += started;
     stats.ms += std::chrono::duration<double, std::milli>(now - start).count();
     if (now - stats.since >= std::chrono::seconds{2}) {
+        const auto reached = states->TakeDropStats();
         LOG_WARNING(Render_Vulkan,
                     "PERF-034 pipeline read-ahead in {:.1f} s: {} draw states from the command "
                     "thread evaluated, {} builds started, {:.1f} ms; {} draws waited for a build "
-                    "({:.1f} ms); {} pending; owned retries retained {}, unproven {}; new shader requests deferred {}",
+                    "({:.1f} ms); {} pending; owned retries retained {}, unproven {}; new shader requests deferred {}; queued reached dropped {}, decoded returned {}, scan returned {}",
                     std::chrono::duration<double>(now - stats.since).count(), stats.evaluated,
                     stats.started, stats.ms, stats.waits, stats.wait_ms, pending_builds.size(),
-                    stats.retry_retained, stats.retry_unproven, stats.new_shader_deferred);
+                    stats.retry_retained, stats.retry_unproven, stats.new_shader_deferred,
+                    reached.dropped, reached.returned_decoded, reached.returned_scan);
         ReportKeyTrace();
         stats = {};
         stats.since = now;

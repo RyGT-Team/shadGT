@@ -841,6 +841,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
 #endif
         return;
     }
+    const u64 ahead_sequence = read_ahead_states && !compute ? read_ahead_states->NextDrawSequence() : 0;
     // PERF-056: the delta vectors go back and forth between the threads with their capacity.
     std::vector<u32> delta = delta_recycler.Take();
     delta.clear();
@@ -991,11 +992,12 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     draw_pipe->Push([this, delta = std::move(delta), cs, cb_extent = last_cb_extent,
                      db_extent = last_db_extent, expected = std::move(expected),
                      selected = std::move(selected), draw = std::move(draw),
-                     decode_epoch, capture = std::move(capture), staged, indirect_selected
+                     decode_epoch, capture = std::move(capture), staged, indirect_selected, ahead_sequence
 #ifndef NDEBUG
                      , trace_id, pair_token
 #endif
                      ]() mutable {
+        if (ahead_sequence && read_ahead_states) read_ahead_states->NoteRecorderStarted(ahead_sequence);
 #ifndef NDEBUG
         GeometryTrace::Scope trace_scope{trace_id};
         ReadAheadPair::Scope pair_scope{pair_token, true};
@@ -1036,9 +1038,9 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         }
     }, kind, std::move(prepare), std::move(order));
     if (read_ahead_states && !compute) {
-        OfferDrawState(
+        OfferDrawState(ahead_sequence
 #ifndef NDEBUG
-            ReadAheadPair::Metadata{pair_token, indirect.has_value()}
+            , ReadAheadPair::Metadata{pair_token, indirect.has_value()}
 #endif
         );
     }
@@ -1066,9 +1068,9 @@ static bool FilteredDraw(const Regs& state) {
            mode == OperationMode::Resolve;
 }
 
-void Liverpool::OfferDrawState(
+void Liverpool::OfferDrawState(u64 sequence
 #ifndef NDEBUG
-    ReadAheadPair::Metadata metadata
+    , ReadAheadPair::Metadata metadata
 #endif
 ) {
     // The draw being decoded is still ahead of the recorder. Its state is hashed only when a
@@ -1076,7 +1078,7 @@ void Liverpool::OfferDrawState(
     if (pipeline_regs_written && read_ahead_states->Space() > 0) {
         pipeline_regs_written = false;
         if (!FilteredDraw(regs)) {
-            read_ahead_states->Offer(regs.reg_array
+            read_ahead_states->Offer(regs.reg_array, sequence
 #ifndef NDEBUG
                                      , metadata
 #endif

@@ -892,7 +892,42 @@ void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms)
     // next, so protect each committed region of the range on its own. When the range is known to
     // be mapped, try it whole and then in 16 KB pieces (Ryty's view size) before asking Windows
     // where each region ends.
-    if (write) Vulkan::SnapshotLease::MarkUnsafe(virtual_addr, size, 4);
+    Vulkan::SnapshotLease::ProtectionTransition protection_transition{virtual_addr, size};
+    if (const auto clamp = Vulkan::SnapshotLease::published_clamped_protection.load(
+            std::memory_order_acquire)) {
+        // Shared guest views retain their semantic guest permissions. A watch
+        // may restrict them, but retirement must never widen those permissions.
+        // Keep using this after lease revocation: existing watches still retire.
+        const int result = clamp(virtual_addr, size,
+            (read ? 1u : 0u) | (write ? 2u : 0u) | (execute ? 4u : 0u));
+        if (result != 0) {
+            if (result > 0) {
+                // The clamp can turn requested RW into guest NOACCESS. Record
+                // the actual per-region result, never the requested permissions.
+                VAddr at = virtual_addr;
+                const VAddr limit = virtual_addr + size;
+                while (at < limit) {
+                    MEMORY_BASIC_INFORMATION info{};
+                    if (VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info)) != sizeof(info)) {
+                        Vulkan::SnapshotLease::MarkUnsafe(at, limit - at);
+                        break;
+                    }
+                    const VAddr stop = std::min<VAddr>(limit,
+                        reinterpret_cast<VAddr>(info.BaseAddress) + info.RegionSize);
+                    if (stop <= at) break;
+                    RytyMemory::NoteReadable(at, stop - at,
+                        IsCommitted(info) && IsReadable(info.Protect));
+                    at = stop;
+                }
+            } else {
+                Vulkan::SnapshotLease::MarkUnsafe(virtual_addr, size);
+                LOG_ERROR(Kernel_Vmm, "Guest-clamped protection failed for {:#x}+{:#x}",
+                          virtual_addr, size);
+            }
+            return; // Failure in a shared range must not fall through to widening.
+        }
+        // No shared-view overlap: retain the existing private/executable path.
+    }
     RytyMemory::NoteReadable(virtual_addr, size, read || execute);
     VAddr address = virtual_addr;
     const VAddr end = virtual_addr + size;

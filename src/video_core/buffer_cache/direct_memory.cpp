@@ -29,6 +29,7 @@
 #include "ryty_gpu/native/slow_call_trace.h"
 #include "ryty_gpu/native/direct_coherence_registry.h"
 #include "ryty_gpu/native/parallel_direct_capability.h"
+#include "ryty_gpu/native/snapshot_backing_protocol.h"
 #include "video_core/buffer_cache/proto_import.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -51,6 +52,8 @@ using UnmapAliasFn = void (*)(void*);
 MapAliasFn MapAlias() {
 #ifdef _WIN32
     static const auto fn = [] {
+        const auto& protocol = Vulkan::SnapshotLease::BackingProtocol::Get();
+        if (protocol.Available()) return reinterpret_cast<MapAliasFn>(protocol.renderer_alias);
         HMODULE libc = GetModuleHandleA("libc.prx");
         return libc ? reinterpret_cast<MapAliasFn>(GetProcAddress(libc, "TXQU8CpoEtI")) : nullptr;
     }();

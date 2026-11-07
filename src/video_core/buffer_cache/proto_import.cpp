@@ -16,6 +16,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "core/memory.h"
+#include "ryty_gpu/native/snapshot_backing_protocol.h"
 #include <bit>
 #include <chrono>
 
@@ -598,6 +599,7 @@ vk::Buffer ImportGuestView(const Vulkan::Instance& instance, VAddr address, u64 
         return {};
     }
     DWORD old;
+    Vulkan::SnapshotLease::MarkUnsafe(base, end - base);
     if (!VirtualProtect(reinterpret_cast<void*>(base), end - base, PAGE_READWRITE, &old)) {
         return {};
     }

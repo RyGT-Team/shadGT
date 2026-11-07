@@ -44,6 +44,8 @@
 #include "video_core/renderer_vulkan/descriptor_write_groups.h"
 #include "video_core/renderer_vulkan/upload_bytes_equal.h"
 #include "video_core/renderer_vulkan/immutable_upload_memo.h"
+#include "ryty_gpu/native/snapshot_backing_protocol.h"
+#include "common/scope_exit.h"
 #include "video_core/renderer_vulkan/snapshot_source_hints.h"
 #include "video_core/renderer_vulkan/freshness_range_search.h"
 #include "video_core/renderer_vulkan/draw_preparation_options.h"
@@ -904,7 +906,18 @@ struct NativeRenderer::SnapshotUploadMemo {
     ImmutableUploadMemo<std::pair<vk::Buffer, u64>, 1, 8, SnapshotMemoMaxBytes> memo;
     std::unique_ptr<u8[]> scratch;
     SnapshotSourceHints<8> hints;
-    void Clear() { memo.Clear(); hints.Clear(); }
+    SnapshotLease::RuntimePoison poison;
+    SnapshotLease::StateTable<SnapshotLease::RuntimePoison> leases{poison};
+    SnapshotLease::ListTokens tokens;
+    struct FailedProof { u64 address{}, size{}, epoch{}; };
+    std::array<FailedProof, 64> failed{};
+    u32 failed_cursor{};
+#ifndef NDEBUG
+    u64 lease_hits{}, lease_bytes{}, lease_armed{}, lease_rejected{};
+    u64 lease_unavailable{}, lease_poisoned{}, lease_mapping_rejected{}, lease_stack_rejected{};
+    u64 lease_protection_rejected{};
+#endif
+    void Clear() { memo.Clear(); hints.Clear(); tokens.Reset(); }
 };
 
 bool NativeModeRequested() {
@@ -1147,6 +1160,7 @@ void NativeRenderer::FinishNativeFsr(const Targets& targets) {
 }
 
 NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
+    SnapshotLease::BackingProtocol::Initialize();
     sampler_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
     if(PreparedSampledProofRequested())try {prepared_proof_contexts.Register(this);} catch(...) {}
     device = Native::Rhi::CreateVulkanDevice(r.instance);
@@ -2675,6 +2689,7 @@ void NativeRenderer::FlushWritebacks() {
         auto* entry = plan.entry;
         const VAddr address = entry->info.guest_address;
         const u64 size = entry->info.guest_size;
+        SnapshotLease::MarkUnsafe(address, size);
         if (use_batch && std::ranges::any_of(batch_ranges, [&](const auto& range) {
                 return address < range.second && range.first < address + size;
             })) {
@@ -3985,6 +4000,7 @@ void NativeRenderer::RecordRegionWriteback(const std::shared_ptr<WritebackPlan>&
         found->second.gpu_pages->insert(std::move(mark.node));
     }
     for (auto& part : plan.parts) {
+        SnapshotLease::MarkUnsafe(part.page, 4096);
         auto found = regions.find(part.region_begin);
         if (found == regions.end() || found->second.buffer.get() != part.region_buffer)
             UNREACHABLE_MSG("native writeback region changed after preflight");
@@ -4316,6 +4332,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
     if (size == 0) {
         return std::nullopt;
     }
+    if (write) SnapshotLease::MarkUnsafe(address, size);
     PhaseClock guest_clock{stats.guest_buffer_ns}; // NAT-145
     NATIVE_DIAGNOSTIC(++stats.guest_buffer_calls);
     last_mirror = nullptr; // OPT-004
@@ -4404,6 +4421,7 @@ static VAddr NativeInplaceFrom() {
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAddr address, u64 size,
                                                                             bool write,
                                                                             bool mirror) {
+    if (write) SnapshotLease::MarkUnsafe(address, size);
     last_bound = Bound::Region;
     // NAT-114: ranges in (or reaching into) a region use it.
     if (Region* region = RegionOver(address, size)) {
@@ -4527,6 +4545,147 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
         }();
         const u64 readable = Native::ReadablePrefix(reinterpret_cast<const void*>(address), size);
         const auto candidate = direct_compare && readable == size ? cache.hints.Candidate(address, size) : std::nullopt;
+        const SnapshotLease::Range source{address, size};
+        const auto source_pages = SnapshotLease::Pages(source);
+        const auto& protocol = SnapshotLease::BackingProtocol::Get();
+        std::optional<Native::CpuStackRegistry::Lease> source_stack;
+        std::optional<SnapshotLease::Id> capture_lease;
+        SnapshotLease::Mapping capture_before{};
+        bool new_lease = false, protected_source = false;
+        bool capture_committed = false;
+        SCOPE_EXIT {
+            if (capture_lease && new_lease && !capture_committed) {
+                // Failed/abandoned arming must not exhaust the bounded owner
+                // table. Release only metadata here; reconcile OS watches with
+                // every other live owner through the normal retirement path.
+                try {
+                    std::scoped_lock watch_lock{fill_watch_mutex};
+                    if (const auto pages = cache.leases.Release(*capture_lease)) {
+                        retired_watch_ranges.emplace_back(pages->address, pages->address + pages->size);
+                    }
+                } catch (...) {
+                    // Fail closed even during exception unwinding. Existing
+                    // page fault handling still owns any unreconciled watch.
+                    SnapshotLease::MarkUnsafe(address, size);
+                }
+            }
+        };
+        const auto reject_mapping = [&](u64 epoch) {
+            cache.failed[cache.failed_cursor++ % cache.failed.size()] = {address, size, epoch};
+        };
+        if (SnapshotLease::Requested() && protocol.Available() && source_pages &&
+            readable == size) {
+            source_stack.emplace(Native::CpuStacks());
+            const bool stack_allowed = source_stack->Allowed(
+                source_pages->address, source_pages->address + source_pages->size);
+            if (stack_allowed && candidate) {
+                const auto token = cache.tokens.Get(*candidate);
+                const auto fast = cache.memo.WithSlot(0, *candidate, size, [&](std::span<const u8>) {
+                    return cache.leases.ReuseChecked(token, cache.tokens.Epoch(), source, true,
+                        [&] { return protocol.ReadMapping(true); });
+                });
+                if (fast) {
+                    NATIVE_DIAGNOSTIC(++cache.lease_hits);
+                    NATIVE_DIAGNOSTIC(cache.lease_bytes += size);
+                    NATIVE_DIAGNOSTIC(++stats.snapshot_memo_hits);
+                    NATIVE_DIAGNOSTIC(stats.snapshot_upload_bytes_saved += size);
+                    return *fast;
+                }
+            }
+            if (!stack_allowed) {
+                NATIVE_DIAGNOSTIC(++cache.lease_stack_rejected);
+            } else if (!cache.poison.Safe(*source_pages)) {
+                NATIVE_DIAGNOSTIC(++cache.lease_poisoned);
+            } else {
+                const auto state = protocol.ReadMapping(false);
+                const bool failed_before = std::ranges::any_of(cache.failed, [&](const auto& item) {
+                    return item.epoch && item.epoch == state.epoch &&
+                           item.address == address && item.size == size;
+                });
+                if (state.idle && !failed_before) {
+                    capture_before = protocol.Query(source);
+                    if (SnapshotLease::Good(capture_before)) {
+                        // Synchronize owner insertion and page protection with watch
+                        // retirement. Metadata locks never span OS calls or copying.
+                        std::scoped_lock watch_lock{fill_watch_mutex};
+                        // Reserve before registering a new owner, so abandonment
+                        // cannot allocate from the scope-exit path.
+                        retired_watch_ranges.reserve(retired_watch_ranges.size() + 1);
+                        if (const auto owned = cache.leases.FindOwned(source)) {
+                            capture_lease = owned->id;
+                        } else {
+                            capture_lease = cache.leases.Begin(source, capture_before);
+                            new_lease = capture_lease.has_value();
+                        }
+                        if (capture_lease) {
+                            try {
+                                WatchPages(source_pages->address, source_pages->size);
+#ifdef _WIN32
+                                const DWORD previous_error = GetLastError();
+                                VAddr cursor = source_pages->address;
+                                const VAddr end = cursor + source_pages->size;
+                                unsigned count = 0;
+                                while (cursor < end && count++ < 512) {
+                                    MEMORY_BASIC_INFORMATION mbi{};
+                                    if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &mbi,
+                                                      sizeof(mbi)) ||
+                                        mbi.State != MEM_COMMIT || mbi.Type != MEM_MAPPED ||
+                                        (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) break;
+                                    const DWORD access = mbi.Protect & 0xff;
+                                    if (access != PAGE_READONLY && access != PAGE_EXECUTE_READ) break;
+                                    const VAddr begin = reinterpret_cast<VAddr>(mbi.BaseAddress);
+                                    if (begin > cursor || mbi.RegionSize > UINT64_MAX - begin ||
+                                        begin + mbi.RegionSize <= cursor) break;
+                                    cursor = std::min<VAddr>(end, begin + mbi.RegionSize);
+                                }
+                                protected_source = cursor == end;
+                                SetLastError(previous_error);
+#endif
+                            } catch (...) {
+                                protected_source = false;
+                            }
+                            if (!protected_source) {
+                                cache.leases.Invalidate(*capture_lease);
+                                reject_mapping(capture_before.epoch);
+                                NATIVE_DIAGNOSTIC(++cache.lease_protection_rejected);
+                            }
+                        } else {
+                            reject_mapping(capture_before.epoch);
+                        }
+                    } else {
+                        reject_mapping(state.epoch);
+                        NATIVE_DIAGNOSTIC(++cache.lease_mapping_rejected);
+                    }
+                }
+            }
+        } else if (SnapshotLease::Requested()) {
+            NATIVE_DIAGNOSTIC(++cache.lease_unavailable);
+        }
+        // This callback runs only after an exact comparison/capture established
+        // the current memo bytes. The upload binding remains owned by this list.
+        const auto certify = [&](size_t slot, bool exact) {
+            cache.tokens.Forget(static_cast<unsigned>(slot));
+            if (!capture_lease || !protected_source || !exact) {
+                if (capture_lease) cache.leases.Invalidate(*capture_lease);
+                return;
+            }
+            const auto after = protocol.ReadMapping(true);
+            std::optional<SnapshotLease::Id> id;
+            if (new_lease) {
+                if (cache.leases.Commit(*capture_lease, capture_before, after, true, true))
+                    id = capture_lease;
+            } else {
+                id = cache.leases.Renew(*capture_lease, capture_before, after, true, true);
+            }
+            if (!id) {
+                NATIVE_DIAGNOSTIC(++cache.lease_rejected);
+                return;
+            }
+            cache.tokens.Set(static_cast<unsigned>(slot),
+                cache.leases.Bind(*id, cache.tokens.Epoch(), source, capture_before, after, true, true));
+            capture_committed = true;
+            NATIVE_DIAGNOSTIC(++cache.lease_armed);
+        };
         if (candidate) {
             const auto hit = cache.memo.WithSlot(0, *candidate, size, [&](std::span<const u8> previous) {
                 NATIVE_DIAGNOSTIC(++stats.snapshot_direct_attempts);
@@ -4537,6 +4696,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
                 return ok && equal;
             });
             if (hit) {
+                certify(*candidate, true);
                 NATIVE_DIAGNOSTIC(++stats.snapshot_direct_hits);
                 NATIVE_DIAGNOSTIC(stats.snapshot_direct_bytes += size);
                 NATIVE_DIAGNOSTIC(++stats.snapshot_memo_hits);
@@ -4546,8 +4706,10 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
         }
         if (!cache.scratch) cache.scratch = std::make_unique_for_overwrite<u8[]>(SnapshotMemoMaxBytes);
         u8* const captured = cache.scratch.get();
+        bool exact_capture = readable == size;
         if (readable != 0 && !Core::RytyMemory::GuardedCopy(
                                  captured, reinterpret_cast<const void*>(address), readable)) {
+            exact_capture = false;
             r.memory->CopySparseMemory(address, captured, readable);
         }
         if (readable < size) std::memset(captured + readable, 0, size - readable);
@@ -4557,6 +4719,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
         });
         if (lookup.binding) {
             cache.hints.Remember(lookup.slot, address, size);
+            certify(lookup.slot, exact_capture);
             NATIVE_DIAGNOSTIC(++stats.snapshot_memo_hits);
             NATIVE_DIAGNOSTIC(stats.snapshot_upload_bytes_saved += size);
             return *lookup.binding;
@@ -4566,8 +4729,10 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
         std::memcpy(data, captured, size);
         const std::pair binding{buffer, offset};
         cache.hints.Forget(lookup.slot);
+        cache.tokens.Forget(static_cast<unsigned>(lookup.slot));
         if (cache.memo.Store(lookup, 0, bytes, binding)) {
             cache.hints.Remember(lookup.slot, address, size);
+            certify(lookup.slot, exact_capture);
         }
         return binding;
     }
@@ -5523,6 +5688,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                         in_place.Note(BoundKind(desc.is_written ? 4 : 3), base, size); // NAT-142
                     }
                     if (desc.is_written) {
+                        SnapshotLease::MarkUnsafe(base, size);
                         b.gpu_writes.emplace_back(base, size); // NAT-119
                     }
                 } else if (RegionOver(base, size)) {
@@ -10071,6 +10237,7 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                     info = {found->first, aligned, size + adjust};
                     b.writes_buffers |= desc.is_written;
                     if (desc.is_written) {
+                        SnapshotLease::MarkUnsafe(base, size);
                         b.gpu_writes.emplace_back(base, size); // NAT-119
                     }
                 } else {
@@ -11801,6 +11968,7 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
         return false;
     }
     std::scoped_lock lock{mutex};
+    SnapshotLease::MarkUnsafe(address, data.size());
     auto* direct = r.buffer_cache.GetDirectMemory();
     if (!direct || !direct->EnsureImported(address, data.size())) {
         return false;
@@ -12433,6 +12601,8 @@ void NativeRenderer::WatchPages(VAddr address, u64 size) {
 }
 
 void NativeRenderer::UnwatchPages(VAddr begin, VAddr end) {
+    // Invalidate before any owner opens the original view.
+    if (end > begin) SnapshotLease::MarkUnsafe(begin, end - begin);
     page_watches.Untrack(begin,end,[&](VAddr run,u64 bytes) {
         r.page_manager.UpdatePageWatchers(run,bytes,VideoCore::PageOp::Untrack);
     });
@@ -12441,6 +12611,13 @@ void NativeRenderer::UnwatchPages(VAddr begin, VAddr end) {
 void NativeRenderer::ReleaseUnusedWatches() {
     std::scoped_lock watch_lock{fill_watch_mutex};
     Native::SlowCallTrace<2> trace{true, "retired-page-watches", {"live-ranges", "unwatch"}};
+    if (snapshot_upload_memo && SnapshotLease::Requested()) {
+        const auto released = snapshot_upload_memo->leases.ReleaseUnsafe();
+        for (size_t i = 0; i < released.count; ++i) {
+            const auto range = released.ranges[i];
+            retired_watch_ranges.emplace_back(range.address, range.address + range.size);
+        }
+    }
     if (retired_watch_ranges.empty()) {
         return;
     }
@@ -12480,6 +12657,13 @@ void NativeRenderer::ReleaseUnusedWatches() {
         for (const auto& [base, mirror] : mirrors) {
             retain(mirror.begin, mirror.end);
         }
+        if (snapshot_upload_memo) {
+            const auto owned = snapshot_upload_memo->leases.AllOwnedRanges();
+            for (size_t i = 0; i < owned.count; ++i) {
+                const auto range = owned.ranges[i];
+                retain(range.address, range.address + range.size);
+            }
+        }
         std::ranges::sort(live);
         trace.Next(1, begin, end - begin);
         VAddr cursor = begin;
@@ -12497,6 +12681,7 @@ void NativeRenderer::ReleaseUnusedWatches() {
 }
 
 void NativeRenderer::OnCpuStack(VAddr address, u64 size) {
+    SnapshotLease::MarkUnsafe(address, size);
     // Queue forced mirror retirement before changing protection. If subsequent
     // invalidation throws, the failed registration still leaves conservative work.
     {
@@ -12540,6 +12725,7 @@ void NativeRenderer::FaultAhead(VAddr begin, VAddr end) {
                 ahead_pages.insert(page);
                 return true;
             }, [&](VAddr address, u64 bytes) {
+                SnapshotLease::MarkUnsafe(address, bytes);
                 r.page_manager.UpdatePageWatchers(address, bytes, VideoCore::PageOp::Untrack);
                 std::scoped_lock lock{region_dirty_mutex};
                 pending_region_writes.emplace_back(address, address + bytes);
@@ -12549,6 +12735,7 @@ void NativeRenderer::FaultAhead(VAddr begin, VAddr end) {
 }
 
 void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
+    SnapshotLease::MarkUnsafe(address, std::max<u64>(size, 1));
     // The written pages stop being watched (so they open up and the write goes on), and the
     // textures over them are uploaded again when next used (which watches them again).
     const VAddr begin = VideoCore::PageManager::GetPageAddr(address);
@@ -13806,6 +13993,19 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
     LOG_INFO(Render_Vulkan, "Snapshot direct compare: {} attempts, {} hits, {} faults, {} copy bytes avoided",
              stats.snapshot_direct_attempts, stats.snapshot_direct_hits, stats.snapshot_direct_faults,
              stats.snapshot_direct_bytes);
+    if (SnapshotLease::Requested() && snapshot_upload_memo) {
+        auto& cache = *snapshot_upload_memo;
+        LOG_INFO(Render_Vulkan,
+            "PERF-349 snapshot leases: hits={} bytes={} armed={} rejected={} unavailable={} "
+            "poisoned={} mapping={} stack={} protection={} early-write={} module-change={}",
+            cache.lease_hits, cache.lease_bytes, cache.lease_armed, cache.lease_rejected,
+            cache.lease_unavailable, cache.lease_poisoned, cache.lease_mapping_rejected,
+            cache.lease_stack_rejected, cache.lease_protection_rejected,
+            SnapshotLease::early_unsafe.load(), SnapshotLease::modules_changed.load());
+        cache.lease_hits = cache.lease_bytes = cache.lease_armed = cache.lease_rejected = 0;
+        cache.lease_unavailable = cache.lease_poisoned = cache.lease_mapping_rejected = 0;
+        cache.lease_stack_rejected = cache.lease_protection_rejected = 0;
+    }
     stats.snapshot_direct_attempts = stats.snapshot_direct_hits = stats.snapshot_direct_faults = stats.snapshot_direct_bytes = 0;
     stats.snapshot_memo_hits = stats.snapshot_memo_misses = stats.snapshot_upload_bytes_saved = 0;
     stats.record_ns = {};

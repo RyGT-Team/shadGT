@@ -916,7 +916,7 @@ struct NativeRenderer::SnapshotUploadMemo {
 #ifndef NDEBUG
     u64 lease_hits{}, lease_bytes{}, lease_armed{}, lease_rejected{};
     u64 lease_unavailable{}, lease_poisoned{}, lease_mapping_rejected{}, lease_stack_rejected{};
-    u64 lease_protection_rejected{};
+    u64 lease_protection_rejected{}, lease_capacity_rejected{}, lease_first_use_deferred{};
     std::array<u64, 9> poison_cause_calls{}, poison_cause_bytes{};
 #endif
     void Clear() { memo.Clear(); hints.Clear(); tokens.Reset(); }
@@ -4575,11 +4575,19 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
                 }
             }
         };
-        const auto reject_mapping = [&](u64 epoch) {
-            cache.failed[cache.failed_cursor++ % cache.failed.size()] = {address, size, epoch};
+        const auto reject_mapping = [&] {
+            // Our own re-protection can advance the epoch. Remember the state
+            // after the failed attempt, rather than immediately missing this
+            // negative cache on the following draw.
+            const auto after = protocol.ReadMapping(false);
+            if (after.idle && after.epoch)
+                cache.failed[cache.failed_cursor++ % cache.failed.size()] = {address, size, after.epoch};
         };
+        // First use already needs the original exact capture/upload. Arm only
+        // once the current list has an address/size candidate to reuse, rather
+        // than protecting one-off sources that may never be requested again.
         if (SnapshotLease::Requested() && protocol.Available() && source_pages &&
-            readable == size) {
+            readable == size && candidate) {
             source_stack.emplace(Native::CpuStacks());
             const bool stack_allowed = source_stack->Allowed(
                 source_pages->address, source_pages->address + source_pages->size);
@@ -4613,6 +4621,11 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
                     }
                 }
 #endif
+            } else if (!cache.leases.FindOwned(source) && !cache.leases.HasCapacityFor(source)) {
+                // This rejects only an optimization. Do not query, pin or
+                // change page protection for a range we cannot own; the exact
+                // comparison/copy path below remains authoritative.
+                NATIVE_DIAGNOSTIC(++cache.lease_capacity_rejected);
             } else {
                 const auto state = protocol.ReadMapping(false);
                 const bool failed_before = std::ranges::any_of(cache.failed, [&](const auto& item) {
@@ -4700,17 +4713,18 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
                                     retired_watch_ranges.emplace_back(source_pages->address,
                                         source_pages->address + source_pages->size);
                                 source_pin.reset();
-                                reject_mapping(state.epoch);
+                                reject_mapping();
                                 NATIVE_DIAGNOSTIC(++cache.lease_protection_rejected);
                             }
                     } else {
-                        reject_mapping(state.epoch);
+                        reject_mapping();
                         NATIVE_DIAGNOSTIC(++cache.lease_mapping_rejected);
                     }
                 }
             }
         } else if (SnapshotLease::Requested()) {
-            NATIVE_DIAGNOSTIC(++cache.lease_unavailable);
+            NATIVE_DIAGNOSTIC(if (!candidate) ++cache.lease_first_use_deferred;
+                              else ++cache.lease_unavailable);
         }
         // This callback runs only after an exact comparison/capture established
         // the current memo bytes. The upload binding remains owned by this list.
@@ -14065,14 +14079,16 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
         auto& cache = *snapshot_upload_memo;
         LOG_INFO(Render_Vulkan,
             "PERF-349 snapshot leases: hits={} bytes={} armed={} rejected={} unavailable={} "
-            "poisoned={} mapping={} stack={} protection={} early-write={} module-change={}",
+            "poisoned={} mapping={} stack={} protection={} capacity={} first-use={} early-write={} module-change={}",
             cache.lease_hits, cache.lease_bytes, cache.lease_armed, cache.lease_rejected,
             cache.lease_unavailable, cache.lease_poisoned, cache.lease_mapping_rejected,
-            cache.lease_stack_rejected, cache.lease_protection_rejected,
+            cache.lease_stack_rejected, cache.lease_protection_rejected, cache.lease_capacity_rejected,
+            cache.lease_first_use_deferred,
             SnapshotLease::early_unsafe.load(), SnapshotLease::modules_changed.load());
         cache.lease_hits = cache.lease_bytes = cache.lease_armed = cache.lease_rejected = 0;
         cache.lease_unavailable = cache.lease_poisoned = cache.lease_mapping_rejected = 0;
-        cache.lease_stack_rejected = cache.lease_protection_rejected = 0;
+        cache.lease_stack_rejected = cache.lease_protection_rejected = cache.lease_capacity_rejected = 0;
+        cache.lease_first_use_deferred = 0;
         if (SnapshotLease::PoisonTraceRequested()) {
             for (unsigned bit = 0; bit < cache.poison_cause_calls.size(); ++bit)
                 LOG_INFO(Render_Vulkan,

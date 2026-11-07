@@ -72,6 +72,20 @@ class StateTable {
 
 public:
     explicit StateTable(PoisonProvider& p) : poison(p) {}
+    // Advisory only: another owner may consume capacity before Begin. Existing
+    // owners do not need new capacity and must be checked separately.
+    bool HasCapacityFor(Range source) {
+        const auto pages = Pages(source);
+        if (!pages)
+            return false;
+        std::lock_guard lock(mutex);
+        if (owned > Budget || pages->size > Budget - owned || next_generation == 0)
+            return false;
+        for (const auto& lease : leases)
+            if (lease.state == State::Empty)
+                return true;
+        return false;
+    }
     std::optional<Id> Find(Range r) {
         std::lock_guard lock(mutex);
         for (uint32_t i = 0; i < leases.size(); ++i) {

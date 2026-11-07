@@ -35,6 +35,33 @@ inline bool PoisonTraceRequested() {
 inline constinit std::atomic<bool> protocol_initialized{false};
 inline constinit std::atomic<bool> early_unsafe{false};
 inline constinit std::atomic<bool> modules_changed{false};
+inline constinit std::atomic<std::uint32_t> driver_vendor{0};
+inline constinit std::atomic<bool> driver_ready{false};
+#ifdef _WIN32
+inline constinit std::atomic<HMODULE> driver_module{nullptr};
+inline constinit std::atomic<std::uint64_t> driver_next_poll{0};
+#endif
+inline bool DriverReady() {
+#ifdef _WIN32
+    const auto vendor = driver_vendor.load(std::memory_order_acquire);
+    if (!vendor) return false;
+    if (vendor != 0x10de) return true;
+    if (driver_ready.load(std::memory_order_acquire)) return true;
+    const auto now = GetTickCount64();
+    auto next = driver_next_poll.load(std::memory_order_relaxed);
+    if (now < next || !driver_next_poll.compare_exchange_strong(next, now + 100, std::memory_order_relaxed)) return false;
+    HMODULE module{};
+    const auto error = GetLastError();
+    const bool found = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"nvrtum64.dll", &module) != FALSE;
+    SetLastError(error);
+    if (!found) return false;
+    driver_module.store(module, std::memory_order_release);
+    driver_ready.store(true, std::memory_order_release);
+    return true;
+#else
+    return false;
+#endif
+}
 #if defined(_WIN32) && !defined(NDEBUG)
 // LDR_DLL_NOTIFICATION_DATA has identical loaded/unloaded member layouts.
 struct ModuleNoticeString { USHORT length; USHORT maximum_length; const wchar_t* buffer; };
@@ -171,15 +198,26 @@ struct BackingProtocol {
 #endif
     }
 
+    // Bridge selection only: trusted renderer aliases are safe to create once
+    // pre-write poisoning is published, even while reuse admission is deferred.
+    bool AliasBridgeAvailable() const {
+        return protocol_initialized.load(std::memory_order_acquire) && Requested() &&
+               version && version() == 2 && mark && renderer_alias &&
+               published_unsafe.load(std::memory_order_acquire) == mark;
+    }
+
     bool Available() const {
         return protocol_initialized.load(std::memory_order_acquire) &&
                !early_unsafe.load(std::memory_order_seq_cst) &&
                !modules_changed.load(std::memory_order_seq_cst) &&
-               Requested() && PrototypeCompatible() && version && state && query && mark && safe && renderer_alias &&
+               Requested() && PrototypeCompatible() && DriverReady() && version && state && query && mark && safe && renderer_alias &&
                protection_begin && protection_end && pin && release_pin && protect_clamped && version() == 2;
     }
 
-    static void Initialize() {
+    static void Initialize(std::uint32_t vendor) {
+        auto previous = std::uint32_t{0};
+        if (!vendor || (!driver_vendor.compare_exchange_strong(previous, vendor, std::memory_order_acq_rel) && previous != vendor))
+            modules_changed.store(true, std::memory_order_seq_cst);
         // Called on the initialization thread, before creating the native device
         // or installing watches. Fault handlers never perform lazy resolution.
         const auto& api = Get();
@@ -231,6 +269,8 @@ struct BackingProtocol {
 #endif
 
     static bool GuardWriterLifetime() {
+        // Do not instantiate the one-time guard while the driver is still cold.
+        if (!DriverReady()) return false;
         static const bool guarded = [] {
 #ifdef _WIN32
             if (!Get().Available()) return false;
@@ -248,6 +288,9 @@ struct BackingProtocol {
             if (!register_notification ||
                 register_notification(0, &ModuleNotification, nullptr, &cookie) < 0)
                 return false;
+            // Close the pre-registration unload race; any later unload revokes.
+            if (driver_vendor.load(std::memory_order_acquire) == 0x10de &&
+                GetModuleHandleW(L"nvrtum64.dll") != driver_module.load(std::memory_order_acquire)) return false;
             // Register first: a module arriving during capability attestation
             // must also revoke the proof, before that module is initialized.
             for (const char* name : {"libc.prx", "libkernel.prx", "libSceNet.prx",

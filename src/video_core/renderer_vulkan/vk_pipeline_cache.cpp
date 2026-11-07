@@ -62,6 +62,9 @@
 #include "core/memory.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/info.h"
+#ifndef NDEBUG
+#include "shader_recompiler/srt_arena_trace.h"
+#endif
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
@@ -1847,6 +1850,9 @@ bool ReplayTranslate(const Shader::Profile& profile, Shader::Pools& pools,
     } reset;
     auto runtime_info = spec.runtime_info;
     auto binding = spec.start;
+#ifndef NDEBUG
+    Shader::SrtArenaTrace::OriginScope arena_origin{Shader::SrtArenaTrace::Origin::CachedRebuild};
+#endif
     try {
         Common::RecoverableScope recoverable;
         const auto ir = Shader::TranslateProgram(params.code, pools, info, runtime_info, profile);
@@ -4048,6 +4054,9 @@ namespace Vulkan {
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
                                               Shader::Backend::Bindings& binding) {
+#ifndef NDEBUG
+    Shader::SrtArenaTrace::OriginScope arena_origin{Shader::SrtArenaTrace::Origin::Synchronous};
+#endif
     // FIX-044: translating a shader on the GPU thread holds the guest clocks; a PS4 runs
     // precompiled shaders, so the game never sees this time pass.
     Common::GuestClock::CompilePause hold;
@@ -5199,6 +5208,9 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
                                      const Shader::ShaderParams& params,
                                      const Shader::RuntimeInfo& runtime_info,
                                      const Shader::Backend::Bindings& start, bool speculative) {
+#ifndef NDEBUG
+    Shader::SrtArenaTrace::OriginScope arena_origin{speculative ? Shader::SrtArenaTrace::Origin::Speculative : Shader::SrtArenaTrace::Origin::Required};
+#endif
     static const bool reported=[] { LOG_INFO(Render_Vulkan, "CPU/compiler diagnostic batch mask {} (1 priority, 2 retry, 4 library futures, 8 descriptor hash)", CompileCpuBatchMask()); return true; }();
     (void)reported;
     auto& jobs = translate_jobs[params.hash];
@@ -6216,6 +6228,9 @@ void PipelineCache::RecoverAttributeFlags(Shader::Info& info,
                                           const Shader::ShaderParams& params,
                                           const Shader::RuntimeInfo& runtime_info,
                                           size_t perm_idx) {
+#ifndef NDEBUG
+    Shader::SrtArenaTrace::OriginScope arena_origin{Shader::SrtArenaTrace::Origin::Flags};
+#endif
     // FIX-012: a shader from a cache entry stored without its attribute loads/stores is
     // translated again for them (its stored SPIR-V is kept), because the rect/quad-list helper
     // shaders forward exactly the outputs these flags name. The entry is stored again with them.

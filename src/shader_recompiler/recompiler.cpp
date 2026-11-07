@@ -15,6 +15,9 @@
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
+#ifndef NDEBUG
+#include "shader_recompiler/srt_arena_trace.h"
+#endif
 
 namespace Shader {
 
@@ -305,6 +308,9 @@ static void NanTracePass(IR::Program& program, const Info& info) {
 
 IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Info& info,
                              RuntimeInfo& runtime_info, const Profile& device_profile) {
+#ifndef NDEBUG
+    SrtArenaTrace::FrontendScope arena_trace_scope;
+#endif
     auto profile = device_profile;
     // AMD explicit interpolation and KHR per-vertex arrays are alternative ABIs.
     // Both extensions may be enabled on the device, but a shader must select one.

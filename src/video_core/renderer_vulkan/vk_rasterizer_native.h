@@ -614,6 +614,8 @@ private:
     /// run share one barrier.
     static bool LdsBatchOn();
     static bool CaptureLdsReader(LdsReader& reader, const DrawBindings& bindings);
+    void BindGraphics(Stream& s, const GraphicsPipeline& pipeline,
+                      const std::shared_ptr<const void>& owner);
     /// PERF-GT7-060: the stream's waiting reader passes, after one full barrier, in their pass
     /// (reason: 0 another draw, 1 the pass ends, 2 the run's limit).
     void FlushLdsReaders(u32 reason);

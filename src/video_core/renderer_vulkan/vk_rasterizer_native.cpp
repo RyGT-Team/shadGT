@@ -2056,6 +2056,36 @@ bool NativeRenderer::CaptureLdsReader(LdsReader& reader, const DrawBindings& b) 
     return true;
 }
 
+void NativeRenderer::BindGraphics(Stream& s, const GraphicsPipeline& pipeline,
+                                  const std::shared_ptr<const void>& owner) {
+    const CmdBuf cmdbuf{s.cmd};
+    if (pipeline.UsesShaderObjects()) {
+        ASSERT_MSG(owner && owner.get() == &pipeline, "Shader object pipeline must outlive deferred recording");
+        static const bool delta = [] {
+            const char* env = std::getenv("RYGT_SO_DELTA");
+            std::error_code ec;
+            return !(env && env[0] == '0') && !std::filesystem::exists("so_delta.off", ec) && !ec;
+        }();
+        const bool known = delta && s.so_known && s.so_epoch == s.pipelines.InvalidationEpoch();
+        const auto previous = s.so_state;
+        const auto shaders = s.so_shaders;
+        const auto* bound = &pipeline;
+        cmdbuf.Run([bound, owner, known, previous, shaders](vk::CommandBuffer cmd) {
+            bound->BindShaderObjects(cmd, known ? &previous : nullptr, known ? &shaders : nullptr);
+        });
+        if (!known) s.pipelines.Invalidate();
+        s.so_epoch = s.pipelines.InvalidationEpoch();
+        s.so_known = true;
+        s.so_state = pipeline.GetShaderObjectState();
+        s.so_shaders = pipeline.ShaderObjects();
+    } else {
+        s.so_known = false;
+        s.pipelines.Graphics(pipeline.Handle(), [&] {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.Handle());
+        });
+    }
+}
+
 void NativeRenderer::FlushLdsReaders(u32) {
     Stream& s = stream;
     if (s.lds_readers.empty()) return;
@@ -2081,13 +2111,27 @@ void NativeRenderer::FlushLdsReaders(u32) {
     s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount=1,.pMemoryBarriers=&barrier});
     BeginRendering(resumed);
     s.render = current;
+#ifndef NDEBUG
+    int so018_kind = s.so_known ? 0 : 1;
+    const auto so018_writer_shaders = s.so_shaders;
+    vk::Pipeline so018_pipeline{};
+    u32 so018_readers = 0, so018_other = 0, so018_null = 0;
+#endif
     s.pipelines.Invalidate();
+    s.so_known = false;
     s.vertex_state_known = false;
     for (auto& reader : readers) {
         const auto& pipeline = *reader.pipeline;
-        s.pipelines.Graphics(pipeline.Handle(), [&] {
-            s.cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.Handle());
-        });
+#ifndef NDEBUG
+        if (pipeline.UsesShaderObjects()) {
+            ++so018_readers;
+            if (so018_pipeline) { so018_pipeline = vk::Pipeline{}; so018_kind = 2; ++so018_null; }
+            if (so018_kind != 0 || so018_writer_shaders != pipeline.ShaderObjects()) ++so018_other;
+        } else if (so018_pipeline != pipeline.Handle()) {
+            so018_pipeline = pipeline.Handle(); so018_kind = 1;
+        }
+#endif
+        BindGraphics(s, pipeline, reader.pipeline_owner);
         s.dynamic = reader.dynamic;
         s.dynamic.Invalidate();
         s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
@@ -2108,7 +2152,23 @@ void NativeRenderer::FlushLdsReaders(u32) {
         } else s.cmd.draw(reader.count, reader.instances, reader.vertex_offset, reader.first_instance);
         r.scheduler.DeferOperation([owner=std::move(reader.pipeline_owner)] {});
     }
+#ifndef NDEBUG
+    if (so018_readers) {
+        static std::atomic<u64> total_readers{}, total_other{}, total_null{};
+        static std::atomic<u32> logged{};
+        const u64 readers_so_far = total_readers += so018_readers;
+        const u64 other_so_far = total_other += so018_other;
+        const u64 null_so_far = total_null += so018_null;
+        if (so018_other) {
+            if (const u32 n = ++logged; n <= 5 || n % 500 == 0)
+                LOG_WARNING(Render_Vulkan, "SO-018: {} readers, {} shader object readers, {} previously wrong ({} after null); totals {}/{}/{} ({} runs)",
+                            readers.size(), so018_readers, so018_other, so018_null,
+                            readers_so_far, other_so_far, null_so_far, n);
+        }
+    }
+#endif
     s.pipelines.Invalidate();
+    s.so_known = false;
     s.dynamic.Invalidate();
     s.vertex_state_known = false;
 }
@@ -8817,31 +8877,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     retired_pipeline_owners.Hold(pipeline_owner);
     {
         PhaseClock part{stats.record_ns[4]};
-        if (!parallel_draw && pipeline->UsesShaderObjects()) {
-            auto owner = pipeline_owner;
-            ASSERT_MSG(owner, "Shader object pipeline must outlive deferred recording");
-            static const bool delta = [] {
-                const char* env = std::getenv("RYGT_SO_DELTA");
-                std::error_code ec;
-                return !(env && env[0] == '0') && !std::filesystem::exists("so_delta.off", ec) && !ec;
-            }();
-            const bool known = delta && s.so_known && s.so_epoch == s.pipelines.InvalidationEpoch();
-            const auto previous = s.so_state;
-            const auto shaders = s.so_shaders;
-            cmdbuf.Run([pipeline, owner = std::move(owner), known, previous, shaders](vk::CommandBuffer cmd) {
-                pipeline->BindShaderObjects(cmd, known ? &previous : nullptr, known ? &shaders : nullptr);
-            });
-            if (!known) s.pipelines.Invalidate();
-            s.so_epoch = s.pipelines.InvalidationEpoch();
-            s.so_known = true;
-            s.so_state = pipeline->GetShaderObjectState();
-            s.so_shaders = pipeline->ShaderObjects();
-        } else if (!parallel_draw) {
-            s.so_known = false;
-            s.pipelines.Graphics(pipeline->Handle(), [&] {
-                cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
-            });
-        }
+        if (!parallel_draw) BindGraphics(s, *pipeline, pipeline_owner);
     }
     {
         PhaseClock part{stats.record_ns[5]};
@@ -9069,9 +9105,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                         s.dynamic.Invalidate();
                         s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
                         RecordVertexIndex(*vi);
-                        s.pipelines.Graphics(pipeline->Handle(), [&] {
-                            s.cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
-                        });
+                        BindGraphics(s, *pipeline, pipeline_owner);
                         PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
                     }
                     push_scratch(address | 1);
@@ -9106,9 +9140,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 s.dynamic.Invalidate();
                 s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
                 RecordVertexIndex(*vi);
-                s.pipelines.Graphics(pipeline->Handle(), [&] {
-                    s.cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
-                });
+                BindGraphics(s, *pipeline, pipeline_owner);
                 PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
             }
             record_draw();

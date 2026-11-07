@@ -477,6 +477,7 @@ private:
 #ifndef NDEBUG
         u32 retry_retained{};
         u32 retry_unproven{};
+        u32 new_shader_deferred{};
 #endif
     } queued_state_stats;
     std::mutex on_screen_mutex;

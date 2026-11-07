@@ -2650,6 +2650,18 @@ static bool RetryBlockedReadAhead() {
     return enabled;
 }
 
+static bool ReadAheadNewShadersEnabled() {
+#ifndef RYTY_GPU
+    return true;
+#else
+    static const bool enabled = [] {
+        const char* value = std::getenv("RYGT_READ_AHEAD_NEW_SHADERS");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+#endif
+}
+
 bool PipelineCache::DirectOnlyRetryProgram(u64 hash) const {
     const auto program = program_cache.find(hash);
     if (program == program_cache.end() || !program->second) return false;
@@ -2848,10 +2860,10 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
         LOG_WARNING(Render_Vulkan,
                     "PERF-034 pipeline read-ahead in {:.1f} s: {} draw states from the command "
                     "thread evaluated, {} builds started, {:.1f} ms; {} draws waited for a build "
-                    "({:.1f} ms); {} pending; owned retries retained {}, unproven {}",
+                    "({:.1f} ms); {} pending; owned retries retained {}, unproven {}; new shader requests deferred {}",
                     std::chrono::duration<double>(now - stats.since).count(), stats.evaluated,
                     stats.started, stats.ms, stats.waits, stats.wait_ms, pending_builds.size(),
-                    stats.retry_retained, stats.retry_unproven);
+                    stats.retry_retained, stats.retry_unproven, stats.new_shader_deferred);
         stats = {};
         stats.since = now;
     }
@@ -5975,6 +5987,8 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
                 if (matched && fast_mode) RecordSpecInputs(permutation, info, runtime_info, binding);
             }
             if (matched &&
+                !(regs_override && !ReadAheadNewShadersEnabled() &&
+                  !info.attribute_flags_known && IsTessEmulatedDraw()) &&
                 !(AsyncTranslation() && !info.attribute_flags_known && IsTessEmulatedDraw())) {
                 if (!info.attribute_flags_known && IsTessEmulatedDraw()) {
                     RecoverAttributeFlags(info, permutation.spec, params, runtime_info,
@@ -6019,7 +6033,8 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         }
         // Old cache metadata needs a fresh translation to recover attribute flags.
         // Let the existing worker miss path do it instead of recompiling here.
-        if (AsyncTranslation() && !info.attribute_flags_known && IsTessEmulatedDraw()) {
+        if ((AsyncTranslation() || (regs_override && !ReadAheadNewShadersEnabled())) &&
+            !info.attribute_flags_known && IsTessEmulatedDraw()) {
             continue;
         }
         bool matches;
@@ -6079,6 +6094,14 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         return std::make_tuple(&info, permutation.module, HashCombine(params.hash, perm_idx));
     }
     match_timer.reset();
+    // A queued state owns registers, but not the guest resources they point to. Reuse
+    // known permutations for read-ahead; let the actual draw translate a new one.
+    if (regs_override && !ReadAheadNewShadersEnabled()) {
+#ifndef NDEBUG
+        ++queued_state_stats.new_shader_deferred;
+#endif
+        return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
+    }
     if (AsyncTranslation()) {
         // FIX-078: a translation the workers made for these inputs.
         const bool read_ahead = regs_override != nullptr;

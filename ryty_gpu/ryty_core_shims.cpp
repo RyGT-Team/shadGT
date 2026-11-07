@@ -897,7 +897,7 @@ void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms)
     // next, so protect each committed region of the range on its own. When the range is known to
     // be mapped, try it whole and then in 16 KB pieces (Ryty's view size) before asking Windows
     // where each region ends.
-    if (write) Vulkan::SnapshotLease::MarkUnsafe(virtual_addr, size);
+    if (write) Vulkan::SnapshotLease::MarkUnsafe(virtual_addr, size, 4);
     RytyMemory::NoteReadable(virtual_addr, size, read || execute);
     VAddr address = virtual_addr;
     const VAddr end = virtual_addr + size;
@@ -1061,7 +1061,7 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size,
     }
     // Aliases bypass protection on the original guest view. Invalidate before
     // any branch can copy, including the cached-alias fast path.
-    Vulkan::SnapshotLease::MarkUnsafe(virtual_addr, size);
+    Vulkan::SnapshotLease::MarkUnsafe(virtual_addr, size, 8);
 #ifndef NDEBUG
     RecordBackingWrite(virtual_addr, size, loc); // DIAG-071
 #endif

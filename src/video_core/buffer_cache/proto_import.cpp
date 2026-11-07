@@ -599,7 +599,7 @@ vk::Buffer ImportGuestView(const Vulkan::Instance& instance, VAddr address, u64 
         return {};
     }
     DWORD old;
-    Vulkan::SnapshotLease::MarkUnsafe(base, end - base);
+    Vulkan::SnapshotLease::MarkUnsafe(base, end - base, 4);
     if (!VirtualProtect(reinterpret_cast<void*>(base), end - base, PAGE_READWRITE, &old)) {
         return {};
     }

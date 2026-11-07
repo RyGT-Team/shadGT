@@ -920,6 +920,7 @@ struct NativeRenderer::SnapshotUploadMemo {
     u64 lease_hits{}, lease_bytes{}, lease_armed{}, lease_rejected{};
     u64 lease_unavailable{}, lease_poisoned{}, lease_mapping_rejected{}, lease_stack_rejected{};
     u64 lease_protection_rejected{};
+    std::array<u64, 9> poison_cause_calls{}, poison_cause_bytes{};
 #endif
     void Clear() { memo.Clear(); hints.Clear(); tokens.Reset(); }
 };
@@ -2693,7 +2694,7 @@ void NativeRenderer::FlushWritebacks() {
         auto* entry = plan.entry;
         const VAddr address = entry->info.guest_address;
         const u64 size = entry->info.guest_size;
-        SnapshotLease::MarkUnsafe(address, size);
+        SnapshotLease::MarkUnsafe(address, size, 16);
         if (use_batch && std::ranges::any_of(batch_ranges, [&](const auto& range) {
                 return address < range.second && range.first < address + size;
             })) {
@@ -4004,7 +4005,7 @@ void NativeRenderer::RecordRegionWriteback(const std::shared_ptr<WritebackPlan>&
         found->second.gpu_pages->insert(std::move(mark.node));
     }
     for (auto& part : plan.parts) {
-        SnapshotLease::MarkUnsafe(part.page, 4096);
+        SnapshotLease::MarkUnsafe(part.page, 4096, 16);
         auto found = regions.find(part.region_begin);
         if (found == regions.end() || found->second.buffer.get() != part.region_buffer)
             UNREACHABLE_MSG("native writeback region changed after preflight");
@@ -4336,7 +4337,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
     if (size == 0) {
         return std::nullopt;
     }
-    if (write) SnapshotLease::MarkUnsafe(address, size);
+    if (write) SnapshotLease::MarkUnsafe(address, size, 16);
     PhaseClock guest_clock{stats.guest_buffer_ns}; // NAT-145
     NATIVE_DIAGNOSTIC(++stats.guest_buffer_calls);
     last_mirror = nullptr; // OPT-004
@@ -4425,7 +4426,7 @@ static VAddr NativeInplaceFrom() {
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAddr address, u64 size,
                                                                             bool write,
                                                                             bool mirror) {
-    if (write) SnapshotLease::MarkUnsafe(address, size);
+    if (write) SnapshotLease::MarkUnsafe(address, size, 16);
     last_bound = Bound::Region;
     // NAT-114: ranges in (or reaching into) a region use it.
     if (Region* region = RegionOver(address, size)) {
@@ -4657,6 +4658,18 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
                 NATIVE_DIAGNOSTIC(++cache.lease_stack_rejected);
             } else if (!cache.poison.Safe(*source_pages)) {
                 NATIVE_DIAGNOSTIC(++cache.lease_poisoned);
+#ifndef NDEBUG
+                if (SnapshotLease::PoisonTraceRequested()) {
+                    const u32 causes = protocol.causes ? protocol.causes(address, size) : 0;
+                    for (unsigned bit = 0; bit < cache.poison_cause_calls.size(); ++bit) {
+                        const bool selected = bit == 8 ? causes == 0 : (causes & (1u << bit)) != 0;
+                        if (selected) {
+                            ++cache.poison_cause_calls[bit];
+                            cache.poison_cause_bytes[bit] += size;
+                        }
+                    }
+                }
+#endif
             } else {
                 const auto state = protocol.ReadMapping(false);
                 const bool failed_before = std::ranges::any_of(cache.failed, [&](const auto& item) {
@@ -5753,7 +5766,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                         in_place.Note(BoundKind(desc.is_written ? 4 : 3), base, size); // NAT-142
                     }
                     if (desc.is_written) {
-                        SnapshotLease::MarkUnsafe(base, size);
+                        SnapshotLease::MarkUnsafe(base, size, 16);
                         b.gpu_writes.emplace_back(base, size); // NAT-119
                     }
                 } else if (RegionOver(base, size)) {
@@ -10302,7 +10315,7 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                     info = {found->first, aligned, size + adjust};
                     b.writes_buffers |= desc.is_written;
                     if (desc.is_written) {
-                        SnapshotLease::MarkUnsafe(base, size);
+                        SnapshotLease::MarkUnsafe(base, size, 16);
                         b.gpu_writes.emplace_back(base, size); // NAT-119
                     }
                 } else {
@@ -12033,7 +12046,7 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
         return false;
     }
     std::scoped_lock lock{mutex};
-    SnapshotLease::MarkUnsafe(address, data.size());
+    SnapshotLease::MarkUnsafe(address, data.size(), 16);
     auto* direct = r.buffer_cache.GetDirectMemory();
     if (!direct || !direct->EnsureImported(address, data.size())) {
         return false;
@@ -12667,7 +12680,7 @@ void NativeRenderer::WatchPages(VAddr address, u64 size) {
 
 void NativeRenderer::UnwatchPages(VAddr begin, VAddr end) {
     // Invalidate before any owner opens the original view.
-    if (end > begin) SnapshotLease::MarkUnsafe(begin, end - begin);
+    if (end > begin) SnapshotLease::MarkUnsafe(begin, end - begin, 4);
     page_watches.Untrack(begin,end,[&](VAddr run,u64 bytes) {
         r.page_manager.UpdatePageWatchers(run,bytes,VideoCore::PageOp::Untrack);
     });
@@ -12746,7 +12759,7 @@ void NativeRenderer::ReleaseUnusedWatches() {
 }
 
 void NativeRenderer::OnCpuStack(VAddr address, u64 size) {
-    SnapshotLease::MarkUnsafe(address, size);
+    SnapshotLease::MarkUnsafe(address, size, 4);
     // Queue forced mirror retirement before changing protection. If subsequent
     // invalidation throws, the failed registration still leaves conservative work.
     {
@@ -12790,7 +12803,7 @@ void NativeRenderer::FaultAhead(VAddr begin, VAddr end) {
                 ahead_pages.insert(page);
                 return true;
             }, [&](VAddr address, u64 bytes) {
-                SnapshotLease::MarkUnsafe(address, bytes);
+                SnapshotLease::MarkUnsafe(address, bytes, 4);
                 r.page_manager.UpdatePageWatchers(address, bytes, VideoCore::PageOp::Untrack);
                 std::scoped_lock lock{region_dirty_mutex};
                 pending_region_writes.emplace_back(address, address + bytes);
@@ -12800,7 +12813,7 @@ void NativeRenderer::FaultAhead(VAddr begin, VAddr end) {
 }
 
 void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
-    SnapshotLease::MarkUnsafe(address, std::max<u64>(size, 1));
+    SnapshotLease::MarkUnsafe(address, std::max<u64>(size, 1), 2);
     // The written pages stop being watched (so they open up and the write goes on), and the
     // textures over them are uploaded again when next used (which watches them again).
     const VAddr begin = VideoCore::PageManager::GetPageAddr(address);
@@ -14098,6 +14111,15 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
         cache.lease_hits = cache.lease_bytes = cache.lease_armed = cache.lease_rejected = 0;
         cache.lease_unavailable = cache.lease_poisoned = cache.lease_mapping_rejected = 0;
         cache.lease_stack_rejected = cache.lease_protection_rejected = 0;
+        if (SnapshotLease::PoisonTraceRequested()) {
+            for (unsigned bit = 0; bit < cache.poison_cause_calls.size(); ++bit)
+                LOG_INFO(Render_Vulkan,
+                    "DIAG-350 poison-first-cause mask={} calls={} requested_bytes={}",
+                    bit == 8 ? 0u : 1u << bit,
+                    cache.poison_cause_calls[bit], cache.poison_cause_bytes[bit]);
+            cache.poison_cause_calls = {};
+            cache.poison_cause_bytes = {};
+        }
     }
     stats.snapshot_direct_attempts = stats.snapshot_direct_hits = stats.snapshot_direct_faults = stats.snapshot_direct_bytes = 0;
     stats.snapshot_memo_hits = stats.snapshot_memo_misses = stats.snapshot_upload_bytes_saved = 0;

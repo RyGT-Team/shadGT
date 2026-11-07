@@ -14,6 +14,17 @@
 namespace Vulkan::SnapshotLease {
 using UnsafeCallback = void (*)(std::uint64_t, std::uint64_t);
 inline constinit std::atomic<UnsafeCallback> published_unsafe{nullptr};
+#ifndef NDEBUG
+using TaggedUnsafeCallback = void (*)(std::uint64_t, std::uint64_t, std::uint32_t);
+inline constinit std::atomic<TaggedUnsafeCallback> published_tagged_unsafe{nullptr};
+inline bool PoisonTraceRequested() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("RYGT_SNAPSHOT_POISON_TRACE");
+        return value && value[0] == '1' && !value[1];
+    }();
+    return enabled;
+}
+#endif
 inline constinit std::atomic<bool> protocol_initialized{false};
 inline constinit std::atomic<bool> early_unsafe{false};
 inline constinit std::atomic<bool> modules_changed{false};
@@ -45,6 +56,11 @@ struct BackingProtocol {
     MarkFn mark{};
     SafeFn safe{};
     AliasFn renderer_alias{};
+#ifndef NDEBUG
+    TaggedUnsafeCallback tagged_mark{};
+    using CausesFn = std::uint32_t (*)(std::uint64_t, std::uint64_t);
+    CausesFn causes{};
+#endif
 
 #ifdef _WIN32
     static FARPROC Export(HMODULE module, const char* raw, const char* nid) {
@@ -66,6 +82,12 @@ struct BackingProtocol {
                 result.mark = reinterpret_cast<MarkFn>(Export(module, "RytySnapshotMarkUnsafe", "hZxVJ2Jdlec"));
                 result.safe = reinterpret_cast<SafeFn>(Export(module, "RytySnapshotRangeSafe", "BBa3HIGOhMQ"));
                 result.renderer_alias = reinterpret_cast<AliasFn>(Export(module, "RytySnapshotMapRendererAlias", "KY9dH6tnK5g"));
+#ifndef NDEBUG
+                result.tagged_mark = reinterpret_cast<TaggedUnsafeCallback>(
+                    Export(module, "RytySnapshotMarkUnsafeTagged", "zTrmAFyR-+A"));
+                result.causes = reinterpret_cast<CausesFn>(
+                    Export(module, "RytySnapshotUnsafeCauses", "nRxz39q9nH8"));
+#endif
             }
             SetLastError(previous_error);
 #endif
@@ -113,6 +135,10 @@ struct BackingProtocol {
             // handling, even when the optional protocol is not yet supported.
             std::uint64_t epoch{}, active{};
             if (api.state) api.state(&epoch, &active);
+#ifndef NDEBUG
+            if (PoisonTraceRequested())
+                published_tagged_unsafe.store(api.tagged_mark, std::memory_order_release);
+#endif
             published_unsafe.store(api.mark, std::memory_order_release);
         }
         protocol_initialized.store(true, std::memory_order_release);
@@ -179,8 +205,14 @@ struct RuntimePoison {
         const auto& api = BackingProtocol::Get();
         return api.Available() && api.safe(range.address, range.size) != 0;
     }
-    void MarkUnsafe(Range range) const {
+    void MarkUnsafe(Range range, std::uint32_t cause = 128) const {
         if (!range.size) return;
+#ifndef NDEBUG
+        if (const auto callback = published_tagged_unsafe.load(std::memory_order_acquire)) {
+            callback(range.address, range.size, cause);
+            return;
+        }
+#endif
         if (const auto callback = published_unsafe.load(std::memory_order_acquire)) {
             callback(range.address, range.size);
         } else {
@@ -189,8 +221,8 @@ struct RuntimePoison {
     }
 };
 
-inline void MarkUnsafe(std::uint64_t address, std::uint64_t size) {
-    RuntimePoison{}.MarkUnsafe({address, size});
+inline void MarkUnsafe(std::uint64_t address, std::uint64_t size, std::uint32_t cause = 64) {
+    RuntimePoison{}.MarkUnsafe({address, size}, cause);
 }
 
 } // namespace Vulkan::SnapshotLease

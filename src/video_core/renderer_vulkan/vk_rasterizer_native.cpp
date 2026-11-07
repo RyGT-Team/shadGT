@@ -7360,6 +7360,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
     ASSERT_MSG(PipelineOwnerMatches(pipeline, pipeline_owner), "Graphics pipeline owner mismatch");
+#ifndef NDEBUG
+    r.pipeline_cache.TraceRecorderSelected(*pipeline, DrawIndirectParams{
+        .vertex_sgpr_offset = 0, .instance_sgpr_offset = 0,
+        .tessellate_quads = quad_list && !quad_triangles, .is_indirect = false});
+#endif
 #if !defined(NDEBUG)
     // DIAG-152 (RYGT_NATIVE_SKIP_PS=<hex,...>): draws with these pixel shaders are skipped.
     static const std::vector<u64> skip_ps = [] {

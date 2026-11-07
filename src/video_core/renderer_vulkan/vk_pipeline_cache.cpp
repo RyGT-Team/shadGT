@@ -106,21 +106,47 @@ extern thread_local u64 g_diag_compiling_hash;
 namespace Vulkan {
 #ifndef NDEBUG
 // Used under the pipeline lookup lock. The allocation and all tracing are opt-in.
+static bool KeyTraceEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("RYGT_READ_AHEAD_KEY_TRACE");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+template<class Stages>
+static std::array<u64, MaxShaderStages> KeyTracePrograms(const Stages& stages) {
+    std::array<u64, MaxShaderStages> programs{};
+    for (size_t i = 0; i < programs.size() && i < stages.size(); ++i)
+        if (stages[i]) programs[i] = stages[i]->pgm_hash;
+    return programs;
+}
 ReadAheadKeyTrace* PipelineCache::KeyTrace() noexcept {
     if (!read_ahead_key_trace_initialized) {
         read_ahead_key_trace_initialized = true;
-        const char* value = std::getenv("RYGT_READ_AHEAD_KEY_TRACE");
-        if (value && value[0] == '1' && value[1] == '\0')
+        if (KeyTraceEnabled())
             read_ahead_key_trace.reset(new (std::nothrow) ReadAheadKeyTrace);
     }
     return read_ahead_key_trace.get();
+}
+void PipelineCache::TraceRecorderSelected(const GraphicsPipeline& pipeline,
+                                          const DrawIndirectParams& params) noexcept {
+    if (!KeyTraceEnabled()) return;
+    try {
+    std::unique_lock lock{lookup_mutex, std::try_to_lock};
+    if (!lock.owns_lock()) { ++read_ahead_key_trace_dropped; return; }
+    if (auto* trace = KeyTrace())
+        trace->RecorderSelected(pipeline.GetGraphicsKey(), KeyTracePrograms(pipeline.GetStages()),
+                                params.is_indirect, params.tessellate_quads);
+    else ++read_ahead_key_trace_dropped;
+    } catch (...) { ++read_ahead_key_trace_dropped; }
 }
 void PipelineCache::ReportKeyTrace() noexcept {
     try {
         auto* trace = KeyTrace();
         if (!trace) return;
         const auto s = trace->Take();
-        if (!s.ahead && !s.actual_observations) return;
+        const auto dropped = read_ahead_key_trace_dropped.exchange(0);
+        if (!s.ahead && !s.actual_observations && !s.recorder_selected && !dropped) return;
         std::string fields, stages;
         for (size_t i = 0; i < s.fields.size(); ++i)
             fields += fmt::format(" {}={}", ReadAheadKeyTrace::FieldNames[i], s.fields[i]);
@@ -128,12 +154,19 @@ void PipelineCache::ReportKeyTrace() noexcept {
             stages += fmt::format(" {}={}", i, s.stage_mismatch[i]);
         LOG_WARNING(Render_Vulkan, "AHEAD-KEY-TRACE bounded interval: ahead={} actual_hook_observations={} retained_ahead_first_demand={} evicted_undemanded={} evicted_demanded={}; first_diff:{}; no_same_stages_vs_latest:{}",
                     s.ahead, s.actual_observations, s.exact_later, s.evicted_undemanded, s.evicted_demanded, fields, stages);
+        LOG_WARNING(Render_Vulkan, "AHEAD-KEY-TRACE recorder_selected={} retained_first_selected={} evicted_unselected={} evicted_selected={} dropped_lock={} same_program_same_stage={} same_program_different_stage={} no_retained_program_match={} ahead_evaluation_params_direct/indirect/tess={}/{}/{} params_selected_direct/indirect/tess={}/{}/{}",
+                    s.recorder_selected, s.selected_first, s.evicted_unselected, s.evicted_selected, dropped, s.same_program_same_stages,
+                    s.same_program_different_stages, s.no_program_match, s.ahead_params[0], s.ahead_params[1],
+                    s.ahead_params[2], s.selected_params[0], s.selected_params[1], s.selected_params[2]);
         for (size_t i = 0; i < s.example_count; ++i) {
             const auto& e = s.examples[i];
-            LOG_WARNING(Render_Vulkan, "AHEAD-KEY-TRACE example first_diff={} ahead_key={:#x} actual_key={:#x} stages={:#x}/{:#x}/{:#x}/{:#x}/{:#x}",
-                        ReadAheadKeyTrace::FieldNames[e.field], std::hash<GraphicsPipelineKey>{}(e.ahead),
+            LOG_WARNING(Render_Vulkan, "AHEAD-KEY-TRACE example same_programs={} first_diff={} ahead_key={:#x} selected_key={:#x} ahead_stages={:#x}/{:#x}/{:#x}/{:#x}/{:#x} selected_stages={:#x}/{:#x}/{:#x}/{:#x}/{:#x} ahead_programs={:#x}/{:#x}/{:#x}/{:#x}/{:#x} selected_programs={:#x}/{:#x}/{:#x}/{:#x}/{:#x}",
+                        e.same_programs, ReadAheadKeyTrace::FieldNames[e.field], std::hash<GraphicsPipelineKey>{}(e.ahead),
                         std::hash<GraphicsPipelineKey>{}(e.actual), e.ahead.stage_hashes[0],
-                        e.ahead.stage_hashes[1], e.ahead.stage_hashes[2], e.ahead.stage_hashes[3], e.ahead.stage_hashes[4]);
+                        e.ahead.stage_hashes[1], e.ahead.stage_hashes[2], e.ahead.stage_hashes[3], e.ahead.stage_hashes[4],
+                        e.actual.stage_hashes[0], e.actual.stage_hashes[1], e.actual.stage_hashes[2], e.actual.stage_hashes[3], e.actual.stage_hashes[4],
+                        e.ahead_programs[0], e.ahead_programs[1], e.ahead_programs[2], e.ahead_programs[3], e.ahead_programs[4],
+                        e.actual_programs[0], e.actual_programs[1], e.actual_programs[2], e.actual_programs[3], e.actual_programs[4]);
         }
     } catch (...) { /* Diagnostics cannot affect rendering. */ }
 }
@@ -2630,7 +2663,9 @@ void PipelineCache::ReadAhead(const DrawIndirectParams params, bool restore) {
         }
         pending_builds.emplace(S().graphics_key, StartPipelineBuild(false));
 #ifndef NDEBUG
-        if (auto* trace = KeyTrace()) trace->Ahead(S().graphics_key);
+        if (auto* trace = KeyTrace()) trace->Ahead(S().graphics_key, KeyTracePrograms(S().infos),
+                                                   S().draw_indirect_params.is_indirect,
+                                                   S().draw_indirect_params.tessellate_quads);
 #endif
         ++started;
         return true;
@@ -2833,6 +2868,9 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
                 pending.value() = StartPipelineBuild(false);
 #ifndef NDEBUG
                 ++prewarm_stats.promoted;
+                if (auto* trace = KeyTrace()) trace->Ahead(S().graphics_key, KeyTracePrograms(S().infos),
+                                                           S().draw_indirect_params.is_indirect,
+                                                           S().draw_indirect_params.tessellate_quads);
 #endif
                 ++started;
             }
@@ -2840,7 +2878,9 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
         }
         pending_builds.emplace(S().graphics_key, StartPipelineBuild(false));
 #ifndef NDEBUG
-        if (auto* trace = KeyTrace()) trace->Ahead(S().graphics_key);
+        if (auto* trace = KeyTrace()) trace->Ahead(S().graphics_key, KeyTracePrograms(S().infos),
+                                                   S().draw_indirect_params.is_indirect,
+                                                   S().draw_indirect_params.tessellate_quads);
 #endif
         ++started;
         return true;

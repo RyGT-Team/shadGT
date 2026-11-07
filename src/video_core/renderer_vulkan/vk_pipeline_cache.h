@@ -168,6 +168,10 @@ public:
     LookupLock& LookupMutex() {
         return lookup_mutex;
     }
+#ifndef NDEBUG
+    // Diagnostic only: drops rather than waiting for the cache lookup lock.
+    void TraceRecorderSelected(const GraphicsPipeline& pipeline, const DrawIndirectParams& params) noexcept;
+#endif
     /// The infos the last GetGraphicsPipeline selected, with that draw's user data.
     const std::array<const Shader::Info*, MaxShaderStages>& SelectedInfos() const {
         return scratch_.infos;
@@ -475,6 +479,7 @@ private:
     void ReportKeyTrace() noexcept;
     std::unique_ptr<ReadAheadKeyTrace> read_ahead_key_trace;
     bool read_ahead_key_trace_initialized{};
+    std::atomic<u64> read_ahead_key_trace_dropped{};
 #endif
     struct QueuedStateStats {
         u32 evaluated{};

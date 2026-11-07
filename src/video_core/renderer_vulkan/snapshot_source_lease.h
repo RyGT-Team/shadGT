@@ -36,6 +36,19 @@ struct Mapping {
 inline bool Good(Mapping m) {
     return m.idle && m.capability && m.unique_backing && m.epoch;
 }
+// Reuse of a backing receipt never proves the source bytes unchanged. The
+// caller must obtain current from the live protocol and still perform capture.
+inline std::optional<Mapping> ReuseBackingReceipt(Range source, Range receipt_source,
+                                                   Mapping proven, Mapping current,
+                                                   bool source_safe) {
+    if (source.address != receipt_source.address || source.size != receipt_source.size ||
+        !source_safe || !Good(proven) || !current.idle || !current.capability || !current.epoch ||
+        current.epoch != proven.epoch)
+        return {};
+    U end{};
+    if (!End(source, end)) return {};
+    return Mapping{current.epoch, true, true, true};
+}
 struct Id {
     uint32_t slot{};
     U generation{};
@@ -104,6 +117,19 @@ public:
                 if (frame && frame > l.last_use_frame) l.last_use_frame = frame;
                 return OwnedLease{Id{i, l.generation}, l.state, l.map_epoch};
             }
+        }
+        return {};
+    }
+    // A valid owner records a proof for this exact source and epoch only.
+    // A successful result is a mapping receipt, not a content or token proof.
+    std::optional<Mapping> KnownBacking(Range source, Mapping current) {
+        if (!current.idle || !current.capability || !current.epoch) return {};
+        std::lock_guard lock(mutex);
+        for (const auto& l : leases) {
+            if (l.state == State::Valid && l.source.address == source.address &&
+                l.source.size == source.size && l.map_epoch == current.epoch &&
+                poison.Safe(l.pages))
+                return Mapping{current.epoch, true, true, true};
         }
         return {};
     }

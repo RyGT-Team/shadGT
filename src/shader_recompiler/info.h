@@ -136,6 +136,8 @@ struct Info : InfoPersistent {
     // Guest source address of each flattened dword, or zero for user data and unread slots.
     std::vector<u64> flattened_ud_src;
     PersistentSrtInfo srt_info;
+    // Outside the serialized POD: keeps executable walker storage alive across Info copies.
+    std::shared_ptr<void> srt_walker_owner;
 
     AttributeFlags loads{};
     AttributeFlags stores{};
@@ -244,6 +246,7 @@ struct Info : InfoPersistent {
         ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
         if (srt_info.walker_func) {
+            const auto walker_lease = srt_walker_owner;
             srt_info.walker_func(user_data.data(), flattened_ud_buf.data(),
                                  flattened_ud_src.data());
         }

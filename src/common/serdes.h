@@ -39,6 +39,11 @@ struct Archive {
         return container.size();
     }
 
+    [[nodiscard]] size_t RemainingBytes() const {
+        ASSERT_MSG(offset <= container.size(), "Invalid deserialization offset");
+        return container.size() - offset;
+    }
+
     u8* CurrPtr() {
         return container.data() + offset;
     }

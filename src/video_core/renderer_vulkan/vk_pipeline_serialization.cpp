@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <mutex>
@@ -463,8 +464,9 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
         // This byte was padding before quad-mask emulation, and need not have been zero.
         spec.runtime_info.hw.fs.quad_sample_mask = false;
     }
-    info.Deserialize(ar, perm_hash_ar,
-                     meta_version != Serialization::ShaderMetaVersionWithoutAttributeFlags);
+    if (!info.Deserialize(ar, perm_hash_ar,
+                          meta_version != Serialization::ShaderMetaVersionWithoutAttributeFlags))
+        return false;
     if (!StoredCubesFit(spec, info, face_cubes,
                         native_cube_cache_enabled.load(std::memory_order_relaxed))) return false;
     if (binary_version != ShaderBinaryVersionFor(spec, Serialization::UsesScalarPrefix(info))) {
@@ -565,7 +567,7 @@ bool Info::Deserialize(Serialization::Archive& ar, u64 walker_key, bool has_attr
         info.Read(stores.flags.data(), stores.flags.size());
     }
 
-    return srt_info.Deserialize(ar, walker_key);
+    return srt_info.Deserialize(ar, srt_walker_owner, walker_key);
 }
 
 void Gcn::FetchShaderData::Serialize(Serialization::Archive& ar) const {
@@ -598,18 +600,89 @@ void PersistentSrtInfo::Serialize(Serialization::Archive& ar) const {
     }
 }
 
-bool PersistentSrtInfo::Deserialize(Serialization::Archive& ar, u64 walker_key) {
+bool PersistentSrtInfo::Deserialize(Serialization::Archive& ar, std::shared_ptr<void>& owner, u64 walker_key) {
     Serialization::Reader srt{ar};
 
-    srt.Read(this, sizeof(*this));
-
-    if (walker_func_size) {
-        walker_func = RegisterWalkerCode(ar.CurrPtr(), walker_func_size, walker_key);
-        ar.Advance(walker_func_size);
+    PersistentSrtInfo loaded{};
+    if (ar.RemainingBytes() < sizeof(loaded)) return false;
+    srt.Read(&loaded, sizeof(loaded));
+    loaded.walker_func = nullptr; // Serialized process addresses are never valid here.
+    if (loaded.flattened_bufsize_dw < NUM_USER_DATA_REGS ||
+        loaded.flattened_bufsize_dw > UINT16_MAX) return false;
+    std::shared_ptr<void> next_owner;
+    if (loaded.walker_func_size) {
+        if (loaded.walker_func_size > ar.RemainingBytes()) return false;
+        auto code = RegisterWalkerCode(ar.CurrPtr(), loaded.walker_func_size, walker_key);
+        ar.Advance(loaded.walker_func_size);
+        loaded.walker_func = code.function;
+        next_owner = std::move(code.owner);
     }
+    *this = loaded;
+    owner = std::move(next_owner);
 
     return true;
 }
+
+#if defined(RYTY_GPU) && defined(_WIN32) && !defined(NDEBUG)
+// Exercises the actual cache reader and Info ownership against the built Debug DLL.
+extern "C" __declspec(dllexport) int RytySrtWalkerOwnershipSelfTest(char* report, int capacity) {
+    if (!report || capacity <= 0) return -1;
+    try {
+        static_assert(sizeof(PersistentSrtInfo) == 24);
+        static_assert(offsetof(PersistentSrtInfo, walker_func_size) == 8);
+        static_assert(offsetof(PersistentSrtInfo, flattened_bufsize_dw) == 16);
+        // SysV walker: copy UD[0] to flat[16] and its guest address to source[16].
+        constexpr u8 bytes[]{0x8B,0x07, 0x89,0x46,0x40,
+                             0x48,0x89,0xBA,0x80,0,0,0, 0xC3};
+        std::array<u32, NUM_USER_DATA_REGS> data{};
+        data[0] = 0x12345678;
+        Info original{};
+        original.user_data = data;
+        auto published = RegisterWalkerCode(bytes, sizeof(bytes), 0x339);
+        original.srt_info = {published.function, sizeof(bytes), NUM_USER_DATA_REGS + 1};
+        original.srt_walker_owner = std::move(published.owner);
+        Info copy = original;
+        original.srt_walker_owner.reset();
+        copy.RefreshFlatBuf();
+        if (copy.flattened_ud_buf[16] != data[0] ||
+            copy.flattened_ud_src[16] != reinterpret_cast<u64>(data.data())) return -2;
+        Serialization::Archive archive;
+        copy.srt_info.Serialize(archive);
+        auto wire = archive.TakeOff();
+        if (wire.size() != sizeof(PersistentSrtInfo) + sizeof(bytes) ||
+            std::memcmp(wire.data(), &copy.srt_info, sizeof(PersistentSrtInfo)) != 0) return -3;
+        Info loaded{};
+        loaded.user_data = data;
+        Serialization::Archive input{std::vector<u8>{wire}};
+        if (!loaded.srt_info.Deserialize(input, loaded.srt_walker_owner, 0x339) ||
+            !loaded.srt_walker_owner || loaded.srt_info.walker_func == copy.srt_info.walker_func) return -4;
+        copy.srt_walker_owner.reset();
+        loaded.RefreshFlatBuf();
+        if (loaded.flattened_ud_buf[16] != data[0] ||
+            loaded.flattened_ud_src[16] != reinterpret_cast<u64>(data.data())) return -5;
+        const auto keep_function = loaded.srt_info.walker_func;
+        const auto keep_owner = loaded.srt_walker_owner;
+        for (int which = 0; which < 4; ++which) {
+            auto damaged = wire;
+            if (which == 0) damaged.resize(sizeof(PersistentSrtInfo) - 1);
+            if (which == 1) damaged.resize(damaged.size() - 1);
+            if (which == 2) { const size_t huge = SIZE_MAX; std::memcpy(damaged.data() + 8, &huge, sizeof(huge)); }
+            if (which == 3) { const u32 huge = UINT32_MAX; std::memcpy(damaged.data() + 16, &huge, sizeof(huge)); }
+            Serialization::Archive bad{std::move(damaged)};
+            if (loaded.srt_info.Deserialize(bad, loaded.srt_walker_owner, 0x339) ||
+                loaded.srt_info.walker_func != keep_function || loaded.srt_walker_owner != keep_owner) return -6;
+            loaded.RefreshFlatBuf();
+            if (loaded.flattened_ud_buf[16] != data[0]) return -7;
+        }
+        std::snprintf(report, static_cast<size_t>(capacity),
+            "passed: legacy 24-byte wire record, owned Info copy, cached execution/address, distinct cached code, four malformed records preserve prior owner");
+        return 0;
+    } catch (const std::exception& e) {
+        std::snprintf(report, static_cast<size_t>(capacity), "failed: %s", e.what());
+        return -8;
+    }
+}
+#endif
 
 void StageSpecialization::Serialize(Serialization::Archive& ar) const {
     Serialization::Writer spec{ar};

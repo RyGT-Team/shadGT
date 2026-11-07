@@ -644,6 +644,15 @@ foreach(t ${TEST_TARGETS})
     target_compile_definitions(${t} PRIVATE BOOST_ASIO_STANDALONE)
 endforeach()
 
+# Stable executable walker storage, including allocation reuse and real x86 execution.
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|amd64)")
+    add_executable(shadgt_srt_walker_storage_test test_srt_walker_storage.cpp)
+    target_compile_features(shadgt_srt_walker_storage_test PRIVATE cxx_std_20)
+    target_include_directories(shadgt_srt_walker_storage_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(shadgt_srt_walker_storage_test PRIVATE xbyak::xbyak Threads::Threads)
+    add_test(NAME srt_walker_storage COMMAND shadgt_srt_walker_storage_test)
+endif()
+
 target_link_libraries(shadps4_settings_test PRIVATE
     GTest::gtest_main
     fmt::fmt

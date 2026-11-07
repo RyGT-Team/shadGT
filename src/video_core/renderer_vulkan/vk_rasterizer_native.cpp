@@ -4792,16 +4792,14 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
                             // capture checkpoint afterward, while the pin still
                             // excludes guest remap and semantic permission changes.
                             if (protected_source) {
-                                const auto current = protocol.ReadMapping(false);
-                                const auto receipt = SnapshotLease::ReuseBackingReceipt(
-                                    source, source, eligible, current, cache.poison.Safe(*source_pages));
-                                if (receipt) {
-                                    capture_before = *receipt;
-                                    NATIVE_DIAGNOSTIC(++cache.lease_backing_reused);
-                                } else {
-                                    capture_before = protocol.Query(source);
-                                    NATIVE_DIAGNOSTIC(++cache.lease_backing_queries);
-                                }
+                                // ProtectAndVerify verified read-only state and advanced
+                                // the epoch via re-protect. Now re-query backing uniqueness
+                                // with protocol.Query: ReadMapping(true) assumes uniqueness
+                                // without proof; a second guest address can map the same
+                                // section/offset after the initial query, and the source pin
+                                // does not exclude mutations at that other address.
+                                capture_before = protocol.Query(source);
+                                NATIVE_DIAGNOSTIC(++cache.lease_backing_queries);
                             }
                         }
                         if (SnapshotLease::Good(capture_before)) {

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 #include "upload_bytes_equal.h"
 
@@ -62,12 +63,19 @@ public:
 
     // Predicate is called synchronously while the current list owns this entry.
     template<class Predicate>
-    std::optional<Binding> WithLast(std::uint32_t stage, std::size_t size, Predicate&& predicate) const {
-        if (stage >= Stages || last[stage] >= Slots) return std::nullopt;
-        const auto& entry = entries[last[stage]];
+    std::optional<Binding> WithSlot(std::uint32_t stage, std::size_t slot, std::size_t size,
+                                    Predicate&& predicate) const {
+        if (stage >= Stages || slot >= Slots) return std::nullopt;
+        const auto& entry = entries[slot];
         if (!entry.valid || entry.stage != stage || entry.bytes.size() != size) return std::nullopt;
         if (!predicate(std::span<const std::uint8_t>{entry.bytes})) return std::nullopt;
         return entry.binding;
+    }
+
+    template<class Predicate>
+    std::optional<Binding> WithLast(std::uint32_t stage, std::size_t size, Predicate&& predicate) const {
+        if (stage >= Stages) return std::nullopt;
+        return WithSlot(stage, last[stage], size, std::forward<Predicate>(predicate));
     }
 
     bool Store(const Lookup& lookup, std::uint32_t stage,

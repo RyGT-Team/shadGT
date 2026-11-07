@@ -44,6 +44,7 @@
 #include "video_core/renderer_vulkan/descriptor_write_groups.h"
 #include "video_core/renderer_vulkan/upload_bytes_equal.h"
 #include "video_core/renderer_vulkan/immutable_upload_memo.h"
+#include "video_core/renderer_vulkan/snapshot_source_hints.h"
 #include "video_core/renderer_vulkan/freshness_range_search.h"
 #include "video_core/renderer_vulkan/draw_preparation_options.h"
 #include "video_core/renderer_vulkan/tess_lds_scratch.h"
@@ -902,10 +903,8 @@ constexpr size_t SnapshotMemoMaxBytes = 1_MB;
 struct NativeRenderer::SnapshotUploadMemo {
     ImmutableUploadMemo<std::pair<vk::Buffer, u64>, 1, 8, SnapshotMemoMaxBytes> memo;
     std::unique_ptr<u8[]> scratch;
-    VAddr last_address{};
-    u64 last_size{};
-    bool last_valid{};
-    void Clear() { memo.Clear(); last_valid = false; }
+    SnapshotSourceHints<8> hints;
+    void Clear() { memo.Clear(); hints.Clear(); }
 };
 
 bool NativeModeRequested() {
@@ -4527,9 +4526,9 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
             return !value || value[0] != '0';
         }();
         const u64 readable = Native::ReadablePrefix(reinterpret_cast<const void*>(address), size);
-        if (direct_compare && cache.last_valid && cache.last_address == address &&
-            cache.last_size == size && readable == size) {
-            const auto hit = cache.memo.WithLast(0, size, [&](std::span<const u8> previous) {
+        const auto candidate = direct_compare && readable == size ? cache.hints.Candidate(address, size) : std::nullopt;
+        if (candidate) {
+            const auto hit = cache.memo.WithSlot(0, *candidate, size, [&](std::span<const u8> previous) {
                 NATIVE_DIAGNOSTIC(++stats.snapshot_direct_attempts);
                 bool equal = false;
                 const bool ok = Core::RytyMemory::GuardedEqual(
@@ -4557,7 +4556,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
             return Native::Parallel::AdaptiveXXH3(data, length);
         });
         if (lookup.binding) {
-            cache.last_address = address; cache.last_size = size; cache.last_valid = true;
+            cache.hints.Remember(lookup.slot, address, size);
             NATIVE_DIAGNOSTIC(++stats.snapshot_memo_hits);
             NATIVE_DIAGNOSTIC(stats.snapshot_upload_bytes_saved += size);
             return *lookup.binding;
@@ -4566,9 +4565,9 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
         const auto [buffer, offset, data] = Allocate(size, r.instance.StorageMinAlignment());
         std::memcpy(data, captured, size);
         const std::pair binding{buffer, offset};
-        cache.last_valid = false;
+        cache.hints.Forget(lookup.slot);
         if (cache.memo.Store(lookup, 0, bytes, binding)) {
-            cache.last_address = address; cache.last_size = size; cache.last_valid = true;
+            cache.hints.Remember(lookup.slot, address, size);
         }
         return binding;
     }

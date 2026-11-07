@@ -921,6 +921,7 @@ struct NativeRenderer::SnapshotUploadMemo {
     u64 lease_hits{}, lease_bytes{}, lease_armed{}, lease_rejected{};
     u64 lease_unavailable{}, lease_poisoned{}, lease_mapping_rejected{}, lease_stack_rejected{};
     u64 lease_protection_rejected{}, lease_capacity_rejected{}, lease_first_use_deferred{}, lease_idle_retired{};
+    u64 lease_backing_reused{}, lease_backing_queries{};
     std::array<u64, 9> poison_cause_calls{}, poison_cause_bytes{};
 #endif
     void Clear() { memo.Clear(); hints.Clear(); tokens.Reset(); }
@@ -4695,7 +4696,14 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
                            item.address == address && item.size == size;
                 });
                 if (state.idle && !failed_before) {
-                    const auto eligible = protocol.Query(source);
+                    SnapshotLease::Mapping eligible{};
+                    if (const auto known = cache.leases.KnownBacking(source, state)) {
+                        eligible = *known;
+                        NATIVE_DIAGNOSTIC(++cache.lease_backing_reused);
+                    } else {
+                        eligible = protocol.Query(source);
+                        NATIVE_DIAGNOSTIC(++cache.lease_backing_queries);
+                    }
                     source_pin.reset(SnapshotLease::Good(eligible) ?
                         protocol.pin(source_pages->address, source_pages->size) : nullptr);
                     if (source_pin) {
@@ -4761,7 +4769,19 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
                             // Re-protection changes the epoch itself. Establish the
                             // capture checkpoint afterward, while the pin still
                             // excludes guest remap and semantic permission changes.
-                            capture_before = protected_source ? protocol.Query(source) : SnapshotLease::Mapping{};
+                            capture_before = {};
+                            if (protected_source) {
+                                const auto current = protocol.ReadMapping(false);
+                                const auto receipt = SnapshotLease::ReuseBackingReceipt(
+                                    source, source, eligible, current, cache.poison.Safe(*source_pages));
+                                if (receipt) {
+                                    capture_before = *receipt;
+                                    NATIVE_DIAGNOSTIC(++cache.lease_backing_reused);
+                                } else {
+                                    capture_before = protocol.Query(source);
+                                    NATIVE_DIAGNOSTIC(++cache.lease_backing_queries);
+                                }
+                            }
                             if (SnapshotLease::Good(capture_before)) {
                                 if (previous_owner) capture_lease = previous_owner->id;
                                 else {
@@ -14195,18 +14215,20 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
 #endif
         LOG_INFO(Render_Vulkan,
             "PERF-349 snapshot leases: hits={} bytes={} armed={} rejected={} unavailable={} "
-            "poisoned={} mapping={} stack={} protection={} capacity={} first-use={} idle-retired={} early-write={} module-change={}",
+            "poisoned={} mapping={} stack={} protection={} capacity={} first-use={} idle-retired={} proof-reused={} proof-queries={} early-write={} module-change={}",
             cache.lease_hits, cache.lease_bytes, cache.lease_armed, cache.lease_rejected,
             cache.lease_unavailable, cache.lease_poisoned, cache.lease_mapping_rejected,
             cache.lease_stack_rejected, cache.lease_protection_rejected, cache.lease_capacity_rejected,
             cache.lease_first_use_deferred,
             cache.lease_idle_retired,
+            cache.lease_backing_reused, cache.lease_backing_queries,
             SnapshotLease::early_unsafe.load(), SnapshotLease::modules_changed.load());
         cache.lease_hits = cache.lease_bytes = cache.lease_armed = cache.lease_rejected = 0;
         cache.lease_unavailable = cache.lease_poisoned = cache.lease_mapping_rejected = 0;
         cache.lease_stack_rejected = cache.lease_protection_rejected = cache.lease_capacity_rejected = 0;
         cache.lease_first_use_deferred = 0;
         cache.lease_idle_retired = 0;
+        cache.lease_backing_reused = cache.lease_backing_queries = 0;
         if (SnapshotLease::PoisonTraceRequested()) {
             for (unsigned bit = 0; bit < cache.poison_cause_calls.size(); ++bit)
                 LOG_INFO(Render_Vulkan,

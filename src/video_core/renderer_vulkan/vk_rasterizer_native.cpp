@@ -920,7 +920,7 @@ struct NativeRenderer::SnapshotUploadMemo {
 #ifndef NDEBUG
     u64 lease_hits{}, lease_bytes{}, lease_armed{}, lease_rejected{};
     u64 lease_unavailable{}, lease_poisoned{}, lease_mapping_rejected{}, lease_stack_rejected{};
-    u64 lease_protection_rejected{}, lease_capacity_rejected{}, lease_first_use_deferred{};
+    u64 lease_protection_rejected{}, lease_capacity_rejected{}, lease_first_use_deferred{}, lease_idle_retired{};
     std::array<u64, 9> poison_cause_calls{}, poison_cause_bytes{};
 #endif
     void Clear() { memo.Clear(); hints.Clear(); tokens.Reset(); }
@@ -4602,6 +4602,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
 #endif
         if (!snapshot_upload_memo) snapshot_upload_memo = std::make_unique<SnapshotUploadMemo>();
         auto& cache = *snapshot_upload_memo;
+        const u64 lease_frame = frame + (frame != UINT64_MAX);
         static const bool direct_compare = [] {
             const char* value = std::getenv("RYGT_NATIVE_SNAPSHOT_DIRECT_COMPARE");
             return !value || value[0] != '0';
@@ -4656,7 +4657,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
                 const auto token = cache.tokens.Get(*candidate);
                 const auto fast = cache.memo.WithSlot(0, *candidate, size, [&](std::span<const u8>) {
                     return cache.leases.ReuseChecked(token, cache.tokens.Epoch(), source, true,
-                        [&] { return protocol.ReadMapping(true); });
+                        [&] { return protocol.ReadMapping(true); }, lease_frame);
                 });
                 if (fast) {
                     NATIVE_DIAGNOSTIC(++cache.lease_hits);
@@ -4682,7 +4683,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
                     }
                 }
 #endif
-            } else if (!cache.leases.FindOwned(source) && !cache.leases.HasCapacityFor(source)) {
+            } else if (!cache.leases.FindOwned(source, lease_frame) && !cache.leases.HasCapacityFor(source)) {
                 // This rejects only an optimization. Do not query, pin or
                 // change page protection for a range we cannot own; the exact
                 // comparison/copy path below remains authoritative.
@@ -4704,7 +4705,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
                         // Reserve before registering a new owner, so abandonment
                         // cannot allocate from the scope-exit path.
                         retired_watch_ranges.reserve(retired_watch_ranges.size() + 1);
-                        const auto previous_owner = cache.leases.FindOwned(source);
+                        const auto previous_owner = cache.leases.FindOwned(source, lease_frame);
                         bool touched_watch = false;
                             try {
 #ifdef _WIN32
@@ -4764,7 +4765,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
                             if (SnapshotLease::Good(capture_before)) {
                                 if (previous_owner) capture_lease = previous_owner->id;
                                 else {
-                                    capture_lease = cache.leases.Begin(source, capture_before);
+                                    capture_lease = cache.leases.Begin(source, capture_before, lease_frame);
                                     new_lease = capture_lease.has_value();
                                 }
                             }
@@ -12764,6 +12765,16 @@ void NativeRenderer::ReleaseUnusedWatches() {
             const auto range = released.ranges[i];
             retired_watch_ranges.emplace_back(range.address, range.address + range.size);
         }
+        // Stale menu/race ranges must not permanently consume the bounded
+        // table. This removes source metadata only; upload bindings retain
+        // their own lifetime, and all live owners below still retain watches.
+        const auto idle = snapshot_upload_memo->leases.ReleaseUnused(
+            frame + (frame != UINT64_MAX), 120);
+        NATIVE_DIAGNOSTIC(snapshot_upload_memo->lease_idle_retired += idle.count);
+        for (size_t i = 0; i < idle.count; ++i) {
+            const auto range = idle.ranges[i];
+            retired_watch_ranges.emplace_back(range.address, range.address + range.size);
+        }
     }
     if (retired_watch_ranges.empty()) {
         return;
@@ -14184,16 +14195,18 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
 #endif
         LOG_INFO(Render_Vulkan,
             "PERF-349 snapshot leases: hits={} bytes={} armed={} rejected={} unavailable={} "
-            "poisoned={} mapping={} stack={} protection={} capacity={} first-use={} early-write={} module-change={}",
+            "poisoned={} mapping={} stack={} protection={} capacity={} first-use={} idle-retired={} early-write={} module-change={}",
             cache.lease_hits, cache.lease_bytes, cache.lease_armed, cache.lease_rejected,
             cache.lease_unavailable, cache.lease_poisoned, cache.lease_mapping_rejected,
             cache.lease_stack_rejected, cache.lease_protection_rejected, cache.lease_capacity_rejected,
             cache.lease_first_use_deferred,
+            cache.lease_idle_retired,
             SnapshotLease::early_unsafe.load(), SnapshotLease::modules_changed.load());
         cache.lease_hits = cache.lease_bytes = cache.lease_armed = cache.lease_rejected = 0;
         cache.lease_unavailable = cache.lease_poisoned = cache.lease_mapping_rejected = 0;
         cache.lease_stack_rejected = cache.lease_protection_rejected = cache.lease_capacity_rejected = 0;
         cache.lease_first_use_deferred = 0;
+        cache.lease_idle_retired = 0;
         if (SnapshotLease::PoisonTraceRequested()) {
             for (unsigned bit = 0; bit < cache.poison_cause_calls.size(); ++bit)
                 LOG_INFO(Render_Vulkan,

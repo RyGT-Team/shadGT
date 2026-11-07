@@ -50,6 +50,7 @@ struct Lease {
     Range source{}, pages{};
     U map_epoch{}, generation{};
     State state{};
+    U last_use_frame{};
 };
 struct OwnedRanges {
     std::array<Range, 64> ranges{};
@@ -95,14 +96,25 @@ public:
         }
         return {};
     }
-    std::optional<OwnedLease> FindOwned(Range r) {
+    std::optional<OwnedLease> FindOwned(Range r, U frame = 0) {
         std::lock_guard lock(mutex);
         for (uint32_t i = 0; i < leases.size(); ++i) {
-            const auto& l = leases[i];
-            if (l.state != State::Empty && l.source.address == r.address && l.source.size == r.size)
+            auto& l = leases[i];
+            if (l.state != State::Empty && l.source.address == r.address && l.source.size == r.size) {
+                if (frame && frame > l.last_use_frame) l.last_use_frame = frame;
                 return OwnedLease{Id{i, l.generation}, l.state, l.map_epoch};
+            }
         }
         return {};
+    }
+    bool Touch(Id id, U frame) {
+        std::lock_guard lock(mutex);
+        if (id.slot >= leases.size() || !Same(id, leases[id.slot]) ||
+            leases[id.slot].state != State::Valid)
+            return false;
+        auto& l = leases[id.slot];
+        if (frame && frame > l.last_use_frame) l.last_use_frame = frame;
+        return true;
     }
     OwnedRanges AllOwnedRanges() {
         std::lock_guard lock(mutex);
@@ -130,6 +142,24 @@ public:
         }
         return result;
     }
+    // Caller holds watch reconciliation lock, retains other owners and advances
+    // the mapping epoch before any pages are opened. No poison bits are cleared.
+    // Unstamped records and in-flight arming records are never expired.
+    OwnedRanges ReleaseUnused(U now, U max_idle) {
+        std::lock_guard lock(mutex);
+        OwnedRanges result;
+        if (!now) return result;
+        for (auto& lease : leases) {
+            if (lease.state == State::Empty || lease.state == State::Arming ||
+                !lease.last_use_frame || now < lease.last_use_frame ||
+                now - lease.last_use_frame <= max_idle)
+                continue;
+            result.ranges[result.count++] = lease.pages;
+            owned -= lease.pages.size;
+            lease.state = State::Empty;
+        }
+        return result;
+    }
     bool Invalidate(Id id) {
         std::lock_guard lock(mutex);
         if (id.slot >= leases.size() || !Same(id, leases[id.slot]) ||
@@ -138,7 +168,7 @@ public:
         leases[id.slot].state = State::Invalid;
         return true;
     }
-    std::optional<Id> Begin(Range r, Mapping m) {
+    std::optional<Id> Begin(Range r, Mapping m, U frame = 0) {
         auto pages = Pages(r);
         if (!pages || !Good(m) || !poison.Safe(*pages))
             return {};
@@ -148,7 +178,7 @@ public:
         for (uint32_t i = 0; i < leases.size(); ++i)
             if (leases[i].state == State::Empty) {
                 auto g = next_generation++;
-                leases[i] = {r, *pages, m.epoch, g, State::Arming};
+                leases[i] = {r, *pages, m.epoch, g, State::Arming, frame};
                 owned += pages->size;
                 return Id{i, g};
             }
@@ -221,15 +251,17 @@ public:
             return {};
         return {id, list_epoch, r.address, r.size, true};
     }
-    bool Reuse(Token t, U list_epoch, Range r, Mapping m, bool stack_allowed) {
+    bool Reuse(Token t, U list_epoch, Range r, Mapping m, bool stack_allowed, U usage_frame = 0) {
         std::lock_guard lock(mutex);
         if (!t.valid || !list_epoch || t.list_epoch != list_epoch || t.address != r.address ||
             t.size != r.size || t.id.slot >= leases.size())
             return false;
         auto& l = leases[t.id.slot];
-        return Same(t.id, l) && l.state == State::Valid && l.source.address == r.address &&
-               l.source.size == r.size && Good(m) && m.epoch == l.map_epoch && stack_allowed &&
-               poison.Safe(l.pages);
+        const bool valid = Same(t.id, l) && l.state == State::Valid && l.source.address == r.address &&
+                           l.source.size == r.size && Good(m) && m.epoch == l.map_epoch && stack_allowed &&
+                           poison.Safe(l.pages);
+        if (valid && usage_frame > l.last_use_frame) l.last_use_frame = usage_frame;
+        return valid;
     }
     // Runtime mapping receipts must bracket the first poison/lease check. A
     // final poison check catches writes concurrent with the second receipt.
@@ -237,13 +269,13 @@ public:
     // by the runtime; this component cannot prove those external guarantees.
     template <class ReadMapping>
     bool ReuseChecked(Token t, U list_epoch, Range r, bool stack_allowed,
-                      ReadMapping&& read_mapping) {
+                      ReadMapping&& read_mapping, U usage_frame = 0) {
         const Mapping before = read_mapping();
         if (!Reuse(t, list_epoch, r, before, stack_allowed))
             return false;
         const Mapping after = read_mapping();
         return Good(before) && Good(after) && before.epoch == after.epoch &&
-               Reuse(t, list_epoch, r, after, stack_allowed);
+               Reuse(t, list_epoch, r, after, stack_allowed, usage_frame);
     }
 };
 class ListTokens {

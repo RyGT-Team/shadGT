@@ -4636,8 +4636,10 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
                 });
                 if (state.idle && !failed_before) {
                     SnapshotLease::Mapping eligible{};
+                    bool known_backing = false;
                     if (const auto known = cache.leases.KnownBacking(source, state)) {
                         eligible = *known;
+                        known_backing = true;
                         NATIVE_DIAGNOSTIC(++cache.lease_backing_reused);
                     } else {
                         eligible = protocol.Query(source);
@@ -4654,6 +4656,26 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
                         retired_watch_ranges.reserve(retired_watch_ranges.size() + 1);
                         const auto previous_owner = cache.leases.FindOwned(source, lease_frame);
                         bool touched_watch = false;
+                        // Verify receipt still matches under the acquired pin. If protection
+                        // changed between KnownBacking and pin acquisition, the epoch advanced
+                        // and we must fall back to ProtectAndVerify to check read-only state.
+                        bool receipt_matches = false;
+                        if (known_backing) {
+                            const auto current = protocol.ReadMapping(false);
+                            const auto receipt = SnapshotLease::ReuseBackingReceipt(
+                                source, source, eligible, current, cache.poison.Safe(*source_pages));
+                            if (receipt) {
+                                capture_before = *receipt;
+                                receipt_matches = true;
+                                NATIVE_DIAGNOSTIC(++cache.lease_backing_reused);
+                            }
+                        }
+                        if (receipt_matches) {
+                            // Fast path: backing unchanged, receipt valid under pin.
+                            protected_source = true;
+                        } else {
+                            // Slow path: either no KnownBacking, or receipt invalidated by
+                            // protection change. Run full ProtectAndVerify to verify current state.
                             try {
 #ifdef _WIN32
                                 const DWORD previous_error = GetLastError();
@@ -4708,7 +4730,6 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
                             // Re-protection changes the epoch itself. Establish the
                             // capture checkpoint afterward, while the pin still
                             // excludes guest remap and semantic permission changes.
-                            capture_before = {};
                             if (protected_source) {
                                 const auto current = protocol.ReadMapping(false);
                                 const auto receipt = SnapshotLease::ReuseBackingReceipt(
@@ -4721,22 +4742,23 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
                                     NATIVE_DIAGNOSTIC(++cache.lease_backing_queries);
                                 }
                             }
-                            if (SnapshotLease::Good(capture_before)) {
-                                if (previous_owner) capture_lease = previous_owner->id;
-                                else {
-                                    capture_lease = cache.leases.Begin(source, capture_before, lease_frame);
-                                    new_lease = capture_lease.has_value();
-                                }
+                        }
+                        if (SnapshotLease::Good(capture_before)) {
+                            if (previous_owner) capture_lease = previous_owner->id;
+                            else {
+                                capture_lease = cache.leases.Begin(source, capture_before, lease_frame);
+                                new_lease = capture_lease.has_value();
                             }
-                            if (!capture_lease) {
-                                if (previous_owner) cache.leases.Invalidate(previous_owner->id);
-                                else if (touched_watch)
-                                    retired_watch_ranges.emplace_back(source_pages->address,
-                                        source_pages->address + source_pages->size);
-                                source_pin.reset();
-                                reject_mapping();
-                                NATIVE_DIAGNOSTIC(++cache.lease_protection_rejected);
-                            }
+                        }
+                        if (!capture_lease) {
+                            if (previous_owner) cache.leases.Invalidate(previous_owner->id);
+                            else if (touched_watch)
+                                retired_watch_ranges.emplace_back(source_pages->address,
+                                    source_pages->address + source_pages->size);
+                            source_pin.reset();
+                            reject_mapping();
+                            NATIVE_DIAGNOSTIC(++cache.lease_protection_rejected);
+                        }
                     } else {
                         reject_mapping();
                         NATIVE_DIAGNOSTIC(++cache.lease_mapping_rejected);

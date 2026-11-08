@@ -6291,6 +6291,15 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
         v.sizes.push_back(found ? size : 0);
         v.strides.push_back(guest.GetStride());
 #ifndef NDEBUG
+        if (SceneTrace::Id()) {
+            r.FrameDumpEvent(fmt::format(
+                "scene-vertex id={} program={:#x} binding={} address={:#x} descriptor_bytes={} stride={} data_format={} number_format={} vk_format={} buffer={:#x} offset={} range={}",
+                SceneTrace::Id(), pipeline.GetStage(Shader::SwStage::Vertex).pgm_hash,
+                index, base, sharp_size, guest.GetStride(), u32(guest.GetDataFmt()),
+                u32(guest.GetNumberFmt()), u32(v.attributes[index].format),
+                found ? GeometryTrace::HandleIdentity(static_cast<VkBuffer>(found->first)) : 0,
+                found ? found->second : 0, size));
+        }
         if (GeometryTrace::current) {
             GeometryTrace::Record("vertex_resolved", GeometryTrace::current,
                 index, found ? GeometryTrace::HandleIdentity(static_cast<VkBuffer>(found->first)) : 0,

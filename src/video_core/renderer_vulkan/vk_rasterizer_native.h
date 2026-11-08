@@ -349,6 +349,13 @@ private:
         bool dirty_sorted = true;
     };
     std::map<VAddr, Region> regions; ///< by begin; guarded by mutex
+#ifndef NDEBUG
+    struct GrassFrameVertex {
+        u64 id, address, offset, bytes;
+        VkBuffer buffer;
+    };
+    std::vector<GrassFrameVertex> grass_frame_vertices;
+#endif
     u64 regions_taken_in{}; ///< recorder: incremented whenever region storage is replaced
     std::mutex region_dirty_mutex;   ///< pending_region_writes (CPU write faults: any thread)
     std::vector<std::pair<VAddr, VAddr>> pending_region_writes;

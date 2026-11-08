@@ -6291,6 +6291,17 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
         v.sizes.push_back(found ? size : 0);
         v.strides.push_back(guest.GetStride());
 #ifndef NDEBUG
+        if (SceneTrace::Id() && pipeline.GetStage(Shader::SwStage::Vertex).pgm_hash == 0x5a5c405d &&
+            index == 7 && guest.GetStride() == 56 && found && grass_frame_vertices.size() < 16 &&
+            std::ranges::none_of(grass_frame_vertices, [&](const auto& item) {
+                return item.id == SceneTrace::Id();
+            })) {
+            const u64 bytes = std::min<u64>(size, 56 * 512) & ~u64{3};
+            if (bytes && !(found->second & 3)) {
+                grass_frame_vertices.push_back({SceneTrace::Id(), base, found->second, bytes,
+                                                static_cast<VkBuffer>(found->first)});
+            }
+        }
         if (GeometryTrace::current) {
             GeometryTrace::Record("vertex_resolved", GeometryTrace::current,
                 index, found ? GeometryTrace::HandleIdentity(static_cast<VkBuffer>(found->first)) : 0,
@@ -8990,6 +9001,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
 #endif
         if(SceneTrace::Id()) {
             const auto& d=s.dynamic;
+#ifndef NDEBUG
+            if (vs_info.pgm_hash == 0x5a5c405d) {
+                const auto& trace_key = pipeline->GetGraphicsKey();
+                r.FrameDumpEvent(fmt::format("scene-grass-pipeline id={} shader_objects={} effective_primitive={} vertex_stage_hash={:#x} quad_triangles={} actual_index_count={}",
+                    SceneTrace::Id(), pipeline->UsesShaderObjects(), u32(trace_key.prim_type),
+                    trace_key.stage_hashes[u32(Shader::SwStage::Vertex)], quad_triangles, vi->index_count));
+            }
+#endif
             r.FrameDumpEvent(fmt::format("scene-occlusion-registers id={} db_render={:08x} db_count={:08x} db_depth_view={:08x} db_override={:08x}",SceneTrace::Id(),regs.reg_array[0xA000],regs.reg_array[0xA001],regs.reg_array[0xA002],regs.reg_array[0xA003]));
             r.FrameDumpEvent(fmt::format("scene-draw id={} vs={:#x} ps={:#x} indices={} instances={} vertex_offset={} instance_offset={} depth_test={} depth_write={} compare={} bias_enable={} depth_bias={}/{}/{} cull={} front={} discard={} viewport_count={} depth_target={:#x} size={}x{} layers={}",
                 SceneTrace::Id(),vs_info.pgm_hash,fs?fs->pgm_hash:0,regs.num_indices,instances,vertex_offset,instance_offset,
@@ -13245,6 +13264,42 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
         u64 size;
     };
     std::vector<RegionReadback> region_readbacks;
+    struct GrassReadback {
+        GrassFrameVertex vertex;
+        std::unique_ptr<Native::Rhi::Buffer> buffer;
+        std::string status;
+    };
+    std::vector<GrassReadback> grass_readbacks;
+    // Frame-end data only: re-resolve ownership; never copy a remembered raw handle.
+    for (const auto& vertex : grass_frame_vertices) {
+        auto it = regions.upper_bound(vertex.address);
+        if (it == regions.begin()) {
+            grass_readbacks.push_back({vertex, {}, "no_region"});
+            continue;
+        }
+        const Region& region = std::prev(it)->second;
+        if (!region.buffer || vertex.address < region.begin || vertex.address >= region.end ||
+            vertex.bytes > region.end - vertex.address) {
+            grass_readbacks.push_back({vertex, {}, "no_containing_region"});
+            continue;
+        }
+        const u64 offset = vertex.address - region.begin;
+        const vk::Buffer source{Handle<VkBuffer_T>(region.buffer->NativeHandle())};
+        if (static_cast<VkBuffer>(source) != vertex.buffer || offset != vertex.offset) {
+            grass_readbacks.push_back({vertex, {}, "binding_changed"});
+            continue;
+        }
+        auto buffer = device->CreateBuffer({.size = vertex.bytes,
+            .usage = Native::Rhi::BufferUsageTransferDst,
+            .memory = Native::Rhi::MemoryKind::Readback, .name = "grass frame-end trace"});
+        if (!buffer || !buffer->Mapped()) {
+            grass_readbacks.push_back({vertex, {}, "allocation_failed"});
+            continue;
+        }
+        s.cmd.copyBuffer(source, vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
+                         vk::BufferCopy{.srcOffset = offset, .dstOffset = 0, .size = vertex.bytes});
+        grass_readbacks.push_back({vertex, std::move(buffer), "queued"});
+    }
     std::string region_manifest;
     // Prioritize small CPU-backed sampled textures before the image readback budget is spent.
     // These guest bytes are observed during this dump, not at texture upload time.
@@ -13371,6 +13426,29 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
     s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount=1,.pMemoryBarriers=&trace_to_host});
     Splice();
     r.scheduler.Finish();
+    std::string grass_manifest = "id,address,offset,bytes,status,file\n";
+    for (auto& readback : grass_readbacks) {
+        std::string filename;
+        if (readback.buffer) {
+            readback.buffer->Invalidate();
+            filename = fmt::format("grass-vertices-{}.bin", readback.vertex.id);
+            if (auto* file = std::fopen((dir / filename).string().c_str(), "wb")) {
+                const bool written = std::fwrite(readback.buffer->Mapped(), 1, readback.vertex.bytes, file) == readback.vertex.bytes;
+                const bool closed = std::fclose(file) == 0;
+                readback.status = written && closed ? "frame_end" : "write_failed";
+            } else {
+                readback.status = "open_failed";
+            }
+        }
+        grass_manifest += fmt::format("{},{:#x},{},{},{},{}\n", readback.vertex.id,
+            readback.vertex.address, readback.vertex.offset, readback.vertex.bytes,
+            readback.status, filename);
+    }
+    if (auto* file = std::fopen((dir / "grass-vertices.csv").string().c_str(), "w")) {
+        std::fwrite(grass_manifest.data(), 1, grass_manifest.size(), file);
+        std::fclose(file);
+    }
+    grass_frame_vertices.clear();
     for (const auto& readback : region_readbacks) {
         readback.buffer->Invalidate();
         if (auto* file = std::fopen((dir / (readback.stem + "-gpu.bin")).string().c_str(), "wb")) {

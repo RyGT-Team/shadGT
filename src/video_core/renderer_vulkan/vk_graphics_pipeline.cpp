@@ -1650,7 +1650,9 @@ void GraphicsPipeline::GetVertexInputs(
         const auto& attrib = fetch_shader.attributes[semantic];
         const auto step_rate = attrib.GetStepRate();
         const auto buffer = attrib.GetSharp(vs_info);
-        auto format = LiverpoolToVK::TrySurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt());
+        const auto code_buffer = attrib.GetSharpForCode(vs_info);
+        auto format =
+            LiverpoolToVK::TrySurfaceFormat(code_buffer.GetDataFmt(), code_buffer.GetNumberFmt());
         if (format == vk::Format::eUndefined) {
             // FIX-052: a garbage V# (data format 13 with number format 1 in a GT Sport race)
             // asserted and stopped the game. Its attribute reads four floats instead; the draw's

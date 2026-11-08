@@ -4151,7 +4151,7 @@ bool PipelineCache::RefreshGraphicsStages() {
         // Stride will still be handled outside the pipeline using dynamic state.
         u32 vertex_binding = 0;
         for (const auto& attrib : S().fetch_shader->attributes) {
-            const auto& buffer = attrib.GetSharp(*vs_info);
+            const auto buffer = attrib.GetSharpForCode(*vs_info);
             ASSERT_MSG(vertex_binding < MaxVertexBufferCount,
                        "Vertex attribute binding count exceeded limit: {} >= {}", vertex_binding,
                        MaxVertexBufferCount);

@@ -23,35 +23,38 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
+// Invalidate compiled shader binaries across all GPU families while keeping older metadata
+// discoverable for prewarm. LoadShaderMeta checks the exact binary version before reuse.
+static constexpr u32 ShaderBinaryRevision = Shader::Backend::PushDataLayoutRevision | 0x400u;
 // Synthetic dual-source exports change the fragment shader interface. Version 13 adds the
 // general swizzled factor blend, which also changes the runtime color-buffer layout.
-static constexpr u32 ShaderBinaryVersion = 271u + Shader::Backend::PushDataLayoutRevision;
+static constexpr u32 ShaderBinaryVersion = 271u + ShaderBinaryRevision;
 // Only masked fragment permutations need the extra push constants. Keep ordinary cached
 // shaders compatible; older renderers must skip the new permutations on rollback.
-static constexpr u32 ShaderBinaryVersionQuadSampleMask = 272u + Shader::Backend::PushDataLayoutRevision;
-static constexpr u32 ShaderBinaryVersionMsaaRead = 273u + Shader::Backend::PushDataLayoutRevision;
-static constexpr u32 ShaderBinaryVersionMsaaReadQuadSampleMask = 274u + Shader::Backend::PushDataLayoutRevision;
+static constexpr u32 ShaderBinaryVersionQuadSampleMask = 272u + ShaderBinaryRevision;
+static constexpr u32 ShaderBinaryVersionMsaaRead = 273u + ShaderBinaryRevision;
+static constexpr u32 ShaderBinaryVersionMsaaReadQuadSampleMask = 274u + ShaderBinaryRevision;
 // Scalar-pointer compute loads support bounded prefixes and prologue table loads.
-static constexpr u32 ShaderBinaryVersionScalarPrefix = 275u + Shader::Backend::PushDataLayoutRevision;
-static constexpr u32 ShaderBinaryVersionScalarPrefixMsaaRead = 276u + Shader::Backend::PushDataLayoutRevision;
+static constexpr u32 ShaderBinaryVersionScalarPrefix = 275u + ShaderBinaryRevision;
+static constexpr u32 ShaderBinaryVersionScalarPrefixMsaaRead = 276u + ShaderBinaryRevision;
 // Vertex fetch conversion/swizzles must agree with the invalid-descriptor cache policy.
-static constexpr u32 ShaderBinaryVersionVertexFetch = 277u + Shader::Backend::PushDataLayoutRevision;
+static constexpr u32 ShaderBinaryVersionVertexFetch = 277u + ShaderBinaryRevision;
 // Shader semantic revision 0x100 invalidates binaries emitted before the MED3 quiet-NaN fix.
 // Fragment reflections use cube views; other stages keep their existing array path.
-static constexpr u32 ShaderBinaryVersionNativeCube = 279u + Shader::Backend::PushDataLayoutRevision;
+static constexpr u32 ShaderBinaryVersionNativeCube = 279u + ShaderBinaryRevision;
 // AMD single-sample KHR barycentrics change the fragment interface and interpolation.
-static constexpr u32 ShaderBinaryVersionSingleSampleBarycentric = 282u + Shader::Backend::PushDataLayoutRevision;
+static constexpr u32 ShaderBinaryVersionSingleSampleBarycentric = 282u + ShaderBinaryRevision;
 // Tessellation modules and keys must use the same translation-time layout.
-static constexpr u32 ShaderBinaryVersionTessellationLayout = 283u + Shader::Backend::PushDataLayoutRevision;
-static constexpr u32 ShaderBinaryVersionTessellationMip = 286u + Shader::Backend::PushDataLayoutRevision;
-static constexpr u32 ShaderBinaryVersionTessellationNoMip = 287u + Shader::Backend::PushDataLayoutRevision;
+static constexpr u32 ShaderBinaryVersionTessellationLayout = 283u + ShaderBinaryRevision;
+static constexpr u32 ShaderBinaryVersionTessellationMip = 286u + ShaderBinaryRevision;
+static constexpr u32 ShaderBinaryVersionTessellationNoMip = 287u + ShaderBinaryRevision;
 // FIX-335: LDS readers branch before input loads and use bounded, padded scratch.
 // Only emulated TCS modules change; unrelated stored shaders remain compatible.
-static constexpr u32 ShaderBinaryVersionTessellationLdsBoundsMip = 288u + Shader::Backend::PushDataLayoutRevision;
-static constexpr u32 ShaderBinaryVersionTessellationLdsBoundsNoMip = 289u + Shader::Backend::PushDataLayoutRevision;
+static constexpr u32 ShaderBinaryVersionTessellationLdsBoundsMip = 288u + ShaderBinaryRevision;
+static constexpr u32 ShaderBinaryVersionTessellationLdsBoundsNoMip = 289u + ShaderBinaryRevision;
 // FIX-223: fragment shaders whose discards end the pixel (AMD). 285: FIX-GTS-011 keeps some
 // shaders' discarded pixels as helpers again.
-static constexpr u32 ShaderBinaryVersionDiscardKill = 285u + Shader::Backend::PushDataLayoutRevision;
+static constexpr u32 ShaderBinaryVersionDiscardKill = 285u + ShaderBinaryRevision;
 
 static bool UsesScalarPrefix(const Shader::Info& info) {
     return info.hw_stage == Shader::HwStage::Compute &&
@@ -171,7 +174,7 @@ static bool IsKnownShaderBinaryVersion(u32 version) {
     version |= 0x100u;
     // Old metadata remains discoverable for prewarm and index reservation. The
     // exact comparison in LoadShaderMeta still rejects its incompatible SPIR-V.
-    version |= Shader::Backend::PushDataLayoutRevision;
+    version |= Serialization::ShaderBinaryRevision;
     if (version == Serialization::ShaderBinaryVersionTessellationLdsBoundsMip ||
         version == Serialization::ShaderBinaryVersionTessellationLdsBoundsNoMip ||
         version == Serialization::ShaderBinaryVersionTessellationMip ||

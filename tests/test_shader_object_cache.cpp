@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -63,6 +64,19 @@ TEST(ShaderObjectCache, BlendedHudAndLdsEmulationDefaultToPipelines) {
     EXPECT_FALSE(ShaderObjectPolicyAllows(false, 0, 0, 1));
     EXPECT_TRUE(ShaderObjectPolicyAllows(true, 0, 0, 1));
     EXPECT_TRUE(ShaderObjectPolicyAllows(true, 0, 1, 0));
+}
+
+TEST(ShaderObjectCache, LinkingDefaultsAndOverrides) {
+    using Vulkan::ShaderObjectLinkingEnabled;
+    for (const auto [vendor, default_link] :
+         {std::pair{0x10deu, false}, std::pair{0x1002u, true}, std::pair{0x8086u, true}}) {
+        EXPECT_EQ(ShaderObjectLinkingEnabled(vendor, nullptr), default_link);
+        EXPECT_EQ(ShaderObjectLinkingEnabled(vendor, ""), default_link);
+        EXPECT_FALSE(ShaderObjectLinkingEnabled(vendor, "0"));
+        EXPECT_FALSE(ShaderObjectLinkingEnabled(vendor, "0extra"));
+        EXPECT_TRUE(ShaderObjectLinkingEnabled(vendor, "1"));
+        EXPECT_TRUE(ShaderObjectLinkingEnabled(vendor, "other"));
+    }
 }
 
 TEST(ShaderObjectCache, RejectsUncheckedLegacyBinary) {

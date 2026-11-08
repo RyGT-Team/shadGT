@@ -1260,13 +1260,18 @@ bool GraphicsPipeline::CreateShaderObjects(
     constexpr std::array<vk::ShaderStageFlagBits, 4> stage_bits{
         vk::ShaderStageFlagBits::eVertex, vk::ShaderStageFlagBits::eTessellationControl,
         vk::ShaderStageFlagBits::eTessellationEvaluation, vk::ShaderStageFlagBits::eFragment};
-    // SO-007: the stages are made together, linked (RYGT_SO_LINK=0: each on its own), so the
-    // driver sees the whole set as it does a pipeline's: it can merge the stages the GPU runs as
-    // one program and drop what the next stage never reads. SO-006: for independent-sets layouts.
-    static const bool link = [] {
-        const char* env = std::getenv("RYGT_SO_LINK");
-        return !(env && env[0] == '0');
-    }();
+    // SO-007: link stages by default except on NVIDIA, where GTS grass was correct with
+    // unlinked objects. RYGT_SO_LINK explicitly overrides the default. The flags enter the
+    // cache key below. SO-006: for independent-sets layouts.
+    const char* link_override = std::getenv("RYGT_SO_LINK");
+    const bool link = ShaderObjectLinkingEnabled(instance.GetVendorID(), link_override);
+#ifndef NDEBUG
+    static std::atomic<bool> link_logged{};
+    if (!link_logged.exchange(true)) {
+        LOG_WARNING(Render_Vulkan, "SO-LINK: linked={} vendor={:#x} override={}", link,
+                    instance.GetVendorID(), link_override && *link_override ? link_override : "default");
+    }
+#endif
     vk::ShaderCreateFlagsEXT flags{};
     if (link) {
         flags |= vk::ShaderCreateFlagBitsEXT::eLinkStage;

@@ -28,6 +28,20 @@ image_memory_requirements measures uncached small-image memory requirement queri
 temporary image creation on the fallback path; E fields contain footprint and dedicated flag.
 These events do not cover all presenter auxiliary views, swapchain images, or ImGui images.
 Present B fields are frame pointer, reuse flag, game-frame flag, and anti-lag frame token.
+Upload pool spans use upload_take B fields a=requested bytes and b=known completed tick;
+its E fields are a=1 for pool reuse or 0 for a new allocation, and b=selected capacity.
+The span starts after the existing optional timeline refresh, so it excludes refresh time.
+upload_free_before_reclaim and upload_free_after_reclaim B fields are parent span ID,
+free count, free bytes, fitting count, and smallest fitting capacity. Each is followed by
+upload_retiring with parent ID, retiring count, retiring bytes, oldest retire tick (zero
+if empty), and known completed tick. These snapshots describe cached free and retiring
+chunks, not all active chunks. upload_create_buffer B fields are parent ID, requested
+bytes and planned capacity; E fields are success flag and actual buffer capacity. Each
+allocation attempt, including recovery attempts, receives a separate span.
+Upload events can be frequent and add pool-walk overhead while capture is active. Check
+the trace drop count and capture-window coverage before interpreting missing events.
+The retiring totals do not identify which in-flight chunks fit, or independently show
+whether a completed chunk was evicted by the free-pool budget.
 Frame-prepared B fields are sequence and guest address; timestamps are correlation anchors,
 not a guaranteed one-to-one link between the sequence and present pointer.
 

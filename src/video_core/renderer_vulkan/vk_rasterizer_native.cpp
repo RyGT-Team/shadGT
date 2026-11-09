@@ -2936,11 +2936,32 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
         semaphore->Refresh();
     }
     const u64 known = semaphore->KnownGpuTick();
+    ImageLife::Scope pool_trace{"upload_take", size, known};
+    // Only walk the pool during an active bounded capture. These are CPU-side
+    // sizes and already-known timeline values, not additional GPU queries.
+    const auto trace_pool = [&](const char* label) {
+        if (!pool_trace.Active()) return;
+        u64 free_bytes = 0, retiring_bytes = 0, fits = 0, best = 0, oldest = 0;
+        for (const auto& item : free_chunks) {
+            const u64 bytes = item.buffer->Size();
+            free_bytes += bytes;
+            if (bytes >= size) { ++fits; if (!best || bytes < best) best = bytes; }
+        }
+        for (const auto& item : retiring_chunks) {
+            retiring_bytes += item.buffer->Size();
+            if (!oldest || item.retire_tick < oldest) oldest = item.retire_tick;
+        }
+        ImageLife::Scope free_info{label, pool_trace.Id(), free_chunks.size(), free_bytes, fits, best};
+        ImageLife::Scope retiring_info{"upload_retiring", pool_trace.Id(), retiring_chunks.size(),
+                                        retiring_bytes, oldest, known};
+    };
+    trace_pool("upload_free_before_reclaim");
     // Loading can briefly need hundreds of MiB of upload chunks. Keep a bounded
     // reserve once their GPU work finishes instead of retaining that peak forever.
     trace.Next(2);
     trace.Next(3);
     CacheCompletedUploadChunks(free_chunks, retiring_chunks, known);
+    trace_pool("upload_free_after_reclaim");
     free_chunks_low = std::min(free_chunks_low, free_chunks.size());
     trace.Next(4);
     auto fit = free_chunks.end();
@@ -2952,20 +2973,24 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
         Chunk chunk = std::move(*fit);
         free_chunks.erase(fit);
         free_chunks_low = std::min(free_chunks_low, free_chunks.size());
+        pool_trace.Finish(1, chunk.buffer->Size());
         return chunk;
     }
     Chunk chunk;
     trace.Next(5);
+    const u64 capacity = UploadChunkCapacity(size, ChunkSize());
     const auto create = [&] {
         Chunk result;
+        ImageLife::Scope create_trace{"upload_create_buffer", pool_trace.Id(), size, capacity};
         result.buffer = device->CreateBuffer({
-        .size = UploadChunkCapacity(size, ChunkSize()),
+        .size = capacity,
         .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageUniform |
                  Native::Rhi::BufferUsageIndex | Native::Rhi::BufferUsageVertex |
                  Native::Rhi::BufferUsageIndirect | Native::Rhi::BufferUsageTransferSrc,
         .memory = Native::Rhi::MemoryKind::Upload,
         .name = "native upload",
         });
+        create_trace.Finish(result.buffer ? 1 : 0, result.buffer ? result.buffer->Size() : 0);
         return result;
     };
     chunk = create();
@@ -2985,6 +3010,7 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     }
     ASSERT_MSG(chunk.buffer && chunk.buffer->Mapped(), "NAT-100: no upload memory ({} bytes)",
                size);
+    pool_trace.Finish(0, chunk.buffer->Size());
     return chunk;
 }
 

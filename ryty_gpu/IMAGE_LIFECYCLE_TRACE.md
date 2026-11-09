@@ -85,6 +85,24 @@ The trace records CPU wall time and does not identify GPU waits or reflection ta
 Compare to an external QPC-aligned capture and measure opt-in overhead against a matched trace-off
 Release run.
 
+Set `RYGT_IMAGE_TRACE_UPLOAD_ONLY=1` with the main trace opt-in for workload summaries,
+presentation anchors and existing image lifecycle/source/CPU staging events for requests
+of at least 4 MiB. This mode takes precedence over workload-only and presentation-only;
+import-only takes precedence over it. The CSV header reports `upload_only`. Other kinds and
+slow-span clocks are suppressed. Existing entry create/evict/stale/upload events cover only
+CPU-origin entries; source-result events cover all qualifying upload requests.
+texture_source_result B fields are entry pointer, guest address, requested size, source kind,
+and buffer-present flag; E fields are CPU-origin and GPU-backing-written flags. Kind 1 is
+region, 2 direct import, 3 gather or local copy of an import, and 4 CPU staging (possibly
+followed by a local copy). Kind 0/no buffer enters registry fallback, not proof of success.
+texture_registry_fallback B fields are entry pointer, guest address and requested size; E
+field a is 0 for allocation/mapping failure or 1 after copy setup, and b is readable bytes.
+This does not prove copied bytes, GPU completion, or image semantics. Pointer reuse, missing
+begin/end records and concurrent dirty events limit identity and ordering. Frequent stale
+events can exhaust the bounded ring; inspect drops and capture boundaries.
+The two new result event kinds are also included in unrestricted full trace mode; normal
+trace-off behavior is unchanged.
+
 Set `RYGT_IMAGE_TRACE_WORKLOAD_ONLY=1` with the main trace opt-in for bounded workload
 summaries and `present`/`frame_prepared` anchors only. It suppresses unrelated event kinds
 and slow-span clocks; import-only takes precedence if both modes are set. The CSV header

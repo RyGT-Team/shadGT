@@ -1520,6 +1520,11 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
         if (upload_source) {
             gpu_source = upload_source(*entry, list);
         }
+        { ImageLife::Scope route{size >= (4ull << 20), "texture_source_result",
+                                 ImageLife::Handle(entry), info.guest_address, size,
+                                 static_cast<u64>(gpu_source.kind), gpu_source.buffer ? 1ull : 0ull};
+          if (route.Active()) route.Finish(entry->from_cpu ? 1 : 0,
+              entry->gpu_backing_written.load(std::memory_order_relaxed) ? 1 : 0); }
         if (entry->total_uploads.load(std::memory_order_relaxed) == 0) {
             entry->guest_writes_tracked = gpu_source.guest_writes_tracked;
         }
@@ -1538,12 +1543,15 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
         }
 #endif
         if (!bytes) {
+            ImageLife::Scope fallback{size >= (4ull << 20), "texture_registry_fallback",
+                                      ImageLife::Handle(entry), info.guest_address, size};
             trace.Next(5);
             source = device.CreateBuffer({.size = size,
                                           .usage = Rhi::BufferUsageStorage |
                                                    Rhi::BufferUsageTransferSrc,
                                           .memory = Rhi::MemoryKind::Upload});
             if (!source || !source->Mapped()) {
+                fallback.Finish(0);
                 continue;
             }
             // Only what is mapped is read (a T# can reach past the end of a mapping); the rest of
@@ -1572,6 +1580,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
             }
             bytes = source.get();
             bytes_offset = 0;
+            fallback.Finish(1, readable);
         }
         const Rhi::Buffer* linear = bytes;
         u64 linear_offset = bytes_offset;

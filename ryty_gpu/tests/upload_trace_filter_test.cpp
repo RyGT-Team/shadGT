@@ -14,6 +14,9 @@ int main() {
     assert(ImageLife::UploadKind("upload_allocation_info"));
     assert(ImageLife::UploadKind("upload_heap_info"));
     assert(ImageLife::UploadKind("upload_block_info"));
+    assert(ImageLife::UploadKind("unmap_memory"));
+    assert(ImageLife::UploadKind("unmap_phase_summary"));
+    assert(ImageLife::UploadKind("unmap_phase_detail"));
     assert(!ImageLife::UploadKind("origin_write_fault"));
     assert(!ImageLife::UploadKind(nullptr));
 }

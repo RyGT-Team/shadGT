@@ -50,6 +50,16 @@ run only during active capture. Monitor drops and observer cost in upload-only c
 Metadata also appears in unrestricted full capture. The enclosing create-buffer span includes
 metadata queries and event emission, so its duration includes diagnostic overhead.
 
+Upload-only captures include unmap_memory spans (address, requested size) and unmap_phase_summary
+aggregates for phases 1 native invalidation, 2 direct-memory invalidation, 3 buffer invalidation,
+4 synchronous GPU-command cleanup or inline cleanup, and 5 mapped-range removal. unmap_memory
+begins after the export's BeginUnmap and NoteMappingChange work. Phase 4 includes command queue,
+wait and CPU cleanup on the synchronous path; it is not GPU execution time. Subtracting callback
+time from a runtime batch duration does not isolate OS mapping time. Each summary covers 256 completed phase
+calls on one thread, with a wait_summary_window child giving first/last timestamps; totals cannot
+be clipped to frames. unmap_phase_detail records individual spans at least 200 microseconds.
+Different unmap calls and phases can overlap across threads; do not sum as a critical path.
+
 Upload-only captures also contain queue_wait_summary and direct_wait_summary/direct_hold_summary.
 B fields are owner pointer, role, count (256), total QPC ticks and maximum QPC ticks; E field a
 counts try-lock busy outcomes. Direct roles: 1 FindBuffer, 2 ReleaseHeldAfterSplice,

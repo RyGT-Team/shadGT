@@ -17,7 +17,8 @@ struct WaitAggregate {
         last=end;
         ++count; total+=elapsed; maximum=std::max(maximum,elapsed); busy+=is_busy;
         if (elapsed >= SlowThresholdTicks()) {
-            const char* detail = !std::strcmp(label,"direct_hold_summary") ? "direct_hold_detail" :
+            const char* detail = !std::strcmp(label,"unmap_phase_summary") ? "unmap_phase_detail" :
+                                 !std::strcmp(label,"direct_hold_summary") ? "direct_hold_detail" :
                                  !std::strcmp(label,"direct_wait_summary") ? "direct_wait_detail" : "queue_wait_detail";
             Scope slow{detail, owner, role, start, end, is_busy ? 1ull : 0ull};
             slow.Finish(depth,0);

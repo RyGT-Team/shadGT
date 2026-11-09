@@ -11,7 +11,8 @@ inline bool UploadKind(const char* kind) {
         "upload_free_before_reclaim", "upload_free_after_reclaim", "upload_retiring",
         "upload_create_buffer", "upload_allocation_info", "upload_heap_info", "upload_block_info",
         "queue_wait_summary", "queue_wait_detail", "direct_wait_summary", "direct_wait_detail",
-        "direct_hold_summary", "direct_hold_detail", "wait_summary_window"};
+        "direct_hold_summary", "direct_hold_detail", "wait_summary_window", "unmap_memory",
+        "unmap_phase_summary", "unmap_phase_detail"};
     for (const char* name : allowed) if (!std::strcmp(kind,name)) return true;
     return !std::strncmp(kind,"texture_cpu_",12);
 }

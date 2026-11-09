@@ -11,4 +11,8 @@ int main() {
     assert(!ImageLife::PresentationKind("origin_write_fault"));
     assert(!ImageLife::PresentationKind("texture_entry_stale"));
     assert(!ImageLife::PresentationKind("presentation_unknown"));
+    assert(ImageLife::PresentationSlowKind("producer_job_walk"));
+    assert(ImageLife::PresentationSlowKind("fault_read_handler"));
+    assert(!ImageLife::PresentationSlowKind("origin_write_fault"));
+    assert(!ImageLife::PresentationSlowKind(nullptr));
 }

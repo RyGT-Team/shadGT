@@ -1,6 +1,13 @@
 #pragma once
 #include <cstring>
 namespace ImageLife {
+inline bool PresentationSlowKind(const char* kind) {
+    if (!kind) return false;
+    constexpr const char* allowed[] = {"producer_job_walk", "producer_pipeline_lookup",
+        "producer_draw_prepare", "fault_early_fence", "fault_guard", "fault_read_handler"};
+    for (const char* name : allowed) if (std::strcmp(kind, name) == 0) return true;
+    return false;
+}
 inline bool PresentationKind(const char* kind) {
     constexpr const char* allowed[] = {"present", "frame_prepared", "presentation_prepare_frame",
         "presentation_free_queue", "presentation_frame_fence", "presentation_swapchain_acquire",

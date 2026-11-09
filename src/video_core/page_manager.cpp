@@ -882,11 +882,14 @@ struct SignalImpl : public PageManager::Impl {
         }
         const VAddr fault_page = PageManager::GetPageAddr(addr);
         if (!is_gpu_thread) {
+            const u64 write_tag = ImageLife::Enabled("fault_early_fence") && Common::IsWriteError(context) ? 1 : 0;
             // PERF-063: the game was told work is done (an early fence) that the recorder has
             // not recorded yet; if it reads this page, the access waits for it.
-            rasterizer->WaitForEarlyFences(fault_page);
+            { ImageLife::SlowScope trace{"fault_early_fence", fault_page, write_tag};
+              rasterizer->WaitForEarlyFences(fault_page); }
             // PERF-070: a page a decoded GPU write guards opens once the write is recorded.
-            rasterizer->WaitForGuard(fault_page);
+            { ImageLife::SlowScope trace{"fault_guard", fault_page, write_tag};
+              rasterizer->WaitForGuard(fault_page); }
         } else if (rasterizer->GetPageManager().IsGuarded(fault_page)) {
             // PERF-070: an emulator thread reads or writes a guarded page itself: open it.
             rasterizer->GetPageManager().DropGuards(fault_page);
@@ -915,6 +918,7 @@ struct SignalImpl : public PageManager::Impl {
             origin.Finish(rip, result ? 1 : 0);
             return result;
         } else {
+            ImageLife::SlowScope trace{"fault_read_handler", fault_page, size};
             return rasterizer->ReadMemory(addr, size, assume_locks);
         }
         return false;

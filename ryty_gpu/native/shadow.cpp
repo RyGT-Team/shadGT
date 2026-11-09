@@ -23,6 +23,7 @@
 #include <xxhash.h>
 
 #include "common/logging/log.h"
+#include "ryty_gpu/image_lifecycle.h"
 #include "ryty_gpu/native/job_walker.h"
 #include "ryty_gpu/native/shadow.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -594,8 +595,9 @@ public:
             const auto start = std::chrono::steady_clock::now();
 #endif
             auto* rasterizer = liverpool->GetRasterizer();
-            const Vulkan::GraphicsPipeline* found =
-                rasterizer->LookupJobPipeline(pipeline_keepalive, &miss);
+            const Vulkan::GraphicsPipeline* found;
+            { ImageLife::SlowScope trace{"producer_pipeline_lookup", ImageLife::Handle(packet)};
+              found = rasterizer->LookupJobPipeline(pipeline_keepalive, &miss); }
             pipeline = found;
             if (found && PrepareOn()) {
                 // OPT-010: the draw's bindings, worked out here for the recorder.
@@ -604,6 +606,7 @@ public:
                     const bool is_indexed = opcode != PM4ItOpcode::DrawIndexAuto;
                     const u32 index_offset =
                         opcode == PM4ItOpcode::DrawIndexOffset2 ? packet[2] : 0; // its body[1]
+                    ImageLife::SlowScope trace{"producer_draw_prepare", ImageLife::Handle(packet)};
                     native->PrepareJobDraw(
                         packet, epoch, regs, *found, pipeline_keepalive,
                         std::span<const Shader::Info* const>{infos.data(),
@@ -653,6 +656,7 @@ private:
 // Walks a job's commands up to `until` like the command processor does (NAT-004), recording a
 // snapshot of the state at each draw.
 void WalkJobTo(Job& job, const u32* until) {
+    ImageLife::SlowScope trace{"producer_job_walk", ImageLife::Handle(&job), ImageLife::Handle(until)};
 #ifndef NDEBUG
     const auto start = std::chrono::steady_clock::now();
 #endif

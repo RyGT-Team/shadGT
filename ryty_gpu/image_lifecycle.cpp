@@ -103,7 +103,7 @@ void Initialize() {
 }
 bool Enabled(const char* kind) {
     State* s=state;
-    return s && s->open.load() && (!s->present_only || PresentationKind(kind));
+    return s && s->open.load() && (!s->present_only || PresentationSlowKind(kind) || PresentationKind(kind));
 }
 std::uint64_t Begin(const char* kind,std::uint64_t a,std::uint64_t b,std::uint64_t c,std::uint64_t d,std::uint64_t e) {
     State* s=state;
@@ -114,15 +114,15 @@ std::uint64_t Begin(const char* kind,std::uint64_t a,std::uint64_t b,std::uint64
 void End(std::uint64_t id,const char* kind,std::uint64_t a,std::uint64_t b) {
     if(id) Append('E',id,kind,a,b);
 }
-std::uint64_t SlowStart() {
+std::uint64_t SlowStart(const char* kind) {
     State* s=state;
-    if(!s || !s->open.load() || s->present_only) return 0;
+    if(!s || !s->open.load() || (s->present_only && !PresentationSlowKind(kind))) return 0;
     LARGE_INTEGER q{}; QueryPerformanceCounter(&q);
     return q.QuadPart;
 }
 void SlowEnd(std::uint64_t start,const char* kind,std::uint64_t address,std::uint64_t size) {
     State* s=state;
-    if(!start || !s || !s->open.load() || s->present_only) return;
+    if(!start || !s || !s->open.load() || (s->present_only && !PresentationSlowKind(kind))) return;
     LARGE_INTEGER q{}; QueryPerformanceCounter(&q);
     if(q.QuadPart-start >= s->frequency.QuadPart/5000)
         Append('S',0,kind,start,address,size);

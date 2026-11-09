@@ -1,23 +1,19 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <cstdlib>
 #include <fmt/format.h>
 #include <magic_enum/magic_enum.hpp>
+#include "common/logging/log.h"
 #include "common/logging/classes.h"
 #include "shader_recompiler/frontend/control_flow_graph.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/structured_control_flow.h"
 #include "shader_recompiler/frontend/translate/translate.h"
-#include "shader_recompiler/ir/ir_emitter.h"
 #include "shader_recompiler/ir/passes/ir_passes.h"
 #include "shader_recompiler/ir/post_order.h"
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
-#ifndef NDEBUG
-#include "shader_recompiler/srt_arena_trace.h"
-#endif
 
 namespace Shader {
 
@@ -39,15 +35,7 @@ IR::BlockList GenerateBlocks(const IR::AbstractSyntaxList& syntax_list) {
 }
 
 void EmitControlFlowGraph(IR::Program& program, Pools& pools, Gcn::CFG& cfg,
-                          RuntimeInfo& runtime_info, const Profile& device_profile) {
-    auto profile = device_profile;
-    if (runtime_info.hw_stage == HwStage::Fragment &&
-        runtime_info.hw.fs.single_sample_barycentric) {
-        profile.supports_amd_shader_explicit_vertex_parameter = false;
-        // Preserve P1/P2 arithmetic when MOV makes another component per-vertex.
-        // Otherwise the shared attribute qualifier turns prior hardware reads into P0.
-        profile.needs_manual_interpolation = true;
-    }
+                          RuntimeInfo& runtime_info, const Profile& profile) {
     Gcn::Translator translator{program.info, runtime_info, profile};
     for (auto& block : cfg) {
         const u32 start = block.begin_index;
@@ -134,6 +122,34 @@ bool HasLaneReads(std::span<const u32> code) {
     return false;
 }
 
+bool HasLaneReadsAndLoop(std::span<const u32> code) {
+    using namespace Gcn;
+    Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
+    Gcn::GcnDecodeContext decoder;
+    bool lane_reads = false;
+    bool loop = false;
+    while (!slice.atEnd()) {
+        const GcnInst inst = decoder.decodeInstruction(slice);
+        switch (inst.opcode) {
+        case Opcode::V_READLANE_B32:
+        case Opcode::V_MBCNT_LO_U32_B32:
+        case Opcode::V_MBCNT_HI_U32_B32:
+            lane_reads = true;
+            break;
+        default:
+            break;
+        }
+        if (inst.category == InstCategory::FlowControl && inst.control.sopp.simm < 0 &&
+            (inst.IsUnconditionalBranch() || inst.IsConditionalBranch())) {
+            loop = true;
+        }
+        if (inst.opcode == Opcode::S_ENDPGM) {
+            break;
+        }
+    }
+    return lane_reads && loop;
+}
+
 std::optional<u32> FetchShaderSgprBase(std::span<const u32> code) {
     using namespace Gcn;
     GcnCodeSlice slice(code.data(), code.data() + code.size());
@@ -164,8 +180,6 @@ std::optional<size_t> FetchShaderLength(std::span<const u32> code) {
     }
     return std::nullopt;
 }
-
-bool HasLaneReadsAndLoop(std::span<const u32> code) {
 
 bool HasMemoryWrites(std::span<const u32> code) {
     using namespace Gcn;
@@ -210,21 +224,14 @@ bool HasLegacyMad(std::span<const u32> code) {
     return false;
 }
 
-bool HasSdwaCompareDestination(std::span<const u32> code) {
-    using namespace Gcn;
-    GcnCodeSlice slice(code.data(), code.data() + code.size());
-    GcnDecodeContext decoder;
+bool HasWholeWaveRegions(std::span<const u32> code) {
+    Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
+    Gcn::GcnDecodeContext decoder;
+    std::vector<Gcn::GcnInst> list;
     while (!slice.atEnd()) {
-        const auto inst = decoder.decodeInstruction(slice);
-        if (inst.encoding == InstEncoding::VOPC &&
-            inst.dst[1].field != OperandField::VccLo) {
-            return true;
-        }
-        if (inst.opcode == Opcode::S_ENDPGM) {
-            break;
-        }
+        list.emplace_back(decoder.decodeInstruction(slice));
     }
-    return false;
+    return !Gcn::FindWholeWaveRegions(list).empty();
 }
 
 bool HasEmptyScopeBeforeElse(std::span<const u32> code) {
@@ -254,86 +261,21 @@ bool HasEmptyScopeBeforeElse(std::span<const u32> code) {
     return false;
 }
 
-#ifndef NDEBUG
-// DIAG-209 (RYGT_NAN_TRACE=<hash>): that pixel shader paints the index of the first NaN among the
-// F32 values of the block that writes RenderTarget0, in base 8 over R, G and B (digit + 1) / 8.
-static void NanTracePass(IR::Program& program, const Info& info) {
-    static const u64 hash = [] {
-        const char* env = std::getenv("RYGT_NAN_TRACE");
-        return env && *env ? std::strtoull(env, nullptr, 16) : 0;
-    }();
-    if (hash == 0 || info.pgm_hash != hash) {
-        return;
-    }
-    for (IR::Block* block : program.blocks) {
-        auto write = block->end();
-        for (auto it = block->begin(); it != block->end(); ++it) {
-            if (it->GetOpcode() == IR::Opcode::SetAttribute &&
-                it->Arg(0).Attribute() == IR::Attribute::RenderTarget0) {
-                write = it;
-                break;
-            }
-        }
-        if (write == block->end()) {
-            continue;
-        }
-        std::vector<IR::Inst*> values;
-        for (auto it = block->begin(); it != write; ++it) {
-            if (it->Type() == IR::Type::F32) {
-                LOG_WARNING(Render_Recompiler, "DIAG-209: value {} is {}", values.size(),
-                            magic_enum::enum_name(it->GetOpcode()));
-                values.push_back(&*it);
-            }
-        }
-        if (values.size() > 511) {
-            values.resize(511);
-        }
-        IR::IREmitter ir{*block, write};
-        IR::U32 found = ir.Imm32(~0U);
-        for (size_t i = values.size(); i-- > 0;) {
-            found = IR::U32{ir.Select(ir.FPIsNan(IR::F32{IR::Value{values[i]}}),
-                                      ir.Imm32(u32(i)), found)};
-        }
-        const IR::U1 any = ir.INotEqual(found, ir.Imm32(~0U));
-        const auto digit = [&](u32 shift) {
-            const IR::U32 d = IR::U32{ir.BitwiseAnd(
-                ir.ShiftRightLogical(found, ir.Imm32(shift)), ir.Imm32(7U))};
-            const IR::F32 f = IR::F32{ir.ConvertUToF(32, 32, ir.IAdd(d, ir.Imm32(1U)))};
-            return ir.FPMul(f, ir.Imm32(0.125f));
-        };
-        const std::array<IR::F32, 3> marks{digit(0), digit(3), digit(6)};
-        for (auto it = write; it != block->end(); ++it) {
-            if (it->GetOpcode() != IR::Opcode::SetAttribute ||
-                it->Arg(0).Attribute() != IR::Attribute::RenderTarget0) {
-                continue;
-            }
-            const u32 comp = it->Arg(2).U32();
-            if (comp < 3) {
-                IR::IREmitter at{*block, it};
-                it->SetArg(1, at.Select(any, marks[comp], IR::F32{it->Arg(1)}));
-            }
-        }
-        return;
-    }
-}
-
-#endif
-
 IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Info& info,
                              RuntimeInfo& runtime_info, const Profile& device_profile) {
-#ifndef NDEBUG
-    SrtArenaTrace::FrontendScope arena_trace_scope;
-#endif
     auto profile = device_profile;
-    // AMD explicit interpolation and KHR per-vertex arrays are alternative ABIs.
-    // Both extensions may be enabled on the device, but a shader must select one.
-    if (profile.supports_amd_shader_explicit_vertex_parameter) {
-        profile.supports_fragment_shader_barycentric = false;
+    if (runtime_info.sw_stage == SwStage::TessellationControl) { // FIX-227 (diagnosis)
+        static int logged = 0;
+        if (logged++ < 10) {
+            LOG_WARNING(Render_Recompiler, "FIX-227: translating hull shader, LDS emulation {} "
+                        "patches {} input cp {}",
+                        u32(runtime_info.sw.tcs.lds_emulation), u32(runtime_info.sw.tcs.num_patches),
+                        runtime_info.sw.tcs.num_input_control_points);
+        }
     }
     if (runtime_info.hw_stage == HwStage::Fragment &&
         runtime_info.hw.fs.single_sample_barycentric) {
         profile.supports_amd_shader_explicit_vertex_parameter = false;
-        profile.supports_fragment_shader_barycentric = true;
         // Preserve P1/P2 arithmetic when MOV makes another component per-vertex.
         // Otherwise the shared attribute qualifier turns prior hardware reads into P0.
         profile.needs_manual_interpolation = true;
@@ -381,15 +323,11 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
         Shader::Optimization::DomainShaderTransform(program, runtime_info);
     }
     Shader::Optimization::RingAccessElimination(program, runtime_info);
-#ifndef NDEBUG
     Shader::IR::DumpProgram(program, info, "pre-res-discover.");
-#endif
     auto resources = Shader::Optimization::ResourceDiscoverPass(program, profile);
     Shader::Optimization::LowerDynamicReadConstPass(program, resources);
     Shader::Optimization::FlattenExtendedUserdataPass(program);
-#ifndef NDEBUG
     Shader::IR::DumpProgram(program, info, "pre-res-patch.");
-#endif
     Shader::Optimization::ResourcePatchingPass(program.info, resources, profile);
     Shader::Optimization::LowerBufferFormatToRaw(program);
     Shader::Optimization::SharedMemorySimplifyPass(program, profile);
@@ -397,9 +335,7 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::Optimization::LowerUserClipPlanes(program, runtime_info);
     Shader::Optimization::PhiSimplificationPass(program);
     Shader::Optimization::InverseBallotEliminationPass(program);
-#ifndef NDEBUG
     Shader::IR::DumpProgram(program, info, "pre-lower-phi.");
-#endif
 
     // Prepare for structurization by clearing flow graph and lowering phis
     for (auto* ir_block : program.blocks) {
@@ -423,13 +359,8 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::Optimization::LowerHardwareIntrinsics(program);
     Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
     Shader::Optimization::DeadCodeEliminationPass(program);
- #ifndef NDEBUG
-    NanTracePass(program, info);
- #endif
     Shader::Optimization::CollectShaderInfoPass(program, profile);
-#ifndef NDEBUG
     Shader::IR::DumpProgram(program, info);
-#endif
 
     return program;
 }

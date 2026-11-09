@@ -959,6 +959,26 @@ std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
                 desc.size, vk::to_string(vk::Result{result.result}));
       return nullptr;
     }
+    if (desc.memory == MemoryKind::Upload) {
+        ImageLife::Scope trace{"upload_allocation_info"};
+        if (trace.Active()) {
+            VmaAllocationInfo2 extended{};
+            vmaGetAllocationInfo2(allocator, allocation, &extended);
+            const VkPhysicalDeviceMemoryProperties* properties = nullptr;
+            vmaGetMemoryProperties(allocator, &properties);
+            const auto type = extended.allocationInfo.memoryType;
+            const auto heap = properties->memoryTypes[type].heapIndex;
+            ImageLife::Scope detail{"upload_heap_info", trace.Id(), heap,
+                                    properties->memoryHeaps[heap].flags,
+                                    properties->memoryHeaps[heap].size,
+                                    desc.name == "native upload" ? 1ull : 0ull};
+            detail.Finish(properties->memoryTypes[type].propertyFlags, extended.dedicatedMemory);
+            ImageLife::Scope block{"upload_block_info", trace.Id(), ImageLife::Handle(buffer),
+                                   extended.blockSize, type};
+            block.Finish();
+            trace.Finish(desc.size, extended.allocationInfo.size);
+        }
+    }
 #ifndef NDEBUG
 
     TraceResourceChurn("allocate", "buffer", reinterpret_cast<u64>(buffer), info.size,

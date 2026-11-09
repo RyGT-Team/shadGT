@@ -38,6 +38,17 @@ if empty), and known completed tick. These snapshots describe cached free and re
 chunks, not all active chunks. upload_create_buffer B fields are parent ID, requested
 bytes and planned capacity; E fields are success flag and actual buffer capacity. Each
 allocation attempt, including recovery attempts, receives a separate span.
+Upload-only mode also includes these pool events. Successful upload-memory buffer allocations
+emit upload_allocation_info (E: requested bytes, allocation bytes), upload_block_info (B:
+parent ID, buffer handle, containing VMA block bytes, memory type index), and upload_heap_info
+(B: parent ID, heap index, heap flags, heap size, native-upload name flag; E: memory property
+flags, dedicated allocation flag). This covers every upload-memory buffer, with name flag 1
+only for the native upload pool. Associate a pool creation by same-thread nesting and time;
+there is no cross-scope ID. A containing block may have existed already: its size does not
+establish a new device allocation or its cause. Queries use VMA cached information only and
+run only during active capture. Monitor drops and observer cost in upload-only captures.
+Metadata also appears in unrestricted full capture. The enclosing create-buffer span includes
+metadata queries and event emission, so its duration includes diagnostic overhead.
 Upload events can be frequent and add pool-walk overhead while capture is active. Check
 the trace drop count and capture-window coverage before interpreting missing events.
 The retiring totals do not identify which in-flight chunks fit, or independently show

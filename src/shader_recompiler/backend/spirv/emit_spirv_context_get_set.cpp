@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
+#include "common/diagnostics.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
@@ -17,8 +18,13 @@ namespace Shader::Backend::SPIRV {
 using PointerType = EmitContext::PointerType;
 using PointerSize = EmitContext::PointerSize;
 
+// FIX-GT7-005: the tessellation attribute arrays are sized from the hull's constants and not
+// defined when a stride there is 0. Sirit aborts the process on an undefined id (a race start
+// crashed in a translation worker); this fails the translation instead, which drops a worker's
+// job or skips the draw.
 static Id AttrArray(Id array, const char* which) {
-    ASSERT_MSG(array.value != 0, "{} not defined: a stride of 0 in tessellation constants", which);
+    ASSERT_MSG(array.value != 0, "{} not defined: a stride of 0 in the tessellation constants",
+               which);
     return array;
 }
 
@@ -289,7 +295,8 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
         const u32 attr_index{u32(attr) - u32(IR::Attribute::Param0)};
         if (ctx.hw_stage == HwStage::Local) {
             const auto component_ptr = ctx.TypePointer(spv::StorageClass::Output, ctx.F32[1]);
-            return op_store(ctx.OpAccessChain(component_ptr, AttrArray(ctx.output_attr_array, "out_attrs"),
+            return op_store(ctx.OpAccessChain(component_ptr,
+                                              AttrArray(ctx.output_attr_array, "out_attrs"),
                                               ctx.ConstU32(attr_index), ctx.ConstU32(element)));
         } else {
             const auto& info{ctx.output_params.at(attr_index)};
@@ -332,8 +339,15 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
             ctx.OpAccessChain(ctx.output_f32, ctx.cull_distances, ctx.ConstU32(element)));
     case IR::Attribute::PointSize:
         return op_store(ctx.output_point_size);
-    case IR::Attribute::RenderTargetIndex:
+    case IR::Attribute::RenderTargetIndex: {
+        // DIAG-231 (diagnosis, RYGT_DIAG_TES_LAYER0=1): domain shaders draw into layer 0.
+        static const bool tes_layer0 = Common::DiagEnv("RYGT_DIAG_TES_LAYER0") != nullptr;
+        if (tes_layer0 && ctx.sw_stage == SwStage::TessellationEval) {
+            value = ctx.ConstF32(0.0f);
+            return op_store(ctx.output_layer);
+        }
         return op_store(ctx.output_layer);
+    }
     case IR::Attribute::ViewportIndex:
         return op_store(ctx.output_viewport_index);
     case IR::Attribute::Depth:
@@ -357,29 +371,39 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
 }
 
 Id EmitGetTessGenericAttribute(EmitContext& ctx, Id vertex_index, Id attr_index, Id comp_index) {
-    ASSERT_MSG(ctx.input_attr_array.value != 0, "in_attrs not defined: a stride of 0 in tessellation constants");
+    // DIAG-238 (diagnosis, RYGT_DIAG_TCS_CLAMP_VERTEX=1): hull shader input reads stay inside the
+    // patch (an index past gl_PatchVerticesIn reads undefined values in Vulkan).
+    static const bool clamp_vertex = Common::DiagEnv("RYGT_DIAG_TCS_CLAMP_VERTEX") != nullptr;
+    if (clamp_vertex && ctx.sw_stage == SwStage::TessellationControl &&
+        Sirit::ValidId(ctx.patch_vertices)) {
+        const Id last = ctx.OpISub(ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.patch_vertices),
+                                   ctx.u32_one_value);
+        vertex_index = ctx.OpUMin(ctx.U32[1], vertex_index, last);
+    }
     if (ctx.sw_stage == SwStage::TessellationControl && Sirit::ValidId(ctx.lds_vertex_base)) {
+        // FIX-227: from the scratch buffer the writer pass filled.
         const u32 num_attrs = (ctx.runtime_info.sw.tcs.ls_stride + 15) / 16;
         const Id vertex = ctx.OpIAdd(ctx.U32[1], ctx.lds_vertex_base, vertex_index);
-        const Id dword = ctx.OpIAdd(ctx.U32[1], ctx.OpIMul(ctx.U32[1], vertex, ctx.ConstU32(num_attrs * 4)),
-            ctx.OpIAdd(ctx.U32[1], ctx.OpShiftLeftLogical(ctx.U32[1], attr_index, ctx.ConstU32(2u)), comp_index));
-        const Id address = ctx.OpIAdd(ctx.U64, ctx.lds_scratch_base,
+        const Id dword = ctx.OpIAdd(
+            ctx.U32[1], ctx.OpIMul(ctx.U32[1], vertex, ctx.ConstU32(num_attrs * 4)),
+            ctx.OpIAdd(ctx.U32[1],
+                       ctx.OpShiftLeftLogical(ctx.U32[1], attr_index, ctx.ConstU32(2u)),
+                       comp_index));
+        const Id address = ctx.OpIAdd(
+            ctx.U64, ctx.lds_scratch_base,
             ctx.OpUConvert(ctx.U64, ctx.OpShiftLeftLogical(ctx.U32[1], dword, ctx.ConstU32(2u))));
-        const u32 num_cp = std::max(ctx.runtime_info.sw.tcs.num_input_control_points, 1u);
-        const Id in_range = ctx.OpULessThan(ctx.U1[1], vertex_index, ctx.ConstU32(num_cp));
-        const Id attr_valid = ctx.OpLogicalAnd(ctx.U1[1],
-            ctx.OpULessThan(ctx.U1[1], attr_index, ctx.ConstU32(num_attrs)),
-            ctx.OpULessThan(ctx.U1[1], comp_index, ctx.ConstU32(4u)));
-        const Id from_scratch = ctx.OpLogicalOr(ctx.U1[1], ctx.OpLogicalNot(ctx.U1[1], attr_valid),
-            ctx.OpLogicalNot(ctx.U1[1], in_range));
         // The patch's own control points from its inputs (all of them when the draw has no
         // scratch); only those past them from scratch.
         const u32 num_cp = std::max(ctx.runtime_info.sw.tcs.num_input_control_points, 1u);
         const Id in_range = ctx.OpULessThan(ctx.U1[1], vertex_index, ctx.ConstU32(num_cp));
-        const Id from_scratch = ctx.OpLogicalAnd(ctx.U1[1], ctx.lds_enabled, ctx.OpLogicalNot(ctx.U1[1], in_range));
+        const Id from_scratch =
+            ctx.OpLogicalAnd(ctx.U1[1], ctx.lds_enabled, ctx.OpLogicalNot(ctx.U1[1], in_range));
+        // FIX-GT7-010: FIX-GT7-005's guard on this read too (the array isn't defined for an
+        // LS stride of 0, which the LDS emulation accepts).
         const auto own_ptr = ctx.TypePointer(spv::StorageClass::Input, ctx.F32[1]);
-        const Id own_value = ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(own_ptr, ctx.input_attr_array,
-                                                                      vertex_index, attr_index, comp_index));
+        const Id own_value = ctx.OpLoad(
+            ctx.F32[1], ctx.OpAccessChain(own_ptr, AttrArray(ctx.input_attr_array, "in_attrs"),
+                                          vertex_index, attr_index, comp_index));
         const Id own_label = ctx.last_label;
         const Id scratch_label = ctx.OpLabel();
         const Id merge_label = ctx.OpLabel();
@@ -394,15 +418,17 @@ Id EmitGetTessGenericAttribute(EmitContext& ctx, Id vertex_index, Id attr_index,
         return ctx.OpPhi(ctx.F32[1], scratch_value, scratch_label, own_value, own_label);
     }
     const auto attr_comp_ptr = ctx.TypePointer(spv::StorageClass::Input, ctx.F32[1]);
-    return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(attr_comp_ptr, ctx.input_attr_array,
-                                                    vertex_index, attr_index, comp_index));
+    return ctx.OpLoad(ctx.F32[1],
+                      ctx.OpAccessChain(attr_comp_ptr, AttrArray(ctx.input_attr_array, "in_attrs"),
+                                        vertex_index, attr_index, comp_index));
 }
 
 Id EmitReadTcsGenericOuputAttribute(EmitContext& ctx, Id vertex_index, Id attr_index,
                                     Id comp_index) {
     const auto attr_comp_ptr = ctx.TypePointer(spv::StorageClass::Output, ctx.F32[1]);
-    return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(attr_comp_ptr, AttrArray(ctx.output_attr_array, "out_attrs"),
-                                                    vertex_index, attr_index, comp_index));
+    return ctx.OpLoad(ctx.F32[1],
+                      ctx.OpAccessChain(attr_comp_ptr, AttrArray(ctx.output_attr_array, "out_attrs"),
+                                        vertex_index, attr_index, comp_index));
 }
 
 void EmitSetTcsGenericAttribute(EmitContext& ctx, Id value, Id attr_index, Id comp_index) {
@@ -447,6 +473,12 @@ void EmitSetPatch(EmitContext& ctx, IR::Patch patch, Id value) {
             UNREACHABLE_MSG("Patch {}", u32(patch));
         }
     }()};
+    // DIAG-229 (diagnosis, RYGT_DIAG_TESS_MIN1=1): tessellation levels below 1 or NaN become 1,
+    // so no patch is culled by its factors.
+    static const bool min1 = Common::DiagEnv("RYGT_DIAG_TESS_MIN1") != nullptr;
+    if (min1 && !IR::IsGeneric(patch)) {
+        value = ctx.OpNMax(ctx.F32[1], value, ctx.ConstF32(1.0f));
+    }
     ctx.OpStore(pointer, value);
 }
 

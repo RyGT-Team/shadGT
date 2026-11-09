@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/diagnostics.h"
+#include "ryty_gpu/image_lifecycle.h"
 #include "common/debug.h"
 #include "common/frame_queue_trace.h"
 #include "common/elf_info.h"
@@ -879,6 +880,7 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
     const u64 guestFrame = g_prepared_frames.fetch_add(1, std::memory_order_relaxed);
+    { ImageLife::Scope trace{"frame_prepared", guestFrame, cpu_address}; }
 #ifndef NDEBUG
     rasterizer->FrameDumpFlip(); // NAT-116
 #endif
@@ -1431,6 +1433,7 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread, Frame* frame) {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame, u64 anti_lag_frame) {
+    ImageLife::Scope lifecycle_present{"present", reinterpret_cast<std::uint64_t>(frame), is_reusing_frame, is_game_frame, anti_lag_frame};
 #ifndef NDEBUG
     auto* trace = Common::FrameQueueTrace::current;
     struct TracePresentScope {

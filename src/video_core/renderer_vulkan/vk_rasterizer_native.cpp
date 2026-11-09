@@ -1,5 +1,6 @@
 #include <exception>
 #include "ryty_gpu/native/cpu_stack_registry.h"
+#include "ryty_gpu/image_lifecycle.h"
 #include "ryty_gpu/native/cube_view_policy.h"
 #include "ryty_gpu/native/readable_binding.h"
 #include "ryty_gpu/native/ahead_descriptor_pools.h"
@@ -12575,6 +12576,7 @@ void NativeRenderer::FaultAhead(VAddr begin, VAddr end) {
 }
 
 void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
+    ImageLife::SlowScope lifecycle_fault{"cpu_write", address, size, exact};
     // The written pages stop being watched (so they open up and the write goes on), and the
     // textures over them are uploaded again when next used (which watches them again).
     const VAddr begin = VideoCore::PageManager::GetPageAddr(address);
@@ -12593,9 +12595,13 @@ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
     // frame, and the CPU writes other data in that page every frame, so the cockpit was lit in
     // one frame of three and dark in the other two.
     if (end - begin <= 64_KB) {
+        ImageLife::SlowScope map_wait{"buffer_map_acquire", begin, end - begin};
         std::shared_lock map_lock{buffer_map_mutex};
+        map_wait.Finish();
         if (RegionOver(begin, end - begin)) {
+            ImageLife::SlowScope dirty_wait{"region_dirty_acquire", begin, end - begin};
             std::scoped_lock pending_lock{region_dirty_mutex};
+            dirty_wait.Finish();
             for (VAddr page = begin; page < end; page += 4096) {
                 auto& slot = page_snapshots[page];
                 if (slot) {
@@ -12612,16 +12618,20 @@ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
         }
     }
     {
+        ImageLife::SlowScope fill_wait{"fill_watch_acquire", begin, end - begin};
         std::scoped_lock watch_lock{fill_watch_mutex};
-        UnwatchPages(begin, end);
+        fill_wait.Finish();
+        { ImageLife::SlowScope trace{"unwatch_pages", begin, end - begin}; UnwatchPages(begin, end); }
         Native::UploadCause::ScopedCpuFault cause{address,size,exact};
-        registry->CpuWrite(begin, end - begin, exact != 0 ? (address - begin) + exact : 0);
+        { ImageLife::SlowScope trace{"registry_cpu_write", begin, end - begin}; registry->CpuWrite(begin, end - begin, exact != 0 ? (address - begin) + exact : 0); }
     }
     NATIVE_DIAGNOSTIC(++stats.cpu_writes);
     // NAT-114: pages of regions written by the CPU (a fault on any thread) are copied in before
     // the region's next use; the recorder sorts them to their regions.
     {
+        ImageLife::SlowScope dirty_wait{"region_dirty_enqueue_acquire", begin, end - begin};
         std::scoped_lock pending_lock{region_dirty_mutex};
+        dirty_wait.Finish();
         pending_region_writes.emplace_back(begin, end);
     }
     has_pending_region_writes.store(true, std::memory_order_release);

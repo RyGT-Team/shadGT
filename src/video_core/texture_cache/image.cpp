@@ -13,6 +13,7 @@
 #include <memory>
 #include <string>
 #include "common/diagnostics.h"
+#include "ryty_gpu/image_lifecycle.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/ryty_config.h"
@@ -273,11 +274,15 @@ struct RetiredRecycleImages {
     std::vector<RecycledImage> images;
     decltype(g_recycled) buckets;
     ~RetiredRecycleImages() {
-        for (const auto& image : images)
+        for (const auto& image : images) {
+            ImageLife::Scope trace{"image_destroy_recycled", ImageLife::Handle(static_cast<VkImage>(image.image)), image.size_bytes};
             vmaDestroyImage(allocator, image.image, image.allocation);
+        }
         for (const auto& [key, entries] : buckets)
-            for (const auto& image : entries)
+            for (const auto& image : entries) {
+                ImageLife::Scope trace{"image_destroy_recycled", ImageLife::Handle(static_cast<VkImage>(image.image)), image.size_bytes};
                 vmaDestroyImage(allocator, image.image, image.allocation);
+            }
     }
 };
 
@@ -417,7 +422,9 @@ UniqueImage::~UniqueImage() {
 
 void UniqueImage::Destroy() {
     if (image) {
+        ImageLife::Scope trace{"image_retire", ImageLife::Handle(static_cast<VkImage>(image)), size_bytes};
         if (!Recycle(allocator, image_ci, allocation, image, size_bytes)) {
+            ImageLife::Scope destroy{"image_destroy", ImageLife::Handle(static_cast<VkImage>(image)), size_bytes};
             vmaDestroyImage(allocator, image, allocation);
         }
         image = vk::Image{};
@@ -426,14 +433,21 @@ void UniqueImage::Destroy() {
 }
 
 void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
+    ImageLife::Scope create{"image_create", image_ci.extent.width, image_ci.extent.height,
+                            static_cast<std::uint64_t>(image_ci.format), static_cast<std::uint64_t>(VkImageUsageFlags(image_ci.usage)),
+                            (std::uint64_t(image_ci.arrayLayers) << 32) | image_ci.mipLevels};
     this->image_ci = image_ci;
     ASSERT(!image);
+    const auto lookup = ImageLife::Begin("recycle_lookup");
     if (const auto recycled = TakeRecycled(image_ci)) {
+        ImageLife::End(lookup, "recycle_lookup", 1);
         allocation = recycled->allocation;
         image = recycled->image;
         size_bytes = recycled->size_bytes;
+        create.Finish(ImageLife::Handle(static_cast<VkImage>(image)), size_bytes);
         return;
     }
+    ImageLife::End(lookup, "recycle_lookup", 0);
     VmaAllocationCreateInfo alloc_ci = {
         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
@@ -492,6 +506,7 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
                vk::to_string(image_ci.usage), vk::to_string(image_ci.tiling));
     image = vk::Image{unsafe_image};
     size_bytes = alloc_info.size;
+    create.Finish(ImageLife::Handle(static_cast<VkImage>(image)), size_bytes);
 }
 
 Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,

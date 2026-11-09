@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "common/diagnostics.h"
+#include "ryty_gpu/image_lifecycle.h"
 #include "common/guest_clock.h"
 #include "common/mapping_writeback_gate.h"
 #include "common/logging/log.h"
@@ -441,6 +442,7 @@ void StartHeapReport() {
 static bool SerializedMapProtocolAvailable();
 
 void Ryty::RytyLibraryInitialize() {
+    ImageLife::Initialize();
     Common::GuestMappingWritebackGate().FreezeProtocol(SerializedMapProtocolAvailable());
     InitializeCommon("shadgt_ryty.log");
     // Camera file I/O, executable validation and hook setup belong to library startup,

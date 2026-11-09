@@ -10,6 +10,8 @@ The header records QPC frequency and capture bounds, capacity, attempted and dro
 B/E rows are paired by ID; spans crossing capture boundaries or dropped records can be incomplete.
 S rows represent fault/lock spans of at least 200 microseconds and put start QPC, address and size
 in a/b/c. Fast fault spans are omitted. A nonzero dropped count means coverage is incomplete.
+For scheduler_wait, b is the requested tick. For native_fence_wait, b is the value and c is
+the semaphore handle. These spans measure host wall time and do not alone prove GPU causation.
 Image-create B fields are width, height, Vulkan format, usage, and packed layers/mips; E fields
 are the image handle and allocation bytes. Recycle lookup E field a is 1 for a hit, 0 for a miss.
 The native path emits native_image_create and native_image_create_from with width, height,

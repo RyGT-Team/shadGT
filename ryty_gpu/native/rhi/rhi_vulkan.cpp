@@ -361,6 +361,7 @@ public:
         return result == vk::Result::eSuccess ? value : 0;
     }
     bool Wait(u64 value, u64 timeout_ns) const override {
+        ImageLife::SlowScope lifecycle_wait{"native_fence_wait", value, ImageLife::Handle(static_cast<VkSemaphore>(semaphore))};
         const vk::SemaphoreWaitInfo info{
             .semaphoreCount = 1,
             .pSemaphores = &semaphore,

@@ -11,6 +11,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/diagnostics.h"
+#include "ryty_gpu/image_lifecycle.h"
 #include "common/logging/log.h"
 #include "common/perf_monitor.h"
 #include "common/scope_exit.h"
@@ -449,6 +450,7 @@ void Scheduler::Finish(std::source_location loc) {
 }
 
 void Scheduler::Wait(u64 tick, std::source_location loc) {
+    ImageLife::SlowScope lifecycle_wait{"scheduler_wait", tick};
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};

@@ -4,6 +4,8 @@
 #include "ryty_gpu/prepared_trace.h"
 #include "ryty_gpu/workload_trace.h"
 #include "ryty_gpu/native/content_probe.h"
+#include "ryty_gpu/native/alias_probe.h"
+#include "ryty_gpu/native/alias_probe_windows.h"
 #include "ryty_gpu/native/cube_view_policy.h"
 #include "ryty_gpu/native/readable_binding.h"
 #include "ryty_gpu/native/ahead_descriptor_pools.h"
@@ -1364,6 +1366,37 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
             if (Native::PreferCpuTextureStaging(size, true, true, true, gpu_written,
                     has_sources, false, single_import,cpu_readable)) {
                 policy_trace.Next(4);
+#if defined(_WIN32) && defined(RYTY_GPU)
+                if (selection.Active() && ImageLife::AliasProbeEnabled()) {
+                    static std::atomic<std::uint32_t> budget{};
+                    static std::atomic_flag in_flight = ATOMIC_FLAG_INIT;
+                    if (budget.load(std::memory_order_relaxed) < Native::AliasProbe::Budget) {
+                        using MapFn = void* (*)(std::uintptr_t, std::size_t);
+                        using UnmapFn = Native::AliasProbe::UnmapFn;
+                        HMODULE libc = GetModuleHandleA("libc.prx");
+                        const auto map = libc ? reinterpret_cast<MapFn>(GetProcAddress(libc,"TXQU8CpoEtI")) : nullptr;
+                        HMODULE kernel = GetModuleHandleW(L"KernelBase.dll");
+                        const auto unmap = kernel ? reinterpret_cast<UnmapFn>(GetProcAddress(kernel,"UnmapViewOfFile2")) : nullptr;
+                        const auto cleanup = [unmap](void* alias, std::uint32_t& error) {
+                            return Native::AliasProbe::Cleanup(alias,error,unmap);
+                        };
+                        const u64 started=ImageLife::Timestamp();
+                        const auto result=Native::AliasProbe::Try(true,address,size,budget,in_flight,map,unmap != nullptr,cleanup);
+                        const u64 ended=ImageLife::Timestamp();
+                        if (result.status != Native::AliasProbe::Status::BudgetExhausted &&
+                            result.status != Native::AliasProbe::Status::Busy) {
+                            ImageLife::Scope event{"texture_alias_probe", selection.Id(), ImageLife::Handle(&entry),
+                                                   address,size,entry.image->NativeHandle()};
+                            if (event.Active()) {
+                                ImageLife::Scope detail{"texture_alias_probe_detail", event.Id(),result.base,
+                                                        result.span,started,ended};
+                                detail.Finish(result.low_bits,result.error);
+                                event.Finish(static_cast<u64>(result.status),result.ordinal);
+                            }
+                        }
+                    }
+                }
+#endif
                 static std::atomic<u64> staged{};
                 const u64 count = ++staged;
                 if (count <= 8 || count % 128 == 0) {

@@ -117,6 +117,29 @@ entry or mapping reuse, incompatible descriptors, forced or GPU-written data, mi
 events and capture boundaries. Hash matches can collide and never suppress an upload.
 The extra copy and hash perturb timing: this capture is not a performance benchmark.
 
+For point-in-time alias feasibility only, set `RYGT_IMAGE_TRACE_ALIAS_PROBE=1` with active
+upload-only capture. At most 32 policy-selected CPU staging requests (4–64 MiB) per process
+are attempted; this is a bounded sample, not complete or necessarily representative. Each
+range is rounded out to 16 KiB pages; rounded span can exceed 64 MiB by less than 32 KiB.
+The probe calls the existing runtime alias export and immediately uses the same Windows
+UnmapViewOfFile2 operation as the current runtime to release the returned view, after
+checking its allocation base. It performs no Vulkan import or direct-memory cache publication.
+texture_alias_probe B fields are
+selection ID, entry pointer, guest address, requested size and image handle; E fields are
+status and one-based budget ordinal. Status 1=invalid range, 2=missing export, 4=refused,
+5=successfully mapped and unmapped, 6=unmap failed; disabled and exhausted calls emit no
+event. texture_alias_probe_detail B fields are parent event ID, rounded base, rounded span,
+pre-call QPC and post-call QPC; E fields are the alias pointer's low 16 bits and cleanup error.
+Those bits do
+not establish alignment requirements above 64 KiB. A successful probe does not prove later
+mapping identity, GPU ownership, host coherence, Vulkan acceptance or correct ordering. An
+unmap or allocation-base query failure is reported and disables further probes; the one
+unreleased alias can remain until process exit. A nonblocking single-in-flight guard skips
+concurrent attempts, so capture coverage is not complete. This cleanup depends on the current
+runtime MapAlias implementation creating an OS view without separate alias bookkeeping.
+Captures may clip/drop records and
+the extra mapping work perturbs timing; use a separate run from the content probe.
+
 Set `RYGT_IMAGE_TRACE_WORKLOAD_ONLY=1` with the main trace opt-in for bounded workload
 summaries and `present`/`frame_prepared` anchors only. It suppresses unrelated event kinds
 and slow-span clocks; import-only takes precedence if both modes are set. The CSV header

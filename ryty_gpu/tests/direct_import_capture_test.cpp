@@ -10,6 +10,7 @@ int main() {
     SetEnvironmentVariableA("RYGT_IMAGE_TRACE_WORKLOAD_ONLY", "1");
     SetEnvironmentVariableA("RYGT_IMAGE_TRACE_UPLOAD_ONLY", "1");
     SetEnvironmentVariableA("RYGT_IMAGE_TRACE_CONTENT_PROBE", "1");
+    SetEnvironmentVariableA("RYGT_IMAGE_TRACE_ALIAS_PROBE", "1");
     ImageLife::Initialize();
     char path[MAX_PATH]; std::snprintf(path,sizeof(path),"logs/image-lifecycle-%lu.start",GetCurrentProcessId());
     FILE* f=std::fopen(path,"w"); assert(f); std::fclose(f);
@@ -19,6 +20,7 @@ int main() {
     assert(!ImageLife::Enabled("workload_summary"));
     assert(!ImageLife::Enabled("texture_source_result"));
     assert(!ImageLife::ContentProbeEnabled());
+    assert(!ImageLife::AliasProbeEnabled());
     assert(ImageLife::SlowStart("producer_job_walk")==0);
     assert(ImageLife::Timestamp()!=0);
     { ImageLife::Scope s{"direct_import_operation",1,0,0,12,34}; s.Finish(1); }

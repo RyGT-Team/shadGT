@@ -2,6 +2,7 @@
 #include "ryty_gpu/native/cpu_stack_registry.h"
 #include "ryty_gpu/image_lifecycle.h"
 #include "ryty_gpu/prepared_trace.h"
+#include "ryty_gpu/workload_trace.h"
 #include "ryty_gpu/native/cube_view_policy.h"
 #include "ryty_gpu/native/readable_binding.h"
 #include "ryty_gpu/native/ahead_descriptor_pools.h"
@@ -7166,6 +7167,7 @@ struct PixelTrace {
 } // namespace
 
 void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
+    WorkloadTrace::Add(WorkloadTrace::Draws);
     std::scoped_lock lock{mutex};
     struct StreamUnwindGuard {
         NativeRenderer& renderer;
@@ -11147,6 +11149,7 @@ bool NativeRenderer::MetaClearDispatch(const Shader::Info& cs) {
 }
 
 void NativeRenderer::DispatchDirect() {
+    WorkloadTrace::Add(WorkloadTrace::Dispatches);
     std::scoped_lock lock{mutex};
 #if !defined(NDEBUG)
     const auto start = std::chrono::steady_clock::now();
@@ -11531,6 +11534,7 @@ void NativeRenderer::DispatchDirect() {
 }
 
 void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+    WorkloadTrace::Add(WorkloadTrace::Dispatches);
     std::scoped_lock lock{mutex};
 #if !defined(NDEBUG)
     SceneTrace::CpuScope scene_trace{r.FrameDumpCollecting(),frame,"dispatch-indirect"};
@@ -13011,6 +13015,13 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     }
     frame_writebacks.clear();
     ++frame;
+    if (ImageLife::Enabled("workload_summary")) {
+        const auto counts = WorkloadTrace::Snapshot();
+        const u64 frontend = Common::GetWorkCounters().draws.load(std::memory_order_relaxed);
+        ImageLife::Scope summary{"workload_summary", frame, frontend, counts[WorkloadTrace::Draws],
+                                 counts[WorkloadTrace::Dispatches], counts[WorkloadTrace::ImageUploadRequestedBytes]};
+        summary.Finish(counts[WorkloadTrace::HashBytes]);
+    }
     if (ImageLife::Enabled("prepared_summary_0")) {
         const auto s = prepared_trace_aggregate.Drain();
         ImageLife::Scope a{"prepared_summary_0", s[0], s[1], s[2], s[3], s[4]}; a.Finish(frame);

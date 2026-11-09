@@ -25,6 +25,7 @@ struct Event {
 struct State {
     bool present_only = false;
     bool import_only = false;
+    bool workload_only = false;
     std::atomic<bool> open{false};
     std::atomic<std::uint64_t> active{0}, next{0}, dropped{0}, ids{0};
     std::unique_ptr<Event[]> events{new Event[Capacity]};
@@ -60,9 +61,9 @@ DWORD WINAPI Worker(void* raw) {
     QueryPerformanceCounter(&s->end);
     while(s->active.load()!=0) Sleep(1);
     if (auto* f=_wfopen(s->output,L"w")) {
-        std::fprintf(f,"# pid=%lu,qpc_frequency=%lld,start=%lld,end=%lld,capacity=%llu,attempted=%llu,dropped=%llu,slow_threshold_us=200,present_only=%u,import_only=%u\n",
+        std::fprintf(f,"# pid=%lu,qpc_frequency=%lld,start=%lld,end=%lld,capacity=%llu,attempted=%llu,dropped=%llu,slow_threshold_us=200,present_only=%u,import_only=%u,workload_only=%u\n",
                      GetCurrentProcessId(),s->frequency.QuadPart,s->start.QuadPart,s->end.QuadPart,
-                     Capacity,s->next.load(),s->dropped.load(),s->present_only ? 1u : 0u,s->import_only ? 1u : 0u);
+                     Capacity,s->next.load(),s->dropped.load(),s->present_only ? 1u : 0u,s->import_only ? 1u : 0u,s->workload_only ? 1u : 0u);
         std::fprintf(f,"qpc,tid,phase,id,kind,a,b,c,d,e\n");
         const auto count=(std::min)(s->next.load(),Capacity);
         for(std::uint64_t i=0;i<count;++i) {
@@ -86,6 +87,9 @@ void Initialize() {
     char import_only[3]{};
     s->import_only = GetEnvironmentVariableA("RYGT_IMAGE_TRACE_IMPORT_ONLY", import_only,
                                               sizeof(import_only)) == 1 && import_only[0] == '1';
+    char workload_only[3]{};
+    s->workload_only = GetEnvironmentVariableA("RYGT_IMAGE_TRACE_WORKLOAD_ONLY", workload_only,
+                                                sizeof(workload_only)) == 1 && workload_only[0] == '1';
     wchar_t exe[MAX_PATH]{};
     const DWORD length=GetModuleFileNameW(nullptr,exe,MAX_PATH);
     if(!length || length>=MAX_PATH) { delete s; return; }
@@ -108,6 +112,9 @@ void Initialize() {
 static bool Allowed(State* s, const char* kind) {
     const bool is_import = kind && std::strncmp(kind, "direct_import_", 14) == 0;
     if (s->import_only || is_import) return s->import_only && is_import;
+    if (s->workload_only) return kind && (!std::strcmp(kind,"workload_summary") ||
+        !std::strcmp(kind,"present") || !std::strcmp(kind,"frame_prepared"));
+    if (kind && !std::strcmp(kind,"workload_summary")) return false;
     return !s->present_only || PresentationSlowKind(kind) || PresentationKind(kind);
 }
 bool Enabled(const char* kind) {
@@ -121,8 +128,9 @@ std::uint64_t Timestamp() {
 std::uint64_t SlowThresholdTicks() { return state ? state->frequency.QuadPart / 5000 : 0; }
 std::uint64_t Begin(const char* kind,std::uint64_t a,std::uint64_t b,std::uint64_t c,std::uint64_t d,std::uint64_t e) {
     State* s=state;
-    if(!s || !s->open.load() || (kind && std::strncmp(kind,"direct_import_",14)==0 && !s->import_only) ||
-       (s->import_only ? !Allowed(s,kind) : (s->present_only && !PresentationKind(kind)))) return 0;
+    if(!s || !s->open.load() || (s->import_only || s->workload_only ? !Allowed(s,kind) :
+       ((kind && (!std::strncmp(kind,"direct_import_",14) || !std::strcmp(kind,"workload_summary"))) ||
+        (s->present_only && !PresentationKind(kind))))) return 0;
     const auto id=s->ids.fetch_add(1)+1;
     return Append('B',id,kind,a,b,c,d,e) ? id : 0;
 }
@@ -131,13 +139,13 @@ void End(std::uint64_t id,const char* kind,std::uint64_t a,std::uint64_t b) {
 }
 std::uint64_t SlowStart(const char* kind) {
     State* s=state;
-    if(!s || !s->open.load() || s->import_only || (s->present_only && !PresentationSlowKind(kind))) return 0;
+    if(!s || !s->open.load() || s->import_only || s->workload_only || (s->present_only && !PresentationSlowKind(kind))) return 0;
     LARGE_INTEGER q{}; QueryPerformanceCounter(&q);
     return q.QuadPart;
 }
 void SlowEnd(std::uint64_t start,const char* kind,std::uint64_t address,std::uint64_t size) {
     State* s=state;
-    if(!start || !s || !s->open.load() || s->import_only || (s->present_only && !PresentationSlowKind(kind))) return;
+    if(!start || !s || !s->open.load() || s->import_only || s->workload_only || (s->present_only && !PresentationSlowKind(kind))) return;
     LARGE_INTEGER q{}; QueryPerformanceCounter(&q);
     if(q.QuadPart-start >= s->frequency.QuadPart/5000)
         Append('S',0,kind,start,address,size);

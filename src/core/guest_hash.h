@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
+#include "ryty_gpu/workload_trace.h"
 
 #include <xxhash.h>
 #include "common/types.h"
@@ -18,6 +19,7 @@ namespace Core {
 /// release pool memory (or make it inaccessible) while the caches still watch it; reading it
 /// directly then crashed a GPU thread at the start of a race, so it is read safely there.
 inline u64 HashGuestBytes(VAddr address, u64 size) {
+    WorkloadTrace::Add(WorkloadTrace::HashBytes, size);
 #ifdef RYTY_GPU
     return RytyMemory::HashGuestMemory(address, size);
 #else

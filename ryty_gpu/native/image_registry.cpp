@@ -12,6 +12,7 @@
 #include "core/memory.h"
 #include "ryty_gpu/native/image_registry.h"
 #include "ryty_gpu/image_lifecycle.h"
+#include "ryty_gpu/workload_trace.h"
 #include "ryty_gpu/native/upload_scratch_capacity.h"
 #include "ryty_gpu/native/gpu_checkpoints.h"
 #include "ryty_gpu/native/slow_call_trace.h"
@@ -1515,6 +1516,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
         // GPU work filled, in memory the CPU may not even read), else a copy the CPU makes now.
         trace.Next(4);
         UploadSource gpu_source;
+        WorkloadTrace::Add(WorkloadTrace::ImageUploadRequestedBytes, size);
         if (upload_source) {
             gpu_source = upload_source(*entry, list);
         }

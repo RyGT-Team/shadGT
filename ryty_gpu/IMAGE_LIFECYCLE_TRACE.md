@@ -85,6 +85,22 @@ The trace records CPU wall time and does not identify GPU waits or reflection ta
 Compare to an external QPC-aligned capture and measure opt-in overhead against a matched trace-off
 Release run.
 
+Set `RYGT_IMAGE_TRACE_WORKLOAD_ONLY=1` with the main trace opt-in for bounded workload
+summaries and `present`/`frame_prepared` anchors only. It suppresses unrelated event kinds
+and slow-span clocks; import-only takes precedence if both modes are set. The CSV header
+reports `workload_only`. A `workload_summary` B row at NativeRenderer's FindDisplay frame
+boundary contains frame number, cumulative frontend draws, cumulative serial native Draw
+attempts, cumulative serial native direct/indirect dispatch attempts, and cumulative image
+upload-source requested bytes. E field a contains cumulative requested HashGuestBytes bytes.
+The frontend counter runs outside capture; the other counters run only while capture is open.
+Compare differences between successive complete summaries, not absolute values. Image upload
+requests include GPU region/import/gather and unsuccessful requests, not just CPU copies;
+hash bytes are requested sizes from all HashGuestBytes callers and threads, not guaranteed
+completed reads. Draws and dispatches are attempts, not necessarily submitted commands, and
+parallel paths are not fully represented. Individual relaxed atomic loads can span concurrent
+updates; frame bins do not guarantee correspondence to one presented frame. Capture start/end,
+missing summaries and dropped records limit comparisons; tracing can add observer overhead.
+
 Set `RYGT_IMAGE_TRACE_IMPORT_ONLY=1` with the main opt-in for a separate direct-import
 capture; it takes precedence over presentation-only and suppresses other event kinds and
 slow-span clocks. The CSV header records `import_only`. Roles in direct_import_operation B

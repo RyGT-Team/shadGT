@@ -85,6 +85,11 @@ The trace records CPU wall time and does not identify GPU waits or reflection ta
 Compare to an external QPC-aligned capture and measure opt-in overhead against a matched trace-off
 Release run.
 
+For a controlled preparation comparison, `RYGT_NATIVE_PREPARE_TEXTURE_WARM=0` disables
+only speculative texture imports from producer-side PrepareTextures. The default is enabled;
+other draw preparation and recorder-side import and upload paths are unchanged. Set the
+option before process startup; it is sampled on first use.
+
 Set `RYGT_IMAGE_TRACE_PRESENT_ONLY=1` before process startup alongside the main trace opt-in
 to retain only `present`, `frame_prepared`, and the explicitly listed `presentation_*` stages:
 prepare_frame, free_queue, frame_fence, swapchain_acquire, queue_present, wait_request,

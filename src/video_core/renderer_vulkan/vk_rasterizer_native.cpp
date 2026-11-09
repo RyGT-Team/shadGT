@@ -10200,6 +10200,11 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
     // copies of sources (the recorder does them).
     DrawBindings& b = p.bindings;
     const auto warm_upload = [&](VAddr address, u64 size) {
+        static const bool enabled = [] {
+            const char* value = std::getenv("RYGT_NATIVE_PREPARE_TEXTURE_WARM");
+            return !(value && value[0] == '0' && value[1] == '\0');
+        }();
+        if (!enabled) return;
         // Only establish aliases/imports here; never refresh, copy, upload or
         // alter image state on the worker. The recorder still validates freshness
         // and orders every actual upload. Keep this bounded to real texture data.

@@ -11,6 +11,7 @@ template<class T> std::uint64_t Handle(T value) {
 #if defined(_WIN32) && defined(RYTY_GPU)
 namespace ImageLife {
 void Initialize();
+bool Enabled(const char* kind);
 std::uint64_t Begin(const char* kind, std::uint64_t a=0, std::uint64_t b=0,
                     std::uint64_t c=0, std::uint64_t d=0, std::uint64_t e=0);
 void End(std::uint64_t id, const char* kind, std::uint64_t a=0, std::uint64_t b=0);
@@ -41,6 +42,7 @@ struct Scope {
 #else
 namespace ImageLife {
 inline void Initialize() {}
+inline bool Enabled(const char*) { return false; }
 inline std::uint64_t Begin(const char*,std::uint64_t=0,std::uint64_t=0,std::uint64_t=0,std::uint64_t=0,std::uint64_t=0) { return 0; }
 inline void End(std::uint64_t,const char*,std::uint64_t=0,std::uint64_t=0) {}
 struct SlowScope { explicit SlowScope(const char*,std::uint64_t=0,std::uint64_t=0,std::uint64_t=0) {} void Finish() {} };

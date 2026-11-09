@@ -1,6 +1,7 @@
 #include <exception>
 #include "ryty_gpu/native/cpu_stack_registry.h"
 #include "ryty_gpu/image_lifecycle.h"
+#include "ryty_gpu/prepared_trace.h"
 #include "ryty_gpu/native/cube_view_policy.h"
 #include "ryty_gpu/native/readable_binding.h"
 #include "ryty_gpu/native/ahead_descriptor_pools.h"
@@ -3077,6 +3078,9 @@ static bool FlatUploadReuseEnabled() {
     return reuse_enabled;
 }
 
+static PreparedTrace::Aggregate prepared_trace_aggregate;
+static thread_local PreparedTrace::Outcome* prepared_trace_current = nullptr;
+
 vk::DescriptorBufferInfo NativeRenderer::UploadFlatData(u32 stage, const u8* source, u32 size, bool* backing_proven) {
     Native::SlowCallTrace<5> trace{t_timed, "upload-flat-data",
         {"compare", "allocate", "copy-upload", "copy-reference", "finish"}};
@@ -3091,6 +3095,7 @@ vk::DescriptorBufferInfo NativeRenderer::UploadFlatData(u32 stage, const u8* sou
             return Native::Parallel::AdaptiveXXH3(data, length);
         });
         if (lookup.binding) {
+            if (prepared_trace_current) prepared_trace_current->flat_hit += size;
             if(backing_proven)*backing_proven=lookup.backing_proven;
             NATIVE_DIAGNOSTIC(++stats.flat_upload_hits);
             NATIVE_DIAGNOSTIC(stats.flat_upload_bytes_saved += size);
@@ -3105,6 +3110,7 @@ vk::DescriptorBufferInfo NativeRenderer::UploadFlatData(u32 stage, const u8* sou
     if(backing_proven)*backing_proven=allocated_backing;
     trace.Next(2);
     std::memcpy(data, source, size);
+    if (prepared_trace_current) prepared_trace_current->flat_miss += size;
     NATIVE_DIAGNOSTIC(stats.flat_upload_bytes_uploaded += size);
     const vk::DescriptorBufferInfo binding{buffer, offset, size};
     trace.Next(3);
@@ -7383,10 +7389,19 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     // OPT-010: the draw a game job thread prepared, if any.
     static const bool prepare = PrepareEnabled();
     PreparedDraw* prepared = nullptr;
+    const bool prepared_trace_enabled = ImageLife::Enabled("prepared_summary_0");
+    PreparedTrace::Outcome prepared_outcome{.enabled = prepared_trace_enabled};
+    struct PublishPreparedOutcome {
+        PreparedTrace::Outcome& outcome;
+        ~PublishPreparedOutcome() { prepared_trace_aggregate.Publish(outcome); }
+    } publish_prepared{prepared_outcome};
+    bool attempted_prepared = false;
     if (prepare && !r.FrameDumpCollecting() && RytyGtsInRace()) {
+        attempted_prepared = true;
         prepared = TakePrepared(Rasterizer::t_draw_packet);
         NATIVE_DIAGNOSTIC(stats.prepared_missing += prepared ? 0 : 1);
     }
+    if (!prepared) prepared_outcome.result = attempted_prepared ? PreparedTrace::Missing : PreparedTrace::NotEligible;
     struct GiveBack {
         NativeRenderer& n;
         PreparedDraw* p;
@@ -7520,6 +7535,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     u64 buffer_freshness_seq = 0;
     if (prepared) {
         PhaseClock clock{stats.phase_ns[2]};
+        struct ActivePreparedTrace {
+            bool active;
+            PreparedTrace::Outcome* previous = nullptr;
+            explicit ActivePreparedTrace(PreparedTrace::Outcome* p) : active(p != nullptr) {
+                if (active) { previous = prepared_trace_current; prepared_trace_current = p; }
+            }
+            ~ActivePreparedTrace() { if (active) prepared_trace_current = previous; }
+        } active_trace{prepared_trace_enabled ? &prepared_outcome : nullptr};
         from_prepared = CommitPrepared(*prepared, *pipeline, regs, trusted);
         if (from_prepared) {
             buffer_freshness_seq = buffer_log.Seq();
@@ -7532,13 +7555,19 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         prepared_vertices_valid=CommitPreparedVertices(*prepared,*pipeline,regs,is_indexed,index_offset,quad_triangles,trusted);
         // MirrorBuffer may process CPU writes after CommitPrepared. A changed
         // range invalidates both prepared bindings and vertices, not only vi.
-        if(prepared->unmap_gen!=unmap_generation.load(std::memory_order_acquire) ||
-           !buffer_log.Untouched(prepared->buffer_seq,prepared->buffer_ranges)) {
+        const bool vertex_unmapped = prepared->unmap_gen!=unmap_generation.load(std::memory_order_acquire);
+        if(vertex_unmapped || !buffer_log.Untouched(prepared->buffer_seq,prepared->buffer_ranges)) {
+            if (prepared_trace_enabled) prepared_outcome.result = vertex_unmapped
+                ? PreparedTrace::VertexUnmap : PreparedTrace::VertexBuffer;
             from_prepared=false;prepared_vertices_valid=false;buffer_freshness_certified=false;
         } else {
             buffer_freshness_seq=buffer_log.Seq();
             buffer_freshness_certified=true;
         }
+    }
+    if (prepared_trace_enabled && from_prepared) {
+        prepared_outcome.result = PreparedTrace::Accepted;
+        prepared_outcome.vertex_fallback = prepared->has_vertices && !prepared_vertices_valid;
     }
     DrawBindings& b = from_prepared ? prepared->bindings : bindings;
     if (!from_prepared) {
@@ -7578,6 +7607,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
     for (unsigned attempt = 0; b.region_writeback && !RegionPlanValid(*b.region_writeback) && attempt < 4; ++attempt) {
+        if (prepared_trace_enabled && from_prepared) prepared_outcome.result = PreparedTrace::RegionRebuild;
         b.Clear();
         b.push = UserData(regs);
         BindStagesStable(pipeline->GetStages(), regs, false, b);
@@ -10612,8 +10642,13 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     Native::SlowCallTrace<8> trace{t_timed, "commit-prepared",
         {"stage-validation", "image-freshness", "sort-cpu-writes", "buffer-freshness",
          "refresh-regions", "upload-data", "image-rewrite-sources", "push-data"}};
-    const auto reject = [&](u32 why) {
+    const auto reject = [&](u32 why, bool late = false) {
         NATIVE_DIAGNOSTIC(++stats.prepared_rejected[why]);
+        if (prepared_trace_current) {
+            constexpr PreparedTrace::Field reasons[] = {PreparedTrace::Pipeline, PreparedTrace::Stage,
+                PreparedTrace::EarlyUnmap, PreparedTrace::Image, PreparedTrace::EarlyBuffer};
+            prepared_trace_current->result = late ? (why == 2 ? PreparedTrace::LateUnmap : PreparedTrace::LateBuffer) : reasons[why];
+        }
         return false;
     };
     if (p.pipeline != &pipeline) {
@@ -10675,6 +10710,7 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         } else {
             const auto [buffer, offset, data] = Allocate(size, alignment, receipt_requested?&backing_proven:nullptr);
             std::memcpy(data, source, size);
+            if (prepared_trace_current) prepared_trace_current->nonflat += size;
             p.bindings.buffers[upload.info] = vk::DescriptorBufferInfo{buffer, offset, size};
         }
         uploads_proven=uploads_proven && backing_proven;
@@ -10701,8 +10737,8 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     // then reject the whole prepared draw before selecting its bindings or
     // dereferencing its vertex mirrors if any prepared range changed.
     Begin();
-    if (p.unmap_gen != unmap_generation.load(std::memory_order_acquire)) return reject(2);
-    if (!buffer_log.Untouched(recheck_from, p.buffer_ranges)) return reject(4);
+    if (p.unmap_gen != unmap_generation.load(std::memory_order_acquire)) return reject(2, true);
+    if (!buffer_log.Untouched(recheck_from, p.buffer_ranges)) return reject(4, true);
     // The viewport transform the shaders get, from the registers as recorded.
     trace.Next(7);
     const Shader::PushData fresh = UserData(regs);
@@ -12970,6 +13006,13 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     }
     frame_writebacks.clear();
     ++frame;
+    if (ImageLife::Enabled("prepared_summary_0")) {
+        const auto s = prepared_trace_aggregate.Drain();
+        ImageLife::Scope a{"prepared_summary_0", s[0], s[1], s[2], s[3], s[4]}; a.Finish(frame);
+        ImageLife::Scope b{"prepared_summary_1", s[5], s[6], s[7], s[8], s[9]}; b.Finish(frame);
+        ImageLife::Scope c{"prepared_summary_2", s[10], s[11], s[12], s[13], s[14]}; c.Finish(frame);
+        ImageLife::Scope d{"prepared_summary_3", s[15], s[16], s[17], s[18]}; d.Finish(frame);
+    }
     TrimIdleChunks();
     {
         std::scoped_lock watch_lock{fill_watch_mutex};

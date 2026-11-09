@@ -101,6 +101,10 @@ void Initialize() {
     HANDLE thread=CreateThread(nullptr,0,Worker,s,0,nullptr);
     if(thread) CloseHandle(thread);
 }
+bool Enabled(const char* kind) {
+    State* s=state;
+    return s && s->open.load() && (!s->present_only || PresentationKind(kind));
+}
 std::uint64_t Begin(const char* kind,std::uint64_t a,std::uint64_t b,std::uint64_t c,std::uint64_t d,std::uint64_t e) {
     State* s=state;
     if(!s || !s->open.load() || (s->present_only && !PresentationKind(kind))) return 0;

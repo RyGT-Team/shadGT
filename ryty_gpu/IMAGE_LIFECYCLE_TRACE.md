@@ -96,5 +96,23 @@ acquisition where applicable; they do not establish that a GPU or frame limiter 
 Free-queue timing includes mutex acquisition and queue removal. Acquire E field b is not a
 valid new image index when the call fails; queue-present includes the existing DLSS-G markers.
 Condition-variable waits can wake early or spuriously and do not prove deliberate pacing.
+Presentation-only mode also retains upload_take, upload_free_before_reclaim,
+upload_free_after_reclaim, upload_retiring, upload_create_buffer, and prepared_summary_0..3.
+The summary covers the serial Draw path only; parallel prepared paths are unsupported.
+Each summary E field a is the frame counter. B fields a..e are, in order:
+* summary_0: missing, accepted, pipeline reject, stage reject, early unmap reject.
+* summary_1: image reject, early buffer reject, late unmap reject, late buffer reject,
+  post-vertex unmap reject.
+* summary_2: post-vertex buffer reject, region-plan rebuild, incomplete, prepared vertex
+  fallback, non-flat copied bytes.
+* summary_3: flat memo hit bytes, flat copied miss bytes, materialized bytes associated
+  with nonaccepted outcomes, and not-eligible draws; e is unused.
+These bytes count the CommitPrepared path only. Nonaccepted bytes are not necessarily
+wasted: recorded work or memo entries may still reference them. Accepted means bindings
+survived these checks; a later draw return can still prevent submission. Including
+upload-pool spans raises ring event volume and possible drops. Publish and frame drains
+use separate relaxed atomic fields, so one draw can span bins; aggregate over longer
+windows instead of interpreting individual-frame ratios. Capture-end counts may remain
+unflushed, and dropped ring events leave incomplete bins. Timing remains diagnostic.
 As with other spans, capture boundaries or a full ring can leave incomplete pairs.
 

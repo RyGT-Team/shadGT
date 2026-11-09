@@ -21,6 +21,10 @@ class TextureCache;
 
 namespace Vulkan {
 
+/// FIX-GT7-030: this thread builds a pipeline a draw is waiting for: it does not wait for another
+/// build's shared libraries.
+inline thread_local bool g_pipeline_build_urgent = false;
+
 static constexpr u32 MaxShaderStages = static_cast<u32>(Shader::SwStage::NumLogicalStages);
 static constexpr u32 MaxVertexBufferCount = 32;
 
@@ -73,17 +77,6 @@ struct GraphicsPipelineKey {
 
 class GraphicsPipeline : public Pipeline {
 public:
-    struct ParallelStageSummary {
-        bool known{true};
-        bool safe{true};
-        bool vertex_fetch{};
-        bool uses_direct{};
-    };
-
-    const ParallelStageSummary& GetParallelStageSummary() const noexcept {
-        return parallel_stage_summary;
-    }
-
     struct SerializationSupport {
         VertexInputs<vk::VertexInputAttributeDescription> vertex_attributes{};
         VertexInputs<vk::VertexInputBindingDescription> vertex_bindings{};
@@ -103,8 +96,7 @@ public:
                      std::span<const Shader::Info*, MaxShaderStages> stages,
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                      const Shader::Gcn::FetchShaderData* fetch_shader,
-                     std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
-                     bool preloading = false);
+                     std::span<const vk::ShaderModule> modules, SerializationSupport& sdata);
     ~GraphicsPipeline();
 
     const Shader::Gcn::FetchShaderData& GetFetchShader() const noexcept {
@@ -157,7 +149,6 @@ public:
     u32 LdsVertexBytes() const {
         return lds_vertex_bytes;
     }
-    u32 LdsGroupPatches() const { return lds_group_patches; }
 
     /// Gets the attributes and bindings for vertex inputs.
     template <typename Attribute, typename Binding>
@@ -176,27 +167,25 @@ public:
                          u32 step_rate_1, const Shader::Info& vs_info) const;
 
 private:
-    void BuildDescSetLayout(bool preloading);
+    void BuildDescSetLayout();
 
 public:
     /// PERF-021: optimized relinks wait until no new pipeline has been needed for a while, so
     /// they never take cores from pipelines a draw is waiting for.
     static void NotePipelineMiss();
-    bool CanRetire() const {
-        return !library_link || !library_link->optimized.valid() ||
-               library_link->optimized.wait_for(std::chrono::seconds{0}) == std::future_status::ready;
-    }
 
     /// PERF-019: a pipeline built on a worker from copies of the shader infos points at the
     /// cached infos once it is used.
-    void SetStageInfos(std::span<const Shader::Info*, MaxShaderStages> infos);
+    void SetStageInfos(std::span<const Shader::Info*, MaxShaderStages> infos) {
+        std::ranges::copy(infos, stages.begin());
+        std::ranges::copy(infos, canonical_stages.begin());
+    }
 
 private:
     /// PERF-017: stage libraries of a runtime pipeline and the optimized link built from them.
     struct LibraryLink {
         /// Vertex input and fragment output libraries; the shader libraries are shared (PERF-018).
         std::array<vk::UniquePipeline, 2> owned_libraries;
-        std::array<std::shared_ptr<vk::UniquePipeline>, 2> shared_libraries;
         std::future<void> optimized;
     };
     /// PERF-018 / SHD-002: hashes of the stage set layouts' bindings, so a shader library is
@@ -221,10 +210,8 @@ private:
 
     GraphicsPipelineKey key;
     u32 lds_emulation{};
-    u32 lds_group_patches{};
     u32 lds_vertex_bytes{};
     Shader::Gcn::FetchShaderData fetch_shader{};
-    ParallelStageSummary parallel_stage_summary;
 };
 
 struct ClipDistanceShaderKey {

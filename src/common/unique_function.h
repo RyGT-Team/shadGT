@@ -1,0 +1,86 @@
+// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <memory>
+#include <type_traits>
+#include <utility>
+
+#include "common/recycling_pool.h"
+
+namespace Common {
+
+/// General purpose function wrapper similar to std::function.
+/// Unlike std::function, the captured values don't have to be copyable.
+/// This class can be moved but not copied.
+template <typename ResultType, typename... Args>
+class UniqueFunction {
+    class CallableBase {
+    public:
+        virtual ~CallableBase() = default;
+        virtual ResultType operator()(Args&&...) = 0;
+
+        // PERF-056: callables are often made on one thread and destroyed on another.
+        static void* operator new(std::size_t size) {
+            return RecyclingPool::Allocate(size);
+        }
+        static void operator delete(void* block, std::size_t size) {
+            RecyclingPool::Free(block, size);
+        }
+        static void* operator new(std::size_t size, std::align_val_t alignment) {
+            return ::operator new(size, alignment);
+        }
+        static void operator delete(void* block, std::size_t, std::align_val_t alignment) {
+            ::operator delete(block, alignment);
+        }
+    };
+
+    template <typename Functor>
+    class Callable final : public CallableBase {
+    public:
+        template <typename F>
+        explicit Callable(F&& functor_) : functor{std::forward<F>(functor_)} {}
+        ~Callable() override = default;
+
+        ResultType operator()(Args&&... args) override {
+            if constexpr (std::is_void_v<ResultType>) {
+                functor(std::forward<Args>(args)...);
+            } else {
+                return functor(std::forward<Args>(args)...);
+            }
+        }
+
+    private:
+        Functor functor;
+    };
+
+public:
+    UniqueFunction() = default;
+
+    template <typename Functor>
+        requires(!std::is_same_v<std::remove_cvref_t<Functor>, UniqueFunction> &&
+                 std::is_invocable_r_v<ResultType, std::decay_t<Functor>&, Args...>)
+    UniqueFunction(Functor&& functor)
+        : callable{std::make_unique<Callable<std::decay_t<Functor>>>(
+              std::forward<Functor>(functor))} {}
+
+    UniqueFunction& operator=(UniqueFunction&& rhs) noexcept = default;
+    UniqueFunction(UniqueFunction&& rhs) noexcept = default;
+
+    UniqueFunction& operator=(const UniqueFunction&) = delete;
+    UniqueFunction(const UniqueFunction&) = delete;
+
+    ResultType operator()(Args&&... args) const {
+        return (*callable)(std::forward<Args>(args)...);
+    }
+
+    explicit operator bool() const noexcept {
+        return static_cast<bool>(callable);
+    }
+
+private:
+    std::unique_ptr<CallableBase> callable;
+};
+
+} // namespace Common

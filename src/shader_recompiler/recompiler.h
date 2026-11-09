@@ -1,0 +1,60 @@
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <string>
+
+#include "common/object_pool.h"
+#include "shader_recompiler/ir/basic_block.h"
+#include "shader_recompiler/ir/program.h"
+
+namespace Shader {
+
+struct Profile;
+struct RuntimeInfo;
+
+struct Pools {
+    static constexpr u32 InstPoolSize = 8192;
+    static constexpr u32 BlockPoolSize = 32;
+
+    Common::ObjectPool<IR::Inst> inst_pool;
+    Common::ObjectPool<IR::Block> block_pool;
+
+    explicit Pools() : inst_pool{InstPoolSize}, block_pool{BlockPoolSize} {}
+
+    void ReleaseContents() {
+        block_pool.ReleaseContents();
+        inst_pool.ReleaseContents();
+    }
+};
+
+/// FIX-018: true when the code has an EXEC scope opened right before an instruction that closes
+/// it and opens the next one (an else after an empty if). Translations made before FIX-018 ran
+/// that next scope with every invocation active.
+[[nodiscard]] bool HasEmptyScopeBeforeElse(std::span<const u32> code);
+
+/// FIX-020: true when the code reads single lanes or lane masks and has a loop (a backward
+/// branch). On hosts with 32-wide subgroups, translations before FIX-020 left those reads 32-wide
+/// in compute shaders with more than 32 invocations per workgroup.
+[[nodiscard]] bool HasLaneReadsAndLoop(std::span<const u32> code);
+
+/// Whether the code contains lane reads or lane-mask operations.
+[[nodiscard]] bool HasLaneReads(std::span<const u32> code);
+
+/// FIX-101: true when the code uses V_MAD_LEGACY_F32 or V_MAC_LEGACY_F32, whose translations
+/// before FIX-101 made NaN from 0 * Inf.
+[[nodiscard]] bool HasLegacyMad(std::span<const u32> code);
+/// SHD-005: whether the program stores to memory (buffer, image or GDS writes and atomics).
+[[nodiscard]] bool HasMemoryWrites(std::span<const u32> code);
+
+[[nodiscard]] bool HasSdwaCompareDestination(std::span<const u32> code);
+
+/// DIAG-031: a readable listing of GCN code (pc, opcode, operands, memory offsets).
+[[nodiscard]] std::string ListGcnCode(std::span<const u32> code);
+
+[[nodiscard]] IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools,
+                                           Info& info, RuntimeInfo& runtime_info,
+                                           const Profile& profile);
+
+} // namespace Shader

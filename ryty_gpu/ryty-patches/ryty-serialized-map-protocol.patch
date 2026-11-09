@@ -1,0 +1,180 @@
+diff --git a/core/libs/prx/libkernel/DirectMemory/DirectMemory.cpp b/core/libs/prx/libkernel/DirectMemory/DirectMemory.cpp
+--- a/core/libs/prx/libkernel/DirectMemory/DirectMemory.cpp
++++ b/core/libs/prx/libkernel/DirectMemory/DirectMemory.cpp
+@@ -135,6 +135,14 @@
+ }
+ #endif
+ 
++#ifdef _WIN32
++extern "C"
++#ifdef _MSC_VER
++__declspec(dllexport)
++#endif
++unsigned RytySerializedMapProtocolVersion_nid_no_patch_cut() { return 1; }
++#endif
++
+ namespace {
+ 
+ constexpr int GuestMapFixedFlag = 0x10;
+@@ -527,6 +535,10 @@
+ #endif
+ }
+ 
++// Serialize renderer notifications and OS mapping changes as one transition.
++// Guest registry and alias operations must never acquire this mutex.
++std::recursive_mutex g_mappingTransitionMutex;
++
+ // MAP_FIXED without MAP_NO_OVERWRITE replaces whatever is mapped there (PS4 titles rely on it,
+ // e.g. GT Sport remaps a larger block over an existing one). A range wholly inside one registered
+ // allocation is remapped in place by RemapFixedIntoRegistered; any other overlap is unmapped first.
+@@ -550,57 +562,63 @@
+     if (physStart < 0 || (static_cast<std::uint64_t>(physStart) & (PS5_PAGE_SIZE - 1)) != 0 || static_cast<std::uint64_t>(physStart) >= DIRECT_MEMORY_SIZE || len > DIRECT_MEMORY_SIZE - static_cast<std::uint64_t>(physStart)) {
+         return SCE_KERNEL_ERROR_EINVAL;
+     }
++    std::lock_guard transition(g_mappingTransitionMutex);
+     if (*addr != nullptr && (flags & GuestMapFixedFlag) != 0) NotifyRenderer("RytyGpuUnmapMemory", *addr, len);
+     ReleaseFixedOverlap(*addr, len, flags);
+-    GuestAllocations::Mutation mutation;
+-    if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags, physStart)) {
+-        RecordProtection(*addr, len, prot);
+-        NotifyRenderer("RytyGpuMapMemory", *addr, len);
++    const int result = [&]() {
++        GuestAllocations::Mutation mutation;
++        if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags, physStart)) {
++            RecordProtection(*addr, len, prot);
++            return 0;
++        }
++        if (*addr != nullptr && (flags & GuestMapFixedFlag) != 0) mutation.RequireAvailable(*addr, len);
++        std::lock_guard lock(g_directLock);
++        ValidatePhysicalRange(static_cast<std::uint64_t>(physStart), len);
++        void* mapped = MapAligned(*addr, len, PROT_NONE, flags, alignment);
++        try {
++            AddMapping(reinterpret_cast<std::uintptr_t>(mapped), len, static_cast<std::uint64_t>(physStart), LinuxProtFromSce(prot));
++            mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0);
++        } catch (...) {
++            EraseMappings(reinterpret_cast<std::uintptr_t>(mapped), reinterpret_cast<std::uintptr_t>(mapped) + len);
++            Unmap(mapped, len);
++            throw;
++        }
++        *addr = mapped;
++        RecordProtection(mapped, len, prot);
++        Trace("map direct %p+0x%zx phys=0x%llx prot=0x%x flags=0x%x align=0x%zx", mapped, len, static_cast<unsigned long long>(physStart), prot, flags, alignment);
+         return 0;
+-    }
+-    if (*addr != nullptr && (flags & GuestMapFixedFlag) != 0) mutation.RequireAvailable(*addr, len);
+-    std::lock_guard lock(g_directLock);
+-    ValidatePhysicalRange(static_cast<std::uint64_t>(physStart), len);
+-    void* mapped = MapAligned(*addr, len, PROT_NONE, flags, alignment);
+-    try {
+-        AddMapping(reinterpret_cast<std::uintptr_t>(mapped), len, static_cast<std::uint64_t>(physStart), LinuxProtFromSce(prot));
+-        mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0);
+-    } catch (...) {
+-        EraseMappings(reinterpret_cast<std::uintptr_t>(mapped), reinterpret_cast<std::uintptr_t>(mapped) + len);
+-        Unmap(mapped, len);
+-        throw;
+-    }
+-    *addr = mapped;
+-    RecordProtection(mapped, len, prot);
+-    Trace("map direct %p+0x%zx phys=0x%llx prot=0x%x flags=0x%x align=0x%zx", mapped, len, static_cast<unsigned long long>(physStart), prot, flags, alignment);
+-    NotifyRenderer("RytyGpuMapMemory", mapped, len);
+-    return 0;
++    }();
++    if (result == 0) NotifyRenderer("RytyGpuMapMemory", *addr, len);
++    return result;
+ }
+ 
+ int DoMapAnon(void** addr, size_t len, int prot, int flags) {
+     ValidateOutput(addr);
+     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
++    std::lock_guard transition(g_mappingTransitionMutex);
+     if (*addr != nullptr && (flags & GuestMapFixedFlag) != 0) NotifyRenderer("RytyGpuUnmapMemory", *addr, len);
+     ReleaseFixedOverlap(*addr, len, flags);
+-    GuestAllocations::Mutation mutation;
+-    if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags)) {
+-        RecordProtection(*addr, len, prot);
+-        NotifyRenderer("RytyGpuMapMemory", *addr, len);
++    const int result = [&]() {
++        GuestAllocations::Mutation mutation;
++        if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags)) {
++            RecordProtection(*addr, len, prot);
++            return 0;
++        }
++        if (*addr != nullptr && (flags & GuestMapFixedFlag) != 0) mutation.RequireAvailable(*addr, len);
++        void* mapped = MapAligned(*addr, len, LinuxProtFromSce(prot), flags, PS5_PAGE_SIZE);
++        try {
++            mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0);
++        } catch (...) {
++            Unmap(mapped, len);
++            throw;
++        }
++        *addr = mapped;
++        RecordProtection(mapped, len, prot);
++        Trace("map anon %p+0x%zx prot=0x%x flags=0x%x", mapped, len, prot, flags);
+         return 0;
+-    }
+-    if (*addr != nullptr && (flags & GuestMapFixedFlag) != 0) mutation.RequireAvailable(*addr, len);
+-    void* mapped = MapAligned(*addr, len, LinuxProtFromSce(prot), flags, PS5_PAGE_SIZE);
+-    try {
+-        mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0);
+-    } catch (...) {
+-        Unmap(mapped, len);
+-        throw;
+-    }
+-    *addr = mapped;
+-    RecordProtection(mapped, len, prot);
+-    Trace("map anon %p+0x%zx prot=0x%x flags=0x%x", mapped, len, prot, flags);
+-    NotifyRenderer("RytyGpuMapMemory", mapped, len);
+-    return 0;
++    }();
++    if (result == 0) NotifyRenderer("RytyGpuMapMemory", *addr, len);
++    return result;
+ }
+ 
+ int DoMprotect(const void* addr, size_t len, int prot) {
+@@ -644,21 +662,24 @@
+ int DoMunmap(void* addr, size_t len) {
+     Trace("unmap %p+0x%zx", addr, len);
+     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0 || !addr) return SCE_KERNEL_ERROR_EINVAL;
++    std::lock_guard transition(g_mappingTransitionMutex);
+     NotifyRenderer("RytyGpuUnmapMemory", addr, len);
+-    GuestAllocations::Mutation mutation;
+-    mutation.Unmap(addr, len, [&](const void* piece, std::size_t pieceBytes, const void* allocation, bool last) {
+-        auto* pieceAddress = const_cast<void*>(piece);
+-        std::lock_guard lock(g_directLock);
+-        EraseMappings(reinterpret_cast<std::uintptr_t>(piece), reinterpret_cast<std::uintptr_t>(piece) + pieceBytes);
+-#if defined(__linux__)
+-        Unmap(pieceAddress, pieceBytes);
+-#else
+-        if (KernelArena::Get().Contains(pieceAddress, pieceBytes)) munmap(pieceAddress, pieceBytes);
+-        else if (last) munmap_release(const_cast<void*>(allocation));
+-        else munmap(pieceAddress, pieceBytes);
+-#endif
+-    });
+-    RecordProtection(addr, len, -1);
++    {
++        GuestAllocations::Mutation mutation;
++        mutation.Unmap(addr, len, [&](const void* piece, std::size_t pieceBytes, const void* allocation, bool last) {
++            auto* pieceAddress = const_cast<void*>(piece);
++            std::lock_guard lock(g_directLock);
++            EraseMappings(reinterpret_cast<std::uintptr_t>(piece), reinterpret_cast<std::uintptr_t>(piece) + pieceBytes);
++    #if defined(__linux__)
++            Unmap(pieceAddress, pieceBytes);
++    #else
++            if (KernelArena::Get().Contains(pieceAddress, pieceBytes)) munmap(pieceAddress, pieceBytes);
++            else if (last) munmap_release(const_cast<void*>(allocation));
++            else munmap(pieceAddress, pieceBytes);
++    #endif
++        });
++        RecordProtection(addr, len, -1);
++    }
+     // The renderer was told before the unmap so it stops using the memory; this tells it the
+     // pages are gone, so answers it cached in between are dropped.
+     NotifyRenderer("RytyGpuMappingChanged", addr, len);
+@@ -700,6 +721,7 @@
+ // Releasing direct memory on a PS4 also unmaps every virtual mapping of it; titles release
+ // without unmapping first (GT Sport maps, queries and releases scratch blocks this way).
+ void UnmapDirectMemory(int64_t start, size_t len) {
++    std::lock_guard transition(g_mappingTransitionMutex);
+     const auto first = static_cast<std::uint64_t>(start);
+     const auto last = first + len;
+     std::vector<std::pair<std::uintptr_t, std::size_t>> ranges;

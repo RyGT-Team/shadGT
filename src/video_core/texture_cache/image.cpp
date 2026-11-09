@@ -1,0 +1,661 @@
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdlib>
+#include <deque>
+#include <mutex>
+#include <optional>
+#include <unordered_map>
+#include <vector>
+#include <memory>
+#include <string>
+#include "common/diagnostics.h"
+#include "common/assert.h"
+#include "common/logging/log.h"
+#include "common/ryty_config.h"
+#include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_runtime.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/texture_cache/blit_helper.h"
+#include "video_core/texture_cache/image.h"
+#include "video_core/renderer_vulkan/image_allocation.h"
+#include <chrono>
+
+#include <vk_mem_alloc.h>
+
+namespace VideoCore {
+
+using namespace Vulkan;
+
+Common::IncrementalIdProvider<u64> Image::global_image_uid{};
+Common::IncrementalIdProvider<u64> Image::global_contents_version{};
+
+#ifndef NDEBUG
+std::span<const VAddr> WatchedImageWindows() {
+    // GT Sport's car thumbnail chain: the 800x450 car frames, their 1600x900 accumulation (later
+    // reused for the 400x225 result) and the 1600x225 vertical pass.
+    static const std::vector<VAddr> windows = [] {
+        std::vector<VAddr> list{0x101fe00000, 0x1027800000, 0x101f210000};
+        if (const char* env = Common::DiagEnv("SHADGT_WATCH_IMAGE"); env && *env) {
+            list.clear();
+            const std::string text{env};
+            for (size_t start = 0; start < text.size();) {
+                const size_t end = std::min(text.find(',', start), text.size());
+                list.push_back(VAddr(std::stoull(text.substr(start, end - start), nullptr, 16)));
+                start = end + 1;
+            }
+        }
+        return list;
+    }();
+    return windows;
+}
+
+bool IsWatchedImageAddress(VAddr address, u64 size) {
+    for (const VAddr base : WatchedImageWindows()) {
+        if (address < base + WatchedImageWindowSize && base < address + size) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static std::mutex g_diag_mutex;
+static std::deque<std::string> g_diag_records;
+static u32 g_diag_live = 0;
+
+void PushDiagRecord(std::string record) {
+    std::scoped_lock lk{g_diag_mutex};
+    if (g_diag_live > 0) {
+        --g_diag_live;
+        LOG_WARNING(Render_Vulkan, "{}", record);
+        return;
+    }
+    g_diag_records.push_back(std::move(record));
+    if (g_diag_records.size() > 20000) {
+        g_diag_records.pop_front();
+    }
+}
+
+void FlushDiagRecords(u32 then_live) {
+    std::scoped_lock lk{g_diag_mutex};
+    LOG_WARNING(Render_Vulkan, "DIAG-043: the {} records before this thumbnail draw:",
+                g_diag_records.size());
+    for (const auto& record : g_diag_records) {
+        LOG_WARNING(Render_Vulkan, "{}", record);
+    }
+    g_diag_records.clear();
+    g_diag_live = then_live;
+}
+
+static constexpr size_t ImageModRingSize = 1 << 18;
+static std::array<ImageModRecord, ImageModRingSize> g_image_mods{};
+static std::atomic<u64> g_image_mod_index{};
+
+void NoteImageModification(u64 uid, u64 version, std::source_location loc) {
+    const u64 index = g_image_mod_index.fetch_add(1, std::memory_order_relaxed);
+    g_image_mods[index % ImageModRingSize] = {uid, version, loc.file_name(), loc.line()};
+}
+
+std::vector<ImageModRecord> RecentImageModifications(u64 uid, size_t max_count) {
+    const u64 end = g_image_mod_index.load();
+    const u64 begin = end > ImageModRingSize ? end - ImageModRingSize : 0;
+    std::vector<ImageModRecord> found;
+    for (u64 i = end; i-- > begin && found.size() < max_count;) {
+        const auto& record = g_image_mods[i % ImageModRingSize];
+        if (record.uid == uid) {
+            found.push_back(record);
+        }
+    }
+    std::reverse(found.begin(), found.end());
+    return found;
+}
+
+void NoteWatchedImageModification(const Image& image, std::source_location loc) {
+    std::string_view file = loc.file_name();
+    if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+        file.remove_prefix(slash + 1);
+    }
+    PushDiagRecord(fmt::format("DIAG-042: image at {:#x} {}x{} {} {} modified to ver {} by {}:{}",
+                               image.info.guest_address, image.info.size.width,
+                               image.info.size.height, vk::to_string(image.info.pixel_format),
+                               AmdGpu::NameOf(image.info.tile_mode), image.contents_version,
+                               file, loc.line()));
+}
+
+#else
+std::span<const VAddr> WatchedImageWindows() { return {}; }
+bool IsWatchedImageAddress(VAddr, u64) { return false; }
+void PushDiagRecord(std::string) {}
+void FlushDiagRecords(u32) {}
+void NoteImageModification(u64, u64, std::source_location) {}
+std::vector<ImageModRecord> RecentImageModifications(u64, size_t) { return {}; }
+void NoteWatchedImageModification(const Image&, std::source_location) {}
+#endif
+
+static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance& instance,
+                                           const ImageInfo& info) {
+    vk::ImageUsageFlags usage = vk::ImageUsageFlagBits::eTransferSrc |
+                                vk::ImageUsageFlagBits::eTransferDst |
+                                vk::ImageUsageFlagBits::eSampled;
+    if (!info.props.is_block) {
+        if (instance.IsAttachmentFeedbackLoopLayoutSupported()) {
+            usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
+        }
+        if (info.props.is_depth) {
+            usage |= vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        } else {
+            usage |= vk::ImageUsageFlagBits::eColorAttachment;
+            // Always create images with storage flag to avoid needing re-creation in case of e.g
+            // compute clears This sacrifices a bit of performance but is less work. ExtendedUsage
+            // flag is also used. The exception here is for multisample images when storage is not
+            // supported, where even with ExtendedUsage we may get only one supported sample back.
+            if (info.num_samples == 1 || instance.IsMultisampleStorageImageSupported())
+                usage |= vk::ImageUsageFlagBits::eStorage;
+        }
+    } else {
+        // Similarly to above, we specify storage usage. This is typically not supported by
+        // compressed formats, but may be used for uncompressed views. In order to satisfy this,
+        // we will also specify the extended usage bit.
+        usage |= vk::ImageUsageFlagBits::eStorage;
+    }
+
+    return usage;
+}
+
+static vk::ImageType ConvertImageType(AmdGpu::ImageType type) noexcept {
+    switch (type) {
+    case AmdGpu::ImageType::Color1D:
+    case AmdGpu::ImageType::Color1DArray:
+    case AmdGpu::ImageType::Color2D:
+    case AmdGpu::ImageType::Color2DMsaa:
+    case AmdGpu::ImageType::Color2DArray:
+    case AmdGpu::ImageType::Cube:
+        return vk::ImageType::e2D;
+    case AmdGpu::ImageType::Color3D:
+        return vk::ImageType::e3D;
+    default:
+        UNREACHABLE();
+    }
+}
+
+static vk::FormatFeatureFlags2 FormatFeatureFlags(const vk::ImageUsageFlags usage_flags) {
+    vk::FormatFeatureFlags2 feature_flags{};
+    if (usage_flags & vk::ImageUsageFlagBits::eTransferSrc) {
+        feature_flags |= vk::FormatFeatureFlagBits2::eTransferSrc;
+    }
+    if (usage_flags & vk::ImageUsageFlagBits::eTransferDst) {
+        feature_flags |= vk::FormatFeatureFlagBits2::eTransferDst;
+    }
+    if (usage_flags & vk::ImageUsageFlagBits::eSampled) {
+        feature_flags |= vk::FormatFeatureFlagBits2::eSampledImage;
+    }
+    if (usage_flags & vk::ImageUsageFlagBits::eColorAttachment) {
+        feature_flags |= vk::FormatFeatureFlagBits2::eColorAttachment;
+    }
+    if (usage_flags & vk::ImageUsageFlagBits::eDepthStencilAttachment) {
+        feature_flags |= vk::FormatFeatureFlagBits2::eDepthStencilAttachment;
+    }
+    // Note: StorageImage is intentionally ignored for now since it is always set, and can mess up
+    // compatibility checks.
+    return feature_flags;
+}
+
+namespace {
+// PERF-104: GT Sport places a different render target in its scratch memory pass after pass, so
+// the cache frees and makes about 1,100 images a second (allocations, driver calls and image
+// destruction on the recorder). Freed images (the GPU is done with them by then) wait here and
+// are handed out again for an identical create info. SHADGT_IMAGE_RECYCLE=0 turns it off.
+struct RecycleKey {
+    u32 flags, type, format, width, height, depth, mips, layers, samples, usage;
+    bool operator==(const RecycleKey&) const = default;
+};
+struct RecycleKeyHash {
+    size_t operator()(const RecycleKey& k) const noexcept {
+        u64 h = 0xcbf29ce484222325ULL;
+        for (const u32 v : {k.flags, k.type, k.format, k.width, k.height, k.depth, k.mips,
+                            k.layers, k.samples, k.usage}) {
+            h = (h ^ v) * 0x100000001b3ULL;
+        }
+        return size_t(h);
+    }
+};
+struct RecycledImage {
+    VmaAllocation allocation;
+    vk::Image image;
+    vk::DeviceSize size_bytes;
+    u64 seq;
+    std::chrono::steady_clock::time_point unused_since;
+};
+std::deque<std::pair<RecycleKey, u64>> g_recycle_order; // oldest first, for eviction
+u64 g_recycle_seq = 0;
+std::mutex g_recycle_mutex;
+std::unordered_map<RecycleKey, std::vector<RecycledImage>, RecycleKeyHash> g_recycled;
+u64 g_recycled_bytes = 0;
+// GPU.image_recycle_mb (launcher quality preset) or SHADGT_IMAGE_RECYCLE_MB; 512 by default.
+u64 RecycleBudgetBytes() {
+    static const u64 budget = [] {
+        if (const char* env = std::getenv("SHADGT_IMAGE_RECYCLE_MB"); env && *env) {
+            return std::strtoull(env, nullptr, 10) << 20;
+        }
+        if (const auto value = Common::RytyGameConfigValue("image_recycle_mb")) {
+            return std::strtoull(value->c_str(), nullptr, 10) << 20;
+        }
+        return u64{512} << 20;
+    }();
+    return budget;
+}
+constexpr size_t RecyclePerKey = 8;
+std::atomic<u64> g_recycle_hits{}, g_recycle_misses{}, g_recycle_dropped{};
+
+bool RecycleEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_IMAGE_RECYCLE");
+        return !env || env[0] != '0';
+    }();
+    return enabled;
+}
+
+RecycleKey KeyOf(const vk::ImageCreateInfo& ci) {
+    return {u32(VkImageCreateFlags(ci.flags)), u32(ci.imageType), u32(ci.format),
+            ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels, ci.arrayLayers,
+            u32(ci.samples), u32(VkImageUsageFlags(ci.usage))};
+}
+
+// Destruction may enter the driver and block. Declare this batch before the pool
+// lock so its destructor always runs after that lock has been released, including
+// early returns. Only GPU-complete images removed from the pool enter this batch.
+struct RetiredRecycleImages {
+    VmaAllocator allocator;
+    std::vector<RecycledImage> images;
+    decltype(g_recycled) buckets;
+    ~RetiredRecycleImages() {
+        for (const auto& image : images)
+            vmaDestroyImage(allocator, image.image, image.allocation);
+        for (const auto& [key, entries] : buckets)
+            for (const auto& image : entries)
+                vmaDestroyImage(allocator, image.image, image.allocation);
+    }
+};
+
+/// Keeps the image for reuse; false when it should be destroyed instead.
+bool Recycle(VmaAllocator allocator, const vk::ImageCreateInfo& ci, VmaAllocation allocation,
+             vk::Image image, vk::DeviceSize size_bytes) {
+    RetiredRecycleImages retired{allocator};
+    if (!RecycleEnabled() || ci.pNext != nullptr || size_bytes > (64ULL << 20) || size_bytes > RecycleBudgetBytes()) {
+        return false;
+    }
+    std::scoped_lock lk{g_recycle_mutex};
+    const RecycleKey key = KeyOf(ci);
+    auto& list = g_recycled[key];
+    if (list.size() >= RecyclePerKey) {
+        ++g_recycle_dropped;
+        return false;
+    }
+    // Over budget: the images waiting longest go (most were made once, e.g. while loading).
+    while (g_recycled_bytes + size_bytes > RecycleBudgetBytes() && !g_recycle_order.empty()) {
+        const auto [old_key, old_seq] = g_recycle_order.front();
+        g_recycle_order.pop_front();
+        auto& old_list = g_recycled[old_key];
+        const auto it = std::ranges::find(old_list, old_seq, &RecycledImage::seq);
+        if (it != old_list.end()) {
+            retired.images.push_back(*it);
+            g_recycled_bytes -= it->size_bytes;
+            old_list.erase(it);
+            ++g_recycle_dropped;
+        }
+    }
+    if (g_recycle_order.size() > 65536) {
+        // Entries of images taken again stay until reached; drop them now and then.
+        std::erase_if(g_recycle_order, [](const auto& entry) {
+            const auto& entries = g_recycled[entry.first];
+            return std::ranges::find(entries, entry.second, &RecycledImage::seq) == entries.end();
+        });
+    }
+    const u64 seq = ++g_recycle_seq;
+    g_recycled[key].push_back({allocation, image, size_bytes, seq, std::chrono::steady_clock::now()});
+    g_recycle_order.emplace_back(key, seq);
+    g_recycled_bytes += size_bytes;
+    return true;
+}
+
+/// AMD-VRAM-001: every image kept for reuse is destroyed, to make room when VRAM runs out.
+/// Returns the bytes freed.
+u64 DropRecycled(VmaAllocator allocator) {
+    RetiredRecycleImages retired{allocator};
+    std::scoped_lock lk{g_recycle_mutex};
+    const u64 freed = g_recycled_bytes;
+    retired.buckets.swap(g_recycled);
+    g_recycle_order.clear();
+    g_recycled_bytes = 0;
+    return freed;
+}
+
+std::optional<RecycledImage> TakeRecycled(const vk::ImageCreateInfo& ci) {
+    if (!RecycleEnabled() || ci.pNext != nullptr) {
+        return std::nullopt;
+    }
+    std::scoped_lock lk{g_recycle_mutex};
+    const auto it = g_recycled.find(KeyOf(ci));
+    if (it == g_recycled.end() || it->second.empty()) {
+        ++g_recycle_misses;
+        return std::nullopt;
+    }
+    const RecycledImage taken = it->second.back();
+    it->second.pop_back();
+    g_recycled_bytes -= taken.size_bytes;
+    if (const u64 n = ++g_recycle_hits; n == 1 || n % 20000 == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "PERF-104: {} images reused, {} made new, {} not kept; {} MiB waiting",
+                    n, g_recycle_misses.load(), g_recycle_dropped.load(),
+                    g_recycled_bytes >> 20);
+    }
+    return taken;
+}
+} // namespace
+
+u64 RecycledImageBytes() {
+    std::scoped_lock lk{g_recycle_mutex};
+    return g_recycled_bytes;
+}
+
+void ClearRecycledImages(VmaAllocator allocator) {
+    RetiredRecycleImages retired{allocator};
+    std::scoped_lock lk{g_recycle_mutex};
+    retired.buckets.swap(g_recycled);
+    g_recycle_order.clear();
+    g_recycled_bytes = 0;
+}
+
+void TrimUnusedRecycledImages(VmaAllocator allocator) {
+    RetiredRecycleImages retired{allocator};
+    const auto cutoff = std::chrono::steady_clock::now() - std::chrono::seconds{30};
+    std::scoped_lock lk{g_recycle_mutex};
+    while (!g_recycle_order.empty()) {
+        const auto& [key, seq] = g_recycle_order.front();
+        auto bucket = g_recycled.find(key);
+        if (bucket == g_recycled.end()) {
+            g_recycle_order.pop_front();
+            continue;
+        }
+        auto& images = bucket->second;
+        const auto it = std::ranges::find(images, seq, &RecycledImage::seq);
+        if (it != images.end()) {
+            if (it->unused_since > cutoff) break;
+            // Images enter this pool only after their GPU completion callback.
+            retired.images.push_back(*it);
+            g_recycled_bytes -= it->size_bytes;
+            images.erase(it);
+            ++g_recycle_dropped;
+        }
+        if (images.empty()) g_recycled.erase(bucket);
+        g_recycle_order.pop_front();
+    }
+}
+
+u64 ReleaseRecycledImages(VmaAllocator allocator) {
+    RetiredRecycleImages retired{allocator};
+    std::scoped_lock lock{g_recycle_mutex};
+    const u64 released = g_recycled_bytes;
+    for (const auto& [key, images] : g_recycled) {
+        for (const auto& image : images) {
+            ++g_recycle_dropped;
+        }
+    }
+    retired.buckets.swap(g_recycled);
+    g_recycle_order.clear();
+    g_recycled_bytes = 0;
+    return released;
+}
+
+UniqueImage::~UniqueImage() {
+    Destroy();
+}
+
+void UniqueImage::Destroy() {
+    if (image) {
+        if (!Recycle(allocator, image_ci, allocation, image, size_bytes)) {
+            vmaDestroyImage(allocator, image, allocation);
+        }
+        image = vk::Image{};
+        allocation = {};
+    }
+}
+
+void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
+    this->image_ci = image_ci;
+    ASSERT(!image);
+    if (const auto recycled = TakeRecycled(image_ci)) {
+        allocation = recycled->allocation;
+        image = recycled->image;
+        size_bytes = recycled->size_bytes;
+        return;
+    }
+    VmaAllocationCreateInfo alloc_ci = {
+        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        .requiredFlags = 0,
+        .preferredFlags = 0,
+        .pool = VK_NULL_HANDLE,
+        .pUserData = nullptr,
+    };
+    // AMD-VRAM-003: render targets and depth buffers are drawn to every frame, so they stay in
+    // VRAM first; textures only sampled get the default and are paged out before them. (VMA
+    // passes it to the driver only when the allocator was made with memory priority: on AMD.)
+    // Many images carry every usage (a texture may become a target), so only depth buffers and
+    // colour targets never sampled count as render targets here.
+    const bool depth_target = bool(image_ci.usage & vk::ImageUsageFlagBits::eDepthStencilAttachment);
+    const bool pure_target = (image_ci.usage & vk::ImageUsageFlagBits::eColorAttachment) &&
+                             !(image_ci.usage & vk::ImageUsageFlagBits::eSampled);
+    alloc_ci.priority = depth_target || pure_target ? 1.0f : 0.5f;
+
+    const VkImageCreateInfo image_ci_unsafe = static_cast<VkImageCreateInfo>(image_ci);
+    alloc_ci.pool = Vulkan::SmallImageAllocationPool(allocator, image_ci_unsafe, alloc_ci);
+    VkImage unsafe_image{};
+    VmaAllocationInfo alloc_info{};
+    VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
+                                     &allocation, &alloc_info);
+    if (result != VK_SUCCESS && alloc_ci.pool) {
+        alloc_ci.pool = VK_NULL_HANDLE;
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
+                               &allocation, &alloc_info);
+    }
+    // AMD-VRAM-001: out of video memory (an 8 GB RX 7600 ran out in races and the game stopped
+    // here). First the images kept for reuse go, then the allocation may exceed the budget: the
+    // driver pages less-used memory to system RAM (VK_EXT_pageable_device_local_memory), which is
+    // slower for a moment but keeps the game running.
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        const u64 freed = DropRecycled(allocator);
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
+                                &allocation, &alloc_info);
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            alloc_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+            result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
+                                    &allocation, &alloc_info);
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "AMD-VRAM-001: video memory full: {} MB of reusable images freed, image {}x{} "
+                    "{}",
+                    freed >> 20, image_ci.extent.width, image_ci.extent.height,
+                    result == VK_SUCCESS ? "allocated" : "still failed");
+    }
+    ASSERT_MSG(result == VK_SUCCESS,
+               "Failed allocating image: error={} format={} type={} extent={}x{}x{} "
+               "mips={} layers={} samples={} flags={} usage={} tiling={}",
+               vk::to_string(vk::Result{result}), vk::to_string(image_ci.format),
+               vk::to_string(image_ci.imageType), image_ci.extent.width, image_ci.extent.height,
+               image_ci.extent.depth, image_ci.mipLevels, image_ci.arrayLayers,
+               vk::to_string(image_ci.samples), vk::to_string(image_ci.flags),
+               vk::to_string(image_ci.usage), vk::to_string(image_ci.tiling));
+    image = vk::Image{unsafe_image};
+    size_bytes = alloc_info.size;
+}
+
+Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
+             Common::SlotVector<ImageView>& slot_image_views_, const ImageInfo& info_)
+    : runtime{&runtime_}, slot_image_views{&slot_image_views_}, info{info_} {
+    if (info.pixel_format == vk::Format::eUndefined) {
+        return;
+    }
+
+    image_uid = global_image_uid.Next();
+    vk::ImageCreateFlags flags{vk::ImageCreateFlagBits::eMutableFormat |
+                               vk::ImageCreateFlagBits::eExtendedUsage};
+    if (info.props.is_volume) {
+        flags |= vk::ImageCreateFlagBits::e2DArrayCompatible;
+        if (instance.Is2dViewOf3dSupported()) {
+            flags |= vk::ImageCreateFlagBits::e2DViewCompatibleEXT;
+        }
+    }
+    if (info.props.is_block && instance.IsBlockTexelViewSupported()) {
+        flags |= vk::ImageCreateFlagBits::eBlockTexelViewCompatible;
+    }
+
+    usage_flags = ImageUsageFlags(instance, info);
+    format_features = FormatFeatureFlags(usage_flags);
+    // FIX-211: AMD's driver refuses storage use for some block-compressed formats even with
+    // extended usage (BC5 and BC6H on an RX 7600), where NVIDIA's accepts it. The image was made
+    // anyway, outside what the driver supports, and textures came out garbled (broken colours
+    // on car dashboards). Shaders only sample these, so storage use is dropped.
+    if (info.props.is_block && (usage_flags & vk::ImageUsageFlagBits::eStorage)) {
+        static std::mutex refused_mutex;
+        static std::unordered_map<u64, bool> refused_cache;
+        const u64 refused_key = (u64(info.pixel_format) << 40) ^
+                                (u64(ConvertImageType(info.type)) << 36) ^
+                                (u64(VkImageUsageFlags(usage_flags)) << 16) ^
+                                u64(VkImageCreateFlags(flags));
+        std::optional<bool> refused;
+        {
+            std::scoped_lock lk{refused_mutex};
+            if (const auto it = refused_cache.find(refused_key); it != refused_cache.end()) {
+                refused = it->second;
+            }
+        }
+        if (!refused) {
+            const auto result = instance.GetPhysicalDevice()
+                                    .getImageFormatProperties2(vk::PhysicalDeviceImageFormatInfo2{
+                                        .format = info.pixel_format,
+                                        .type = ConvertImageType(info.type),
+                                        .tiling = vk::ImageTiling::eOptimal,
+                                        .usage = usage_flags,
+                                        .flags = flags,
+                                    })
+                                    .result;
+            refused = result == vk::Result::eErrorFormatNotSupported;
+            if (*refused) {
+                LOG_INFO(Render_Vulkan, "FIX-211: format {} made without storage use",
+                         vk::to_string(info.pixel_format));
+            }
+            std::scoped_lock lk{refused_mutex};
+            refused_cache.emplace(refused_key, *refused);
+        }
+        if (*refused) {
+            usage_flags &= ~vk::ImageUsageFlagBits::eStorage;
+            format_features = FormatFeatureFlags(usage_flags);
+        }
+    }
+    if (info.props.is_depth) {
+        aspect_mask = vk::ImageAspectFlagBits::eDepth;
+        if (info.props.has_stencil) {
+            aspect_mask |= vk::ImageAspectFlagBits::eStencil;
+        }
+    }
+
+    constexpr auto tiling = vk::ImageTiling::eOptimal;
+    const auto supported_format = instance.GetSupportedFormat(info.pixel_format, format_features);
+    const vk::PhysicalDeviceImageFormatInfo2 format_info{
+        .format = supported_format,
+        .type = ConvertImageType(info.type),
+        .tiling = tiling,
+        .usage = usage_flags,
+        .flags = flags,
+    };
+    // PERF-104: the answer only depends on these four, and images are made often.
+    static std::mutex samples_mutex;
+    static std::unordered_map<u64, vk::SampleCountFlags> samples_cache;
+    const u64 samples_key = (u64(supported_format) << 40) ^ (u64(format_info.type) << 36) ^
+                            (u64(VkImageUsageFlags(usage_flags)) << 16) ^
+                            u64(VkImageCreateFlags(flags));
+    std::optional<vk::SampleCountFlags> cached_samples;
+    {
+        std::scoped_lock lk{samples_mutex};
+        if (const auto it = samples_cache.find(samples_key); it != samples_cache.end()) {
+            cached_samples = it->second;
+        }
+    }
+    if (cached_samples) {
+        supported_samples = *cached_samples;
+    } else {
+        const auto image_format_properties =
+            instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
+        if (image_format_properties.result == vk::Result::eErrorFormatNotSupported) {
+            LOG_ERROR(Render_Vulkan,
+                      "image format {} type {} is not supported (flags {}, usage {})",
+                      vk::to_string(supported_format), vk::to_string(format_info.type),
+                      vk::to_string(format_info.flags), vk::to_string(format_info.usage));
+        }
+        supported_samples = image_format_properties.result == vk::Result::eSuccess
+                                ? image_format_properties.value.imageFormatProperties.sampleCounts
+                                : vk::SampleCountFlagBits::e1;
+        std::scoped_lock lk{samples_mutex};
+        samples_cache.emplace(samples_key, supported_samples);
+    }
+
+    const vk::ImageCreateInfo image_ci = {
+        .flags = flags,
+        .imageType = ConvertImageType(info.type),
+        .format = supported_format,
+        .extent{
+            .width = info.size.width,
+            .height = info.size.height,
+            .depth = info.size.depth,
+        },
+        .mipLevels = static_cast<u32>(info.resources.levels),
+        .arrayLayers = static_cast<u32>(info.resources.layers),
+        .samples = LiverpoolToVK::NumSamples(info.num_samples, supported_samples),
+        .tiling = tiling,
+        .usage = usage_flags,
+        .initialLayout = vk::ImageLayout::eUndefined,
+    };
+
+    backing = &backing_images.emplace_back();
+    backing->num_samples = info.num_samples;
+    backing->image = UniqueImage{instance.GetDevice(), instance.GetAllocator()};
+    backing->image.Create(image_ci);
+
+    Vulkan::SetObjectName(instance.GetDevice(), GetImage(),
+                          "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{}", info.size.width,
+                          info.size.height, info.size.depth, AmdGpu::NameOf(info.tile_mode),
+                          vk::to_string(info.pixel_format), info.guest_address, info.guest_size,
+                          info.resources.layers, info.resources.levels, info.num_samples);
+}
+
+Image::~Image() = default;
+
+ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_samples) {
+    if (ensure_guest_samples && backing->num_samples > 1 != info.num_samples > 1) {
+        runtime->SetBackingSamples(this, info.num_samples);
+    }
+    const auto& view_infos = backing->image_view_infos;
+    const auto it = std::ranges::find(view_infos, view_info);
+    if (it != view_infos.end()) {
+        const auto view_id = backing->image_view_ids[std::distance(view_infos.begin(), it)];
+        return (*slot_image_views)[view_id];
+    }
+    const auto view_id = slot_image_views->Insert(runtime->GetInstance(), view_info, *this);
+    backing->image_view_infos.emplace_back(view_info);
+    backing->image_view_ids.emplace_back(view_id);
+    return (*slot_image_views)[view_id];
+}
+
+void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                        vk::PipelineStageFlags2 dst_stage,
+                        std::optional<SubresourceRange> subres_range) {
+    ComputeImageBarriers(barriers, *backing, info.resources, GetImage(), aspect_mask, dst_layout,
+                         dst_mask, dst_stage, subres_range);
+}
+
+} // namespace VideoCore

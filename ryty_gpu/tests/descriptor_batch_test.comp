@@ -1,0 +1,7 @@
+#version 450
+layout(local_size_x=8) in;
+layout(set=0,binding=0,std430) readonly buffer A {uint a[];};
+layout(set=1,binding=0,std430) readonly buffer B {uint b[];};
+layout(set=2,binding=0,std430) readonly buffer C {uint c[];};
+layout(set=3,binding=0,std430) writeonly buffer O {uint o[];};
+void main(){uint i=gl_GlobalInvocationID.x;o[i]=a[i]^(b[i]*1664525u+c[i]);}

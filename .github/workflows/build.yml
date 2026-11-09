@@ -1,0 +1,67 @@
+# SPDX-FileCopyrightText: 2024 shadPS4 Emulator Project
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+name: Legacy Windows Build and Tests (manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+jobs:
+  reuse:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - run: python -m pip install reuse
+      - run: python -m reuse lint
+
+  clang-format:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - run: python -m pip install clang-format==19.1.7
+      - name: Check C++ formatting
+        env:
+          COMMIT_RANGE: ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
+        run: ./.github/workflows/scripts/clang-format.ps1
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Set up CMake and Ninja
+        uses: lukka/get-cmake@latest
+      - name: Set up x64 C++ environment
+        uses: egor-tensin/vs-shell@v2
+        with:
+          arch: x64
+      - name: Add LLVM to PATH
+        run: '"C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append'
+      - name: Configure Release
+        run: cmake --preset x64-Clang-Release -DHAVE_ENDIAN_H=OFF
+      - name: Build shadGT
+        run: cmake --build Build/x64-Clang-Release --target shadps4 --parallel $env:NUMBER_OF_PROCESSORS
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: shadGT-win64-${{ github.sha }}
+          path: Build/x64-Clang-Release/shadGT.exe
+          if-no-files-found: error
+      - name: Configure unit tests
+        run: cmake -S . -B Build/tests -G Ninja -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_C_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Debug -DENABLE_TESTS=ON -DHAVE_ENDIAN_H=OFF
+      - name: Build unit tests
+        run: cmake --build Build/tests --parallel $env:NUMBER_OF_PROCESSORS
+      - name: Run unit tests
+        run: ctest --test-dir Build/tests --output-on-failure -E GcnTest

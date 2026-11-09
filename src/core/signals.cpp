@@ -1,0 +1,485 @@
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <array>
+#include <fmt/format.h>
+#include "common/arch.h"
+#include "common/assert.h"
+#include "common/decoder.h"
+#include "common/logging/log.h"
+#include "common/signal_context.h"
+#include "core/cpu_patches.h" // Windows static guest red-zone protection
+#include "core/libraries/kernel/kernel.h"
+#include "core/libraries/kernel/threads/exception.h"
+#include "core/memory.h"
+#include "common/sampling_profiler.h"
+#include "core/signals.h"
+#include "emulator.h"
+
+#ifdef _WIN32
+#include <windows.h>
+static constexpr DWORD MS_VC_EXCEPTION = 0x406D1388;
+#else
+#include <csignal>
+#include <pthread.h>
+#ifdef ARCH_X86_64
+#include <Zydis/Formatter.h>
+#endif
+#endif
+
+namespace Core {
+
+#if defined(_WIN32)
+
+static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
+    using namespace Libraries::Kernel;
+    if (Common::SamplingProfiler::IsProfilerThread()) {
+        return EXCEPTION_CONTINUE_SEARCH; // DIAG-048: the profiler's unwinder handles its faults
+    }
+    const auto* signals = Signals::Instance();
+
+    const bool use_static_windows_guest_red_zone_protection =
+        WindowsGuestRedZoneProtection::IsStaticPatchingEnabled();
+    DWORD code = 0;
+    PVOID address = nullptr;
+
+    if (pExp != nullptr && pExp->ExceptionRecord != nullptr) {
+        code = pExp->ExceptionRecord->ExceptionCode;
+        address = pExp->ExceptionRecord->ExceptionAddress;
+    }
+
+    Ucontext guest_context{pExp->ContextRecord};
+    Siginfo guest_info{
+        ._si_signo = 0,
+        ._si_errno = 0,
+        ._si_code = POSIX_SI_NOINFO,
+        ._si_addr = (void*)guest_context.uc_mcontext.mc_rip,
+    };
+
+    bool handled = false;
+    bool static_protection_exception = false; // Windows static guest red-zone protection
+    switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION:
+        guest_info._si_signo = POSIX_SIGSEGV;
+        guest_info._si_code = POSIX_SEGV_MAPERR;
+        static_protection_exception = true; // Windows static guest red-zone protection
+        handled = signals->DispatchAccessViolation(
+            pExp, reinterpret_cast<void*>(pExp->ExceptionRecord->ExceptionInformation[1]));
+        break;
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+        guest_info._si_signo = POSIX_SIGILL;
+        guest_info._si_code = POSIX_ILL_ILLOPC;
+        static_protection_exception = true; // Windows static guest red-zone protection
+        handled = signals->DispatchIllegalInstruction(pExp);
+        break;
+    case EXCEPTION_PRIV_INSTRUCTION: // Windows static guest red-zone protection
+        if (use_static_windows_guest_red_zone_protection) {
+            static_protection_exception = true;
+            handled = signals->DispatchIllegalInstruction(pExp);
+        }
+        break;
+    case EXCEPTION_IN_PAGE_ERROR:
+        guest_info._si_signo = POSIX_SIGBUS;
+        guest_info._si_code = POSIX_BUS_ADRALN;
+        break;
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+        guest_info._si_signo = POSIX_SIGFPE;
+        guest_info._si_code = POSIX_FPE_INTDIV;
+        break;
+    case EXCEPTION_INT_OVERFLOW:
+        guest_info._si_signo = POSIX_SIGFPE;
+        guest_info._si_code = POSIX_FPE_INTOVF;
+        break;
+    case EXCEPTION_FLT_DIVIDE_BY_ZERO:
+        guest_info._si_signo = POSIX_SIGFPE;
+        guest_info._si_code = POSIX_FPE_FLTDIV;
+        break;
+    case EXCEPTION_FLT_INVALID_OPERATION:
+        guest_info._si_signo = POSIX_SIGFPE;
+        guest_info._si_code = POSIX_FPE_FLTINV;
+        break;
+    case EXCEPTION_FLT_OVERFLOW:
+        guest_info._si_signo = POSIX_SIGFPE;
+        guest_info._si_code = POSIX_FPE_FLTOVF;
+        break;
+    case EXCEPTION_FLT_UNDERFLOW:
+        guest_info._si_signo = POSIX_SIGFPE;
+        guest_info._si_code = POSIX_FPE_FLTUND;
+        break;
+    case EXCEPTION_FLT_DENORMAL_OPERAND:
+        guest_info._si_signo = POSIX_SIGFPE;
+        guest_info._si_code = POSIX_FPE_FLTSUB; // i am not sure about this one
+        break;
+    case EXCEPTION_FLT_INEXACT_RESULT:
+        guest_info._si_signo = POSIX_SIGFPE;
+        guest_info._si_code = POSIX_FPE_FLTRES;
+        break;
+    case EXCEPTION_FLT_STACK_CHECK:
+        guest_info._si_signo = POSIX_SIGILL;
+        guest_info._si_code = POSIX_ILL_BADSTK; // i am not sure about this one either
+        break;
+    case EXCEPTION_BREAKPOINT:
+    case EXCEPTION_SINGLE_STEP:
+        guest_info._si_signo = POSIX_SIGTRAP;
+        guest_info._si_code = POSIX_TRAP_BRKPT;
+        break;
+    case DBG_PRINTEXCEPTION_C:
+    case DBG_PRINTEXCEPTION_WIDE_C:
+        // Used by OutputDebugString functions.
+        return EXCEPTION_CONTINUE_EXECUTION;
+    case MS_VC_EXCEPTION:
+        LOG_DEBUG(Debug, "Pass MS_VC_EXCEPTION at {} to handler", address);
+        return EXCEPTION_EXECUTE_HANDLER;
+    default:
+        break;
+    }
+
+    if (handled) {
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    if (guest_info._si_signo != 0) {
+        if (g_curthread &&
+            g_curthread->DispatchSignal(guest_info._si_signo, &guest_info, &guest_context)) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+
+    const bool report_unhandled =
+        use_static_windows_guest_red_zone_protection ? static_protection_exception : true;
+    if (report_unhandled) {
+        LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+        if (code == EXCEPTION_ACCESS_VIOLATION && pExp->ExceptionRecord->NumberParameters >= 2) {
+            const auto operation = pExp->ExceptionRecord->ExceptionInformation[0];
+            LOG_CRITICAL(Debug, "Guest memory fault: {} at {:#x}",
+                         operation == 0   ? "read"
+                         : operation == 1 ? "write"
+                                          : "execute",
+                         pExp->ExceptionRecord->ExceptionInformation[1]);
+        }
+        const auto& ctx = *pExp->ContextRecord;
+        LOG_CRITICAL(Debug,
+                     "Guest registers: RIP={:#x} RSP={:#x} RBP={:#x} RAX={:#x} RBX={:#x} "
+                     "RCX={:#x} RDX={:#x} RSI={:#x} RDI={:#x}",
+                     ctx.Rip, ctx.Rsp, ctx.Rbp, ctx.Rax, ctx.Rbx, ctx.Rcx, ctx.Rdx, ctx.Rsi,
+                     ctx.Rdi);
+        LOG_CRITICAL(Debug,
+                     "Guest registers: R8={:#x} R9={:#x} R10={:#x} R11={:#x} R12={:#x} "
+                     "R13={:#x} R14={:#x} R15={:#x} EFLAGS={:#x}",
+                     ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15,
+                     ctx.EFlags);
+        // ReadProcessMemory avoids another exception if RIP is unmapped or crosses a page boundary.
+        std::array<u8, 15> bytes{};
+        SIZE_T bytes_read = 0;
+        ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(ctx.Rip), bytes.data(),
+                          bytes.size(), &bytes_read);
+        if (bytes_read != 0) {
+            ZydisDecodedInstruction instruction{};
+            ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+            auto* decoder = Common::Decoder::Instance();
+            if (ZYAN_SUCCESS(
+                    decoder->decodeInstruction(instruction, operands, bytes.data(), bytes_read))) {
+                LOG_CRITICAL(Debug, "Guest instruction: {}",
+                             decoder->disassembleInst(instruction, operands, ctx.Rip));
+            }
+        }
+        // DIAG-034: where the fault address, RIP and the registers point, and the code addresses
+        // on the stack (likely return addresses), so a crash can be traced from the log alone.
+        auto* memory = Core::Memory::Instance();
+        if (code == EXCEPTION_ACCESS_VIOLATION && pExp->ExceptionRecord->NumberParameters >= 2) {
+            LOG_CRITICAL(Debug, "Fault address {:#x}: {}",
+                         pExp->ExceptionRecord->ExceptionInformation[1],
+                         memory->DescribeAddress(pExp->ExceptionRecord->ExceptionInformation[1]));
+        }
+        LOG_CRITICAL(Debug, "RIP {:#x}: {}", ctx.Rip, memory->DescribeAddress(ctx.Rip));
+        const std::array<std::pair<const char*, u64>, 14> regs = {{{"RAX", ctx.Rax},
+                                                                   {"RBX", ctx.Rbx},
+                                                                   {"RCX", ctx.Rcx},
+                                                                   {"RDX", ctx.Rdx},
+                                                                   {"RSI", ctx.Rsi},
+                                                                   {"RDI", ctx.Rdi},
+                                                                   {"RBP", ctx.Rbp},
+                                                                   {"R8", ctx.R8},
+                                                                   {"R9", ctx.R9},
+                                                                   {"R10", ctx.R10},
+                                                                   {"R12", ctx.R12},
+                                                                   {"R13", ctx.R13},
+                                                                   {"R14", ctx.R14},
+                                                                   {"R15", ctx.R15}}};
+        for (const auto& [name, value] : regs) {
+            if (value >= 0x10000) {
+                LOG_CRITICAL(Debug, "{} {:#x}: {}", name, value, memory->DescribeAddress(value));
+            }
+        }
+        std::array<u64, 96> stack{};
+        SIZE_T stack_read = 0;
+        ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(ctx.Rsp), stack.data(),
+                          sizeof(stack), &stack_read);
+        std::string frames;
+        for (size_t i = 0; i < stack_read / sizeof(u64); ++i) {
+            const auto description = memory->DescribeAddress(stack[i]);
+            if (description.find(" Code ") != std::string::npos ||
+                description.find("prot 0x5 ") != std::string::npos ||
+                description.find("prot 0x7 ") != std::string::npos) {
+                frames += fmt::format(" | [rsp+{:#x}] {:#x} {}", i * 8, stack[i], description);
+            }
+        }
+        LOG_CRITICAL(Debug, "Code addresses on the stack:{}", frames.empty() ? " none" : frames);
+        // DIAG-035: emulator writes into guest memory near what the registers point at.
+        for (const auto& [name, value] : regs) {
+            if (value >= 0x10000 && memory->IsValidMapping(value)) {
+                LOG_CRITICAL(Debug, "Emulator writes near {} {:#x}:{}", name, value,
+                             memory->DescribeBackingWrites(value, 0x100));
+            }
+        }
+        Common::Log::Flush();
+        Common::Singleton<Core::Emulator>::Instance()->Shutdown();
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+#else
+
+static std::string DisassembleInstruction(void* code_address) {
+    char buffer[256] = "<unable to decode>";
+
+#ifdef ARCH_X86_64
+    ZydisDecodedInstruction instruction;
+    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+    const auto status =
+        Common::Decoder::Instance()->decodeInstruction(instruction, operands, code_address);
+    if (ZYAN_SUCCESS(status)) {
+        ZydisFormatter formatter;
+        ZydisFormatterInit(&formatter, ZYDIS_FORMATTER_STYLE_INTEL);
+        ZydisFormatterFormatInstruction(&formatter, &instruction, operands,
+                                        instruction.operand_count_visible, buffer, sizeof(buffer),
+                                        reinterpret_cast<u64>(code_address), ZYAN_NULL);
+    }
+#endif
+
+    return buffer;
+}
+
+static s32 NativeSiCodeToGuest(s32 sig, s32 code) {
+    using namespace Libraries::Kernel;
+    switch (sig) {
+    case SIGUSR1:
+        return POSIX_SI_LWP;
+    case SIGSEGV:
+        switch (code) {
+        case SEGV_MAPERR:
+            return POSIX_SEGV_MAPERR;
+        case SEGV_ACCERR:
+            return POSIX_SEGV_ACCERR;
+        }
+    case SIGBUS:
+        switch (code) {
+        case BUS_ADRALN:
+            return POSIX_BUS_ADRALN;
+        case BUS_ADRERR:
+            return POSIX_BUS_ADRERR;
+        case BUS_OBJERR:
+            return POSIX_BUS_OBJERR;
+        }
+    case SIGILL:
+        switch (code) {
+        case ILL_ILLOPC:
+            return POSIX_ILL_ILLOPC;
+        case ILL_ILLOPN:
+            return POSIX_ILL_ILLOPN;
+        case ILL_ILLADR:
+            return POSIX_ILL_ILLADR;
+        case ILL_ILLTRP:
+            return POSIX_ILL_ILLTRP;
+        case ILL_PRVOPC:
+            return POSIX_ILL_PRVOPC;
+        case ILL_PRVREG:
+            return POSIX_ILL_PRVREG;
+        case ILL_COPROC:
+            return POSIX_ILL_COPROC;
+        case ILL_BADSTK:
+            return POSIX_ILL_BADSTK;
+        }
+    case SIGFPE:
+        switch (code) {
+        case FPE_INTOVF:
+            return POSIX_FPE_INTOVF;
+        case FPE_INTDIV:
+            return POSIX_FPE_INTDIV;
+        case FPE_FLTDIV:
+            return POSIX_FPE_FLTDIV;
+        case FPE_FLTOVF:
+            return POSIX_FPE_FLTOVF;
+        case FPE_FLTUND:
+            return POSIX_FPE_FLTUND;
+        case FPE_FLTRES:
+            return POSIX_FPE_FLTRES;
+        case FPE_FLTINV:
+            return POSIX_FPE_FLTINV;
+        case FPE_FLTSUB:
+            return POSIX_FPE_FLTSUB;
+        }
+    case SIGTRAP:
+        switch (code) {
+        case TRAP_BRKPT:
+            return POSIX_TRAP_BRKPT;
+        case TRAP_TRACE:
+            return POSIX_TRAP_TRACE;
+#ifdef __FreeBSD__
+        case TRAP_DTRACE:
+            return POSIX_TRAP_DTRACE;
+#endif
+        }
+
+    default:
+        return POSIX_SI_NOINFO;
+    }
+}
+
+void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
+    using namespace Libraries::Kernel;
+    auto* thread = g_curthread;
+    const auto* signals = Signals::Instance();
+
+    auto* code_address = Common::GetRip(raw_context);
+
+    Ucontext context{info, reinterpret_cast<ucontext_t*>(raw_context)};
+    Siginfo guest_info{};
+    if (info) {
+        guest_info = *reinterpret_cast<Siginfo*>(info);
+        guest_info._si_signo = sig == SIGUSR1 ? 0 : NativeToOrbisSignal(info->si_signo);
+        guest_info._si_errno = NativeToPosixErrno(info->si_errno);
+        guest_info._si_code = NativeSiCodeToGuest(sig, info->si_code);
+        guest_info._si_addr = (void*)context.uc_mcontext.mc_rip;
+    }
+    Siginfo* info_p = info ? &guest_info : nullptr;
+    Ucontext* context_p = raw_context ? &context : nullptr;
+
+    switch (sig) {
+    case SIGSEGV:
+    case SIGBUS: {
+        const bool is_write = Common::IsWriteError(raw_context);
+        const bool is_exec = Common::IsExecuteError(raw_context);
+        if (!signals->DispatchAccessViolation(raw_context, info->si_addr)) {
+            if (thread && thread->DispatchSignal(NativeToOrbisSignal(sig), info_p, context_p)) {
+                return;
+            }
+            UNREACHABLE_MSG("Unhandled access violation at code address {}: {} address {}",
+                            fmt::ptr(code_address),
+                            is_write  ? "Write to"
+                            : is_exec ? "Executed from"
+                                      : "Read from",
+                            fmt::ptr(info->si_addr));
+        }
+        break;
+    }
+    case SIGILL:
+        if (signals->DispatchIllegalInstruction(raw_context)) {
+            return;
+        }
+    case SIGFPE:
+    case SIGTRAP:
+    case SIGSYS: {
+        if (thread && thread->DispatchSignal(NativeToOrbisSignal(sig), info_p, context_p)) {
+            return;
+        }
+
+        UNREACHABLE_MSG("Unhandled signal {} at code address {}", sig, fmt::ptr(code_address));
+    }
+    case SIGSLEEP: {
+        // Sleep thread until signal is received again
+        sigset_t sigset;
+        sigemptyset(&sigset);
+        sigaddset(&sigset, SIGSLEEP);
+        sigwait(&sigset, &sig);
+        break;
+    }
+    case SIGUSR1:
+        if (thread) {
+            thread->DispatchPendingSignals(info_p, context_p);
+        }
+        break;
+    default:
+        UNREACHABLE_MSG("Unhandled signal {} at code address {}", sig, fmt::ptr(code_address));
+    }
+}
+
+#endif
+
+SignalDispatch::SignalDispatch() {
+#if defined(_WIN32) && defined(RYTY_GPU)
+    // Under Ryty, Ryty's libc owns exception handling: it passes guest write faults to the
+    // renderer (RytyGpuHandleWriteFault) and reports real crashes. This handler would treat every
+    // first-chance exception it does not know, such as a C++ exception thrown and caught inside
+    // Ryty's libraries, as fatal and end the process.
+    handle = nullptr;
+#elif defined(_WIN32)
+    ASSERT_MSG(handle = AddVectoredExceptionHandler(0, SignalHandler),
+               "Failed to register exception handler.");
+#else
+    struct sigaction action{};
+    action.sa_sigaction = SignalHandler;
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&action.sa_mask);
+
+    ASSERT_MSG(
+        sigaction(SIGSEGV, &action, nullptr) == 0 && sigaction(SIGBUS, &action, nullptr) == 0 &&
+            sigaction(SIGILL, &action, nullptr) == 0 && sigaction(SIGFPE, &action, nullptr) == 0 &&
+            sigaction(SIGTRAP, &action, nullptr) == 0 && sigaction(SIGSYS, &action, nullptr) == 0 &&
+            sigaction(SIGUSR1, &action, nullptr) == 0 && sigaction(SIGSLEEP, &action, nullptr) == 0,
+        "Failed to register signal handlers.");
+#endif
+}
+
+void SignalDispatch::RemoveHandlers() {
+    // asserting here would get into an infinite loop until too
+    // many nested exceptions makes the OS kill the process
+#if defined(_WIN32)
+    if (handle == nullptr) {
+        return; // Never registered (the Ryty build).
+    }
+    if (!(RemoveVectoredExceptionHandler(handle))) {
+        LOG_CRITICAL(Core, "Failed to remove exception handler.");
+        std::quick_exit(1);
+    }
+#else
+    struct sigaction action{};
+    action.sa_handler = SIG_DFL;
+    action.sa_flags = 0;
+    sigemptyset(&action.sa_mask);
+
+    if (!(sigaction(SIGSEGV, &action, nullptr) == 0 && sigaction(SIGBUS, &action, nullptr) == 0 &&
+          sigaction(SIGILL, &action, nullptr) == 0 && sigaction(SIGFPE, &action, nullptr) == 0 &&
+          sigaction(SIGTRAP, &action, nullptr) == 0 && sigaction(SIGSYS, &action, nullptr) == 0 &&
+          sigaction(SIGUSR1, &action, nullptr) == 0 &&
+          sigaction(SIGSLEEP, &action, nullptr) == 0)) {
+        LOG_CRITICAL(Core, "Failed to remove signal handlers.");
+        std::quick_exit(1);
+    }
+#endif
+}
+
+SignalDispatch::~SignalDispatch() {
+    RemoveHandlers();
+}
+
+bool SignalDispatch::DispatchAccessViolation(void* context, void* fault_address) const {
+    for (const auto& [handler, _] : access_violation_handlers) {
+        if (handler(context, fault_address)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SignalDispatch::DispatchIllegalInstruction(void* context) const {
+    for (const auto& [handler, _] : illegal_instruction_handlers) {
+        if (handler(context)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace Core

@@ -1,0 +1,44 @@
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <memory>
+#include <boost/container/set.hpp>
+#include <boost/container/small_vector.hpp>
+#include "common/types.h"
+
+namespace Serialization {
+struct Archive;
+}
+
+namespace Shader {
+
+// The walker also stores the guest address each flattened dword was read from, so constants
+// written by the GPU can be refreshed on the GPU timeline.
+using PFN_SrtWalker = void PS4_SYSV_ABI (*)(const u32* /*user_data*/, u32* /*flat_dst*/,
+                                            u64* /*flat_src*/);
+struct WalkerCode {
+    PFN_SrtWalker function{};
+    std::shared_ptr<void> owner;
+};
+/// Publishes complete walker code at a stable address owned by the returned lease.
+WalkerCode RegisterWalkerCode(const u8* ptr, size_t size, u64 key = 0);
+
+struct PersistentSrtInfo {
+    // Special case when fetch shader uses step rates.
+    struct SrtSharpReservation {
+        u32 sgpr_base;
+        u32 dword_offset;
+        u32 num_dwords;
+    };
+
+    PFN_SrtWalker walker_func{};
+    size_t walker_func_size{};
+    u32 flattened_bufsize_dw = 16; // NumUserDataRegs
+
+    void Serialize(Serialization::Archive& ar) const;
+    bool Deserialize(Serialization::Archive& ar, std::shared_ptr<void>& owner, u64 walker_key = 0);
+};
+
+} // namespace Shader

@@ -1,0 +1,424 @@
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <cstdlib>
+#include <fmt/format.h>
+#include <magic_enum/magic_enum.hpp>
+#include "common/logging/classes.h"
+#include "shader_recompiler/frontend/control_flow_graph.h"
+#include "shader_recompiler/frontend/decode.h"
+#include "shader_recompiler/frontend/structured_control_flow.h"
+#include "shader_recompiler/frontend/translate/translate.h"
+#include "shader_recompiler/ir/ir_emitter.h"
+#include "shader_recompiler/ir/passes/ir_passes.h"
+#include "shader_recompiler/ir/post_order.h"
+#include "shader_recompiler/ir/program.h"
+#include "shader_recompiler/profile.h"
+#include "shader_recompiler/recompiler.h"
+#ifndef NDEBUG
+#include "shader_recompiler/srt_arena_trace.h"
+#endif
+
+namespace Shader {
+
+IR::BlockList GenerateBlocks(const IR::AbstractSyntaxList& syntax_list) {
+    size_t num_syntax_blocks{};
+    for (const auto& [_, type] : syntax_list) {
+        if (type == IR::AbstractSyntaxNode::Type::Block) {
+            ++num_syntax_blocks;
+        }
+    }
+    IR::BlockList blocks{};
+    blocks.reserve(num_syntax_blocks);
+    for (const auto& [data, type] : syntax_list) {
+        if (type == IR::AbstractSyntaxNode::Type::Block) {
+            blocks.push_back(data.block);
+        }
+    }
+    return blocks;
+}
+
+void EmitControlFlowGraph(IR::Program& program, Pools& pools, Gcn::CFG& cfg,
+                          RuntimeInfo& runtime_info, const Profile& profile) {
+    Gcn::Translator translator{program.info, runtime_info, profile};
+    for (auto& block : cfg) {
+        const u32 start = block.begin_index;
+        const u32 size = block.end_index - start + 1;
+        auto* ir_block = pools.block_pool.Create(pools.inst_pool);
+        ir_block->cfg_block = &block;
+        block.ir_block = ir_block;
+        translator.Translate(ir_block, block.begin, block.cond,
+                             std::span{program.ins_list}.subspan(start, size));
+        program.blocks.push_back(ir_block);
+    }
+    translator.EmitPrologue(program.blocks.front());
+    ASSERT_MSG(!program.info.translation_failed, "Shader translation has failed");
+    for (auto& block : cfg) {
+        auto* ir_block = block.ir_block;
+        if (block.branch_true) {
+            auto* true_block = block.branch_true->ir_block;
+            ir_block->AddBranch(true_block);
+        }
+        if (block.branch_false) {
+            auto* false_block = block.branch_false->ir_block;
+            ir_block->AddBranch(false_block);
+        }
+    }
+    program.post_order_blocks = Shader::IR::PostOrder(program.blocks.front());
+}
+
+std::string ListGcnCode(std::span<const u32> code) {
+    using namespace Gcn;
+    Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
+    Gcn::GcnDecodeContext decoder;
+    std::string out;
+    u32 pc = 0;
+    const auto operand = [](const InstOperand& op) {
+        return fmt::format("{}:{:#x}", magic_enum::enum_name(op.field), op.code);
+    };
+    while (!slice.atEnd()) {
+        const GcnInst inst = decoder.decodeInstruction(slice);
+        out += fmt::format("{:5x}: {}", pc, magic_enum::enum_name(inst.opcode));
+        for (u32 i = 0; i < inst.dst_count; ++i) {
+            out += (i == 0 ? " " : ", ") + operand(inst.dst[i]);
+        }
+        out += " <-";
+        for (u32 i = 0; i < inst.src_count; ++i) {
+            out += (i == 0 ? " " : ", ") + operand(inst.src[i]);
+        }
+        switch (inst.category) {
+        case InstCategory::ScalarMemory:
+            out += fmt::format(" [offset {:#x} imm {} count {}]", inst.control.smrd.offset,
+                               inst.control.smrd.imm, inst.control.smrd.count);
+            break;
+        case InstCategory::VectorMemory:
+            out += fmt::format(" [offset {:#x} offen {} idxen {}]", inst.control.mubuf.offset,
+                               inst.control.mubuf.offen, inst.control.mubuf.idxen);
+            break;
+        case InstCategory::FlowControl:
+            out += fmt::format(" [simm {}]", inst.control.sopp.simm);
+            break;
+        default:
+            break;
+        }
+        out += '\n';
+        pc += inst.length;
+        if (inst.opcode == Opcode::S_ENDPGM) {
+            break;
+        }
+    }
+    return out;
+}
+
+bool HasLaneReads(std::span<const u32> code) {
+    using namespace Gcn;
+    Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
+    Gcn::GcnDecodeContext decoder;
+    while (!slice.atEnd()) {
+        const GcnInst inst = decoder.decodeInstruction(slice);
+        if (inst.opcode == Opcode::V_READLANE_B32) {
+            return true;
+        }
+        if (inst.opcode == Opcode::S_ENDPGM) {
+            break;
+        }
+    }
+    return false;
+}
+
+bool HasLaneReadsAndLoop(std::span<const u32> code) {
+    using namespace Gcn;
+    Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
+    Gcn::GcnDecodeContext decoder;
+    bool lane_reads = false;
+    bool loop = false;
+    while (!slice.atEnd()) {
+        const GcnInst inst = decoder.decodeInstruction(slice);
+        switch (inst.opcode) {
+        case Opcode::V_READLANE_B32:
+        case Opcode::V_MBCNT_LO_U32_B32:
+        case Opcode::V_MBCNT_HI_U32_B32:
+            lane_reads = true;
+            break;
+        default:
+            break;
+        }
+        if (inst.category == InstCategory::FlowControl && inst.control.sopp.simm < 0 &&
+            (inst.IsUnconditionalBranch() || inst.IsConditionalBranch())) {
+            loop = true;
+        }
+        if (inst.opcode == Opcode::S_ENDPGM) {
+            break;
+        }
+    }
+    return lane_reads && loop;
+}
+
+bool HasMemoryWrites(std::span<const u32> code) {
+    using namespace Gcn;
+    Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
+    Gcn::GcnDecodeContext decoder;
+    const auto in = [](Opcode op, Opcode first, Opcode last) { return op >= first && op <= last; };
+    while (!slice.atEnd()) {
+        const GcnInst inst = decoder.decodeInstruction(slice);
+        const Opcode op = inst.opcode;
+        if (in(op, Opcode::BUFFER_STORE_FORMAT_X, Opcode::BUFFER_STORE_FORMAT_XYZW) ||
+            in(op, Opcode::BUFFER_STORE_BYTE, Opcode::BUFFER_STORE_DWORDX3) ||
+            in(op, Opcode::BUFFER_ATOMIC_SWAP, Opcode::BUFFER_ATOMIC_FMAX_X2) ||
+            in(op, Opcode::TBUFFER_STORE_FORMAT_X, Opcode::TBUFFER_STORE_FORMAT_XYZW) ||
+            in(op, Opcode::IMAGE_STORE, Opcode::IMAGE_STORE_MIP_PCK) ||
+            in(op, Opcode::IMAGE_ATOMIC_SWAP, Opcode::IMAGE_ATOMIC_FMAX) ||
+            in(op, Opcode::DS_GWS_SEMA_RELEASE_ALL, Opcode::DS_GWS_BARRIER) ||
+            op == Opcode::DS_CONSUME || op == Opcode::DS_APPEND ||
+            op == Opcode::DS_ORDERED_COUNT ||
+            (inst.category == InstCategory::DataShare && inst.control.ds.gds)) {
+            return true;
+        }
+        if (op == Opcode::S_ENDPGM) {
+            break;
+        }
+    }
+    return false;
+}
+
+bool HasLegacyMad(std::span<const u32> code) {
+    using namespace Gcn;
+    Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
+    Gcn::GcnDecodeContext decoder;
+    while (!slice.atEnd()) {
+        const GcnInst inst = decoder.decodeInstruction(slice);
+        if (inst.opcode == Opcode::V_MAD_LEGACY_F32 || inst.opcode == Opcode::V_MAC_LEGACY_F32) {
+            return true;
+        }
+        if (inst.opcode == Opcode::S_ENDPGM) {
+            break;
+        }
+    }
+    return false;
+}
+
+bool HasSdwaCompareDestination(std::span<const u32> code) {
+    using namespace Gcn;
+    GcnCodeSlice slice(code.data(), code.data() + code.size());
+    GcnDecodeContext decoder;
+    while (!slice.atEnd()) {
+        const auto inst = decoder.decodeInstruction(slice);
+        if (inst.encoding == InstEncoding::VOPC &&
+            inst.dst[1].field != OperandField::VccLo) {
+            return true;
+        }
+        if (inst.opcode == Opcode::S_ENDPGM) {
+            break;
+        }
+    }
+    return false;
+}
+
+bool HasEmptyScopeBeforeElse(std::span<const u32> code) {
+    using namespace Gcn;
+    Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
+    Gcn::GcnDecodeContext decoder;
+    const auto writes_exec = [](const GcnInst& inst) {
+        return inst.dst[0].field == OperandField::ExecLo;
+    };
+    // The open and close conditions of CFG::SplitDivergenceScopes.
+    const auto is_open = [&](const GcnInst& inst) {
+        return inst.opcode == Opcode::S_AND_SAVEEXEC_B64 ||
+               (inst.opcode == Opcode::S_ANDN2_B64 && writes_exec(inst)) || inst.IsCmpx();
+    };
+    bool previous_open = false;
+    while (!slice.atEnd()) {
+        const GcnInst inst = decoder.decodeInstruction(slice);
+        const bool close_and_open = inst.opcode == Opcode::S_ANDN2_B64 && writes_exec(inst);
+        if (previous_open && close_and_open) {
+            return true;
+        }
+        previous_open = is_open(inst);
+        if (inst.opcode == Opcode::S_ENDPGM) {
+            break;
+        }
+    }
+    return false;
+}
+
+#ifndef NDEBUG
+// DIAG-209 (RYGT_NAN_TRACE=<hash>): that pixel shader paints the index of the first NaN among the
+// F32 values of the block that writes RenderTarget0, in base 8 over R, G and B (digit + 1) / 8.
+static void NanTracePass(IR::Program& program, const Info& info) {
+    static const u64 hash = [] {
+        const char* env = std::getenv("RYGT_NAN_TRACE");
+        return env && *env ? std::strtoull(env, nullptr, 16) : 0;
+    }();
+    if (hash == 0 || info.pgm_hash != hash) {
+        return;
+    }
+    for (IR::Block* block : program.blocks) {
+        auto write = block->end();
+        for (auto it = block->begin(); it != block->end(); ++it) {
+            if (it->GetOpcode() == IR::Opcode::SetAttribute &&
+                it->Arg(0).Attribute() == IR::Attribute::RenderTarget0) {
+                write = it;
+                break;
+            }
+        }
+        if (write == block->end()) {
+            continue;
+        }
+        std::vector<IR::Inst*> values;
+        for (auto it = block->begin(); it != write; ++it) {
+            if (it->Type() == IR::Type::F32) {
+                LOG_WARNING(Render_Recompiler, "DIAG-209: value {} is {}", values.size(),
+                            magic_enum::enum_name(it->GetOpcode()));
+                values.push_back(&*it);
+            }
+        }
+        if (values.size() > 511) {
+            values.resize(511);
+        }
+        IR::IREmitter ir{*block, write};
+        IR::U32 found = ir.Imm32(~0U);
+        for (size_t i = values.size(); i-- > 0;) {
+            found = IR::U32{ir.Select(ir.FPIsNan(IR::F32{IR::Value{values[i]}}),
+                                      ir.Imm32(u32(i)), found)};
+        }
+        const IR::U1 any = ir.INotEqual(found, ir.Imm32(~0U));
+        const auto digit = [&](u32 shift) {
+            const IR::U32 d = IR::U32{ir.BitwiseAnd(
+                ir.ShiftRightLogical(found, ir.Imm32(shift)), ir.Imm32(7U))};
+            const IR::F32 f = IR::F32{ir.ConvertUToF(32, 32, ir.IAdd(d, ir.Imm32(1U)))};
+            return ir.FPMul(f, ir.Imm32(0.125f));
+        };
+        const std::array<IR::F32, 3> marks{digit(0), digit(3), digit(6)};
+        for (auto it = write; it != block->end(); ++it) {
+            if (it->GetOpcode() != IR::Opcode::SetAttribute ||
+                it->Arg(0).Attribute() != IR::Attribute::RenderTarget0) {
+                continue;
+            }
+            const u32 comp = it->Arg(2).U32();
+            if (comp < 3) {
+                IR::IREmitter at{*block, it};
+                it->SetArg(1, at.Select(any, marks[comp], IR::F32{it->Arg(1)}));
+            }
+        }
+        return;
+    }
+}
+
+#endif
+
+IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Info& info,
+                             RuntimeInfo& runtime_info, const Profile& device_profile) {
+#ifndef NDEBUG
+    SrtArenaTrace::FrontendScope arena_trace_scope;
+#endif
+    auto profile = device_profile;
+    // AMD explicit interpolation and KHR per-vertex arrays are alternative ABIs.
+    // Both extensions may be enabled on the device, but a shader must select one.
+    if (profile.supports_amd_shader_explicit_vertex_parameter) {
+        profile.supports_fragment_shader_barycentric = false;
+    }
+    if (runtime_info.hw_stage == HwStage::Fragment &&
+        runtime_info.hw.fs.single_sample_barycentric) {
+        profile.supports_amd_shader_explicit_vertex_parameter = false;
+        profile.supports_fragment_shader_barycentric = true;
+        // Preserve P1/P2 arithmetic when MOV makes another component per-vertex.
+        // Otherwise the shared attribute qualifier turns prior hardware reads into P0.
+        profile.needs_manual_interpolation = true;
+    }
+    // Ensure first instruction is expected.
+    constexpr u32 token_mov_vcchi = 0xBEEB03FF;
+    if (code[0] != token_mov_vcchi) {
+        LOG_WARNING(Render_Recompiler, "First instruction is not s_mov_b32 vcc_hi, #imm");
+    }
+
+    Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
+    Gcn::GcnDecodeContext decoder;
+
+    // Decode and save instructions
+    IR::Program program{info};
+    program.ins_list.reserve(code.size());
+    while (!slice.atEnd()) {
+        program.ins_list.emplace_back(decoder.decodeInstruction(slice));
+    }
+
+    // Clear any previous pooled data.
+    pools.ReleaseContents();
+
+    // Create control flow graph
+    Common::ObjectPool<Gcn::Block> gcn_block_pool{64};
+    Gcn::CFG cfg{gcn_block_pool, program.ins_list};
+    EmitControlFlowGraph(program, pools, cfg, runtime_info, profile);
+
+    // On NVIDIA GPUs HW interpolation of clip distance values seems broken, and we need to emulate
+    // it with expensive discard in PS.
+    Shader::InjectClipDistanceAttributes(program, runtime_info);
+
+    // Run optimization passes on unstructured graph
+    if (!profile.support_float64) {
+        Shader::Optimization::LowerFp64ToFp32(program);
+    }
+    Shader::Optimization::SsaRewritePass(program);
+    Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
+    Shader::Optimization::ReadLaneEliminationPass(program);
+    if (info.sw_stage == SwStage::TessellationControl) {
+        Shader::Optimization::TessellationPreprocess(program, runtime_info);
+        Shader::Optimization::HullShaderTransform(program, runtime_info);
+    } else if (info.sw_stage == SwStage::TessellationEval) {
+        Shader::Optimization::TessellationPreprocess(program, runtime_info);
+        Shader::Optimization::DomainShaderTransform(program, runtime_info);
+    }
+    Shader::Optimization::RingAccessElimination(program, runtime_info);
+#ifndef NDEBUG
+    Shader::IR::DumpProgram(program, info, "pre-res-discover.");
+#endif
+    auto resources = Shader::Optimization::ResourceDiscoverPass(program, profile);
+    Shader::Optimization::LowerDynamicReadConstPass(program, resources);
+    Shader::Optimization::FlattenExtendedUserdataPass(program);
+#ifndef NDEBUG
+    Shader::IR::DumpProgram(program, info, "pre-res-patch.");
+#endif
+    Shader::Optimization::ResourcePatchingPass(program.info, resources, profile);
+    Shader::Optimization::LowerBufferFormatToRaw(program);
+    Shader::Optimization::SharedMemorySimplifyPass(program, profile);
+    Shader::Optimization::SharedMemoryToStoragePass(program, runtime_info, profile);
+    Shader::Optimization::LowerUserClipPlanes(program, runtime_info);
+    Shader::Optimization::PhiSimplificationPass(program);
+    Shader::Optimization::InverseBallotEliminationPass(program);
+#ifndef NDEBUG
+    Shader::IR::DumpProgram(program, info, "pre-lower-phi.");
+#endif
+
+    // Prepare for structurization by clearing flow graph and lowering phis
+    for (auto* ir_block : program.blocks) {
+        ir_block->imm_predecessors.clear();
+        ir_block->imm_successors.clear();
+        ir_block->ssa_state.Reset();
+    }
+    Shader::Optimization::LowerPhisToRegsPass(program);
+
+    // Structurize control flow graph and create program.
+    program.syntax_list = Shader::Gcn::BuildASL(pools, cfg, info);
+    program.blocks = GenerateBlocks(program.syntax_list);
+    program.post_order_blocks = Shader::IR::PostOrder(program.syntax_list.front().data.block);
+
+    // Run optimization passes on structured graph
+    Shader::Optimization::SsaRepairPass(program);
+    Shader::Optimization::SsaRewritePass(program);
+    Shader::Optimization::SharedMemoryBarrierPass(program, runtime_info, profile);
+    Shader::Optimization::DeadCodeEliminationPass(program);
+    Shader::Optimization::LowerWave64BallotPass(program, runtime_info, profile);
+    Shader::Optimization::LowerHardwareIntrinsics(program);
+    Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
+    Shader::Optimization::DeadCodeEliminationPass(program);
+ #ifndef NDEBUG
+    NanTracePass(program, info);
+ #endif
+    Shader::Optimization::CollectShaderInfoPass(program, profile);
+#ifndef NDEBUG
+    Shader::IR::DumpProgram(program, info);
+#endif
+
+    return program;
+}
+
+} // namespace Shader

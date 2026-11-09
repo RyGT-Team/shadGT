@@ -1,0 +1,249 @@
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <future>
+#include <memory>
+#include <boost/container/static_vector.hpp>
+#include <xxhash.h>
+
+#include "shader_recompiler/frontend/fetch_shader.h"
+#include "video_core/amdgpu/regs_color.h"
+#include "video_core/amdgpu/regs_depth.h"
+#include "video_core/amdgpu/regs_primitive.h"
+#include "video_core/renderer_vulkan/vk_pipeline_common.h"
+
+namespace VideoCore {
+class BufferCache;
+class TextureCache;
+} // namespace VideoCore
+
+namespace Vulkan {
+
+static constexpr u32 MaxShaderStages = static_cast<u32>(Shader::SwStage::NumLogicalStages);
+static constexpr u32 MaxVertexBufferCount = 32;
+
+class Instance;
+class Scheduler;
+class DescriptorHeap;
+
+template <typename T>
+using VertexInputs = boost::container::static_vector<T, MaxVertexBufferCount>;
+
+struct GraphicsPipelineKey {
+    std::array<size_t, MaxShaderStages> stage_hashes;
+    std::array<vk::Format, MaxVertexBufferCount> vertex_buffer_formats;
+    u32 patch_control_points;
+    u32 num_color_attachments;
+    std::array<Shader::PsColorBuffer, AmdGpu::NUM_COLOR_BUFFERS> color_buffers;
+    std::array<AmdGpu::BlendControl, AmdGpu::NUM_COLOR_BUFFERS> blend_controls;
+    std::array<vk::ColorComponentFlags, AmdGpu::NUM_COLOR_BUFFERS> write_masks;
+    AmdGpu::ColorBufferMask cb_shader_mask;
+    AmdGpu::ColorControl::LogicOp logic_op;
+    u8 num_samples;
+    u8 depth_samples;
+    std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> color_samples;
+    u32 mrt_mask;
+    struct {
+        AmdGpu::DepthBuffer::ZFormat z_format : 2;
+        AmdGpu::DepthBuffer::StencilFormat stencil_format : 1;
+        u32 depth_clamp_enable : 1;
+        u32 alpha_to_coverage : 1; // FIX-220
+    };
+    struct {
+        AmdGpu::PrimitiveType prim_type : 5;
+        AmdGpu::PolygonMode polygon_mode : 2;
+        AmdGpu::ClipSpace clip_space : 1;
+        AmdGpu::ProvokingVtxLast provoking_vtx_last : 1;
+        u32 depth_clip_enable : 1;
+    };
+
+    GraphicsPipelineKey() {
+        std::memset(this, 0, sizeof(*this));
+    }
+
+    bool operator==(const GraphicsPipelineKey& key) const noexcept {
+        return std::memcmp(this, &key, sizeof(key)) == 0;
+    }
+
+    void Serialize(Serialization::Archive& ar) const;
+    bool Deserialize(Serialization::Archive& ar);
+};
+
+class GraphicsPipeline : public Pipeline {
+public:
+    struct ParallelStageSummary {
+        bool known{true};
+        bool safe{true};
+        bool vertex_fetch{};
+        bool uses_direct{};
+    };
+
+    const ParallelStageSummary& GetParallelStageSummary() const noexcept {
+        return parallel_stage_summary;
+    }
+
+    struct SerializationSupport {
+        VertexInputs<vk::VertexInputAttributeDescription> vertex_attributes{};
+        VertexInputs<vk::VertexInputBindingDescription> vertex_bindings{};
+        VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors{};
+        vk::PipelineMultisampleStateCreateInfo multisampling{};
+        std::vector<u32> tcs{};
+        std::vector<u32> tes{};
+        std::vector<u32> fragment{};
+
+        void Serialize(Serialization::Archive& ar) const;
+        bool Deserialize(Serialization::Archive& ar);
+    };
+
+    GraphicsPipeline(const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
+                     const Shader::Profile& profile, const GraphicsPipelineKey& key,
+                     vk::PipelineCache pipeline_cache,
+                     std::span<const Shader::Info*, MaxShaderStages> stages,
+                     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
+                     const Shader::Gcn::FetchShaderData* fetch_shader,
+                     std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
+                     bool preloading = false);
+    ~GraphicsPipeline();
+
+    const Shader::Gcn::FetchShaderData& GetFetchShader() const noexcept {
+        return fetch_shader;
+    }
+
+    const GraphicsPipelineKey& GetGraphicsKey() const {
+        return key;
+    }
+
+    /// SO-001: the state a pipeline would have fixed, set at each draw (SO-010: only what
+    /// changed since the draw before on the same command stream).
+    struct ShaderObjectState {
+        vk::PrimitiveTopology topology{};
+        vk::PolygonMode polygon_mode{};
+        vk::SampleCountFlagBits samples{vk::SampleCountFlagBits::e1};
+        vk::ProvokingVertexModeEXT provoking{};
+        bool depth_clamp{};
+        bool depth_clip{};
+        bool negative_one_to_one{};
+        bool alpha_to_coverage{};
+        bool logic_op_enable{};
+        vk::LogicOp logic_op{};
+        u32 attachments{};
+        u32 patch_control_points{}; ///< SO-003: 0 without tessellation
+        std::array<vk::Bool32, AmdGpu::NUM_COLOR_BUFFERS> blend_enable{};
+        std::array<vk::ColorBlendEquationEXT, AmdGpu::NUM_COLOR_BUFFERS> equations{};
+    };
+
+    /// SO-001: drawn with shader objects instead of a pipeline (Handle() is then null).
+    bool UsesShaderObjects() const noexcept {
+        return static_cast<bool>(shader_objects[0]);
+    }
+    /// SO-001: binds the shader objects and sets the state a pipeline would have fixed.
+    /// SO-010: with the previous draw's shaders and state on the same stream (no pipeline bound
+    /// since), only what differs is recorded.
+    void BindShaderObjects(vk::CommandBuffer cmd, const ShaderObjectState* previous,
+                           const std::array<vk::ShaderEXT, 4>* previous_shaders) const;
+    const ShaderObjectState& GetShaderObjectState() const noexcept {
+        return so_state;
+    }
+    const std::array<vk::ShaderEXT, 4>& ShaderObjects() const noexcept {
+        return shader_objects;
+    }
+
+    /// FIX-227: the hull shader's LDS emulation mode (0: off) and LS output bytes per vertex.
+    u32 LdsEmulation() const {
+        return lds_emulation;
+    }
+    u32 LdsVertexBytes() const {
+        return lds_vertex_bytes;
+    }
+    u32 LdsGroupPatches() const { return lds_group_patches; }
+
+    /// Gets the attributes and bindings for vertex inputs.
+    template <typename Attribute, typename Binding>
+    void GetVertexInputs(VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
+                         VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
+                         VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0,
+                         u32 step_rate_1) const {
+        GetVertexInputs(attributes, bindings, divisors, guest_buffers, step_rate_0, step_rate_1,
+                        GetStage(Shader::SwStage::Vertex));
+    }
+    /// OPT-011: the same with the vertex stage's info given (a game job thread's copy).
+    template <typename Attribute, typename Binding>
+    void GetVertexInputs(VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
+                         VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
+                         VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0,
+                         u32 step_rate_1, const Shader::Info& vs_info) const;
+
+private:
+    void BuildDescSetLayout(bool preloading);
+
+public:
+    /// PERF-021: optimized relinks wait until no new pipeline has been needed for a while, so
+    /// they never take cores from pipelines a draw is waiting for.
+    static void NotePipelineMiss();
+    bool CanRetire() const {
+        return !library_link || !library_link->optimized.valid() ||
+               library_link->optimized.wait_for(std::chrono::seconds{0}) == std::future_status::ready;
+    }
+
+    /// PERF-019: a pipeline built on a worker from copies of the shader infos points at the
+    /// cached infos once it is used.
+    void SetStageInfos(std::span<const Shader::Info*, MaxShaderStages> infos);
+
+private:
+    /// PERF-017: stage libraries of a runtime pipeline and the optimized link built from them.
+    struct LibraryLink {
+        /// Vertex input and fragment output libraries; the shader libraries are shared (PERF-018).
+        std::array<vk::UniquePipeline, 2> owned_libraries;
+        std::array<std::shared_ptr<vk::UniquePipeline>, 2> shared_libraries;
+        std::future<void> optimized;
+    };
+    /// PERF-018 / SHD-002: hashes of the stage set layouts' bindings, so a shader library is
+    /// shared between pipelines whose sets for its stages are identically defined.
+    std::array<u64, Shader::Backend::MaxDescriptorSets> set_layout_hashes{};
+    /// SHD-002: the layout of sets between stage sets (no bindings).
+    vk::UniqueDescriptorSetLayout empty_set_layout;
+    u32 num_sets = 0;
+    std::unique_ptr<LibraryLink> library_link;
+
+    /// SO-001: vertex and fragment shader objects, and the pipeline state they need set.
+    bool CreateShaderObjects(std::span<const vk::ShaderModule> modules,
+                             const SerializationSupport& sdata,
+                             std::span<const vk::PipelineColorBlendAttachmentState> attachments,
+                             bool fragment, bool independent_sets);
+    /// Vertex, tessellation control, tessellation evaluation and fragment shader objects.
+    std::array<vk::ShaderEXT, 4> shader_objects{};
+    ShaderObjectState so_state;
+
+    GraphicsPipelineKey key;
+    u32 lds_emulation{};
+    u32 lds_group_patches{};
+    u32 lds_vertex_bytes{};
+    Shader::Gcn::FetchShaderData fetch_shader{};
+    ParallelStageSummary parallel_stage_summary;
+};
+
+struct ClipDistanceShaderKey {
+    std::array<std::tuple<u8, u8>, 8> clip_locations;
+
+    bool operator==(const ClipDistanceShaderKey& key) const noexcept {
+        return std::memcmp(this, &key, sizeof(key)) == 0;
+    }
+};
+
+} // namespace Vulkan
+
+template <>
+struct std::hash<Vulkan::GraphicsPipelineKey> {
+    std::size_t operator()(const Vulkan::GraphicsPipelineKey& key) const noexcept {
+        return XXH3_64bits(&key, sizeof(key));
+    }
+};
+
+template <>
+struct std::hash<Vulkan::ClipDistanceShaderKey> {
+    std::size_t operator()(const Vulkan::ClipDistanceShaderKey& key) const noexcept {
+        return XXH3_64bits(&key, sizeof(key));
+    }
+};

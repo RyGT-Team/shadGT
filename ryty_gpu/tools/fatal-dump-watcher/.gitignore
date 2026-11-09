@@ -1,0 +1,6 @@
+/GTSport.exe
+/logs/
+/audit-*/
+/fixture-result-*/
+/negative-*/
+/cancel-*.dmp*

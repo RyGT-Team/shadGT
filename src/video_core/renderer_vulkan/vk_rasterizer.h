@@ -1,0 +1,694 @@
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <deque>
+
+#include "common/recycling_pool.h"
+
+#include <optional>
+#include <span>
+
+#include <array>
+#include <chrono>
+#include <unordered_map>
+#include <unordered_set>
+#include "common/recursive_lock.h"
+#include "common/shared_first_mutex.h"
+#include "video_core/buffer_cache/buffer_cache.h"
+#include "common/read_capture.h"
+#include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/texture_cache/texture_cache.h"
+#ifdef RYTY_GPU
+#include "ryty_gpu/ryty_gts_dlss.h"
+#endif
+
+namespace AmdGpu {
+struct Liverpool;
+}
+
+namespace Core {
+class MemoryManager;
+}
+
+namespace Vulkan {
+
+class GraphicsPipeline;
+class Runtime;
+class NativeRenderer;
+
+class Rasterizer {
+public:
+    explicit Rasterizer(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
+                        AmdGpu::Liverpool* liverpool);
+    ~Rasterizer();
+
+    [[nodiscard]] Scheduler& GetScheduler() noexcept {
+        return scheduler;
+    }
+
+    [[nodiscard]] Runtime& GetRuntime() noexcept {
+        return runtime;
+    }
+
+    [[nodiscard]] VideoCore::BufferCache& GetBufferCache() noexcept {
+        return buffer_cache;
+    }
+
+    [[nodiscard]] VideoCore::TextureCache& GetTextureCache() noexcept {
+        return texture_cache;
+    }
+#ifdef RYTY_GPU
+    GtsDlssPass& GetTemporalDlss() { return temporalDlss; }
+#endif
+
+    /// PERF-047: a direct draw's pipeline, selected on the command thread as it decodes the
+    /// draw, with the user data each stage's specialization was decided on.
+    struct SelectedStage {
+        bool present{};
+        VAddr pgm_base{};
+        u32 num_user_data{};
+        std::array<u32, Shader::NUM_USER_DATA_REGS> user_data{};
+        std::vector<u32> flattened;
+        /// FIX-077: a copy of the cache's info, made under the lookup lock the first time the
+        /// command thread selects it, so the recorder makes its shadow without taking the lock.
+        std::shared_ptr<const Shader::Info> seed;
+    };
+    struct SelectedPipeline {
+        std::array<std::shared_ptr<const void>, 3> keepalive;
+        const GraphicsPipeline* pipeline{};
+        /// PERF-055: a direct dispatch's compute pipeline (then `pipeline` is unused).
+        bool is_compute{};
+        const ComputePipeline* compute{};
+        std::array<SelectedStage, Shader::MaxStageTypes> stages{};
+        /// PERF-068: a quad list's pipeline when the recorder tessellates its quads (the
+        /// triangle one is `pipeline`); the recorder decides which it draws with.
+        bool is_quad_list{};
+        bool indirect{};
+        u16 vertex_sgpr_offset{};
+        u32 instance_sgpr_offset{};
+        const GraphicsPipeline* quad_tess_pipeline{};
+        std::array<SelectedStage, Shader::MaxStageTypes> quad_tess_stages{};
+    };
+    /// PERF-047: whether pipelines are selected on the command thread (draw pipe on and
+    /// -DisablePerf 59 not given).
+    bool SelectsPipelinesAhead() const;
+    /// PERF-047: on the command thread, for a direct draw it is decoding. Nothing for draws the
+    /// recorder filters out or whose pipeline depends on the recorder's state (quad lists).
+    std::optional<SelectedPipeline> SelectPipelineAhead(const DrawIndirectParams* indirect = nullptr);
+    /// PERF-055: the same for a direct dispatch it is decoding (-DisablePerf 66: none).
+    std::optional<SelectedPipeline> SelectComputePipelineAhead();
+    /// NAT-030: on a game job thread whose registers Liverpool::SetThreadDrawState installed,
+    /// the built pipeline of its draw, or nullptr (special draws, quad lists, not built yet).
+    const GraphicsPipeline* LookupJobPipeline(std::shared_ptr<const void>& keepalive,
+                                              const char** miss = nullptr);
+    /// NAT-032: a hash of the resource descriptors (V#, T#, S#) the stages read for a draw.
+    static u64 SharpsHash(std::span<const Shader::Info* const> stages);
+    /// NAT-032: right after LookupJobPipeline found a pipeline, the sharps its draw reads, as
+    /// the job thread sees them.
+    static u64 JobSharpsHash();
+    /// NAT-032 (shadow mode): the guest packet of the draw this thread records now.
+    static inline thread_local const void* t_draw_packet = nullptr;
+    /// PERF-062 (command thread): hashes the pages of the selected draw's read-only buffers for
+    /// the upload epoch it is decoded in.
+    void HashDrawPagesAhead(const SelectedPipeline& selected, u32 epoch);
+    /// PERF-063 (command thread): copies into the capture the unprotected guest pages the
+    /// selected draw or dispatch reads (buffers, vertex buffers and their V# tables, textures,
+    /// the index buffer). False when that is not known for all of them; the work is then not
+    /// covered by the capture.
+    bool CaptureDrawReads(const SelectedPipeline& selected, Common::ReadCapture& capture,
+                          VAddr index_address, u64 index_size);
+    /// PERF-063: why the last CaptureDrawReads returned false.
+    const char* CaptureFailure() const {
+        return capture_failure ? capture_failure : "draw not captured";
+    }
+    /// PERF-063 (command thread): the same for one guest range (a DMA source).
+    bool CaptureGuestRange(Common::ReadCapture& capture, VAddr address, u64 size);
+    /// PERF-070
+    VideoCore::PageManager& GetPageManager() {
+        return page_manager;
+    }
+    void WaitForGuard(VAddr page);
+    void NoteGuardDropped() {
+        guards_dropped.fetch_add(1, std::memory_order_relaxed);
+    }
+    u64 TakeGuardsDropped() {
+        return guards_dropped.exchange(0);
+    }
+    /// PERF-070 (command thread): the buffer ranges the last captured draw writes.
+    std::span<const std::pair<VAddr, u64>> CaptureWrites() const {
+        return capture_writes;
+    }
+
+    /// PERF-069 (any thread): whether a CPU write to the page goes unnoticed.
+    bool IsUnwatchedPage(VAddr page) const {
+        return page_manager.IsUnwatched(page);
+    }
+    /// PERF-063 (any thread): fences waiting for the GPU to finish (deferred) right now.
+    bool DeferredFencesPending() const noexcept {
+        return deferred_fences.load(std::memory_order_acquire) != 0;
+    }
+    /// PERF-063 (any thread): when a fence last waited for readbacks (steady clock ns), or 0.
+    s64 LastReadbackFenceNs() const noexcept {
+        // An early fence skips the deferral that notes readbacks: images queued for download
+        // count too.
+        return std::max(last_readback_fence_ns.load(std::memory_order_relaxed),
+                        texture_cache.LastReadbackQueuedNs());
+    }
+    /// PERF-063: a CPU fault on a game thread; waits while work the game was told is done
+    /// (an early fence) and that reads the page is not recorded yet.
+    void WaitForEarlyFences(VAddr page);
+
+    /// PERF-067: the shader buffers of a draw or dispatch, obtained on the buffer stage
+    /// thread ahead of the recorder, in the order BindBuffers obtains them.
+    struct BufferPlan {
+        struct Entry {
+            VAddr address;
+            u32 size;
+            bool written;
+            bool texel;
+            const VideoCore::Buffer* buffer;
+            u64 offset;
+            bool overlapped; // PERF-079: images lie over it
+        };
+        std::vector<Entry> entries;
+        VideoCore::BufferCache::AheadUploads uploads;
+        u64 generation{};
+        size_t next{};
+        u64 labels_done{};   // PERF-082: label writes the recorder had run when planned
+        u64 labels_pushed{}; // and the ones pushed by then
+        bool vertices{};     // MT-004: the vertex buffers lead the entries
+        bool index{};        // MT-005: then the index buffer
+        u64 seq{};           // MT-007: the stage's number for the job
+    };
+    /// PERF-067 (buffer stage thread): obtains what it can of the selected draw's shader
+    /// buffers. False when it stopped early (the recorder obtains the rest, and must have
+    /// recorded this draw before the stage goes on).
+    bool PrepareBuffersAhead(const SelectedPipeline& selected, BufferPlan& plan,
+                             VAddr index_address = 0, u32 index_bytes = 0,
+                             bool order_only = false);
+    /// R5 (stage dispatcher, in job order): numbers the job and lists the ranges it writes.
+    void OrderBuffersAhead(const SelectedPipeline& selected, BufferPlan& plan);
+    /// PERF-067 (recorder): around the draw the plan was made for.
+    void SetBufferPlan(BufferPlan* plan) {
+        if (!plan && buffer_plan && buffer_plan->seq) {
+            // MT-007: this job's writes are registered now.
+            recorded_seq.store(buffer_plan->seq, std::memory_order_release);
+        }
+        buffer_plan = plan;
+    }
+
+    /// PERF-063 (recorder): the capture of the job being recorded, or null.
+    void SetReadCapture(const Common::ReadCapture* capture) {
+        read_capture = capture;
+        buffer_cache.SetReadCapture(capture);
+        Common::t_read_capture = capture;
+    }
+
+    /// PERF-062 (recorder): the upload epoch of the draw being recorded (0 after it).
+    void SetDrawEpoch(u32 epoch) {
+        buffer_cache.SetDrawEpoch(epoch);
+    }
+    /// PERF-047: on the recorder thread, around the draw it selected the pipeline for.
+    void SetSelectedPipeline(SelectedPipeline* selected) {
+        selected_pipeline = selected;
+    }
+    /// PERF-056: a used selection goes back for reuse with its vectors' capacity.
+    void RecycleSelectedPipeline(SelectedPipeline&& selected) {
+        selected.keepalive = {};
+        selected_recycler.Give(std::move(selected));
+    }
+
+    void Draw(bool is_indexed, u32 index_offset = 0);
+    void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
+                      VAddr count_address, u16 vertex_sgpr_offset, u16 instance_sgpr_offset);
+
+    void DispatchDirect();
+    void DispatchIndirect(VAddr address, u32 offset, u32 size);
+
+    void ScopeMarker(fmt::string_view fmt, fmt::format_args args, auto&& func) {
+        if (host_markers_enabled) {
+            ScopeMarkerBegin(fmt::vformat(fmt, args));
+            func();
+            ScopeMarkerEnd();
+        } else {
+            func();
+        }
+    }
+
+    void ScopeMarkerBegin(const std::string_view& str, bool from_guest = false);
+    void ScopeMarkerEnd(bool from_guest = false);
+    void ScopedMarkerInsert(const std::string_view& str, bool from_guest = false);
+    void ScopedMarkerInsertColor(const std::string_view& str, const u32 color,
+                                 bool from_guest = false);
+
+    void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
+    void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
+    u32 ReadDataFromGds(u32 gsd_offset);
+    /// exact_write_size: bytes a faulting CPU store writes from addr, when known (PERF-011b).
+    bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false,
+                          u64 exact_write_size = 0);
+    void OnCpuStack(VAddr addr, u64 size);
+    bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
+    /// FIX-079: see BufferCache::CanWriteThrough; never over images.
+    bool CanWriteThrough(VAddr addr, u64 size);
+    void FinishWriteThrough(VAddr page, std::span<const u8> before, VAddr store, u64 store_size);
+    bool IsMapped(VAddr addr, u64 size);
+    void MapMemory(VAddr addr, u64 size);
+    void RegisterMemory(VAddr addr, u64 size);
+    void UnmapMemory(VAddr addr, u64 size);
+
+    u64 Flush();
+    void Finish();
+    void OnSubmit();
+    /// DIAG-051: runs func once the GPU has finished everything recorded so far.
+    void WhenGpuDone(Common::UniqueFunction<void>&& func);
+    [[nodiscard]] bool HasPendingAsyncReadbacks() const {
+        return buffer_cache.HasPendingAsyncReadbacks();
+    }
+    /// DIAG-016: where a synchronous GPU drain came from.
+    enum class DrainSource : u32 {
+        Submit,
+        GfxEos,
+        GfxEop,
+        GfxWriteData,
+        AscWriteData,
+        AscReleaseMem,
+        GdsStore,
+        Count,
+    };
+    void OnFence(DrainSource source);
+    void FinishForGds();
+    /// Defers a graphics fence signal until the GPU completes when readbacks are pending or
+    /// another fence is already deferred. Returns false if the caller should signal now.
+    /// value: the bytes the fence will write, when known when it is processed (PERF-014).
+    bool DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& signal,
+                          bool compute_queue = false, std::span<const u8> value = {},
+                          bool flush = true);
+    /// D5: submits fences deferred without a submit of their own (recorder out of work).
+    void FlushDeferredFences();
+    /// D6: the imported guest memory holding a range read in place, when direct mode can.
+    std::optional<std::pair<const VideoCore::Buffer*, u64>> DirectReadBuffer(VAddr address,
+                                                                             u64 size);
+    /// FIX-019: a WRITE_DATA packet whose guest write was deferred also writes the GPU copy of
+    /// the memory now, in command order, as hardware does.
+    void InlineDeferredWrite(VAddr address, std::span<const u8> data);
+    std::atomic<bool> deferred_unflushed{false}; // D5
+    /// PERF-014: the dword at address once all deferred fence writes that cover it land.
+    std::optional<u32> PendingFenceDword(VAddr address);
+    [[nodiscard]] bool HasReadbackFences() const {
+        return readback_fences.load() != 0;
+    }
+    /// Submits recorded GPU work if deferred fences are outstanding (before blocking waits).
+    void FlushForDeferredFences();
+    void SubmitChunkIfNeeded();
+    void RecordDeferredFenceLatency(std::chrono::steady_clock::time_point deferred_at);
+
+    PipelineCache& GetPipelineCache() {
+        return pipeline_cache;
+    }
+
+    template <typename Func>
+    void ForEachMappedRangeInRange(VAddr addr, u64 size, Func&& func) {
+        const auto range = decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
+        Common::RecursiveSharedLock lock{mapped_ranges_mutex};
+        for (const auto& mapped_range : (mapped_ranges & range)) {
+            func(mapped_range);
+        }
+    }
+
+#ifdef RYTY_GPU
+    /// NAT-100: native mode's renderer (RYGT_NATIVE=1), or nullptr.
+    NativeRenderer* Native() const noexcept {
+        return native.get();
+    }
+    /// NAT-100: WRITE_DATA written on the GPU in command order (native mode); false when it
+    /// can't be (the caller writes it as before).
+    bool NativeInlineWrite(VAddr address, std::span<const u8> data);
+#endif
+    /// NAT-116 (RYGT_FRAME_DUMP_AT=<seconds>): at a flip after that time, every render target
+    /// the next frame draws into is saved to user\log\dump-<old|native>-<seconds>\ at the flip
+    /// after it (raw texels; tools: dump2png.py). Called by the presenter at each flip.
+    void FrameDumpFlip();
+    /// FIX-156 (diagnosis): starts collecting the frame dump now (finished at the next flip).
+    void StartFrameDumpNow();
+    /// NAT-116: whether the frame being drawn is dumped (render targets are noted).
+    bool FrameDumpCollecting() const noexcept {
+        return frame_dump_collecting;
+    }
+    /// NAT-130 (RYGT_TRACE_RANGE=<hex lo>-<hex hi>): passes, dispatches, copies and fills that
+    /// touch guest memory in [lo, hi) are logged all run long (NAT-130 lines), as the frame dump's
+    /// events. The hooks run when this or the dump wants them.
+    static std::pair<VAddr, VAddr> TraceRange();
+#ifndef NDEBUG
+    bool FrameDumpActive() const noexcept {
+        return frame_dump_collecting || TraceRange().first != TraceRange().second;
+    }
+#else
+    constexpr bool FrameDumpActive() const noexcept { return false; }
+#endif
+    /// NAT-130: whether [address, address + size) meets the traced range.
+    static bool Traced(VAddr address, u64 size) {
+        const auto [lo, hi] = TraceRange();
+        return lo != hi && address < hi && address + std::max<u64>(size, 1) > lo;
+    }
+    /// NAT-117: the dumped frame's work in GPU order (passes with the targets the registers name
+    /// and whether they start cleared, fills, metadata clears), written as events.txt next to
+    /// the dump. Consecutive draws into the same targets are one line.
+    void FrameDumpPass(const AmdGpu::Regs& regs, const RenderState& state,
+                       const GraphicsPipeline* pipeline);
+    void FrameDumpEvent(std::string text);
+    /// NAT-123: the name a sampled texture is dumped under (its T#: address, size, mips,
+    /// layers, format), the same in both renderers.
+    static std::string FrameDumpTextureKey(const VideoCore::ImageInfo& info);
+    /// NAT-118: a dispatch of the dumped frame with what it writes (buffers, storage images).
+    void FrameDumpDispatch(const Shader::Info& cs, const AmdGpu::ComputeProgram& program,
+                           bool indirect);
+
+    std::thread::id GetGpuCommandProcessorThread();
+    /// The command processor thread or the draw pipe's recorder thread (PERF-031).
+    bool IsGpuThread() const;
+    void OnGpuThreadFault();
+    bool CommandThreadFaultIsUrgent();
+#ifdef __linux__
+    bool IsGpuThreadTid(u32 tid) const;
+#endif
+#ifdef __linux__
+    u32 GetGpuCommandProcessorThreadId();
+#endif
+
+private:
+    friend class NativeRenderer;
+    /// NAT-101: the dynamic state the Update*State functions fill: the scheduler's, or a native
+    /// command list's while native mode records into it.
+    static inline thread_local DynamicState* t_dynamic_state = nullptr;
+    DynamicState& DynState() const {
+        return t_dynamic_state ? *t_dynamic_state : scheduler.GetDynamicState();
+    }
+
+    void PrepareRenderState(const GraphicsPipeline* pipeline);
+    RenderState BeginRendering(const GraphicsPipeline* pipeline);
+    void Resolve();
+    void DepthStencilCopy(bool is_depth, bool is_stencil);
+    void EliminateFastClear();
+
+    void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed,
+                            bool quad_triangles = false) const;
+    void UpdateViewportScissorState() const;
+    void UpdateDepthStencilState() const;
+    void UpdatePrimitiveState(bool is_indexed, bool quad_triangles) const;
+    void UpdateRasterizationState() const;
+    void UpdateColorBlendingState(const GraphicsPipeline* pipeline) const;
+
+    bool FilterDraw();
+
+    void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
+                     Shader::PushData& push_data);
+    void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
+    void LogInvalidTextureContext(const Shader::Info& stage, u32 sharp_offset);
+    /// Copies flattened constants whose guest source is GPU-modified from the buffer cache into
+    /// the uploaded flat buffer, so the shader sees them in GPU execution order.
+    void RefreshGpuWrittenConstants(const Shader::Info& stage, const VideoCore::Buffer& flat_buffer,
+                                    u64 flat_offset);
+    void RebindTextures(bool is_compute, u32 num_color_targets);
+    void FinalizeTextureLayouts(RenderState* render_state = nullptr);
+    bool BindResources(const Pipeline* pipeline);
+
+    void BindVertexBuffers(const GraphicsPipeline* pipeline);
+    void BindIndexBuffer(u32 index_offset = 0);
+    bool CanDrawQuadListAsTriangles(bool is_indexed, u32 index_offset);
+    u32 BindQuadListIndices(bool is_indexed, u32 index_offset);
+
+    void ResetBindings(bool is_compute);
+
+    bool IsComputeMetaClear(const Pipeline* pipeline);
+    bool IsComputeImageCopy(const Pipeline* pipeline);
+    bool IsComputeImageClear(const Pipeline* pipeline);
+
+private:
+    friend class VideoCore::BufferCache;
+
+    const Instance& instance;
+    Scheduler& scheduler;
+    Runtime& runtime;
+    VideoCore::PageManager page_manager;
+    VideoCore::BufferCache buffer_cache;
+    VideoCore::TextureCache texture_cache;
+    AmdGpu::Liverpool* liverpool;
+    Core::MemoryManager* memory;
+    boost::icl::interval_set<VAddr> mapped_ranges;
+    Common::SharedFirstMutex mapped_ranges_mutex;
+    PipelineCache pipeline_cache;
+    const bool host_markers_enabled;
+    const bool guest_markers_enabled;
+
+    struct ImageBinding {
+        VideoCore::ImageId image_id;
+        VideoCore::TextureCache::ImageDesc desc;
+    };
+    // PERF-042: decoded texture descriptors. A T# and the resource's depth/written/array flags
+    // decide the image description completely (ImageInfo, ImageViewInfo), so a T# that passed
+    // the checks before is not checked and decoded again. Direct-mapped, by hash.
+    struct DecodedTsharp {
+        std::array<u32, 8> sharp{};
+        u8 flags{};
+        bool valid{};
+        VideoCore::TextureCache::ImageDesc desc;
+        VideoCore::TextureCache::FindMemo find_memo; // PERF-114
+    };
+
+    // PERF-047: the recorder thread binds a graphics draw through its own copies of the pipeline
+    // cache's infos, which the command thread keeps reusing for its lookups.
+    struct ShadowInfo {
+        std::unique_ptr<Shader::Info> info;
+        u64 identity{};
+        std::array<u32, Shader::NUM_USER_DATA_REGS> user_data{};
+    };
+    std::unordered_map<const Shader::Info*, ShadowInfo> shadow_infos;
+    // PERF-065: the last shadow found for a canonical info, direct-mapped by its address.
+    std::array<std::pair<const Shader::Info*, ShadowInfo*>, 512> shadow_lookup{};
+    // FIX-077 (under the lookup lock): the identity each cache info was last seeded with.
+    std::unordered_map<const Shader::Info*, u64> seeded_infos;
+    SelectedPipeline* selected_pipeline{};
+    struct {
+        u64 ahead;
+        u64 compute_ahead; // PERF-055
+        u64 mismatched;
+        u64 recorder;
+        u64 verified;
+        u64 verify_failed;
+        std::chrono::steady_clock::time_point since;
+    } select_stats{};
+    u64 select_verify_count{};
+    Common::Recycler<SelectedPipeline, 4096> selected_recycler;
+    const Common::ReadCapture* read_capture{}; // PERF-063
+    const char* capture_failure{};
+    std::vector<std::pair<VAddr, u64>> capture_writes; // PERF-070
+    std::atomic<u64> guards_dropped{};
+    // PERF-067
+    BufferPlan* buffer_plan{};
+    /// MT-007 (buffer stage thread): ranges the planned jobs not recorded yet write. A later
+    /// job's read over one is left to the recorder, so the stage does not wait after them.
+    struct PendingWrite {
+        u64 seq;
+        VAddr begin;
+        VAddr end;
+    };
+    std::deque<PendingWrite> pending_writes;
+    std::mutex pending_writes_mutex; // R5: the dispatcher adds, the workers read
+    u64 stage_seq{};
+    std::atomic<u64> recorded_seq{};
+    std::array<std::atomic<u64>, 4> plan_refusals{};
+    std::optional<std::pair<const VideoCore::Buffer*, u64>> TakePlannedBuffer(VAddr address,
+                                                                               u32 size,
+                                                                               bool written,
+                                                                               bool texel);
+    struct {
+        u64 used;
+        u64 redone;
+        u64 mismatched;
+        std::chrono::steady_clock::time_point since;
+    } plan_stats{};
+    struct CaptureScan {
+        // Ranges already scanned for the current capture (they repeat across draws).
+        u64 capture_id{};
+        std::unordered_set<u64> ranges;
+        u64 pages_checked{};
+    } capture_scan; // PERF-056
+    /// The pipeline of a graphics draw: the one selected ahead when it still fits the memory the
+    /// recorder sees, else looked up here. With PERF-047 the draw's infos are the copies.
+    const GraphicsPipeline* AcquireGraphicsPipeline(const DrawIndirectParams& params,
+                                                    bool selected_allowed,
+                                                    std::shared_ptr<const void>* owner = nullptr);
+    /// Points the pipeline's stages at copies holding the given user data; with `validate`,
+    /// false if a stage's flattened user data now differs from what selection used.
+    /// PERF-065: the selection's flattened user data is moved into the stage (swapped).
+    bool InstallDrawStages(const Pipeline* pipeline,
+                           std::array<SelectedStage, Shader::MaxStageTypes>& stages,
+                           bool validate);
+    ShadowInfo& ShadowOf(const Shader::Info* canonical, const Shader::Info* seed);
+    /// The user data of the infos the pipeline cache just selected (under its lock).
+    /// PERF-055: the compute stage of the pipeline just looked up, in its pipeline slot.
+    void CopyComputeStage(std::array<SelectedStage, Shader::MaxStageTypes>& out);
+    /// PERF-055: the dispatch's compute pipeline, as selected ahead or looked up here.
+    const ComputePipeline* AcquireComputePipeline();
+    void CopySelectedStages(std::array<SelectedStage, Shader::MaxStageTypes>& out);
+    void SeedStage(SelectedStage& selected, const Shader::Info* info);
+    // FIX-046: bumped on every unmap (any thread); the decoded T#s are checked again after it.
+    std::atomic<u64> tsharp_epoch{};
+    /// FIX-046: whether the address is inside the guest address space.
+    bool IsMappedStart(VAddr address);
+
+
+    struct BoundTexture {
+        u32 descriptor_index;
+        VideoCore::ImageId image_id;
+        VideoCore::TextureCache::ImageDesc* desc; // PERF-121: points into image_bindings
+        vk::Image backing_image;
+    };
+
+    struct BoundBuffer {
+        const VideoCore::Buffer* buffer;
+        u64 offset;
+        u32 size;
+        bool is_written;
+        VAddr guest_address{};
+    };
+
+    /// MT-001: the per-draw state of one recording thread. The recorder thread uses main_ctx;
+    /// worker threads of the multithreaded recorder get their own.
+    struct DrawContext {
+        bool dlssNativeDraw{};
+        u64 dlssNativeUid{};
+        std::array<ImageBinding, Shader::NUM_IMAGES> image_bindings;
+        u32 image_binding_base = 0; // PERF-121: next free entry across the draw's stages
+        /// PERF-123: each hardware stage's last image bindings, reused when the next draw's
+        /// stage reads the same T#s and no image was (un)registered since.
+        struct StageImageMemo {
+            const Shader::Info* stage{};
+            u64 hash{};
+            u64 generation{};
+            u64 epoch{};
+            bool valid{};
+            std::vector<ImageBinding> bindings;
+            std::vector<u32> array_sizes;
+        };
+        std::array<StageImageMemo, 8> stage_image_memos;
+        std::vector<DecodedTsharp> decoded_tsharps;
+        u64 decoded_epoch{};
+        std::array<ImageBinding, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
+        std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc> db_desc;
+        boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
+        boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
+        boost::container::static_vector<BoundTexture, Shader::NUM_IMAGES> bound_textures;
+        boost::container::static_vector<BoundBuffer, Shader::NUM_BUFFERS> bound_buffers;
+        boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
+        std::string diag_empty_bindings;
+        boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> diag_storage_images;
+        u32 set_write_index{};
+        Pipeline::DescriptorWrites set_writes;
+        Pipeline::WriteSets set_write_sets; // SHD-002
+        Shader::PushData push_data;
+        vk::ImageAspectFlags attachment_feedback_loop{};
+        bool needs_barrier{};
+    };
+    DrawContext main_ctx;
+#ifdef RYTY_GPU
+    GtsDlssPass temporalDlss;
+    void applyTemporalDlss(const GraphicsPipeline* pipeline, const RenderState& state,
+                           bool beforeDraw = false);
+    void prepareNativeHud(RenderState& state);
+#endif
+    bool TemporalOwnsDisplay();
+    DrawContext* ctx = &main_ctx;
+    /// DIAG-041: buffers and images of the current draw that were bound empty.
+    /// DIAG-044: records the current draw or dispatch in the dependency history.
+    void RecordDiagHistory(const Pipeline* pipeline, bool compute, u32 count);
+    /// DIAG-044: logs and dumps everything the image's current contents were made from.
+    void TraceImageDependencies(VideoCore::ImageId image_id);
+    VideoCore::ImageId diag_trace_source{};
+    std::string diag_trace_tag{"thumb"};
+    /// DIAG-045: images of the current draw or dispatch bound for writing (storage).
+
+
+    u32 invalid_texture_context_count{};
+    std::unordered_set<u64> logged_gpu_constant_shaders;
+    std::atomic<u32> deferred_fences{};
+    std::atomic<u64> background_readbacks{}; // FIX-070
+    std::atomic<s64> last_readback_fence_ns{}; // PERF-063
+    std::atomic<s64> last_native_fence_submit_ns{}; // per renderer, never shared across devices
+    /// PERF-014b: deferred fences that will also bring GPU data back to guest memory.
+    std::atomic<u32> readback_fences{};
+    u32 draws_since_submit{};
+    struct DrainStats {
+        std::chrono::steady_clock::time_point window_start{};
+        std::array<u32, u32(DrainSource::Count)> count{};
+        std::array<u64, u32(DrainSource::Count)> total_us{};
+    } drain_stats;
+    void ProcessDownloadsTimed(DrainSource source);
+    void RecordDrain(DrainSource source, std::chrono::steady_clock::time_point start);
+    std::mutex deferred_fences_mutex;
+    struct DeferredFenceStats {
+        std::chrono::steady_clock::time_point window_start{};
+        u64 window_frame{};
+        u64 count{};
+        u64 total_us{};
+        u64 max_us{};
+    } deferred_fence_stats;
+    std::unordered_map<VAddr, u32> deferred_fence_addresses;
+    std::unordered_map<VAddr, std::vector<u8>> pending_fence_bytes;
+    u64 gpu_constant_refresh_count{};
+    u64 next_gpu_constant_refresh_report{1000};
+#ifdef RYTY_GPU
+    std::unique_ptr<NativeRenderer> native; // NAT-100
+#endif
+    // NAT-116
+    bool frame_dump_collecting{};
+    bool frame_dump_done{};
+    bool frame_dump_write_old{}; // written at the next draw (not at the flip)
+#ifndef NDEBUG
+    bool debug_frame_dump_active{};
+    bool debug_frame_dump_previous_done{};
+    std::filesystem::path debug_frame_dump_dir;
+#endif
+    std::filesystem::path frame_dump_dir;
+    /// FIX-153 (diagnosis): render targets of the dumped frame the CPU reads back (from
+    /// 0xf000000000 up), and how many flips to wait before their guest memory is saved.
+    u32 frame_dump_index{}; ///< FIX-156 (diagnosis): which RYGT_FRAME_DUMP_AT time is next
+    std::vector<VAddr> frame_dump_mem;
+    std::filesystem::path frame_dump_mem_dir;
+    u32 frame_dump_mem_wait{};
+
+public:
+    /// FIX-153 (diagnosis, RYGT_EXPOSURE_LOG=1): the auto exposure's inputs over time: the
+    /// brightness grids the CPU reads back, and the exposure GT Sport's shaders get.
+    static bool ExposureLogOn();
+    void ExposureLogShader(const Shader::Info& stage, const char* renderer);
+
+private:
+    std::mutex exposure_mutex;
+    std::vector<std::pair<VAddr, u64>> exposure_targets; // brightness grid, flip drawn at
+    u64 exposure_flip{};
+    std::array<u32, 2> exposure_last{};
+    std::atomic<bool> exposure_dump_requested{false};
+    std::vector<std::pair<VideoCore::ImageId, u64>> frame_dump_old; // image, uid
+    void FrameDumpNoteOld();
+    void FrameDumpWriteOld();
+    std::mutex frame_dump_mutex; // NAT-117
+    struct FrameDumpEntry {
+        std::string key;    ///< what merges consecutive draws (targets, clears)
+        std::string detail; ///< the pass's first draw (NAT-118)
+        u32 draws;
+    };
+    std::vector<FrameDumpEntry> frame_dump_events;
+    std::string trace_last_pass; // NAT-130
+    void TraceText(const std::string& text);
+    void FrameDumpWriteEvents(const std::filesystem::path& dir);
+    /// NAT-123: GPU-written images the frame sampled, by texture key (old path).
+    std::vector<std::tuple<std::string, VideoCore::ImageId, u64>> frame_dump_textures;
+};
+
+} // namespace Vulkan

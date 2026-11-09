@@ -1,0 +1,985 @@
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <algorithm>
+#include <array>
+#include <mutex>
+#include <utility>
+#if defined(_WIN32) && !defined(NDEBUG)
+#include <atomic>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cwchar>
+#endif
+#include "common/adaptive_mutex.h"
+#include "common/assert.h"
+#include "common/debug.h"
+#include "common/decoder.h"
+#include "common/div_ceil.h"
+#include "common/error.h"
+#include "common/multi_level_page_table.h"
+#include "common/perf_monitor.h"
+#include "common/sampling_profiler.h"
+#include "common/signal_context.h"
+#include "common/thread.h"
+#include "core/emulator_settings.h"
+#include "core/memory.h"
+#include "core/signals.h"
+#include "video_core/page_manager.h"
+#include "video_core/buffer_cache/proto_import.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
+
+#include "video_core/guest_page_domain.h"
+
+#ifndef _WIN64
+#include <sys/mman.h>
+#include "common/adaptive_mutex.h"
+#else
+#include <windows.h>
+#endif
+
+#ifdef __linux__
+#include <thread>
+#include <fcntl.h>
+#include <linux/userfaultfd.h>
+#include <poll.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#else
+#include "common/spin_lock.h"
+#include "ryty_gpu/ryty_diag.h"
+#endif
+
+namespace VideoCore {
+
+#if defined(_WIN32) && !defined(NDEBUG)
+namespace {
+u64 TracePage() {
+    static const u64 page = [] {
+        const char* value = std::getenv("RYGT_TRACE_PAGE");
+        if (!value || !*value || *value == '-' || *value == '+' || *value == ' ') return ~u64{0};
+        errno = 0;
+        char* end = nullptr;
+        const auto parsed = std::strtoull(value, &end, 0);
+        if (errno == ERANGE || end == value || *end != '\0') return ~u64{0};
+        return static_cast<u64>(parsed) & ~u64{4095};
+    }();
+    return page;
+}
+bool TraceOverlaps(u64 addr, u64 size) {
+    const u64 page = TracePage();
+    return page != ~u64{0} && size && addr <= page + 4095 &&
+           (addr > page || size > page - addr);
+}
+struct PageTraceFile {
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    HMODULE renderer = nullptr;
+    PageTraceFile() {
+        wchar_t path[MAX_PATH]{};
+        const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+        if (!length || length >= MAX_PATH) return;
+        auto* name = std::wcsrchr(path, L'\\');
+        if (!name) return;
+        const auto remaining = std::size(path) - static_cast<size_t>(name + 1 - path);
+        if (std::swprintf(name + 1, remaining, L"logs\\page-owner-%lu.log",
+                          GetCurrentProcessId()) < 0) return;
+        renderer = GetModuleHandleW(L"libSceVideoOut.prx");
+        handle = CreateFileW(path, FILE_APPEND_DATA,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    }
+    ~PageTraceFile() { if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle); }
+};
+PageTraceFile& TraceFile() {
+    static PageTraceFile file;
+    return file;
+}
+void TracePageEvent(const char* source, u64 addr, u64 size, int op, int read_op,
+                    unsigned bw, unsigned br, unsigned bg, unsigned aw, unsigned ar, unsigned ag,
+                    unsigned perms, unsigned old_protect, unsigned new_protect, bool stack) {
+    if (!TraceOverlaps(addr, size)) return;
+    auto& output = TraceFile();
+    if (output.handle == INVALID_HANDLE_VALUE) return;
+    static std::atomic<unsigned> count{};
+    const unsigned index = count.fetch_add(1, std::memory_order_relaxed);
+    if (index >= 128) return;
+    void* frames[12]{};
+    const auto frame_count = stack ? RtlCaptureStackBackTrace(0, 12, frames, nullptr) : 0;
+    char text[1024];
+    int n = std::snprintf(text, sizeof(text),
+        "PAGE-OWNER %u tick=%llu base=%p tid=%lu %s range=%llx+%llx op=%d readop=%d watchers=%u/%u/%u->%u/%u/%u perms=%u protect=%lx->%lx stack=",
+        index, static_cast<unsigned long long>(GetTickCount64()), static_cast<void*>(output.renderer),
+        GetCurrentThreadId(), source, static_cast<unsigned long long>(addr),
+        static_cast<unsigned long long>(size), op, read_op, bw, br, bg, aw, ar, ag, perms,
+        static_cast<unsigned long>(old_protect), static_cast<unsigned long>(new_protect));
+    if (n < 0) return;
+    size_t used = std::min(static_cast<size_t>(n), sizeof(text) - 2);
+    for (unsigned i = 0; i < frame_count && used < sizeof(text) - 2; ++i) {
+        n = std::snprintf(text + used, sizeof(text) - used, "%s%p", i ? "," : "", frames[i]);
+        if (n < 0) break;
+        used += std::min(static_cast<size_t>(n), sizeof(text) - used - 1);
+    }
+    text[used++] = '\n';
+    DWORD written{};
+    WriteFile(output.handle, text, static_cast<DWORD>(used), &written, nullptr);
+}
+}
+#endif
+
+struct PageManager::Impl {
+    struct PageState {
+        u8 num_write_watchers;
+        u8 num_read_watchers;
+        // PERF-070: guards of GPU writes decoded but not recorded yet (no CPU access at all).
+        u8 num_guards;
+
+        Core::MemoryPermission WritePerm() const noexcept {
+            return num_write_watchers == 0 ? Core::MemoryPermission::Write
+                                           : Core::MemoryPermission::None;
+        }
+
+        Core::MemoryPermission ReadPerm() const noexcept {
+            return num_read_watchers == 0 ? Core::MemoryPermission::Read
+                                          : Core::MemoryPermission::None;
+        }
+
+        Core::MemoryPermission Perms() const noexcept {
+            if (num_guards != 0) {
+                return Core::MemoryPermission::None;
+            }
+            return ReadPerm() | WritePerm();
+        }
+
+        template <bool is_read>
+        u8 GetPage() const {
+            if constexpr (is_read) {
+                return num_read_watchers;
+            } else {
+                return num_write_watchers;
+            }
+        }
+
+        constexpr Core::MemoryPermission Update(PageOp write_op, bool update_write = true,
+                                                PageOp read_op = PageOp::None,
+                                                bool update_read = false) {
+            if (update_read) {
+                if (read_op == PageOp::Track) {
+                    ASSERT_MSG(num_read_watchers == 0, "Too many watchers");
+                } else if (read_op == PageOp::Untrack) {
+                    ASSERT_MSG(num_read_watchers > 0, "Not enough watchers");
+                }
+                num_read_watchers += std::to_underlying(read_op);
+            }
+            if (update_write) {
+                if (write_op == PageOp::Track) {
+                    ASSERT_MSG(num_write_watchers < 255, "Too many watchers");
+                } else if (write_op == PageOp::Untrack) {
+                    ASSERT_MSG(num_write_watchers > 0, "Not enough watchers");
+                }
+                num_write_watchers += std::to_underlying(write_op);
+            }
+            return Perms();
+        }
+    };
+
+#if defined(_WIN32) && !defined(NDEBUG)
+    static void TraceState(const char* source, u64 addr, u64 size, int op, int read_op,
+                           u64 page, const PageState& before, const PageState& after) {
+        if (page != (TracePage() >> PM_PAGE_BITS)) return;
+        TracePageEvent(source, addr, size, op, read_op, before.num_write_watchers,
+                       before.num_read_watchers, before.num_guards, after.num_write_watchers,
+                       after.num_read_watchers, after.num_guards,
+                       static_cast<unsigned>(after.Perms()), 0, 0, true);
+    }
+#endif
+
+    static constexpr size_t ADDRESS_BITS = 40;
+    static constexpr size_t NUM_ADDRESS_PAGES = 1ULL << (40 - PM_PAGE_BITS);
+    static constexpr size_t NUM_ADDRESS_LOCKS = NUM_ADDRESS_PAGES / NUM_REGION_PAGES;
+    inline static Vulkan::Rasterizer* rasterizer;
+
+    Impl() = default;
+    virtual ~Impl() = default;
+
+    virtual void OnMap(VAddr address, size_t size) {
+        // No-op
+        EnsurePages(address, address + size);
+    }
+
+    virtual void OnUnmap(VAddr address, size_t size) {
+        // No-op
+    }
+
+    virtual void Protect(VAddr address, size_t size, Core::MemoryPermission perms) = 0;
+
+    void EnsurePages(VAddr begin, VAddr end) {
+        end = std::min(end, VAddr{1} << ADDRESS_BITS) - 1;
+        const size_t start_page = begin >> PM_PAGE_BITS;
+        const size_t end_page = end >> PM_PAGE_BITS;
+        cached_pages.reserve(start_page, end_page);
+        locks.reserve(start_page, end_page);
+    }
+
+    /// PERF-070: adds (or removes) a guard on each tracked page of the range and applies the
+    /// resulting protection. Returns the number of pages guarded.
+    u64 Guard(VAddr addr, u64 size, bool add) {
+        const u64 page_start = addr >> PM_PAGE_BITS;
+        const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
+        u64 guarded = 0;
+        for (u64 page = page_start; page != page_end; ++page) {
+            PageState* state = cached_pages.find(page);
+            if (!state) {
+                continue;
+            }
+            std::scoped_lock lk{locks[page]};
+#if defined(_WIN32) && !defined(NDEBUG)
+            const auto before = *state;
+#endif
+            const auto old_perms = state->Perms();
+            if (add) {
+                if (state->num_guards == 255) {
+                    continue;
+                }
+                ++state->num_guards;
+            } else {
+                if (state->num_guards == 0) {
+                    continue;
+                }
+                --state->num_guards;
+            }
+            ++guarded;
+#if defined(_WIN32) && !defined(NDEBUG)
+            TraceState("Guard", addr, size, add ? 1 : -1, 0, page, before, *state);
+#endif
+            if (const auto new_perms = state->Perms(); new_perms != old_perms) {
+                Protect(page << PM_PAGE_BITS, PM_PAGE_SIZE, new_perms);
+            }
+        }
+        return guarded;
+    }
+
+#ifdef RYTY_GPU
+    /// Ryty: the game changed the protection of the range (sceKernelMprotect), which replaced
+    /// the protections tracking set; tracked pages get them back.
+    void ReapplyProtection(VAddr addr, u64 size) {
+        const u64 page_start = addr >> PM_PAGE_BITS;
+        const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
+        for (u64 page = page_start; page != page_end; ++page) {
+            PageState* state = cached_pages.find(page);
+            if (!state) {
+                continue;
+            }
+            std::scoped_lock lk{locks[page]};
+#if defined(_WIN32) && !defined(NDEBUG)
+            TraceState("ReapplyProtection", addr, size, 0, 0, page, *state, *state);
+#endif
+            if (const auto perms = state->Perms(); perms != Core::MemoryPermission::ReadWrite) {
+                Protect(page << PM_PAGE_BITS, PM_PAGE_SIZE, perms);
+            }
+        }
+    }
+#endif
+
+    /// PERF-070: every guard on the page goes (an emulator thread must access it).
+    void DropGuards(VAddr page_addr) {
+        const u64 page = page_addr >> PM_PAGE_BITS;
+        PageState* state = cached_pages.find(page);
+        if (!state) {
+            return;
+        }
+        std::scoped_lock lk{locks[page]};
+#if defined(_WIN32) && !defined(NDEBUG)
+        const auto before = *state;
+#endif
+        if (state->num_guards == 0) {
+#if defined(_WIN32) && !defined(NDEBUG)
+            TraceState("DropGuards", page_addr, PM_PAGE_SIZE, 0, 0, page, before, *state);
+#endif
+            return;
+        }
+        const auto old_perms = state->Perms();
+        state->num_guards = 0;
+#if defined(_WIN32) && !defined(NDEBUG)
+        TraceState("DropGuards", page_addr, PM_PAGE_SIZE, 0, 0, page, before, *state);
+#endif
+        if (const auto new_perms = state->Perms(); new_perms != old_perms) {
+            Protect(page << PM_PAGE_BITS, PM_PAGE_SIZE, new_perms);
+        }
+    }
+
+    void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) {
+        const u64 page_start = addr >> PM_PAGE_BITS;
+        const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
+
+        Core::MemoryPermission perms{};
+        u64 range_begin = page_start;
+        u64 range_pages = 0;
+        u64 potential_pages = 0;
+
+        const auto release_pending = [&] {
+            if (range_pages > 0) {
+                Protect(range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS, perms);
+                range_pages = 0;
+                potential_pages = 0;
+            }
+        };
+
+        // Iterate requested pages
+        const u64 aligned_addr = page_start << PM_PAGE_BITS;
+        const u64 aligned_end = page_end << PM_PAGE_BITS;
+#ifdef RYTY_GPU
+        EnsurePages(aligned_addr, aligned_end);
+#else
+        if (!rasterizer->IsMapped(aligned_addr, aligned_end - aligned_addr)) {
+            LOG_WARNING(Render,
+                        "Tracking memory region {:#x} - {:#x} which is not fully GPU mapped.",
+                        aligned_addr, aligned_end);
+            EnsurePages(aligned_addr, aligned_end);
+        }
+#endif
+
+        for (u64 page = page_start; page != page_end; ++page) {
+            PageState* state = cached_pages.find(page);
+            if (!state) {
+                continue;
+            }
+
+            locks[page].lock();
+
+#if defined(_WIN32) && !defined(NDEBUG)
+            const auto before = *state;
+#endif
+            const auto old_perms = state->Perms();
+            if (page == page_start) {
+                perms = old_perms;
+            }
+
+            // Apply the change to the page state
+            const auto new_perms = state->Update(write_op);
+#if defined(_WIN32) && !defined(NDEBUG)
+            TraceState("UpdatePageWatchers", addr, size, static_cast<int>(write_op), 0,
+                       page, before, *state);
+#endif
+            if (new_perms != perms) [[unlikely]] {
+                // If the protection changed add pending (un)protect action
+                release_pending();
+                perms = new_perms;
+            } else if (range_pages != 0) {
+                ++potential_pages;
+            }
+
+            // If the page must be (un)protected
+            if (new_perms != old_perms) {
+                if (range_pages == 0) {
+                    // Start a new potential range
+                    range_begin = page;
+                    potential_pages = 1;
+                }
+                // Extend current range up to potential range
+                range_pages = potential_pages;
+            }
+        }
+
+        // Add pending (un)protect action
+        release_pending();
+
+        for (u64 page = page_start; page != page_end; ++page) {
+            if (auto* lock = locks.find(page)) {
+                lock->unlock();
+            }
+        }
+    }
+
+    void UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,
+                                     const RegionBits& write_mask, const RegionBits& read_mask,
+                                     PageOp write_op, PageOp read_op) {
+        const u64 base_page = base_addr >> PM_PAGE_BITS;
+        const u64 page_start = bounds.start_word * PAGES_PER_WORD + bounds.start_page;
+        const u64 page_end = bounds.end_word * PAGES_PER_WORD + bounds.end_page + 1;
+#ifdef RYTY_GPU
+        // Under Ryty, guest memory is mapped without telling the renderer beforehand, so a
+        // region may be tracked before its pages exist here. Tracking skipped such pages while a
+        // later untrack found them, and the watcher count went below zero.
+        EnsurePages((base_page + page_start) << PM_PAGE_BITS, (base_page + page_end) << PM_PAGE_BITS);
+#endif
+
+        Core::MemoryPermission perms{};
+        u64 range_begin = base_page + page_start;
+        u64 range_pages = 0;
+        u64 potential_pages = 0;
+
+        const auto release_pending = [&] {
+            if (range_pages > 0) {
+                Protect(range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS, perms);
+                range_pages = 0;
+                potential_pages = 0;
+            }
+        };
+
+        for (u64 page = page_start; page != page_end; ++page) {
+            PageState* state = cached_pages.find(base_page + page);
+            if (!state) {
+                continue;
+            }
+
+            locks[base_page + page].lock();
+
+#if defined(_WIN32) && !defined(NDEBUG)
+            const auto before = *state;
+#endif
+            const auto old_perms = state->Perms();
+            if (page == page_start) {
+                perms = old_perms;
+            }
+
+            // Apply the change to the page state
+            const bool update_write = write_op != PageOp::None && write_mask.GetPage(page);
+            const bool update_read = read_op != PageOp::None && read_mask.GetPage(page);
+            const auto new_perms = state->Update(write_op, update_write, read_op, update_read);
+#if defined(_WIN32) && !defined(NDEBUG)
+            TraceState("UpdatePageWatchersForRegion", (base_page + page_start) << PM_PAGE_BITS,
+                       (page_end - page_start) << PM_PAGE_BITS,
+                       update_write ? static_cast<int>(write_op) : 0,
+                       update_read ? static_cast<int>(read_op) : 0, base_page + page, before, *state);
+#endif
+
+            if (new_perms != perms) [[unlikely]] {
+                // If the protection changed add pending (un)protect action
+                release_pending();
+                perms = new_perms;
+            } else if (range_pages != 0) {
+                // If the protection did not change, extend the potential range
+                ++potential_pages;
+            }
+
+            // If the page must be (un)protected
+            if (new_perms != old_perms) {
+                if (range_pages == 0) {
+                    // Start a new potential range
+                    range_begin = base_page + page;
+                    potential_pages = 1;
+                }
+                // Extend current rango up to potential range
+                range_pages = potential_pages;
+            }
+        }
+
+        // Add pending (un)protect action
+        release_pending();
+
+        for (u64 page = page_start; page != page_end; ++page) {
+            if (auto* lock = locks.find(base_page + page)) {
+                lock->unlock();
+            }
+        }
+    }
+
+    struct PageTraits {
+        using Entry = PageState;
+        static constexpr size_t ADDRESS_SPACE_BITS = ADDRESS_BITS;
+        static constexpr size_t L1_BITS = 16;
+        static constexpr size_t PAGE_BITS = PM_PAGE_BITS;
+        static constexpr bool NULL_CHECK = false;
+    };
+    Common::MultiLevelPageTable<PageTraits> cached_pages;
+    struct MutexTraits {
+#ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
+        using Entry = Common::AdaptiveMutex;
+#else
+        using Entry = std::mutex;
+#endif
+        static constexpr size_t ADDRESS_SPACE_BITS = ADDRESS_BITS;
+        static constexpr size_t L1_BITS = 16;
+        static constexpr size_t PAGE_BITS = PM_PAGE_BITS;
+        static constexpr bool NULL_CHECK = false;
+    };
+    Common::MultiLevelPageTable<MutexTraits> locks;
+};
+
+#ifdef __linux__
+struct UffdImpl : public PageManager::Impl {
+private:
+    std::jthread ufd_thread;
+    int uffd;
+
+public:
+    UffdImpl(Vulkan::Rasterizer* rasterizer_) : Impl() {
+        rasterizer = rasterizer_;
+        uffd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
+        if (uffd == -1) {
+            LOG_ERROR(Common_Memory,
+                      "userfaultfd syscall failed: {}, falling back to signal implementation",
+                      Common::GetLastErrorMsg());
+            throw std::runtime_error("userfaultfd");
+        }
+
+        // Request uffdio features from kernel.
+        uffdio_api api;
+        api.api = UFFD_API;
+        api.features = UFFD_FEATURE_THREAD_ID;
+        const int ret = ioctl(uffd, UFFDIO_API, &api);
+        if (ret != 0) {
+            LOG_ERROR(Common_Memory,
+                      "uffdio_api call failed: {}, falling back to signal implementation",
+                      Common::GetLastErrorMsg());
+            throw std::runtime_error("uffdio_api");
+        }
+
+        // Create uffd handler thread
+        ufd_thread = std::jthread([&](std::stop_token token) { UffdHandler(token); });
+    }
+
+    ~UffdImpl() = default;
+
+    void OnMap(VAddr address, size_t size) override {
+        PageManager::Impl::OnMap(address, size);
+        uffdio_register reg;
+        reg.range.start = address;
+        reg.range.len = size;
+        reg.mode = UFFDIO_REGISTER_MODE_WP;
+        const int ret = ioctl(uffd, UFFDIO_REGISTER, &reg);
+        ASSERT_MSG(ret != -1, "Uffdio register failed with error: {}", Common::GetLastErrorMsg());
+    }
+
+    void OnUnmap(VAddr address, size_t size) override {
+        uffdio_range range;
+        range.start = address;
+        range.len = size;
+        const int ret = ioctl(uffd, UFFDIO_UNREGISTER, &range);
+        ASSERT_MSG(ret != -1, "Uffdio unregister failed with error: {}", Common::GetLastErrorMsg());
+    }
+
+    void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
+        bool allow_write = True(perms & Core::MemoryPermission::Write);
+        uffdio_writeprotect wp;
+        wp.range.start = address;
+        wp.range.len = size;
+        wp.mode = allow_write ? UFFDIO_WRITEPROTECT_MODE_DONTWAKE : UFFDIO_WRITEPROTECT_MODE_WP;
+        const int ret = ioctl(uffd, UFFDIO_WRITEPROTECT, &wp);
+        ASSERT_MSG(ret != -1, "Uffdio writeprotect failed with error: {}",
+                   Common::GetLastErrorMsg());
+    }
+
+    void UffdHandler(std::stop_token token) {
+        Common::SetCurrentThreadName("shadGT:Uffd");
+
+        auto regions = Core::Memory::Instance()->GetAddressSpace().GetUsableRegions();
+        for (auto& region : regions) {
+            OnMap(region.lower(), region.upper());
+        }
+        LOG_INFO(Common_Memory, "registered reserved memory with userfaultfd");
+
+        while (!token.stop_requested()) {
+            pollfd pollfd;
+            pollfd.fd = uffd;
+            pollfd.events = POLLIN;
+
+            // Block until the descriptor is ready for data reads.
+            const int pollres = poll(&pollfd, 1, -1);
+            switch (pollres) {
+            case -1:
+                perror("Poll userfaultfd");
+                continue;
+                break;
+            case 0:
+                continue;
+            case 1:
+                break;
+            default:
+                UNREACHABLE_MSG("Unexpected number of descriptors {} out of poll", pollres);
+            }
+
+            // We don't want an error condition to have occured.
+            ASSERT_MSG(!(pollfd.revents & POLLERR), "POLLERR on userfaultfd");
+
+            // We waited until there is data to read, we don't care about anything else.
+            if (!(pollfd.revents & POLLIN)) {
+                continue;
+            }
+
+            // Read message from kernel.
+            uffd_msg msg;
+            const int readret = read(uffd, &msg, sizeof(msg));
+            if (readret == -1) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    continue;
+                }
+                LOG_ERROR(Common_Memory, "Unexpected result of uffd read: {}",
+                          Common::GetLastErrorMsg());
+                break;
+            }
+            ASSERT_MSG(readret == sizeof(msg), "Unexpected short read, exiting");
+            ASSERT(msg.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP);
+
+            // Notify rasterizer about the fault.
+            const VAddr addr = msg.arg.pagefault.address;
+            const auto ptid = msg.arg.pagefault.feat.ptid;
+            rasterizer->InvalidateMemory(addr, 1, rasterizer->IsGpuThreadTid(ptid));
+
+            // Some calls to InvalidateMemory never reach the UFFDIO_WRITEPROTECT ioctl in
+            // ::Protect, therefore we use MODE_DONTWAKE and wake the thread with UFFDIO_WAKE here
+            uffdio_range wake;
+            wake.start = msg.arg.pagefault.address;
+            wake.len = PageManager::PM_PAGE_SIZE;
+            const int ret = ioctl(uffd, UFFDIO_WAKE, &wake);
+            ASSERT_MSG(ret != -1, "Waking thread {} failed with: {}", ptid,
+                       Common::GetLastErrorMsg());
+        }
+    }
+};
+#endif // __linux__
+
+struct SignalImpl : public PageManager::Impl {
+    SignalImpl(Vulkan::Rasterizer* rasterizer_) : Impl() {
+        rasterizer = rasterizer_;
+#if defined(_WIN32) && !defined(NDEBUG)
+        // Open the opt-in trace before any page locks or exception callbacks can use it.
+        if (TracePage() != ~u64{0}) (void)TraceFile();
+#endif
+
+        // Should be called first.
+        constexpr auto priority = std::numeric_limits<u32>::min();
+        Core::Signals::Instance()->RegisterAccessViolationHandler(GuestFaultSignalHandler,
+                                                                  priority);
+#ifdef _WIN32
+        // FIX-079: the trap after a write-through store; ahead of every other handler.
+        g_write_through_rasterizer = rasterizer_;
+        AddVectoredExceptionHandler(1, WriteThroughStep);
+#endif
+    }
+
+    void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
+        RENDERER_TRACE;
+#ifdef _WIN32
+        // FIX-079: not while a write-through store has a page open (its protection is put back
+        // as it was when the store has run).
+        std::scoped_lock wt_lock{WriteThroughLock()};
+#endif
+        ++Common::GetWorkCounters().protects;
+        Common::GetWorkCounters().protect_bytes += size;
+        RYDIAG_SCOPE(Protect, address);
+        // P2: imported guest views stay writable (the GPU faults on protected imported pages).
+        if (VideoCore::g_imported_count.load(std::memory_order_acquire) != 0) {
+            bool any_imported = false;
+            VideoCore::ForEachNotImported(address, size, [&](VAddr start, u64 length) {
+                any_imported |= start != address || length != size;
+            });
+            if (any_imported) {
+                boost::container::small_vector<std::pair<VAddr, u64>, 4> parts;
+                VideoCore::ForEachNotImported(address, size, [&](VAddr start, u64 length) {
+                    parts.emplace_back(start, length);
+                });
+                for (const auto& [start, length] : parts) {
+                    Protect(start, length, perms);
+                }
+                return;
+            }
+        }
+        auto* memory = Core::Memory::Instance();
+        auto& impl = memory->GetAddressSpace();
+#if defined(_WIN32) && !defined(NDEBUG)
+        const auto protect = [&](VAddr start, u64 length, Core::MemoryPermission requested) {
+            MEMORY_BASIC_INFORMATION before{}, after{};
+            const bool traced = TraceOverlaps(start, length);
+            if (traced) VirtualQuery(reinterpret_cast<void*>(TracePage()), &before, sizeof(before));
+            impl.Protect(start, length, requested);
+            if (traced) {
+                VirtualQuery(reinterpret_cast<void*>(TracePage()), &after, sizeof(after));
+                TracePageEvent("Protect", start, length, 0, 0, 0, 0, 0, 0, 0, 0,
+                               static_cast<unsigned>(requested), before.Protect, after.Protect, true);
+            }
+        };
+#else
+        const auto protect = [&](VAddr start, u64 length, Core::MemoryPermission requested) {
+            impl.Protect(start, length, requested);
+        };
+#endif
+        ASSERT_MSG(perms != Core::MemoryPermission::Write,
+                   "Attempted to protect region as write-only which is not a valid permission");
+        // FIX-028: keep the execute permission of guest code. A GPU buffer over module code
+        // (GT Sport's dealership bound one over libc) turned its pages non-executable; every
+        // instruction fetch then faulted as a "read" of GPU-mapped memory, was reported handled,
+        // and the game threads looped on the fault forever (the dealership freeze). On x86 an
+        // executable page stays readable, so only CPU writes to code are tracked there.
+        // -DisablePerf 37 protects without it.
+        static const bool keep_exec = Common::PerfFeatureEnabled(37);
+        if (!keep_exec) {
+            protect(address, size, perms);
+            return;
+        }
+        memory->ForEachExecRange(address, size, [&](VAddr start, u64 length, bool exec) {
+            if (exec) {
+                static std::atomic<u32> logged{};
+                if (logged++ < 10) {
+                    LOG_WARNING(Render,
+                                "FIX-028: GPU tracking of guest code at {:#x}+{:#x} keeps it "
+                                "executable",
+                                start, length);
+                }
+            }
+            protect(start, length, exec ? perms | Core::MemoryPermission::Execute : perms);
+        });
+    }
+
+    /// PERF-011b: bytes written by the faulting instruction when they are known exactly: one
+    /// explicit memory destination, no REP prefix or string operation, and starting at the fault
+    /// address (an access cannot have begun on the previous page). 0 when unknown.
+    static u64 ExactWriteSize(void* context, VAddr addr) {
+        ZydisDecodedInstruction instruction;
+        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+        const auto status = Common::Decoder::Instance()->decodeInstruction(instruction, operands,
+                                                                           Common::GetRip(context));
+        if (!ZYAN_SUCCESS(status) ||
+            (instruction.attributes &
+             (ZYDIS_ATTRIB_HAS_REP | ZYDIS_ATTRIB_HAS_REPE | ZYDIS_ATTRIB_HAS_REPNE)) != 0) {
+            return 0;
+        }
+        switch (instruction.mnemonic) {
+        case ZYDIS_MNEMONIC_MOVSB:
+        case ZYDIS_MNEMONIC_MOVSW:
+        case ZYDIS_MNEMONIC_MOVSD:
+        case ZYDIS_MNEMONIC_MOVSQ:
+        case ZYDIS_MNEMONIC_STOSB:
+        case ZYDIS_MNEMONIC_STOSW:
+        case ZYDIS_MNEMONIC_STOSD:
+        case ZYDIS_MNEMONIC_STOSQ:
+            return 0;
+        default:
+            break;
+        }
+        u64 size = 0;
+        for (u32 i = 0; i < instruction.operand_count_visible; ++i) {
+            const auto& operand = operands[i];
+            if (operand.type != ZYDIS_OPERAND_TYPE_MEMORY ||
+                (operand.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) == 0) {
+                continue;
+            }
+            if (size != 0 || operand.size == 0 || operand.size % 8 != 0) {
+                return 0;
+            }
+            size = operand.size / 8;
+        }
+        if (size == 0 || (addr & 0xFFFULL) < size) {
+            return 0;
+        }
+        return size;
+    }
+
+#ifdef _WIN32
+    /// FIX-079: a write fault whose store touches no GPU-written byte of the page runs with the
+    /// page open for that one instruction (trap flag), then the page is protected again and the
+    /// bytes it changed go to the GPU copy. Nothing waits for the GPU.
+    struct WriteThroughState {
+        bool active{};
+        VAddr page{};
+        DWORD old_protect{};
+        VAddr store{};
+        u64 store_size{};
+        std::array<u8, 4096> before{};
+    };
+    static WriteThroughState& WriteThrough() {
+        static thread_local WriteThroughState state;
+        return state;
+    }
+
+    static bool TryWriteThrough(void* context, VAddr addr) {
+        auto& state = WriteThrough();
+        if (state.active) {
+            return false;
+        }
+        // One explicit memory operand, the destination: no second access can fault meanwhile.
+        ZydisDecodedInstruction instruction;
+        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+        if (!ZYAN_SUCCESS(Common::Decoder::Instance()->decodeInstruction(
+                instruction, operands, Common::GetRip(context)))) {
+            return false;
+        }
+        u32 memory_operands = 0;
+        for (u32 i = 0; i < instruction.operand_count; ++i) {
+            memory_operands += operands[i].type == ZYDIS_OPERAND_TYPE_MEMORY ? 1 : 0;
+        }
+        const u64 size = ExactWriteSize(context, addr);
+        if (memory_operands != 1 || size == 0 || !rasterizer->CanWriteThrough(addr, size)) {
+            return false;
+        }
+        const VAddr page = PageManager::GetPageAddr(addr);
+        auto& lock = WriteThroughLock();
+        lock.lock();
+        MEMORY_BASIC_INFORMATION mbi{};
+        const bool readable =
+            VirtualQuery(reinterpret_cast<void*>(page), &mbi, sizeof(mbi)) == sizeof(mbi) &&
+            (mbi.Protect == PAGE_READONLY || mbi.Protect == PAGE_EXECUTE_READ);
+        DWORD old_protect = 0;
+        if (!readable ||
+            !VirtualProtect(reinterpret_cast<void*>(page), 4096,
+                            mbi.Protect == PAGE_READONLY ? PAGE_READWRITE : PAGE_EXECUTE_READWRITE,
+                            &old_protect)) {
+            lock.unlock();
+            return false;
+        }
+        std::memcpy(state.before.data(), reinterpret_cast<const void*>(page), 4096);
+        state.active = true;
+        state.page = page;
+        state.old_protect = old_protect;
+        state.store = addr;
+        state.store_size = size;
+        // (The signal context is the EXCEPTION_POINTERS.)
+        static_cast<EXCEPTION_POINTERS*>(context)->ContextRecord->EFlags |= 0x100; // trap after the store
+        return true;
+    }
+
+    static LONG CALLBACK WriteThroughStep(EXCEPTION_POINTERS* pointers) {
+        if (pointers->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        auto& state = WriteThrough();
+        if (!state.active) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        DWORD unused = 0;
+        VirtualProtect(reinterpret_cast<void*>(state.page), 4096, state.old_protect, &unused);
+        pointers->ContextRecord->EFlags &= ~0x100u;
+        state.active = false;
+        WriteThroughLock().unlock();
+        if (g_write_through_rasterizer) {
+            g_write_through_rasterizer->FinishWriteThrough(state.page, state.before, state.store,
+                                                           state.store_size);
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    static std::recursive_mutex& WriteThroughLock() {
+        static std::recursive_mutex lock;
+        return lock;
+    }
+    static inline Vulkan::Rasterizer* g_write_through_rasterizer{};
+#endif
+
+    static bool GuestFaultSignalHandler(void* context, void* fault_address) {
+        const auto addr = reinterpret_cast<VAddr>(fault_address);
+        // Host/driver faults must continue to their own handlers. Besides
+        // needless GPU drains, indexing the 40-bit guest table with a host
+        // address can fault recursively and hide the original exception.
+        if (!IsTrackedGuestAddress(addr)) return false;
+        const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
+        // PERF-031: the draw pipe's recorder thread is a GPU thread too; a fault on the command
+        // thread lets the recorder finish first, since the handling uses the caches.
+        const auto is_gpu_thread = rasterizer->IsGpuThread();
+        if (is_gpu_thread) {
+            // DIAG-049: which GPU-thread code touched protected guest memory. A fault on the
+            // command thread drains the recorder and may wait for the GPU.
+            // Per thread, so the recorder's faults do not hide the command thread's.
+            static thread_local u32 logged = 0;
+            if (logged++ < 48) {
+                LOG_WARNING(Render, "DIAG-049 GPU-thread {} fault at {:#x} from {}; stack:{}",
+                            Common::IsWriteError(context) ? "write" : "read", addr,
+                            Common::SamplingProfiler::DescribeCode(
+                                reinterpret_cast<u64>(Common::GetRip(context))),
+                            Common::SamplingProfiler::DescribeStack());
+            }
+        }
+        const VAddr fault_page = PageManager::GetPageAddr(addr);
+        if (!is_gpu_thread) {
+            // PERF-063: the game was told work is done (an early fence) that the recorder has
+            // not recorded yet; if it reads this page, the access waits for it.
+            rasterizer->WaitForEarlyFences(fault_page);
+            // PERF-070: a page a decoded GPU write guards opens once the write is recorded.
+            rasterizer->WaitForGuard(fault_page);
+        } else if (rasterizer->GetPageManager().IsGuarded(fault_page)) {
+            // PERF-070: an emulator thread reads or writes a guarded page itself: open it.
+            rasterizer->GetPageManager().DropGuards(fault_page);
+            rasterizer->NoteGuardDropped();
+            return true;
+        }
+        // PERF-054: the command thread's fault is flushed as urgent work on the recorder,
+        // which then holds the caches; otherwise this thread drains the recorder and uses them.
+        const bool assume_locks = is_gpu_thread && !rasterizer->CommandThreadFaultIsUrgent();
+        if (assume_locks) {
+            rasterizer->OnGpuThreadFault();
+        }
+#ifdef _WIN32
+        if (!is_gpu_thread && Common::IsWriteError(context) && TryWriteThrough(context, addr)) {
+            return true; // FIX-079
+        }
+#endif
+        // The faulting instruction, with bit 63 set for a write.
+        RYDIAG_SCOPE(WriteFault, reinterpret_cast<u64>(Common::GetRip(context)) |
+                                     (u64(Common::IsWriteError(context)) << 63));
+        if (Common::IsWriteError(context)) {
+            return rasterizer->InvalidateMemory(addr, size, assume_locks,
+                                                ExactWriteSize(context, addr));
+        } else {
+            return rasterizer->ReadMemory(addr, size, assume_locks);
+        }
+        return false;
+    }
+};
+
+PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
+#ifdef __linux__
+    if (EmulatorSettings.IsUserfaultfdTracking()) {
+        try {
+            impl = std::make_unique<UffdImpl>(rasterizer_);
+            LOG_INFO(Config, "Memory tracking method: userfaultfd");
+            return;
+        } catch (const std::runtime_error& e) {
+            // if uffd is unsupported, falls back to SignalImpl
+        }
+    }
+    LOG_INFO(Config, "Memory tracking method: signals");
+#endif
+    impl = std::make_unique<SignalImpl>(rasterizer_);
+}
+
+PageManager::~PageManager() = default;
+
+u64 PageManager::Guard(VAddr address, u64 size) {
+    return impl->Guard(address, size, true);
+}
+
+void PageManager::Unguard(VAddr address, u64 size) {
+    impl->Guard(address, size, false);
+}
+
+bool PageManager::IsGuarded(VAddr page) const {
+    const auto* state = FindTrackedGuestPage(impl->cached_pages,page,PM_PAGE_BITS);
+    return state && state->num_guards != 0;
+}
+
+bool PageManager::IsUnwatched(VAddr page) const {
+    const auto* state = FindTrackedGuestPage(impl->cached_pages,page,PM_PAGE_BITS);
+    return !state || (state->num_write_watchers == 0 && state->num_read_watchers == 0 &&
+                      state->num_guards == 0);
+}
+
+#ifdef RYTY_GPU
+void PageManager::ReapplyProtection(VAddr address, u64 size) {
+    impl->ReapplyProtection(address, size);
+}
+#endif
+
+void PageManager::DropGuards(VAddr page) {
+    impl->DropGuards(page);
+}
+
+void PageManager::OnGpuMap(VAddr address, size_t size) {
+    impl->OnMap(address, size);
+}
+
+void PageManager::OnGpuUnmap(VAddr address, size_t size) {
+    impl->OnUnmap(address, size);
+}
+
+void PageManager::UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) const {
+    impl->UpdatePageWatchers(addr, size, write_op);
+}
+
+void PageManager::UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,
+                                              const RegionBits& write_mask,
+                                              const RegionBits& read_mask, PageOp write_op,
+                                              PageOp read_op) const {
+    impl->UpdatePageWatchersForRegion(base_addr, bounds, write_mask, read_mask, write_op, read_op);
+}
+
+} // namespace VideoCore

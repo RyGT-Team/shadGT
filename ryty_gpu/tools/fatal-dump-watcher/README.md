@@ -1,0 +1,26 @@
+# Fatal snapshot watcher (opt-in, isolated)
+
+Only for a future launch with APS5_CRASH_PAUSE=180 set in that game's environment. Start this watcher after that exact process exists and logs/stderr.log is created; wait for ready.txt before relying on capture. Supply exact GTSport.exe path, PID, process creation FILETIME in UTC, stderr path, and a new output directory under investigation-build. It records the existing stderr byte offset, so old fatal lines are ignored. It requires both a new FATAL: unhandled exception line and a new pause line naming that PID. Normal guarded reads do not trigger. The handler is vectored: its fatal classification is not a guaranteed Windows second-chance exception.
+
+Example (adapt paths and PID):
+
+```powershell
+$p = Get-Process -Id <PID>
+& .\Watch-Fatal.ps1 -TargetPid $p.Id -ExePath $p.Path -StartFileTime $p.StartTime.ToUniversalTime().ToFileTimeUtc() -Stderr (Join-Path (Split-Path $p.Path) 'logs\stderr.log') -OutputDir '<new absolute path under investigation-build>' -WatchSeconds 3600 -DumpSeconds 120 -MaxMiB 8192
+```
+
+No debugger attach, game changes or network operation. External worker rechecks PID, executable path and creation time and captures a PSS VA clone with thread contexts, then MiniDumpWriteDump. The dump requests private read/write memory, memory map and thread information; it is not a full-memory dump and may omit mapped/image memory. PSS and the dump writer may fail due to OS, permissions or target state. Other threads continue until PSS captures its snapshot. The thread is already inside Sleep; there is no original exception stream. fatal-context.txt preserves the handler's printed registers and stack candidates, not full original CONTEXT. status.txt reports bounded directory validation, not complete evidence or root cause.
+
+Existing output directory is refused. Free-space check requires MaxMiB plus 1 GiB reserve. The dump callback requests cooperative cancellation after the configured dump duration or combined file size; file size can overshoot between callbacks, and partial or oversized dumps are invalid. A five-second supervisor grace follows the deadline, then a hung worker is forcibly terminated. The documented PssFreeSnapshot call runs on normal completion and cooperative cancellation; Microsoft documentation reviewed does not establish snapshot-clone cleanup after forced worker termination, so that fallback may leave resources until Windows reclaims them. The worker deadline starts before PSS capture, although PSS cannot be interrupted by the callback. Completed size and the 1 GiB free-space reserve are checked again. Output may contain sensitive game and process memory and is not uploaded. The snapshot itself has memory/commit cost. A rotated or truncated log can cause a timeout rather than capture. ready.txt is written only after opening the log and recording its initial offset. Failure details and worker stderr are saved beside output.
+
+On a primary MiniDumpWriteDump E_INVALIDARG only, the worker preserves the partial primary file and error, then tries MiniDumpNormal into fatal-fallback.dmp using the same snapshot and remaining time and size budget. Cancellation is never retried. The fallback requests thread and module information and stacks, but omits private heap coverage and has no original exception stream. Thread contexts reflect the later paused state; fatal-context.txt retains the printed original registers. The watcher checks bounded stream directories, nonempty thread and module lists, and at least one thread with bounded context and stack bytes, including stacks covered by memory or memory64 lists; this does not prove all stacks or memory are usable. The loaded DbgHelp path and file version are recorded next to the primary output. FallbackSelfTest.ps1 injects a primary failure only into a disposable fixture copy and exercises the actual fallback writer. The corrected AMD64 context flags are not proof of the cause of an earlier E_INVALIDARG.
+
+SelfTest.ps1 runs a disposable local fixture only, emits a harmless guarded-read line, then synthetic fatal/pause text, and checks MDMP signature and a private heap marker. Most recent run succeeded: 40,858,756 bytes, marker found. It does not test an actual game crash, all Windows configurations, a full memory dump, or finding a corrupting writer.
+
+References: https://learn.microsoft.com/en-us/previous-versions/windows/desktop/proc_snap/export-a-process-snapshot-to-a-file ; https://learn.microsoft.com/en-us/windows/win32/api/minidumpapiset/nf-minidumpapiset-minidumpwritedump ; https://learn.microsoft.com/en-us/windows/win32/api/processsnapshot/ne-processsnapshot-pss_capture_flags
+
+NegativeTest.ps1 passed wrong PID/start rejection, old-fatal suppression, and watch timeout. CancelTest.ps1 expects HRESULT_FROM_WIN32(ERROR_CANCELLED) and one attempt; DeadlineTest.ps1 expects the explicit budget error before any dump attempt. They do not prove cleanup after a forced worker kill or a hang inside PSS.
+
+
+
+Build the disposable test fixture with Build-Fixture.ps1 in a clean checkout. Run SelfTest.ps1, FallbackSelfTest.ps1, CancelTest.ps1, DeadlineTest.ps1 and NegativeTest.ps1 in separate 64-bit Windows PowerShell processes. Generated fixture binaries and dumps are ignored; do not use the actual converted game as the fixture.

@@ -1,0 +1,76 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <algorithm>
+#include <memory>
+#include <boost/container/small_vector.hpp>
+#include "shader_recompiler/specialization.h"
+#include "vulkan/vulkan.hpp"
+
+namespace Vulkan {
+
+struct Program {
+    struct Module {
+        vk::ShaderModule module{};
+        Shader::StageSpecialization spec;
+        // Pipelines retain this address, so metadata must survive list reallocations.
+        std::unique_ptr<Shader::Info> info;
+        /// FIX-043 diagnostic: hash of the SPIR-V, to count permutations that repeat another.
+        u64 spv_hash{};
+        /// PERF-032: listed from the shader store; its module is loaded the first time it matches.
+        bool stored{};
+        /// PERF-GT7-058: the inputs it last matched with, as StageSpecialization::PackInputs packs
+        /// them; R7 confirms it again from these when they are the same.
+        struct SpecInputs {
+            bool valid{};
+            Shader::RuntimeInfo runtime_info{};
+            Shader::Backend::Bindings start{};
+            std::vector<u64> words;
+        } inputs;
+    };
+    static constexpr size_t MaxPermutations = 8;
+    using ModuleList = boost::container::small_vector<Module, MaxPermutations>;
+
+    ModuleList modules{};
+    /// PERF-GT7-058: else_scope_checked was looked at for this program object.
+
+    /// PERF-044: the inputs of the last permutation search and its outcome. A specialization is
+    /// made from the permutation's info, the runtime info, the start bindings and the sharps,
+    /// which come from the user data and the flattened user data (and, for vertex and
+    /// tessellation stages, from guest memory too, so those are never memoized). With the same
+    /// inputs, permutations up to the one that matched decide the same way again.
+    struct MatchMemo {
+        bool valid{};
+        size_t perm{};
+        size_t modules_size{};
+        Shader::RuntimeInfo runtime_info{};
+        Shader::Backend::Bindings start{};
+        std::vector<u32> user_data;
+        std::vector<std::vector<u32>> flats;
+    } match_memo;
+    /// R7: the permutation the last search found; tried first next time.
+    size_t last_match{~size_t{0}};
+    MatchMemo ahead_memo;
+    size_t ahead_last_match{~size_t{0}};
+
+    MatchMemo& SearchMemo(bool ahead) { return ahead ? ahead_memo : match_memo; }
+    size_t& SearchLastMatch(bool ahead) { return ahead ? ahead_last_match : last_match; }
+
+    void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
+                   std::unique_ptr<Shader::Info> info) {
+        spec.info = info.get();
+        modules.emplace_back(module, std::move(spec), std::move(info));
+    }
+
+    void InsertPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
+                      std::unique_ptr<Shader::Info> info, size_t perm_idx) {
+        modules.resize(std::max(modules.size(), perm_idx + 1));
+        ASSERT(!modules[perm_idx].info);
+        spec.info = info.get();
+        modules[perm_idx] = {module, std::move(spec), std::move(info)};
+    }
+};
+
+} // namespace Vulkan

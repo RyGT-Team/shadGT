@@ -1,6 +1,7 @@
 #include <exception>
 #include "ryty_gpu/native/cpu_stack_registry.h"
 #include "ryty_gpu/image_lifecycle.h"
+#include "ryty_gpu/native/aligned_erase.h"
 #include "ryty_gpu/prepared_trace.h"
 #include "ryty_gpu/workload_trace.h"
 #include "ryty_gpu/native/content_probe.h"
@@ -12093,22 +12094,23 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
     DropMirrors(address, size, MirrorUnmapDrop); // NAT-150
     {
         std::scoped_lock pending_lock{region_dirty_mutex}; // FIX-173
-        std::erase_if(page_snapshots, [&](const auto& snapshot) {
+        static const bool keyed_unmap = [] { const char* env=std::getenv("RYGT_NATIVE_KEYED_UNMAP"); return !(env && env[0]=='0' && env[1]=='\0'); }();
+        Native::EraseAligned<4096>(page_snapshots,address,size,false,keyed_unmap,[&](const auto& snapshot) {
             return snapshot.first >= address && snapshot.first < address + size;
         });
-        std::erase_if(cpu_recent_pages, [&](const auto& entry) {
+        Native::EraseAligned<4096>(cpu_recent_pages,address,size,true,keyed_unmap,[&](const auto& entry) {
             return entry.first < address + size && entry.first + 4096 > address;
         });
-        std::erase_if(ahead_pages, [&](VAddr page) {
+        Native::EraseAligned<4096>(ahead_pages,address,size,true,keyed_unmap,[&](VAddr page) {
             return page < address + size && page + 4096 > address;
         });
-        std::erase_if(remapped_pages, [&](VAddr page) {
+        Native::EraseAligned<4096>(remapped_pages,address,size,true,keyed_unmap,[&](VAddr page) {
             return page < address + size && page + 4096 > address;
         });
-        std::erase_if(fault_chunks, [&](const auto& entry) {
+        Native::EraseAligned<65536>(fault_chunks,address,size,true,keyed_unmap,[&](const auto& entry) {
             return entry.first < address + size && entry.first + 64_KB > address;
         });
-        std::erase_if(downloaded_ranges, [&](const auto& entry) {
+        Native::EraseAligned<4096>(downloaded_ranges,address,size,true,keyed_unmap,[&](const auto& entry) {
             return entry.first < address + size && entry.first + 4096 > address;
         });
     }

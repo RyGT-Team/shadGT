@@ -27,6 +27,7 @@
 #include "video_core/buffer_cache/imported_view_lease.h"
 #include "video_core/buffer_cache/imported_part_plan.h"
 #include "ryty_gpu/native/slow_call_trace.h"
+#include "ryty_gpu/image_lifecycle.h"
 #include "ryty_gpu/native/direct_coherence_registry.h"
 #include "ryty_gpu/native/parallel_direct_capability.h"
 #include "video_core/buffer_cache/proto_import.h"
@@ -36,6 +37,63 @@
 namespace VideoCore {
 
 namespace {
+struct ImportMeasure;
+thread_local ImportMeasure* current_import_measure = nullptr;
+std::atomic<u64> warm_busy{};
+// Construct before the view mutex: destruction publishes only after its lock is released.
+struct ImportMeasure {
+    bool active = ImageLife::Enabled("direct_import_operation");
+    u64 role, address, size, owner, start{}, acquired{}, before_unlock{}, wait{}, outcome{}, imports{}, successes{}, bytes{},
+        import_ticks{}, max_import_ticks{}, alias_ticks{}, properties_ticks{}, allocate_ticks{}, create_bind_ticks{};
+    ImportMeasure* previous{};
+    ImportMeasure(u64 r, u64 a, u64 n, u64 o) : role(r), address(a), size(n), owner(o) {
+        if (active) { previous=current_import_measure; current_import_measure=this; }
+    }
+    void Waiting() { if(active) start=ImageLife::Timestamp(); }
+    void Acquired() { if(active) { acquired=ImageLife::Timestamp(); if(start && acquired) wait=acquired-start; } }
+    void BeforeUnlock() { if(active) before_unlock=ImageLife::Timestamp(); }
+    ~ImportMeasure() {
+        if (!active) return;
+        current_import_measure=previous;
+        if (previous) return; // nested instrumentation must not emit under an outer lock
+        if (!start && !imports) return; // coverage-fast path did not take the mutex
+        const u64 end=ImageLife::Timestamp();
+        if (!end || !ImageLife::Enabled("direct_import_operation")) return;
+        const u64 held=acquired && before_unlock ? before_unlock-acquired : 0;
+        if (!imports && wait < ImageLife::SlowThresholdTicks() && held < ImageLife::SlowThresholdTicks()) return;
+        ImageLife::Scope op{"direct_import_operation", role, address, size, wait, held};
+        if (!op.Active()) return;
+        { ImageLife::Scope timing{"direct_import_timing", op.Id(), start, acquired, before_unlock, end}; }
+        ImageLife::Scope detail{"direct_import_detail", op.Id(), imports, successes, bytes, import_ticks};
+        detail.Finish(max_import_ticks, warm_busy.exchange(0, std::memory_order_relaxed));
+        { ImageLife::Scope driver{"direct_import_driver", op.Id(), alias_ticks, properties_ticks,
+                                  allocate_ticks, create_bind_ticks}; }
+        op.Finish(outcome, owner);
+    }
+};
+struct ImportHoldEnd {
+    ImportMeasure& owner;
+    ~ImportHoldEnd() { owner.BeforeUnlock(); }
+};
+struct ImportViewMeasure {
+    ImportMeasure* owner=current_import_measure;
+    u64 start{}, bytes{}; bool success{};
+    ImportViewMeasure() { if(owner) start=ImageLife::Timestamp(); }
+    ~ImportViewMeasure() {
+        if (!owner) return;
+        const u64 end=ImageLife::Timestamp(); if (!start || !end) return;
+        const u64 elapsed=end-start;
+        ++owner->imports; owner->successes+=success; owner->bytes+=success ? bytes : 0;
+        owner->import_ticks+=elapsed; owner->max_import_ticks=std::max(owner->max_import_ticks,elapsed);
+    }
+};
+struct ImportPhase {
+    u64* total{}; u64 start{};
+    explicit ImportPhase(u64 ImportMeasure::* field) {
+        if (current_import_measure) { total=&(current_import_measure->*field); start=ImageLife::Timestamp(); }
+    }
+    ~ImportPhase() { if(total && start) { const u64 end=ImageLife::Timestamp(); if(end) *total+=end-start; } }
+};
 // Every view insertion/removal and owner lifetime change invalidates all local
 // shortcuts. The view mutex still protects each lookup and returned wrapper.
 std::atomic<u64> imported_view_epoch{1};
@@ -218,11 +276,17 @@ bool DirectMemory::Covered(VAddr address, u64 size) const {
 
 std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr address,
                                                                      u64 size) const {
+    ImportMeasure measure{3, address, size, ImageLife::Handle(this)};
+    measure.Waiting();
     std::scoped_lock lk{mutex};
+    measure.Acquired();
+    ImportHoldEnd hold_end{measure};
     static thread_local Native::EpochRangeMemo<const Buffer*> memo;
     const auto epoch = imported_view_epoch.load(std::memory_order_acquire);
-    if (const auto found = memo.Find(this, epoch, address, size))
+    if (const auto found = memo.Find(this, epoch, address, size)) {
+        if (measure.active) measure.outcome=1;
         return std::make_pair(found->value, found->offset);
+    }
     auto it = views.upper_bound(address);
     if (it == views.begin()) {
         return std::nullopt;
@@ -232,6 +296,7 @@ std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr addr
         return std::nullopt;
     }
     memo.Store(this, epoch, view.begin, view.end, view.wrapper.get());
+    if (measure.active) measure.outcome=1;
     return std::make_pair(static_cast<const Buffer*>(view.wrapper.get()), address - view.begin);
 }
 
@@ -258,6 +323,7 @@ u64 ViewPiece() {
 } // namespace
 
 bool DirectMemory::ImportView(VAddr address, VAddr want_end) {
+    ImportViewMeasure measurement;
     Native::SlowCallTrace<8> trace{Native::trace_guest_hash_calls, "import-guest-view",
         {"guest-view", "map-alias", "host-properties", "allocate-memory", "create-bind-buffer",
          "device-address", "map-pages", "store-view"}};
@@ -283,6 +349,7 @@ bool DirectMemory::ImportView(VAddr address, VAddr want_end) {
     if (const auto next = views.upper_bound(base); next != views.end()) {
         end = std::min(end, next->second.begin);
     }
+    measurement.bytes = end > base ? end - base : 0;
     const auto fail = [&](const char* why) {
         // An unmap/remap can leave the allocation temporarily uncommitted or split
         // before the requested page. That is not a permanent import failure.
@@ -308,7 +375,8 @@ bool DirectMemory::ImportView(VAddr address, VAddr want_end) {
         return fail("no GuestArenaMapAlias");
     }
     trace.Next(1, base, end - base);
-    void* alias = map_alias(base, end - base);
+    void* alias;
+    { ImportPhase phase{&ImportMeasure::alias_ticks}; alias = map_alias(base, end - base); }
     if (!alias) {
         return fail("no alias (not shared memory)");
     }
@@ -317,9 +385,12 @@ bool DirectMemory::ImportView(VAddr address, VAddr want_end) {
     VkMemoryHostPointerPropertiesEXT ptr_props{
         VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
     trace.Next(2);
-    if (d.vkGetMemoryHostPointerPropertiesEXT(device,
+    VkResult property_result;
+    { ImportPhase phase{&ImportMeasure::properties_ticks};
+      property_result = d.vkGetMemoryHostPointerPropertiesEXT(device,
                                               VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
-                                              alias, &ptr_props) != VK_SUCCESS ||
+                                              alias, &ptr_props); }
+    if (property_result != VK_SUCCESS ||
         ptr_props.memoryTypeBits == 0) {
         UnmapAlias()(alias);
         return fail("no memory type for the alias");
@@ -344,7 +415,10 @@ bool DirectMemory::ImportView(VAddr address, VAddr want_end) {
                               memory_type_index};
     VkDeviceMemory memory{};
     trace.Next(3);
-    if (const VkResult r = d.vkAllocateMemory(device, &info, nullptr, &memory); r != VK_SUCCESS) {
+    VkResult allocation_result;
+    { ImportPhase phase{&ImportMeasure::allocate_ticks};
+      allocation_result = d.vkAllocateMemory(device, &info, nullptr, &memory); }
+    if (allocation_result != VK_SUCCESS) {
         UnmapAlias()(alias);
         return fail("import refused");
     }
@@ -360,8 +434,11 @@ bool DirectMemory::ImportView(VAddr address, VAddr want_end) {
                         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT; // NAT-100: dispatch arguments
     VkBuffer buffer{};
     trace.Next(4);
-    if (d.vkCreateBuffer(device, &buffer_info, nullptr, &buffer) != VK_SUCCESS ||
-        d.vkBindBufferMemory(device, buffer, memory, 0) != VK_SUCCESS) {
+    bool buffer_ok;
+    { ImportPhase phase{&ImportMeasure::create_bind_ticks};
+      buffer_ok = d.vkCreateBuffer(device, &buffer_info, nullptr, &buffer) == VK_SUCCESS &&
+                  d.vkBindBufferMemory(device, buffer, memory, 0) == VK_SUCCESS; }
+    if (!buffer_ok) {
         if (buffer) {
             d.vkDestroyBuffer(device, buffer, nullptr);
         }
@@ -418,6 +495,7 @@ bool DirectMemory::ImportView(VAddr address, VAddr want_end) {
         LOG_WARNING(Render_Vulkan, "D1: imported view {:#x}+{:#x} ({} views, {} MiB)", base,
                     end - base, views.size(), imported_bytes.load() >> 20);
     }
+    measurement.success = true;
     return true;
 #else
     return false;
@@ -533,10 +611,16 @@ void DirectMemory::WarmImported(VAddr address, u64 size) {
         size > ImportedPageCoverage<>::Limit - address) {
         return;
     }
+    ImportMeasure measure{1, address, size, ImageLife::Handle(this)};
+    measure.Waiting();
     std::unique_lock lock{mutex, std::try_to_lock};
     if (!lock.owns_lock()) {
+        if (measure.active) warm_busy.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    measure.Acquired();
+    ImportHoldEnd hold_end{measure};
+    if (measure.active) measure.outcome=1;
 #ifdef RYTY_GPU
     const u64 mapping_generation = Core::RytyMemory::MappingGeneration();
     if (failed_generation != mapping_generation) {
@@ -577,6 +661,7 @@ void DirectMemory::WarmImported(VAddr address, u64 size) {
 }
 
 bool DirectMemory::EnsureImported(VAddr address, u64 size) {
+    ImportMeasure measure{2, address, size, ImageLife::Handle(this)};
     Native::SlowCallTrace<9> trace{Native::trace_guest_hash_calls, "ensure-imported",
         {"pending-lock", "completion-query", "destroy-wrapper", "free-memory", "unmap-alias",
          "recent-cache", "view-mutex", "mapping-generation", "lookup-import"}};
@@ -591,6 +676,7 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
     static thread_local u64 coverage_hits{}, coverage_misses{};
 #endif
     if (imported_coverage.Covers(address, size)) {
+        if (measure.active) measure.outcome=1;
 #ifndef NDEBUG
         if ((++coverage_hits & 65535) == 0) {
             LOG_INFO(Render_Vulkan,
@@ -604,7 +690,10 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
     ++coverage_misses;
 #endif
     trace.Next(6);
+    measure.Waiting();
     std::scoped_lock lk{mutex};
+    measure.Acquired();
+    ImportHoldEnd hold_end{measure};
 #ifdef RYTY_GPU
     // OnUnmap is reported before the host remap. A lookup during that window can
     // fail, so discard negative results after the completed mapping is reported too.
@@ -641,6 +730,7 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
             return false;
         }
     }
+    if (measure.active) measure.outcome=1;
     return true;
 }
 

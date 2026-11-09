@@ -85,6 +85,34 @@ The trace records CPU wall time and does not identify GPU waits or reflection ta
 Compare to an external QPC-aligned capture and measure opt-in overhead against a matched trace-off
 Release run.
 
+Set `RYGT_IMAGE_TRACE_IMPORT_ONLY=1` with the main opt-in for a separate direct-import
+capture; it takes precedence over presentation-only and suppresses other event kinds and
+slow-span clocks. The CSV header records `import_only`. Roles in direct_import_operation B
+are 1=WarmImported, 2=EnsureImported, 3=FindBuffer, followed by requested address, size,
+mutex acquisition-call ticks and acquire-to-before-unlock ticks. EnsureImported and
+FindBuffer can execute on either producer or recorder threads; use TID and external profile
+for attribution. Operation E field a is success (WarmImported: lock acquired), and b is
+the DirectMemory owner identity. Compare intervals for the same owner; owner pointers can
+be reused across lifetimes, and timestamp overlap alone does not identify the lock holder.
+direct_import_timing B has parent ID, wait-start, acquired, before-unlock and post-unlock
+QPC; the latter is when deferred emission begins. direct_import_detail B has parent ID,
+import attempts, successes, successfully imported bytes and total ImportView ticks; E has
+maximum ImportView ticks and accumulated WarmImported try-lock misses since the previous
+emitted detail (across threads). direct_import_driver B has parent ID and total alias-map,
+host-pointer-properties, Vulkan allocation, and buffer-create/bind wall ticks. These are
+CPU wall durations, not GPU execution time. Per-operation summaries are emitted only when
+an import was attempted or lock acquisition/hold reached 200 microseconds. Fast calls,
+coverage hits and busy attempts can be omitted, and the last busy aggregate may remain
+unreported; do not derive complete rates from emitted records. Records are appended after
+the direct-memory mutex unlock. Capture boundary crossings and ring drops can omit data;
+active timing adds overhead and lock acquisition duration includes scheduling delays.
+Overlapping producer and consumer intervals do not identify a lock holder by themselves.
+Each emitted operation uses up to eight ring events, so check drop counts and coverage.
+Nested measured calls suppress their own output to avoid emission while an outer measured
+lock may be held; counts and driver totals can therefore omit nested work. Before-unlock
+and post-unlock stamps bracket the unlock and any intervening scheduling, rather than
+measuring the unlock instruction itself. Prefix and end-of-capture operations may be absent.
+
 For a controlled preparation comparison, `RYGT_NATIVE_PREPARE_TEXTURE_WARM=0` disables
 only speculative texture imports from producer-side PrepareTextures. The default is enabled;
 other draw preparation and recorder-side import and upload paths are unchanged. Set the

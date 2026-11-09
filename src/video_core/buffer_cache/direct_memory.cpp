@@ -28,6 +28,7 @@
 #include "video_core/buffer_cache/imported_part_plan.h"
 #include "ryty_gpu/native/slow_call_trace.h"
 #include "ryty_gpu/image_lifecycle.h"
+#include "ryty_gpu/wait_trace.h"
 #include "ryty_gpu/native/direct_coherence_registry.h"
 #include "ryty_gpu/native/parallel_direct_capability.h"
 #include "video_core/buffer_cache/proto_import.h"
@@ -276,9 +277,12 @@ bool DirectMemory::Covered(VAddr address, u64 size) const {
 
 std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr address,
                                                                      u64 size) const {
+    ImageLife::DirectWaitTrace wait_trace{ImageLife::Handle(this),1};
     ImportMeasure measure{3, address, size, ImageLife::Handle(this)};
     measure.Waiting();
     std::scoped_lock lk{mutex};
+    wait_trace.Acquired();
+    ImageLife::DirectHoldStamp wait_stamp{wait_trace};
     measure.Acquired();
     ImportHoldEnd hold_end{measure};
     static thread_local Native::EpochRangeMemo<const Buffer*> memo;
@@ -549,7 +553,10 @@ void DirectMemory::HoldNativeReleases() {
 }
 
 bool DirectMemory::ReleaseHeldAfterSplice(u64 tick, bool stop_holding) {
+    ImageLife::DirectWaitTrace wait_trace{ImageLife::Handle(this),2};
     std::scoped_lock lock{mutex};
+    wait_trace.Acquired();
+    ImageLife::DirectHoldStamp wait_stamp{wait_trace};
     const bool queued = RetireLeasesAfterSplice(held_native_releases, tick);
     if (queued && stop_holding) hold_native_releases = false;
     return queued;
@@ -571,8 +578,11 @@ bool DirectMemory::TryForEachPart(
     if (outcome) *outcome = PartOutcome::Invalid;
     if (address > ImportedPageCoverage<>::Limit ||
         size == 0 || size > ImportedPageCoverage<>::Limit - address) return false;
+    ImageLife::DirectWaitTrace wait_trace{ImageLife::Handle(this),3};
     std::unique_lock lock{mutex, std::try_to_lock};
+    wait_trace.Acquired(lock.owns_lock());
     if (!lock.owns_lock()) { if (outcome) *outcome = PartOutcome::Busy; return false; }
+    ImageLife::DirectHoldStamp wait_stamp{wait_trace};
     if (outcome) *outcome = PartOutcome::MissingCoverage;
     const VAddr end = address + size;
     // Two passes: a missing suffix must not leave a partially recorded copy.
@@ -614,11 +624,14 @@ void DirectMemory::WarmImported(VAddr address, u64 size) {
     }
     ImportMeasure measure{1, address, size, ImageLife::Handle(this)};
     measure.Waiting();
+    ImageLife::DirectWaitTrace wait_trace{ImageLife::Handle(this),4};
     std::unique_lock lock{mutex, std::try_to_lock};
+    wait_trace.Acquired(lock.owns_lock());
     if (!lock.owns_lock()) {
         if (measure.active) warm_busy.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    ImageLife::DirectHoldStamp wait_stamp{wait_trace};
     measure.Acquired();
     ImportHoldEnd hold_end{measure};
     if (measure.active) measure.outcome=1;

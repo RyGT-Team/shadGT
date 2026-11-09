@@ -10,6 +10,7 @@
 #include <thread>
 #include <tuple>
 #include <vector>
+#include "../wait_trace.h"
 using u64=std::uint64_t;using VAddr=u64;
 template<class = void> struct ImportedPageCoverage {static constexpr u64 Limit=1024;};
 struct Buffer {int id;};

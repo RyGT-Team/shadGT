@@ -125,6 +125,9 @@ void Initialize() {
 static bool Allowed(State* s, const char* kind) {
     const bool is_import = kind && std::strncmp(kind, "direct_import_", 14) == 0;
     if (s->import_only || is_import) return s->import_only && is_import;
+    const bool wait_only = kind && (!std::strncmp(kind,"queue_wait_",11) ||
+        !std::strncmp(kind,"direct_wait_",12) || !std::strncmp(kind,"direct_hold_",12));
+    if (wait_only) return s->upload_only;
     if (s->upload_only) return UploadKind(kind);
     if (s->workload_only) return kind && (!std::strcmp(kind,"workload_summary") ||
         !std::strcmp(kind,"present") || !std::strcmp(kind,"frame_prepared"));
@@ -150,6 +153,8 @@ std::uint64_t Timestamp() {
 std::uint64_t SlowThresholdTicks() { return state ? state->frequency.QuadPart / 5000 : 0; }
 std::uint64_t Begin(const char* kind,std::uint64_t a,std::uint64_t b,std::uint64_t c,std::uint64_t d,std::uint64_t e) {
     State* s=state;
+    if (s && kind && (!std::strncmp(kind,"queue_wait_",11) || !std::strncmp(kind,"direct_wait_",12) ||
+                      !std::strncmp(kind,"direct_hold_",12)) && !s->upload_only) return 0;
     if(!s || !s->open.load() || (s->import_only || s->upload_only || s->workload_only ? !Allowed(s,kind) :
        ((kind && (!std::strncmp(kind,"direct_import_",14) || !std::strcmp(kind,"workload_summary"))) ||
         (s->present_only && !PresentationKind(kind))))) return 0;

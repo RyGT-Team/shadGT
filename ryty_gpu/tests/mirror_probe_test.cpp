@@ -28,6 +28,7 @@ struct DirectMemory {
 };
 }
 using VideoCore::DirectMemory;using VideoCore::Buffer;
+#include "../wait_trace.h"
 #include "direct-try-parts-under-test.inc"
 struct Allocation{};
 namespace Native::Rhi { using Buffer = Allocation; }

@@ -16,6 +16,7 @@
 #include "common/native_thread_priority.h"
 #include "video_core/buffer_cache/direct_memory.h"
 #include "video_core/amdgpu/draw_pipe.h"
+#include "ryty_gpu/wait_trace.h"
 
 #ifdef RYTY_GPU
 namespace Vulkan {
@@ -480,24 +481,34 @@ void DrawPipe::Run(std::stop_token stop) {
     auto core_since = std::chrono::steady_clock::now();
 
     std::deque<Work> batch;
+    std::array<ImageLife::WaitAggregate,5> queue_waits{};
+    const auto trace_begin = [] { return ImageLife::Enabled("queue_wait_summary") ? ImageLife::Timestamp() : 0; };
     while (true) {
 #ifdef RYTY_GPU
         native_priority.Update(Vulkan::NativeModeRequested() && Common::NativeCpuPriorityRequested());
 #endif
         RunUrgent();
         {
+            ImageLife::QueueWaitBatch wait_batch{queue_waits,ImageLife::Handle(this)};
+            const auto trace_end = [&](unsigned role, u64 begin) { wait_batch.Add(role,begin,queue.size()); };
+            const auto lock_start=trace_begin();
             std::unique_lock lk{mutex};
+            trace_end(1,lock_start);
             if (idle_hook && queue.empty()) {
                 if (exclusive) {
                     recorder_waiting = true;
+                    const auto wait_start=trace_begin();
                     work_cv.wait(lk, [&] { return !exclusive || stop.stop_requested(); });
+                    trace_end(4,wait_start);
                     recorder_waiting = false;
                 }
                 if (queue.empty() && !stop.stop_requested()) {
                     urgent_running = true;
                     lk.unlock();
                     idle_hook();
+                    const auto relock_start=trace_begin();
                     lk.lock();
+                    trace_end(2,relock_start);
                     urgent_running = false;
                     done_cv.notify_all();
                 }
@@ -505,10 +516,12 @@ void DrawPipe::Run(std::stop_token stop) {
             if (queue.empty()) {
                 recorder_waiting = true;
                 const auto idle_from = std::chrono::steady_clock::now();
+                const auto wait_start=trace_begin();
                 work_cv.wait(lk, [&] {
                     return !queue.empty() || (!urgent.empty() && !exclusive) ||
                            stop.stop_requested();
                 });
+                trace_end(5,wait_start);
                 recorder_waiting = false;
                 const auto idle_to = std::chrono::steady_clock::now();
                 if (idle_to - idle_from > std::chrono::microseconds{50}) {
@@ -555,10 +568,15 @@ void DrawPipe::Run(std::stop_token stop) {
             core_jobs = {};
             core_since = now;
         }
-        std::scoped_lock lk{mutex};
-        finished += ran;
-        stats.recorder_busy_us += MicrosecondsSince(start);
-        done_cv.notify_all();
+        {
+            ImageLife::QueueWaitBatch wait_batch{queue_waits,ImageLife::Handle(this)};
+            const auto finish_start=trace_begin();
+            std::scoped_lock lk{mutex};
+            wait_batch.Add(3,finish_start,queue.size());
+            finished += ran;
+            stats.recorder_busy_us += MicrosecondsSince(start);
+            done_cv.notify_all();
+        }
     }
 }
 

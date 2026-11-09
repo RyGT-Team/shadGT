@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include "ryty_gpu/workload_trace.h"
+#include "ryty_gpu/wait_trace.h"
 int main() {
     SetEnvironmentVariableA("RYGT_IMAGE_LIFECYCLE_TRACE","1");
     SetEnvironmentVariableA("RYGT_IMAGE_TRACE_UPLOAD_ONLY","1");
@@ -22,6 +23,8 @@ int main() {
     assert(ImageLife::ContentProbeEnabled());
     assert(ImageLife::AliasProbeEnabled());
     assert(!ImageLife::Enabled("origin_write_fault"));
+    assert(ImageLife::Enabled("queue_wait_summary"));
+    assert(ImageLife::Enabled("direct_wait_summary"));
     assert(ImageLife::SlowStart("producer_job_walk")==0);
     { ImageLife::Scope s{"texture_source_result",1,2,3,4,1}; }
     { ImageLife::Scope s{"texture_registry_fallback",1,2,3}; s.Finish(1,3); }
@@ -41,13 +44,18 @@ int main() {
       take.Finish(0, 16);
     }
     { ImageLife::Scope omitted{"origin_write_fault"}; }
+    { ImageLife::WaitAggregate a;
+      for (unsigned i=0;i<256;++i) { const auto start=ImageLife::Timestamp(); a.Add("queue_wait_summary",42,1,start,start+1,false,3); }
+      const auto start=ImageLife::Timestamp(); Sleep(2); a.Add("queue_wait_summary",42,1,start,ImageLife::Timestamp(),false,3);
+    }
+    { ImageLife::DirectWaitTrace t{44,2}; t.Acquired(); Sleep(2); t.BeforeUnlock(); }
     { ImageLife::Scope sentinel{"present"}; }
     std::snprintf(path,sizeof(path),"logs/image-lifecycle-%lu.csv",GetCurrentProcessId());
     for(unsigned i=0;i<600 && !(f=std::fopen(path,"r"));++i) Sleep(50);
     assert(f); std::fclose(f);
     bool route=false, fallback=false, probe=false, alias=false, unwanted=false, done=false;
     bool nodrops=false, take=false, before=false, after=false, retiring=false, create=false;
-    bool allocation=false, heap=false, block=false; char line[1024];
+    bool allocation=false, heap=false, block=false, queue_summary=false, queue_detail=false, direct_hold=false, window=false; char line[1024];
     for(unsigned i=0;i<100 && !done;++i) {
         f=std::fopen(path,"r"); assert(f);
         while(std::fgets(line,sizeof(line),f)) {
@@ -65,10 +73,19 @@ int main() {
             allocation |= std::strstr(line,",E,") && std::strstr(line,",upload_allocation_info,16,32,");
             heap |= std::strstr(line,",E,") && std::strstr(line,",upload_heap_info,7,1,");
             block |= std::strstr(line,",B,") && std::strstr(line,",42,1024,5,0");
+            queue_summary |= std::strstr(line,",B,") && std::strstr(line,",queue_wait_summary,42,1,256,256,1");
+            queue_detail |= std::strstr(line,",B,") && std::strstr(line,",queue_wait_detail,42,1,");
+            if (const char* p=std::strstr(line,",wait_summary_window,")) {
+                unsigned long long parent=0, first=0, last=0;
+                window |= std::sscanf(p,",wait_summary_window,%llu,%llu,%llu",&parent,&first,&last)==3 &&
+                          parent && first && last>=first;
+            }
+            direct_hold |= std::strstr(line,",B,") && std::strstr(line,",direct_hold_detail,44,2,");
             done |= std::strstr(line,",B,") && std::strstr(line,",present,");
         }
         std::fclose(f); if(!done) Sleep(50);
     }
     assert(done && route && fallback && probe && alias && !unwanted);
     assert(nodrops && take && before && after && retiring && create && allocation && heap && block);
+    assert(queue_summary && queue_detail && direct_hold && window);
 }

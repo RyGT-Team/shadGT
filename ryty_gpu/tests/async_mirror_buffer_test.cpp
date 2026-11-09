@@ -21,6 +21,7 @@ struct DirectMemory {
  enum class PartOutcome { Invalid, Busy, MissingCoverage, Covered };
  bool TryForEachPart(VAddr,u64,const std::function<bool()>&,const std::function<void(const Buffer&,u64,u64,u64)>&, PartOutcome* = nullptr) const;
 };
+#include "../wait_trace.h"
 #include "direct-try-parts-under-test.inc"
 struct Shared {std::atomic<unsigned> made{},destroyed{};std::mutex mutex;std::thread::id destroyed_by;};
 struct Allocation {explicit Allocation(Shared& s,u64 size):shared(s),bytes(size,0xee){} Shared& shared;std::vector<unsigned char> bytes;

@@ -49,6 +49,22 @@ establish a new device allocation or its cause. Queries use VMA cached informati
 run only during active capture. Monitor drops and observer cost in upload-only captures.
 Metadata also appears in unrestricted full capture. The enclosing create-buffer span includes
 metadata queries and event emission, so its duration includes diagnostic overhead.
+
+Upload-only captures also contain queue_wait_summary and direct_wait_summary/direct_hold_summary.
+B fields are owner pointer, role, count (256), total QPC ticks and maximum QPC ticks; E field a
+counts try-lock busy outcomes. Direct roles: 1 FindBuffer, 2 ReleaseHeldAfterSplice,
+The associated wait_summary_window B fields are summary ID, first start QPC, last end QPC.
+Bucket totals cannot be clipped to a frame; use individual details for precise overlaps.
+3 TryForEachPart, 4 WarmImported. The latter two are try-locks; busy is not blocking time.
+Queue roles: 1 initial lock, 2 relock after idle hook, 3 batch completion lock,
+4 exclusive condition wait, 5 empty-work condition wait. Condition waits include mutex
+reacquisition and scheduling delay. Individual >=200 us queue_wait_detail, direct_wait_detail,
+and direct_hold_detail B fields are owner, role, start QPC, end QPC, busy; E field a is
+queue depth sampled after acquisition for queue events. Direct hold ends immediately before
+unlock; its events are emitted after unlock, and nested direct measurements are suppressed.
+Buckets are per thread and owner; partial buckets at capture end or owner changes are omitted.
+Slow details can still fill the bounded ring: check drops. Wall time and overlapping owner
+intervals do not by themselves establish who blocked whom.
 Upload events can be frequent and add pool-walk overhead while capture is active. Check
 the trace drop count and capture-window coverage before interpreting missing events.
 The retiring totals do not identify which in-flight chunks fit, or independently show

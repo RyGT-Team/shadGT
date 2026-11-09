@@ -43,8 +43,8 @@ VmaPool SmallImageAllocationPool(VmaAllocator allocator, const VkImageCreateInfo
     auto& cache = small_image_pool_cache[allocator];
     if (const auto found = cache.find(key); found != cache.end()) return found->second;
     ImageLife::Scope query{"image_memory_requirements", image.extent.width, image.extent.height,
-                           static_cast<u64>(image.format), image.usage,
-                           (u64(image.arrayLayers) << 32) | image.mipLevels};
+                           static_cast<std::uint64_t>(image.format), image.usage,
+                           (std::uint64_t(image.arrayLayers) << 32) | image.mipLevels};
     // Query once per complete resource configuration: compressed images must be
     // classified by their allocation footprint, not uncompressed pixel dimensions.
     const auto& functions = allocator->GetVulkanFunctions();

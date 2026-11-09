@@ -23,181 +23,150 @@ static constexpr u32 NUM_FMASKS = 24;
 
 using SharpLocation = u16;
 
+constexpr SharpLocation UNKNOWN_LOCATION = std::numeric_limits<u16>::max();
+
+template <typename T>
 struct SharpFetch {
+    static constexpr std::size_t N = sizeof(T) / sizeof(u32);
+    static_assert(N <= 8);
+
     enum class Summary : u8 {
-        Id,
-        Min,
-        Max,
-        Avg,
+        SingleLoad,
+        MultiLoad,
+        Invalid,
     };
-    u32 offset;
-    u32 count;
-    Summary summary;
-    u32 src_comp;
-    u32 dst_start;
-    constexpr bool operator==(const SharpFetch&) const = default;
+
+    Summary summary{Summary::MultiLoad};
+    std::array<u32, N> immediates;
+    std::array<SharpLocation, N> offsets;
+    u8 load_mask;
+
+    bool operator==(const SharpFetch&) const = default;
+
+    /// PERF-062: whether every dword Fetch reads lies within a flattened buffer of this size.
+    constexpr bool FitsIn(size_t num_flat_dwords) const {
+        if (summary == Summary::SingleLoad) {
+            return size_t(offsets[0]) + N <= num_flat_dwords;
+        }
+        if (summary == Summary::Invalid) {
+            return true;
+        }
+        u8 mask = load_mask;
+        for (u32 i = 0; i < N; i++, mask >>= 1) {
+            if ((mask & 1) && size_t(offsets[i]) >= num_flat_dwords) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    template <u32 num_dwords = N>
+        requires(num_dwords <= N)
+    constexpr bool Fetch(const u32* flatbuf, T* out) const {
+        if (summary == Summary::SingleLoad) [[likely]] {
+            std::memcpy(out, flatbuf + offsets[0], num_dwords * sizeof(u32));
+            return true;
+        } else if (summary == Summary::Invalid) [[unlikely]] {
+            return false;
+        }
+        u8 mask = load_mask;
+        std::array<u32, num_dwords> out_dw;
+        for (u32 i = 0; i < num_dwords; i++) {
+            out_dw[i] = (mask & 1) ? flatbuf[offsets[i]] : immediates[i];
+            mask >>= 1;
+        }
+        std::memcpy(out, out_dw.data(), sizeof(out_dw));
+        return true;
+    }
 };
 
-struct SharpFetchPostOp : u8 {
+enum class SharpFetchPostOp : u8 {
+    None,
+    // For buffers
+    BitwiseOrDw1WithImm,
+    OffsetByProgramBase,
+    // For images,
+    ConvertCubeTo2DArray,
+    // For samplers
+    DisableAnisoIfSingleLod,
+    ForceRepeatXyzClamp,
+    ForceLastTexelXyClamp,
+    ClearAnisoRatioAndThreshold,
+    // A scalar-memory base pointer, rather than a guest V# descriptor.
+    ReadConstPointer,
+    // Sample a cube through a native cube-array view, retaining cross-face filtering.
     NativeCubeSampling,
-    Normal,
 };
 
 enum class BufferType : u8 {
-    Unknown = 0,
-    U8,
-    U16,
-    U32,
-    S8,
-    S16,
-    S32,
-    F16,
-    F32,
-    F64,
-    U64,
-    U128,
+    Guest,
+    Flatbuf,
+    BdaPagetable,
+    FaultBuffer,
+    GdsBuffer,
+    SharedMemory,
+    ClipPlanes,
+    DirectTable, // D2: per-draw guest addresses of the direct buffers + page table
 };
 
 struct BufferResource {
-    BufferType type;
-    u32 offset;
-    u32 size;
-    u32 stride;
-    u32 num_elements;
-    u32 offset_reg;
-    u32 size_reg;
-    u32 stride_reg;
-    u32 num_elements_reg;
-};
+    SharpFetch<AmdGpu::Buffer> sharp_fetch{};
+    IR::Type used_types{};
+    BufferType buffer_type{};
+    bool is_written{};
+    bool is_formatted{};
+    SharpFetchPostOp post_op{};
+    u32 post_op_dw1_mask{};
 
+    /// D2: read through the direct-memory page table when the draw's table says so.
+    bool IsDirectEligible() const noexcept {
+        return buffer_type == BufferType::Guest && !is_written && !is_formatted;
+    }
+
+    bool IsSpecial() const noexcept {
+        return buffer_type != BufferType::Guest;
+    }
+
+    constexpr AmdGpu::Buffer GetSharp(const auto& info) const noexcept {
+        AmdGpu::Buffer buffer;
+        if (!sharp_fetch.Fetch(info.flattened_ud_buf.data(), &buffer)) {
+            return AmdGpu::Buffer::Null();
+        }
+        if (post_op == SharpFetchPostOp::ReadConstPointer) {
+            u64 address;
+            std::memcpy(&address, &buffer, sizeof(address));
+            address &= 0xFFFFFFFFFFFFULL;
+            // Ordinary guest buffer bindings encode 40-bit addresses. Do not let
+            // a wider scalar-memory pointer become stride or swizzle bits.
+            if (address >= (1ULL << 40)) {
+                return AmdGpu::Buffer::Null();
+            }
+            buffer = {};
+            buffer.base_address = address;
+            // Scalar loads have no V# bounds. Binding clamps this open-ended
+            // range to the mapped guest allocation before accessing the cache.
+            buffer.num_records = UINT32_MAX;
+        } else if (post_op == SharpFetchPostOp::BitwiseOrDw1WithImm) {
+            reinterpret_cast<u32*>(&buffer)[1] |= post_op_dw1_mask;
+        } else if (post_op == SharpFetchPostOp::OffsetByProgramBase) {
+            buffer.base_address += info.pgm_base;
+        }
+        if (!buffer.Valid()) {
+            return AmdGpu::Buffer::Null();
+        }
+        return buffer;
+    }
+};
 using BufferResourceList = boost::container::static_vector<BufferResource, NUM_BUFFERS>;
 
-struct ImageResource {
-    enum class Dim : u8 {
-        Unknown = 0,
-        _1D = 1,
-        _2D = 2,
-        _3D = 3,
-        Cube = 4,
-        _1DArray = 5,
-        _2DArray = 6,
-        CubeArray = 7,
-        Buffer = 8,
-        _2DMultisample = 9,
-        _2DMultisampleArray = 10,
-    };
-    Dim dim;
-    bool is_array;
-    bool is_multisample;
-    bool is_cube;
-    u32 format;
-    u32 num_samples;
-    SharpFetch sharp_fetch;
-    SharpFetchPostOp post_op;
-    u32 texel_size;
-    bool is_integer;
-    bool is_depth;
-    bool is_cube;
-
-    constexpr AmdGpu::ImageType GetViewType(bool is_array) const noexcept {
-        if (dim == Dim::_1D || dim == Dim::_1DArray) {
-            return is_array ? AmdGpu::ImageType::Color1DArray : AmdGpu::ImageType::Color1D;
-        }
-        if (dim == Dim::_2D || dim == Dim::_2DArray || dim == Dim::_2DMultisample || dim == Dim::_2DMultisampleArray) {
-            return is_array ? AmdGpu::ImageType::Color2DArray : AmdGpu::ImageType::Color2D;
-        }
-        if (dim == Dim::_3D) {
-            return AmdGpu::ImageType::Color3D;
-        }
-        if (dim == Dim::Cube || dim == Dim::CubeArray) {
-            return AmdGpu::ImageType::Cube;
-        }
-        return AmdGpu::ImageType::Invalid;
-    }
-};
-
-using ImageResourceList = boost::container::static_vector<ImageResource, NUM_IMAGES>;
-
-struct SamplerResource {
-    u32 filter;
-    u32 wrap_s;
-    u32 wrap_t;
-    u32 wrap_r;
-    u32 min_filter;
-    u32 mag_filter;
-    u32 mip_filter;
-    u32 min_lod;
-    u32 max_lod;
-    u32 lod_bias;
-    u32 compare_mode;
-    u32 compare_func;
-    u32 border_color;
-    u32 aniso_ratio;
-    u32 aniso_threshold;
-
-    constexpr AmdGpu::Sampler GetSharp(const auto& info) const noexcept {
-        AmdGpu::Sampler sampler{};
-        sampler.filter = static_cast<AmdGpu::Sampler::Filter>(filter);
-        sampler.wrap_s = static_cast<AmdGpu::Sampler::Wrap>(wrap_s);
-        sampler.wrap_t = static_cast<AmdGpu::Sampler::Wrap>(wrap_t);
-        sampler.wrap_r = static_cast<AmdGpu::Sampler::Wrap>(wrap_r);
-        sampler.min_filter = static_cast<AmdGpu::Sampler::Filter>(min_filter);
-        sampler.mag_filter = static_cast<AmdGpu::Sampler::Filter>(mag_filter);
-        sampler.mip_filter = static_cast<AmdGpu::Sampler::Filter>(mip_filter);
-        sampler.min_lod = static_cast<AmdGpu::Sampler::Lod>(min_lod);
-        sampler.max_lod = static_cast<AmdGpu::Sampler::Lod>(max_lod);
-        sampler.lod_bias = lod_bias;
-        sampler.compare_mode = compare_mode;
-        sampler.compare_func = compare_func;
-        sampler.border_color = border_color;
-        sampler.aniso_ratio = aniso_ratio;
-        sampler.aniso_threshold = aniso_threshold;
-        return sampler;
-    }
-};
-using SamplerResourceList = boost::container::static_vector<SamplerResource, NUM_SAMPLERS>;
-
-struct FMaskResource {
-    SharpFetch<AmdGpu::Image> sharp_fetch{};
-    bool is_r128{};
-    bool size_read{};
-
-    constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
-        AmdGpu::Image image{};
-        const bool fetched = is_r128 ? sharp_fetch.Fetch<4>(info.flattened_ud_buf.data(), &image)
-                                     : sharp_fetch.Fetch(info.flattened_ud_buf.data(), &image);
-        return fetched ? image : AmdGpu::Image::Null(false);
-    }
-};
-using FMaskResourceList = boost::container::static_vector<FMaskResource, NUM_FMASKS>;
-
-struct PushData {
-    static constexpr u32 XOffsetIndex = 0;
-    static constexpr u32 YOffsetIndex = 1;
-    static constexpr u32 XScaleIndex = 2;
-    static constexpr u32 YScaleIndex = 3;
-    static constexpr u32 BufOffsetIndex = 4;
-    /// After the six buffer-offset vectors.
-    static constexpr u32 QuadSampleMaskIndex = 10;
-    /// FIX-227: scratch address aliases the all-ones sample mask on eligible draws.
-    static constexpr u32 LdsScratchIndex = QuadSampleMaskIndex;
-
-    float xoffset;
-    float yoffset;
-    float xscale;
-    float yscale;
-    /// 96 offsets, each stage with its own range (Backend::StageBufferOffsetBase).
-    std::array<u8, 96> buf_offsets;
-    std::array<u32, 2> quad_sample_mask{~0u, ~0u};
-
-    void AddOffset(u32 binding, u32 offset) {
-        ASSERT(offset < 256 && binding < buf_offsets.size());
-        buf_offsets[binding] = offset;
-    }
-};
-static_assert(offsetof(PushData, quad_sample_mask) == 112 && sizeof(PushData) == 120);
-static_assert(sizeof(PushData) <= 128,
-              "PushData size is greater than minimum size guaranteed by Vulkan spec");
+/// FIX-GT7-043: whether the key tells an FMask from anything else. RYGT_FMASK_KEY=0: as before.
+inline bool FMaskKeyEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_FMASK_KEY");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
 
 /// FIX-GT7-125: an MSAA array T# (Color2DMsaaArray, kept by array instructions) is translated:
 /// samples and loads read it as a multisampled array, its size is queried without a level. The
@@ -223,5 +192,191 @@ enum class MipStorageFallbackMode : u16 {
     DynamicIndex,
     ConstantIndex,
 };
+
+struct ImageResource {
+    SharpFetch<AmdGpu::Image> sharp_fetch{};
+    bool is_depth{};
+    bool is_atomic{};
+    bool is_array{};
+    bool is_written{};
+    bool is_r128{};
+    u8 constant_mip_index{};
+    MipStorageFallbackMode mip_fallback_mode{};
+    SharpFetchPostOp post_op{};
+
+    constexpr bool HasSameBinding(const ImageResource& other) const noexcept {
+        // Vulkan uses different image types and formats for ordinary and comparison sampling.
+        return sharp_fetch == other.sharp_fetch && is_depth == other.is_depth &&
+               is_array == other.is_array && mip_fallback_mode == other.mip_fallback_mode &&
+               constant_mip_index == other.constant_mip_index && post_op == other.post_op;
+    }
+
+    constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
+        AmdGpu::Image image{};
+        if (!Fetch(info.flattened_ud_buf.data(), &image)) {
+            return AmdGpu::Image::Null(is_depth);
+        }
+        if (post_op == SharpFetchPostOp::ConvertCubeTo2DArray) {
+            image.type = u64(AmdGpu::ImageType::Color2DArray);
+            image.depth = (image.depth + 1) * 6 - 1;
+        }
+        if (!image.Valid()) {
+            image = AmdGpu::Image::Null(is_depth);
+        } else if (!image && AmdGpu::IsFmask(image.GetDataFmt()) && FMaskKeyEnabled()) {
+            // FIX-GT7-043: float data GT7 leaves in a slot, not an FMask: an empty slot. As an
+            // FMask, its code would have no address to tell it from a T# that isn't one, and each
+            // such slot would make a variant (27 on one launch instead of 2).
+            image = AmdGpu::Image::Null(is_depth);
+        } else if (is_depth) {
+            const auto data_fmt = image.GetDataFmt();
+            if (data_fmt != AmdGpu::DataFormat::Format16 &&
+                data_fmt != AmdGpu::DataFormat::Format32) {
+                image = AmdGpu::Image::Null(true);
+            }
+        }
+        return image;
+    }
+
+    constexpr bool Fetch(const u32* flatbuf, AmdGpu::Image* out) const {
+        if (!is_r128) {
+            // Fetch full 8 byte T#
+            return sharp_fetch.Fetch(flatbuf, out);
+        }
+        // Fetch r128 T# and fix pitch
+        if (!sharp_fetch.Fetch<4>(flatbuf, out)) {
+            return false;
+        }
+        out->pitch = out->width;
+        return true;
+    }
+
+    u32 NumBindings(const auto& info) const {
+        // The T# is read only when it decides the count.
+        if (mip_fallback_mode != MipStorageFallbackMode::DynamicIndex) {
+            return 1;
+        }
+        const AmdGpu::Image tsharp = GetSharp(info);
+        if (tsharp.last_level < tsharp.base_level) {
+            return 1;
+        }
+        return tsharp.last_level - tsharp.base_level + 1;
+    }
+};
+using ImageResourceList = boost::container::static_vector<ImageResource, NUM_IMAGES>;
+
+/// FIX-215: whether samplers of cube maps clamp at the faces' edges (RYGT_CUBE_SAMPLER_CLAMP=0 off).
+inline bool CubeSamplerClampEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_CUBE_SAMPLER_CLAMP");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+
+struct SamplerResource {
+    SharpFetch<AmdGpu::Sampler> sharp_fetch{};
+    SharpFetchPostOp post_op{};
+    SharpLocation post_op_tsharp_dw3_off{};
+    bool is_depth{};
+    bool is_cube{}; ///< FIX-215: sampled with a cube image (read as a 2D array of its faces)
+
+    constexpr AmdGpu::Sampler GetSharp(const auto& info) const noexcept {
+        AmdGpu::Sampler sampler{};
+        sharp_fetch.Fetch(info.flattened_ud_buf.data(), &sampler);
+        if (post_op == SharpFetchPostOp::DisableAnisoIfSingleLod) {
+            const u32 tsharp_dw3 = info.flattened_ud_buf[post_op_tsharp_dw3_off];
+            if (((tsharp_dw3 >> 12) & 0xff) == 0) {
+                sampler.max_aniso.Assign(AmdGpu::AnisoRatio::One);
+            }
+        } else if (post_op == SharpFetchPostOp::ForceRepeatXyzClamp) {
+            sampler.clamp_x.Assign(AmdGpu::ClampMode::Wrap);
+            sampler.clamp_y.Assign(AmdGpu::ClampMode::Wrap);
+            sampler.clamp_z.Assign(AmdGpu::ClampMode::Wrap);
+        } else if (post_op == SharpFetchPostOp::ForceLastTexelXyClamp) {
+            sampler.clamp_x.Assign(AmdGpu::ClampMode::ClampLastTexel);
+            sampler.clamp_y.Assign(AmdGpu::ClampMode::ClampLastTexel);
+            sampler.clamp_z.Assign(AmdGpu::ClampMode::Wrap);
+        } else if (post_op == SharpFetchPostOp::ClearAnisoRatioAndThreshold) {
+            sampler.max_aniso.Assign(AmdGpu::AnisoRatio::One);
+            sampler.aniso_threshold.Assign(0);
+        }
+        if (is_cube && CubeSamplerClampEnabled()) {
+            // FIX-215: the hardware samples a cube map seamlessly whatever the sampler's address
+            // modes; here its faces are layers of a 2D array, so a wrapping sampler filtered the
+            // texels of a face's far edge into its near one: a bright line where the sky cube's
+            // faces meet (GT7). Each face is clamped at its edges instead.
+            sampler.clamp_x.Assign(AmdGpu::ClampMode::ClampLastTexel);
+            sampler.clamp_y.Assign(AmdGpu::ClampMode::ClampLastTexel);
+        }
+        return sampler;
+    }
+};
+using SamplerResourceList = boost::container::static_vector<SamplerResource, NUM_SAMPLERS>;
+
+struct FMaskResource {
+    // FIX-GT7-043: as the image's own fetch. Eight dwords read in a row from the first one's place
+    // went past the buffer's end for a T# of four, and were another T# for one with scattered dwords.
+    SharpFetch<AmdGpu::Image> sharp_fetch{};
+    bool is_r128{};
+    bool size_read{};
+
+    constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
+        AmdGpu::Image image{};
+        const bool fetched = is_r128 ? sharp_fetch.Fetch<4>(info.flattened_ud_buf.data(), &image)
+                                     : sharp_fetch.Fetch(info.flattened_ud_buf.data(), &image);
+        return fetched ? image : AmdGpu::Image::Null(false);
+    }
+};
+using FMaskResourceList = boost::container::static_vector<FMaskResource, NUM_FMASKS>;
+
+struct PushData {
+    static constexpr u32 XOffsetIndex = 0;
+    static constexpr u32 YOffsetIndex = 1;
+    static constexpr u32 XScaleIndex = 2;
+    static constexpr u32 YScaleIndex = 3;
+    static constexpr u32 BufOffsetIndex = 4;
+    /// After the six buffer-offset vectors.
+    static constexpr u32 QuadSampleMaskIndex = 10;
+    /// FIX-227: the hull shader LDS scratch address (bit 0: the writer pass), in the quad sample
+    /// mask's place (only draws whose mask is all ones use it), so the push block keeps its size
+    /// and every cached pipeline stays valid.
+    static constexpr u32 LdsScratchIndex = QuadSampleMaskIndex;
+
+    float xoffset;
+    float yoffset;
+    float xscale;
+    float yscale;
+    /// Each stage has its own range (Backend::StageBufferOffsetBase).
+    std::array<u8, 96> buf_offsets;
+    std::array<u32, 2> quad_sample_mask{~0u, ~0u};
+
+    void AddOffset(u32 binding, u32 offset) {
+        ASSERT(offset < 256 && binding < buf_offsets.size());
+        buf_offsets[binding] = offset;
+    }
+};
+static_assert(offsetof(PushData, quad_sample_mask) == 112 && sizeof(PushData) == 120);
+static_assert(sizeof(PushData) <= 128,
+              "PushData size is greater than minimum size guaranteed by Vulkan spec");
+
+
+/// FIX-GT7-125: an MSAA array T# (Color2DMsaaArray, kept by array instructions) is translated:
+/// samples and loads read it as a multisampled array, its size is queried without a level. The
+/// translation stopped at the image type before (no SPIR-V type, no sample coordinates for it),
+/// and GT7's draws with such a T# were queued again and again and never drawn (one failed
+/// translation every 2 s in quiet race stretches of 11-08). RYGT_MSAA_ARRAY_SAMPLE=0: as before.
+inline bool MsaaArrayEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_MSAA_ARRAY_SAMPLE");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+
+/// FIX-GT7-125: the multisampled view types the translation handles.
+inline bool IsMsaaView(AmdGpu::ImageType type) {
+    return type == AmdGpu::ImageType::Color2DMsaa ||
+           (type == AmdGpu::ImageType::Color2DMsaaArray && MsaaArrayEnabled());
+}
 
 } // namespace Shader

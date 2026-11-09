@@ -19,6 +19,76 @@
 
 namespace AmdGpu {
 
+/// DIAG-GT7-005 (RYGT_NATIVE_AB=1 or RYGT_DIAG_RECORDER_PARTS=1): the recorder thread's time
+/// while it runs jobs, by part. Each part counts its own time only (a draw inside a draw job is
+/// the draw's); the time waiting for jobs is not counted.
+namespace RecorderParts {
+enum class Part : u32 {
+    Jobs,       ///< jobs outside the parts below (copies, waits, events...)
+    DrawJobs,   ///< a draw or dispatch job around the renderer's draw: registers, selection
+    Draws,      ///< the native renderer's draws
+    Dispatches, ///< and dispatches
+    Labels,     ///< label and fence writes
+    Dmas,       ///< DMA copies
+    Splices,    ///< native lists run in the scheduler's command buffer
+    Submits,    ///< scheduler flushes and submits (around the splices)
+    Uploads,    ///< image uploads and inits before the work (PrepareImages)
+    WriteBacks, ///< pictures written back to guest memory (NAT-112)
+    GpuWaits,   ///< waits for the GPU (scheduler Wait)
+    Ahead,      ///< PERF-GT7-008: lists begun while the recorder waits for jobs
+    Count,
+};
+inline constexpr u32 PartCount = static_cast<u32>(Part::Count);
+#ifdef SHADGT_DIAGNOSTICS
+bool On();
+/// The recorder runs jobs from here to the end of the scope (Jobs until a part starts).
+class Running {
+public:
+    Running() noexcept;
+    ~Running();
+    Running(const Running&) = delete;
+    Running& operator=(const Running&) = delete;
+
+private:
+    bool active;
+};
+/// A part, from here to the end of the scope (nothing outside Running, or on other threads).
+class Scope {
+public:
+    explicit Scope(Part part) noexcept;
+    ~Scope();
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+
+private:
+    Part previous{};
+    bool active;
+};
+/// This thread's nanoseconds by part since the last call.
+std::array<u64, PartCount> Take();
+#else
+// Without diagnostics the parts are never timed (several scopes a draw, each a call).
+constexpr bool On() {
+    return false;
+}
+class Running {
+public:
+    Running() noexcept = default;
+    Running(const Running&) = delete;
+    Running& operator=(const Running&) = delete;
+};
+class Scope {
+public:
+    explicit constexpr Scope(Part) noexcept {}
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+};
+inline std::array<u64, PartCount> Take() {
+    return {};
+}
+#endif
+} // namespace RecorderParts
+
 /// PERF-031: the second stage of the GPU command processor. The command thread (stage A) keeps
 /// decoding PM4 and the register file; the work that records Vulkan commands and touches the
 /// buffer and texture caches (draws, dispatches, copies, fences) runs here, in submission
@@ -41,12 +111,13 @@ public:
     };
 
     /// `thread_init` runs first on the recorder thread (thread name, thread-local state).
-    static constexpr size_t DefaultMaxPending = 4096;
-    /// The idle hook is installed before starting the recorder, avoiding a
-    /// setter race. It runs before sleeping and excludes a concurrent Drain.
-    explicit DrawPipe(std::function<void()> thread_init,
-                      size_t max_pending = DefaultMaxPending,
-                      std::function<void()> idle_hook = {});
+    explicit DrawPipe(std::function<void()> thread_init, size_t max_pending = 4096);
+
+    /// D5: runs on the recorder when it runs out of work and owns the caches. Set once.
+    void SetIdleHook(std::function<void()>&& hook) {
+        std::scoped_lock lk{mutex};
+        idle_hook = std::move(hook);
+    }
     ~DrawPipe();
 
     DrawPipe(const DrawPipe&) = delete;
@@ -78,6 +149,8 @@ public:
         push_tag = tag;
     }
 
+    /// PERF-GT7-046: whether every job pushed so far has finished.
+    bool QueueIdle();
     /// Returns once every job pushed so far has finished. A no-op on the recorder thread.
     /// PERF-050: the caller (the command thread) then owns the caches until its next Push or
     /// ReleaseExclusive; urgent work waits for it or is run by it (RunUrgentIfExclusive).
@@ -96,7 +169,6 @@ public:
 
     /// Command thread: gives up ownership of the caches taken by Drain (before it goes idle).
     void ReleaseExclusive();
-    bool QueueIdle(); // PERF-GT7-046: includes urgent or idle callbacks.
 
     /// Command thread: whether it owns the caches after a drain.
     bool IsExclusive() {
@@ -197,16 +269,17 @@ private:
     std::deque<Work> urgent;
     std::atomic<bool> has_urgent{};
     bool exclusive{};
-    bool urgent_running{};
+    bool recorder_callback_running{}; // an urgent job or the idle hook is using the caches
     u64 pushed{};
     u64 finished{};
-    std::atomic<u64> pushed_jobs{};
-    std::atomic<u64> finished_jobs{};
+    // The command thread writes the one per job, the recorder the other: each its own cache line.
+    alignas(64) std::atomic<u64> pushed_jobs{};
+    alignas(64) std::atomic<u64> finished_jobs{};
     bool recorder_waiting{};
     const size_t max_pending;
     std::atomic<std::thread::id> recorder_id{};
     std::function<void()> thread_init;
-    const std::function<void()> idle_hook; // D5
+    std::function<void()> idle_hook; // D5
     Stats stats{};
     std::jthread recorder;
     std::mutex idle_mutex; // DIAG-114

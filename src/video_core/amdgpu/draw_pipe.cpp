@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
+#include <utility>
 
 #include <immintrin.h>
 #include <string>
@@ -11,9 +13,7 @@
 #include "common/logging/log.h"
 #include "common/nvtx.h"
 #include "common/perf_monitor.h"
-#include "common/scope_exit.h"
 #include "common/thread.h"
-#include "common/native_thread_priority.h"
 #include "video_core/buffer_cache/direct_memory.h"
 #include "video_core/amdgpu/draw_pipe.h"
 
@@ -33,10 +33,71 @@ u64 MicrosecondsSince(std::chrono::steady_clock::time_point start) {
 }
 } // namespace
 
-DrawPipe::DrawPipe(std::function<void()> thread_init_, size_t max_pending_,
-                   std::function<void()> idle_hook_)
-    : max_pending{max_pending_}, thread_init{std::move(thread_init_)},
-      idle_hook{std::move(idle_hook_)} {
+#ifdef SHADGT_DIAGNOSTICS
+namespace RecorderParts {
+namespace {
+thread_local bool t_running = false;
+thread_local Part t_part = Part::Jobs;
+thread_local std::chrono::steady_clock::time_point t_since{};
+thread_local std::array<u64, PartCount> t_ns{};
+
+void Charge(std::chrono::steady_clock::time_point now) {
+    t_ns[static_cast<u32>(t_part)] +=
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now - t_since).count();
+    t_since = now;
+}
+} // namespace
+
+bool On() {
+    static const bool on = [] {
+        const char* ab = Common::DiagEnv("RYGT_NATIVE_AB");
+        const char* parts = Common::DiagEnv("RYGT_DIAG_RECORDER_PARTS");
+        return (ab && ab[0] == '1') || (parts && parts[0] == '1');
+    }();
+    return on;
+}
+
+Running::Running() noexcept : active{On() && !t_running} {
+    if (active) {
+        t_running = true;
+        t_part = Part::Jobs;
+        t_since = std::chrono::steady_clock::now();
+    }
+}
+
+Running::~Running() {
+    if (active) {
+        Charge(std::chrono::steady_clock::now());
+        t_running = false;
+    }
+}
+
+Scope::Scope(Part part) noexcept : active{t_running} {
+    if (active) {
+        Charge(std::chrono::steady_clock::now());
+        previous = t_part;
+        t_part = part;
+    }
+}
+
+Scope::~Scope() {
+    if (active) {
+        Charge(std::chrono::steady_clock::now());
+        t_part = previous;
+    }
+}
+
+std::array<u64, PartCount> Take() {
+    if (t_running) {
+        Charge(std::chrono::steady_clock::now());
+    }
+    return std::exchange(t_ns, {});
+}
+} // namespace RecorderParts
+#endif
+
+DrawPipe::DrawPipe(std::function<void()> thread_init_, size_t max_pending_)
+    : max_pending{max_pending_}, thread_init{std::move(thread_init_)} {
     recorder = std::jthread{[this](std::stop_token stop) { Run(stop); }};
     // Push and Drain may need the recorder's id (OnRecorderThread) as soon as this returns.
     while (recorder_id.load(std::memory_order_acquire) == std::thread::id{}) {
@@ -374,20 +435,25 @@ void DrawPipe::RunDispatcher(std::stop_token stop) {
     }
 }
 
+bool DrawPipe::QueueIdle() {
+    std::scoped_lock lk{mutex};
+    return finished == pushed && !recorder_callback_running;
+}
+
 void DrawPipe::Drain() {
     if (OnRecorderThread()) {
         return;
     }
     std::unique_lock lk{mutex};
     ++stats.drains;
-    if (finished == pushed && !urgent_running) {
+    if (finished == pushed && !recorder_callback_running) {
         exclusive = true;
         return;
     }
     ++stats.drains_that_waited;
     const auto start = std::chrono::steady_clock::now();
     const u64 target = pushed;
-    done_cv.wait(lk, [this, target] { return finished >= target && !urgent_running; });
+    done_cv.wait(lk, [this, target] { return finished >= target && !recorder_callback_running; });
     exclusive = true;
     stats.drain_wait_us += MicrosecondsSince(start);
 }
@@ -411,13 +477,13 @@ void DrawPipe::RunUrgent() {
         }
         jobs.swap(urgent);
         has_urgent.store(false, std::memory_order_relaxed);
-        urgent_running = true;
+        recorder_callback_running = true;
     }
     for (auto& job : jobs) {
         job();
     }
     std::scoped_lock lk{mutex};
-    urgent_running = false;
+    recorder_callback_running = false;
     done_cv.notify_all();
 }
 
@@ -437,11 +503,6 @@ void DrawPipe::RunUrgentIfExclusive() {
     for (auto& job : jobs) {
         job();
     }
-}
-
-bool DrawPipe::QueueIdle() {
-    std::scoped_lock lk{mutex};
-    return finished == pushed && !urgent_running;
 }
 
 void DrawPipe::ReleaseExclusive() {
@@ -466,10 +527,6 @@ DrawPipe::Stats DrawPipe::TakeStats() {
 }
 
 void DrawPipe::Run(std::stop_token stop) {
-    SCOPE_EXIT { Common::UpdateCoreOwner(1, false); };
-#ifdef RYTY_GPU
-    Common::NativeThreadPriority native_priority;
-#endif
     if (thread_init) {
         thread_init();
     }
@@ -481,24 +538,29 @@ void DrawPipe::Run(std::stop_token stop) {
 
     std::deque<Work> batch;
     while (true) {
-#ifdef RYTY_GPU
-        native_priority.Update(Vulkan::NativeModeRequested() && Common::NativeCpuPriorityRequested());
-#endif
-        RunUrgent();
+        {
+            RecorderParts::Running running; // DIAG-GT7-005
+            RunUrgent();
+        }
         {
             std::unique_lock lk{mutex};
             if (idle_hook && queue.empty()) {
+                // The hook can submit to the same scheduler as a caller that drained the pipe.
+                // If the caller got the caches first, it may release them without pushing a job.
                 if (exclusive) {
                     recorder_waiting = true;
                     work_cv.wait(lk, [&] { return !exclusive || stop.stop_requested(); });
                     recorder_waiting = false;
                 }
                 if (queue.empty() && !stop.stop_requested()) {
-                    urgent_running = true;
+                    recorder_callback_running = true;
                     lk.unlock();
-                    idle_hook();
+                    {
+                        RecorderParts::Running running; // DIAG-GT7-005
+                        idle_hook(); // D5, PERF-GT7-008
+                    }
                     lk.lock();
-                    urgent_running = false;
+                    recorder_callback_running = false;
                     done_cv.notify_all();
                 }
             }
@@ -532,6 +594,7 @@ void DrawPipe::Run(std::stop_token stop) {
         const auto start = std::chrono::steady_clock::now();
         u64 ran = 0;
         Common::Nvtx::Scope nvtx{"recording"}; // DIAG-056
+        RecorderParts::Running running;        // DIAG-GT7-005
         while (!batch.empty()) {
             Work work = std::move(batch.front());
             batch.pop_front();

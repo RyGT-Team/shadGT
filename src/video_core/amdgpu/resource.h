@@ -520,7 +520,3 @@ struct fmt::formatter<AmdGpu::ImageType> {
     }
 };
 
-inline bool IsMsaaView(AmdGpu::ImageType type) {
-    return type == AmdGpu::ImageType::Color2DMsaa || type == AmdGpu::ImageType::Color2DMsaaArray;
-}
-

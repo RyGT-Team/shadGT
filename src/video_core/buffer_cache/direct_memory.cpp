@@ -602,7 +602,8 @@ bool DirectMemory::TryForEachPart(
 
 void DirectMemory::WarmImported(VAddr address, u64 size) {
     // Speculative preparation must not wait behind another worker or the recorder.
-    // Bound both driver calls and time spent holding the shared view mutex. Large
+    // Bound the number of driver calls and check elapsed time between imports; an
+    // individual driver call can exceed the time budget. Large
     // Windows allocations stay on the normal path: warming a tiny texture must
     // not eagerly pin hundreds of MiB of unrelated backing.
     constexpr u64 MaxWarmViewBytes = 4ull << 20;

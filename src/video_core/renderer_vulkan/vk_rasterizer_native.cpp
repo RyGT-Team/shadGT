@@ -10202,7 +10202,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
     const auto warm_upload = [&](VAddr address, u64 size) {
         static const bool enabled = [] {
             const char* value = std::getenv("RYGT_NATIVE_PREPARE_TEXTURE_WARM");
-            return !(value && value[0] == '0' && value[1] == '\0');
+            return value && value[0] == '1' && value[1] == '\0';
         }();
         if (!enabled) return;
         // Only establish aliases/imports here; never refresh, copy, upload or

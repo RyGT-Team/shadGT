@@ -1,4 +1,3 @@
-#include "common/recoverable.h"
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -20,6 +19,7 @@
 
 namespace Shader::Backend::SPIRV {
 namespace {
+using namespace Shader;
 
 std::string_view StageName(HwStage stage) {
     switch (stage) {
@@ -247,20 +247,6 @@ Id EmitContext::GetBufferSize(const u32 sharp_idx) {
 }
 
 void EmitContext::DefineBufferProperties() {
-    if (hw_stage == HwStage::Compute && info.uses_direct) {
-        // The per-dispatch table is immutable. Load scalar-pointer entries in the prologue
-        // so their IDs dominate all uses, including dynamic constant reads inside loops.
-        direct_table_words.resize(4 + info.buffers.size() * 4);
-        for (u32 i = 0; i < info.buffers.size(); ++i) {
-            if (!IsDirectBuffer(i) ||
-                info.buffers[i].post_op != SharpFetchPostOp::ReadConstPointer) {
-                continue;
-            }
-            for (u32 word = 4 + i * 4; word < 8 + i * 4; ++word) {
-                direct_table_words[word] = DirectTableWord(word);
-            }
-        }
-    }
     if (!profile.needs_buffer_offsets) {
         return;
     }
@@ -334,12 +320,11 @@ void EmitContext::DefineAmdPerVertexAttribs() {
                 param.id_array[k] = values[order[k]];
                 continue;
             }
-            // AMD-307: vertex k of the barycentrics is the raw per-vertex value at
-            // (*order_check)[k].
-            param.id_array[k] =
-                OpSelect(type, OpIEqual(U1[1], (*order_check)[k], ConstU32(0U)), values[0],
-                         OpSelect(type, OpIEqual(U1[1], (*order_check)[k], ConstU32(1U)), values[1],
-                                  values[2]));
+            // AMD-307: vertex k of the barycentrics is the raw per-vertex value at (*order_check)[k].
+            param.id_array[k] = OpSelect(
+                type, OpIEqual(U1[1], (*order_check)[k], ConstU32(0U)), values[0],
+                OpSelect(type, OpIEqual(U1[1], (*order_check)[k], ConstU32(1U)), values[1],
+                         values[2]));
         }
         param.is_loaded = true;
     }
@@ -366,11 +351,9 @@ std::optional<std::array<Id, 3>> EmitContext::FindVertexOrder() {
         OpInterpolateAtVertexAMD(F32[4], order_vertex_in, ConstU32(2U))};
     const Id reference = OpLoad(F32[4], order_ref_in);
     const Id ones = ConstF32(1.0f, 1.0f, 1.0f, 1.0f);
-    constexpr std::array<std::array<u32, 3>, 6> orders{
-        {{0, 1, 2}, {1, 2, 0}, {2, 0, 1}, {0, 2, 1}, {2, 1, 0}, {1, 0, 2}}};
     Id best_error{};
     std::array<Id, 3> best{};
-    for (const auto& order : orders) {
+    for (const auto& order : AmdVertexOrders) {
         Id blend = OpVectorTimesScalar(F32[4], corners[order[0]], weights[0]);
         blend = OpFAdd(F32[4], blend, OpVectorTimesScalar(F32[4], corners[order[1]], weights[1]));
         blend = OpFAdd(F32[4], blend, OpVectorTimesScalar(F32[4], corners[order[2]], weights[2]));
@@ -683,9 +666,6 @@ void EmitContext::DefineInputs() {
         tess_coord = DefineInput(F32[3], std::nullopt, spv::BuiltIn::TessCoord);
         primitive_id = DefineVariable(U32[1], spv::BuiltIn::PrimitiveId, spv::StorageClass::Input);
 
-        if (runtime_info.sw.tes.hs_output_cp_stride > 64u * 1024u) {
-            throw Common::RecoverableFailure{"Tessellation interface stride exceeds 64 KiB LDS"};
-        }
         const u32 num_attrs = Common::AlignUp(runtime_info.sw.tes.hs_output_cp_stride, 16) >> 4;
         if (num_attrs > 0) {
             const Id per_vertex_type{TypeArray(F32[4], ConstU32(num_attrs))};
@@ -838,9 +818,6 @@ void EmitContext::DefineOutputs() {
             Decorate(output_tess_level_inner, spv::Decoration::Patch);
         }
 
-        if (runtime_info.sw.tcs.hs_output_cp_stride > 64u * 1024u) {
-            throw Common::RecoverableFailure{"Tessellation interface stride exceeds 64 KiB LDS"};
-        }
         const u32 num_attrs = Common::AlignUp(runtime_info.sw.tcs.hs_output_cp_stride, 16) >> 4;
         if (num_attrs > 0) {
             const Id per_vertex_type{TypeArray(F32[4], ConstU32(num_attrs))};
@@ -1027,10 +1004,6 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
 };
 
 void EmitContext::DefineBuffers() {
-    const auto stage = static_cast<u32>(info.sw_stage);
-    if (stage >= StageBufferOffsetCount.size() || info.buffers.size() > StageBufferOffsetCount[stage]) {
-        throw Common::RecoverableFailure{"Shader exceeds its stage's push-offset range"};
-    }
     for (const auto& desc : info.buffers) {
         const auto buf_sharp = desc.GetSharp(info);
         // MTYPE class 3 marks guest buffers shared between invocations; shared
@@ -1396,9 +1369,6 @@ Id EmitContext::DefineUfloatM5ToFloat32(u32 mantissa_bits, const std::string_vie
 }
 
 Id EmitContext::DirectTableWord(u32 index) {
-    if (index < direct_table_words.size() && Sirit::ValidId(direct_table_words[index])) {
-        return direct_table_words[index];
-    }
     const auto& table = buffers[direct_table_index];
     const auto [id, pointer_type] = table.Alias(PointerType::U32);
     return OpLoad(U32[1], OpAccessChain(pointer_type, id, u32_zero_value, ConstU32(index)));
@@ -1451,18 +1421,7 @@ Id EmitContext::EmitDirectLoad(u32 handle, Id byte_offset, u32 bytes, Id result_
     const Id direct_label = OpLabel();
     const Id fallback_label = OpLabel();
     const Id merge_label = OpLabel();
-    const Id mode = DirectTableWord(entry + 3);
-    Id valid = OpINotEqual(U1[1], mode, u32_zero_value);
-    if (info.hw_stage == HwStage::Compute &&
-        info.buffers[handle].post_op == SharpFetchPostOp::ReadConstPointer) {
-        // 0: ordinary SSBO, 1: direct guest reads, >1: SSBO prefix length. Reads beyond
-        // the prefix retain the original direct path and its full guest-buffer bounds.
-        const Id end = OpIAdd(U32[1], byte_offset, ConstU32(bytes));
-        const Id cached = OpLogicalAnd(U1[1], OpUGreaterThan(U1[1], mode, ConstU32(1U)),
-            OpLogicalAnd(U1[1], OpULessThanEqual(U1[1], end, mode),
-                          OpUGreaterThanEqual(U1[1], end, byte_offset)));
-        valid = OpLogicalAnd(U1[1], valid, OpLogicalNot(U1[1], cached));
-    }
+    const Id valid = OpINotEqual(U1[1], DirectTableWord(entry + 3), u32_zero_value);
     OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
     OpBranchConditional(valid, direct_label, fallback_label);
 

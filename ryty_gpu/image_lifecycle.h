@@ -12,6 +12,7 @@ template<class T> std::uint64_t Handle(T value) {
 namespace ImageLife {
 void Initialize();
 bool Enabled(const char* kind);
+bool ContentProbeEnabled();
 std::uint64_t Timestamp();
 std::uint64_t SlowThresholdTicks();
 std::uint64_t Begin(const char* kind, std::uint64_t a=0, std::uint64_t b=0,
@@ -45,6 +46,7 @@ struct Scope {
 namespace ImageLife {
 inline void Initialize() {}
 inline bool Enabled(const char*) { return false; }
+inline bool ContentProbeEnabled() { return false; }
 inline std::uint64_t Timestamp() { return 0; }
 inline std::uint64_t SlowThresholdTicks() { return 0; }
 inline std::uint64_t Begin(const char*,std::uint64_t=0,std::uint64_t=0,std::uint64_t=0,std::uint64_t=0,std::uint64_t=0) { return 0; }

@@ -3,6 +3,7 @@
 #include "ryty_gpu/image_lifecycle.h"
 #include "ryty_gpu/prepared_trace.h"
 #include "ryty_gpu/workload_trace.h"
+#include "ryty_gpu/native/content_probe.h"
 #include "ryty_gpu/native/cube_view_policy.h"
 #include "ryty_gpu/native/readable_binding.h"
 #include "ryty_gpu/native/ahead_descriptor_pools.h"
@@ -1244,11 +1245,42 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
             }
             detail.Next(4);
             bool copied = true;
+            const bool probe_enabled = cpu_trace.Active() && entry.from_cpu && ImageLife::ContentProbeEnabled();
+            Native::ContentProbe::Result probe;
+            if (probe_enabled && readable == size) {
+                static thread_local Native::ContentProbe::Scratch scratch;
+                probe = Native::ContentProbe::Try(scratch, true, size, readable,
+                    reinterpret_cast<const void*>(address), destination,
+                    [&](void* target, const void* input, size_t bytes) {
+                        ImageLife::Scope copy{"texture_cpu_guarded_copy", cpu_trace.Id(), bytes};
+                        const bool ok = Core::RytyMemory::GuardedCopy(target,input,bytes);
+                        copy.Finish(ok ? 1 : 0); return ok;
+                    }, [&](const void* input, size_t bytes) {
+                        ImageLife::Scope hash{"texture_cpu_probe_hash", cpu_trace.Id(), bytes};
+                        return XXH3_64bits(input,bytes);
+                    }, [&](void* target, const void* input, size_t bytes) {
+                        ImageLife::Scope forward{"texture_cpu_probe_forward", cpu_trace.Id(), bytes};
+                        std::memcpy(target,input,bytes);
+                    });
+            }
+            if (probe_enabled) {
+                ImageLife::Scope fingerprint{"texture_content_probe", selection.Id(), ImageLife::Handle(&entry),
+                                             address, size, probe.hash};
+                if (fingerprint.Active()) {
+                    const u64 flags = (probe.status == Native::ContentProbe::Status::Valid ? 3ull : 0ull) |
+                        (probe.status == Native::ContentProbe::Status::Unavailable ? 4ull : 0ull) |
+                        (readable != size ? 8ull : 0ull);
+                    fingerprint.Finish(entry.image->NativeHandle(),flags);
+                }
+            }
             if (readable) {
-                ImageLife::Scope copy{cpu_trace.Active(), "texture_cpu_guarded_copy", cpu_trace.Id(), readable};
-                copied = Core::RytyMemory::GuardedCopy(destination,
-                    reinterpret_cast<const void*>(address), readable);
-                copy.Finish(copied ? 1 : 0);
+                if (probe.status == Native::ContentProbe::Status::CopyFailed) copied = false;
+                else if (probe.status != Native::ContentProbe::Status::Valid) {
+                    ImageLife::Scope copy{cpu_trace.Active(), "texture_cpu_guarded_copy", cpu_trace.Id(), readable};
+                    copied = Core::RytyMemory::GuardedCopy(destination,
+                        reinterpret_cast<const void*>(address), readable);
+                    copy.Finish(copied ? 1 : 0);
+                }
             }
             if (readable && !copied) {
                 detail.Next(5);

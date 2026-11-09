@@ -102,6 +102,20 @@ begin/end records and concurrent dirty events limit identity and ordering. Frequ
 events can exhaust the bounded ring; inspect drops and capture boundaries.
 The two new result event kinds are also included in unrestricted full trace mode; normal
 trace-off behavior is unchanged.
+For a content study only, set `RYGT_IMAGE_TRACE_CONTENT_PROBE=1` with active upload-only
+capture. Eligible CPU-origin staging requests from 4 to 64 MiB with a fully readable range
+are copied once from guest memory into a normal-memory scratch, hashed there with XXH3,
+then copied into the existing upload buffer. The per-thread scratch retains up to 64 MiB
+until thread exit; nested use or allocation failure falls back to the usual direct copy.
+Failed guarded copies retain the usual sparse fallback and produce no valid fingerprint.
+texture_content_probe B fields are selection ID, entry pointer, guest address, requested
+size and hash; E fields are image handle and flags (bit 0 valid, bit 1 snapshot forwarded,
+bit 2 unavailable, bit 3 partially readable). Hash/forward spans measure the added work.
+Hashes describe the bytes forwarded from that snapshot, not an atomic guest-memory view;
+guest writes may race the snapshot. Comparisons must exclude invalid/partial results,
+entry or mapping reuse, incompatible descriptors, forced or GPU-written data, missing
+events and capture boundaries. Hash matches can collide and never suppress an upload.
+The extra copy and hash perturb timing: this capture is not a performance benchmark.
 
 Set `RYGT_IMAGE_TRACE_WORKLOAD_ONLY=1` with the main trace opt-in for bounded workload
 summaries and `present`/`frame_prepared` anchors only. It suppresses unrelated event kinds

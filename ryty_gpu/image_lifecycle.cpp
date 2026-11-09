@@ -28,6 +28,7 @@ struct State {
     bool import_only = false;
     bool workload_only = false;
     bool upload_only = false;
+    bool content_probe = false;
     std::atomic<bool> open{false};
     std::atomic<std::uint64_t> active{0}, next{0}, dropped{0}, ids{0};
     std::unique_ptr<Event[]> events{new Event[Capacity]};
@@ -63,9 +64,9 @@ DWORD WINAPI Worker(void* raw) {
     QueryPerformanceCounter(&s->end);
     while(s->active.load()!=0) Sleep(1);
     if (auto* f=_wfopen(s->output,L"w")) {
-        std::fprintf(f,"# pid=%lu,qpc_frequency=%lld,start=%lld,end=%lld,capacity=%llu,attempted=%llu,dropped=%llu,slow_threshold_us=200,present_only=%u,import_only=%u,workload_only=%u,upload_only=%u\n",
+        std::fprintf(f,"# pid=%lu,qpc_frequency=%lld,start=%lld,end=%lld,capacity=%llu,attempted=%llu,dropped=%llu,slow_threshold_us=200,present_only=%u,import_only=%u,workload_only=%u,upload_only=%u,content_probe=%u\n",
                      GetCurrentProcessId(),s->frequency.QuadPart,s->start.QuadPart,s->end.QuadPart,
-                     Capacity,s->next.load(),s->dropped.load(),s->present_only ? 1u : 0u,s->import_only ? 1u : 0u,s->workload_only ? 1u : 0u,s->upload_only ? 1u : 0u);
+                     Capacity,s->next.load(),s->dropped.load(),s->present_only ? 1u : 0u,s->import_only ? 1u : 0u,s->workload_only ? 1u : 0u,s->upload_only ? 1u : 0u,s->content_probe ? 1u : 0u);
         std::fprintf(f,"qpc,tid,phase,id,kind,a,b,c,d,e\n");
         const auto count=(std::min)(s->next.load(),Capacity);
         for(std::uint64_t i=0;i<count;++i) {
@@ -95,6 +96,9 @@ void Initialize() {
     char upload_only[3]{};
     s->upload_only = GetEnvironmentVariableA("RYGT_IMAGE_TRACE_UPLOAD_ONLY", upload_only,
                                               sizeof(upload_only)) == 1 && upload_only[0] == '1';
+    char content_probe[3]{};
+    s->content_probe = GetEnvironmentVariableA("RYGT_IMAGE_TRACE_CONTENT_PROBE", content_probe,
+                                                sizeof(content_probe)) == 1 && content_probe[0] == '1';
     wchar_t exe[MAX_PATH]{};
     const DWORD length=GetModuleFileNameW(nullptr,exe,MAX_PATH);
     if(!length || length>=MAX_PATH) { delete s; return; }
@@ -126,6 +130,10 @@ static bool Allowed(State* s, const char* kind) {
 bool Enabled(const char* kind) {
     State* s=state;
     return s && s->open.load() && Allowed(s,kind);
+}
+bool ContentProbeEnabled() {
+    State* s=state;
+    return s && s->open.load() && s->upload_only && !s->import_only && s->content_probe;
 }
 std::uint64_t Timestamp() {
     State* s=state; if (!s || !s->open.load()) return 0;

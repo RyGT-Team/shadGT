@@ -959,7 +959,7 @@ std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
                 desc.size, vk::to_string(vk::Result{result.result}));
       return nullptr;
     }
-    if (desc.memory == MemoryKind::Upload) {
+    if (desc.memory == MemoryKind::Upload && desc.name == "native upload") {
         ImageLife::Scope trace{"upload_allocation_info"};
         if (trace.Active()) {
             VmaAllocationInfo2 extended{};

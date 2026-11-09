@@ -42,6 +42,18 @@ Upload events can be frequent and add pool-walk overhead while capture is active
 the trace drop count and capture-window coverage before interpreting missing events.
 The retiring totals do not identify which in-flight chunks fit, or independently show
 whether a completed chunk was evicted by the free-pool budget.
+Texture source selection and CPU staging spans are recorded only for guest sizes of at
+least 4 MiB. texture_source_select B fields are guest address, size, packed width/height,
+tiled flag and Vulkan pixel format. texture_cpu_source B fields are selection ID, guest
+address, size and reason (1=CPU staging policy, 2=import failure). Phase spans identify
+their parent ID and record allocation, mapping, readable-prefix, zero-tail, guarded-copy,
+sparse fallback, wrap and local staging. Guarded-copy E field a indicates success; mapping
+and readable-prefix E field a contain the resulting byte count. texture_policy_readable
+and texture_ensure_imported E field a report their boolean result. Selection includes all
+work until its return, and can enclose the CPU stages. Events may cross capture boundaries
+or be dropped when the shared ring fills; sizes below the threshold are not represented.
+Selection does not report a final source kind: a missing CPU child does not identify which
+other route was selected, especially with capture-boundary clipping or dropped events.
 Frame-prepared B fields are sequence and guest address; timestamps are correlation anchors,
 not a guaranteed one-to-one link between the sequence and present pointer.
 

@@ -1201,37 +1201,62 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
         auto* direct = r.buffer_cache.GetDirectMemory();
         const VAddr address = entry.info.guest_address;
         const u64 size = entry.info.guest_size;
-        const auto cpu_source = [&]() {
+        ImageLife::Scope selection{size >= 4_MB, "texture_source_select", address, size,
+            (u64(entry.info.size.width) << 32) | entry.info.size.height,
+            u64(entry.info.props.is_tiled), static_cast<u64>(entry.info.pixel_format)};
+        const auto cpu_source = [&](u64 reason) {
             Native::ImageRegistry::UploadSource staged;
             if (size == 0 || size > 64_MB) return staged;
+            ImageLife::Scope cpu_trace{selection.Active(), "texture_cpu_source", selection.Id(),
+                                       address, size, reason};
             Native::UploadPhaseTrace<8> detail{size >= 4_MB,"cpu-texture-source",
                 {"allocate", "mapping", "readable-prefix", "zero-tail", "guarded-copy",
                  "sparse-copy", "wrap-buffer", "local-stage"}};
             detail.Next(0,address,size);
+            ImageLife::Scope allocate{cpu_trace.Active(), "texture_cpu_allocate", cpu_trace.Id(), size};
             const auto [buffer, offset, destination] = Allocate(size, r.instance.StorageMinAlignment());
+            allocate.Finish();
             detail.Next(1);
             u64 readable = 0;
+            ImageLife::Scope mapping{cpu_trace.Active(), "texture_cpu_mapping", cpu_trace.Id(), address, size};
             if (r.memory->IsValidMapping(address)) {
                 const u64 mapped = r.memory->ClampRangeSize(address, size);
                 detail.Next(2);
+                mapping.Finish(mapped);
+                ImageLife::Scope prefix{cpu_trace.Active(), "texture_cpu_readable_prefix", cpu_trace.Id(), mapped};
                 readable = Native::ReadablePrefix(reinterpret_cast<const void*>(address), mapped);
+                prefix.Finish(readable);
             }
+            mapping.Finish();
             detail.Next(3);
-            if (readable < size) std::memset(destination + readable, 0, size - readable);
+            if (readable < size) {
+                ImageLife::Scope zero{cpu_trace.Active(), "texture_cpu_zero_tail", cpu_trace.Id(), size - readable};
+                std::memset(destination + readable, 0, size - readable);
+            }
             detail.Next(4);
-            if (readable && !Core::RytyMemory::GuardedCopy(destination,
-                    reinterpret_cast<const void*>(address), readable)) {
+            bool copied = true;
+            if (readable) {
+                ImageLife::Scope copy{cpu_trace.Active(), "texture_cpu_guarded_copy", cpu_trace.Id(), readable};
+                copied = Core::RytyMemory::GuardedCopy(destination,
+                    reinterpret_cast<const void*>(address), readable);
+                copy.Finish(copied ? 1 : 0);
+            }
+            if (readable && !copied) {
                 detail.Next(5);
+                ImageLife::Scope sparse{cpu_trace.Active(), "texture_cpu_sparse_copy", cpu_trace.Id(), readable};
                 r.memory->CopySparseMemory(address, destination, readable);
             }
             detail.Next(6);
+            ImageLife::Scope wrap{cpu_trace.Active(), "texture_cpu_wrap", cpu_trace.Id(), size};
             auto wrapped = device->WrapBuffer(reinterpret_cast<u64>(static_cast<VkBuffer>(buffer)),
                                                stream.chunks.back().buffer->Size());
+            wrap.Finish();
             staged.buffer = wrapped.get();
             staged.offset = offset;
             staged.kind = 4;
             staged.keep.push_back(std::move(wrapped));
             detail.Next(7);
+            ImageLife::Scope local{cpu_trace.Active(), "texture_cpu_local_stage", cpu_trace.Id(), size};
             return Native::LocalTiledSource(*registry,list,std::move(staged),size,
                                             entry.info.props.is_tiled,r.instance.GetVendorID());
         };
@@ -1292,7 +1317,9 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
             policy_trace.Next(2);
             const bool single_import=direct->FindBuffer(address,size).has_value();
             policy_trace.Next(3);
+            ImageLife::Scope readable_check{selection.Active(), "texture_policy_readable", selection.Id(), address, size};
             const bool cpu_readable=Native::Readable(reinterpret_cast<const void*>(address),size);
+            readable_check.Finish(cpu_readable ? 1 : 0);
             if (Native::PreferCpuTextureStaging(size, true, true, true, gpu_written,
                     has_sources, false, single_import,cpu_readable)) {
                 policy_trace.Next(4);
@@ -1303,12 +1330,15 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
                              "UPLOAD-STAGING: CPU-only texture {:#x}+{:#x} avoids host import ({} total)",
                              address, size, count);
                 }
-                return cpu_source();
+                return cpu_source(1);
             }
         }
         trace.Next(3);
-        if (!direct->EnsureImported(address, size)) {
-            return cpu_source();
+        ImageLife::Scope imported{selection.Active(), "texture_ensure_imported", selection.Id(), address, size};
+        const bool import_ok = direct->EnsureImported(address, size);
+        imported.Finish(import_ok ? 1 : 0);
+        if (!import_ok) {
+            return cpu_source(2);
         }
         trace.Next(4);
         if (const auto found = direct->FindBuffer(address, size);

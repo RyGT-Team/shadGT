@@ -26,6 +26,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "core/signals.h"
+#include "ryty_gpu/image_lifecycle.h"
 #include "video_core/page_manager.h"
 #include "video_core/buffer_cache/proto_import.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -907,8 +908,12 @@ struct SignalImpl : public PageManager::Impl {
         RYDIAG_SCOPE(WriteFault, reinterpret_cast<u64>(Common::GetRip(context)) |
                                      (u64(Common::IsWriteError(context)) << 63));
         if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, size, assume_locks,
-                                                ExactWriteSize(context, addr));
+            const u64 exact = ExactWriteSize(context, addr);
+            ImageLife::Scope origin{"origin_write_fault", addr, size, exact};
+            const u64 rip = origin.Active() ? ImageLife::Handle(Common::GetRip(context)) : 0;
+            const bool result = rasterizer->InvalidateMemory(addr, size, assume_locks, exact);
+            origin.Finish(rip, result ? 1 : 0);
+            return result;
         } else {
             return rasterizer->ReadMemory(addr, size, assume_locks);
         }

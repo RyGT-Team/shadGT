@@ -12587,6 +12587,7 @@ void NativeRenderer::ReleaseUnusedWatches() {
 }
 
 void NativeRenderer::OnCpuStack(VAddr address, u64 size) {
+    ImageLife::Scope origin{"origin_cpu_stack", address, size};
     // Queue forced mirror retirement before changing protection. If subsequent
     // invalidation throws, the failed registration still leaves conservative work.
     {

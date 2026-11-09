@@ -71,6 +71,13 @@ changed. Repeated stale events may be frequent and consume the shared bounded ri
 Stale event timing follows the dirty-state exchange and concurrent upload/stale events
 can appear reordered; the observed force flag can race its consumption. Do not infer a
 total causal order from event timestamps or the force snapshot alone.
+origin_runtime_invalidate B fields are the address and size passed to the exported runtime
+invalidation callback. origin_cpu_stack B fields are the registered stack address and size.
+origin_write_fault B fields are fault address, reported size and decoded exact byte size
+(zero when unknown); E fields are instruction pointer and handler result. These scopes
+describe entry paths, not proof that bytes were written or a particular texture changed.
+Correlate nested events by thread and time; clipping and dropped events can break pairing.
+Fault markers can be numerous and may fill the bounded capture early.
 Frame-prepared B fields are sequence and guest address; timestamps are correlation anchors,
 not a guaranteed one-to-one link between the sequence and present pointer.
 

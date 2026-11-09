@@ -785,6 +785,7 @@ extern "C" __declspec(dllexport) void RytyGpuUnregisterCpuStack(u64 address, u64
 // Ryty calls this before the kernel writes guest memory directly (a file read into a guest
 // buffer), which would fail on a write-protected page instead of faulting.
 extern "C" __declspec(dllexport) void RytyGpuInvalidateMemory(u64 address, u64 size) {
+    ImageLife::Scope origin{"origin_runtime_invalidate", address, size};
 #ifndef NDEBUG
     if (Native::WatchedTexture(address, address + size)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: Ryty invalidates {:#x}+{:#x} (a file read)",

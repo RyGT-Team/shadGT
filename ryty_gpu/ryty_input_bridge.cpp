@@ -32,6 +32,9 @@
 #include "ryty_gpu/ryty_camera.h"
 #include "ryty_gpu/ryty_camera_input.h"
 
+extern "C" void RytyReplayVideoToggle(const char* source); // GTS-015, gts_replay_video.cpp
+extern "C" void RytyClipSave(const char* source);         // GTS-015
+
 namespace {
 
 // Mirrors Ryty's PadInputState (core/libs/prx/libScePad/include/PadState.hpp).
@@ -260,6 +263,11 @@ void ForwardInput() {
     // in-game Controllers window (as F3 does).
     std::chrono::steady_clock::time_point combo_since{};
     bool combo_latched = false;
+    // GTS-015, as the PS4's Share button: a short press of Share/Create alone starts or stops a
+    // video recording, holding it for a second saves the last minutes as a clip.
+    bool share_was_down = false;
+    bool share_in_combo = false;
+    std::chrono::steady_clock::time_point share_since{};
     while (true) {
         // Player 1 always plays (keyboard and first gamepad); player 2 while shadGT has a gamepad
         // in their slot (the user folder's users.json lists who player 2 is).
@@ -285,6 +293,26 @@ void ForwardInput() {
             }
         }
         const auto now = std::chrono::steady_clock::now();
+        bool share = false;
+        for (int slot = 0; slot < MaxPlayers; ++slot) {
+            if (SDL_Gamepad* pad = (*controllers)[slot]->m_sdl_gamepad) {
+                share |= SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_BACK);
+            }
+        }
+        if (share && !share_was_down) {
+            share_since = now;
+            share_in_combo = false;
+        }
+        share_in_combo |= combo;
+        if (share && !share_in_combo && now - share_since >= std::chrono::milliseconds{1000}) {
+            share_in_combo = true; // held: saved once, and no recording toggle on release
+            RytyClipSave("Share button held");
+        }
+        if (!share && share_was_down && !share_in_combo &&
+            now - share_since < std::chrono::milliseconds{600}) {
+            RytyReplayVideoToggle("Share button");
+        }
+        share_was_down = share;
         if (!combo) {
             combo_since = {};
             combo_latched = false;

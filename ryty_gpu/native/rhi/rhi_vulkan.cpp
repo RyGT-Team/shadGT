@@ -939,6 +939,7 @@ std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
         [&] {
           Collect();
           const auto reclaimed = Vulkan::TrimEmptyVmaBlocks(allocator);
+          g_device_memory_pressure.store(true, std::memory_order_relaxed); // VRAM-PRESSURE-001
           LOG_WARNING(Render_Vulkan,
                       "Native buffer allocation pressure: {} bytes, {} "
                       "empty-block bytes reclaimed; retrying once",
@@ -1154,6 +1155,7 @@ std::unique_ptr<Image> VulkanDevice::CreateImageFrom(const VkImageCreateInfo& im
         [&] {
           Collect();
           const auto reclaimed = Vulkan::TrimEmptyVmaBlocks(allocator);
+          g_device_memory_pressure.store(true, std::memory_order_relaxed); // VRAM-PRESSURE-001
           LOG_WARNING(Render_Vulkan,
                       "Native image allocation pressure: {}x{}, {} empty-block "
                       "bytes reclaimed; retrying once",

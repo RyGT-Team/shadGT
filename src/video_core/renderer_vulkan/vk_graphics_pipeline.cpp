@@ -43,6 +43,7 @@
 #include "video_core/renderer_vulkan/fragment_multisample_key.h"
 #include "video_core/renderer_vulkan/shared_creation_cache.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_pipeline_binary_store.h" // BIN-001
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
@@ -321,6 +322,9 @@ static std::atomic<s64> last_pipeline_miss_ms{};
 
 // Preserve the existing ordinary/UI policy: optional optimized replacement is opt-in.
 // Tessellation never retains optimizer IR or enters LTO (previous multi-GB failures).
+// AMD-PERF-001 was reverted: RyGTS AMD-322 found that on an RX 7600 link-time data and the
+// optimized link made menu pipelines take 0.4-0.7 s and filled pipeline memory (4.4 GB), and
+// here it made loading much slower and ran out of memory. RYGT_PIPELINE_LTO=1 still trials it.
 static bool LinkTimeOptimization() {
     static const bool lto = [] {
         const char* env = std::getenv("RYGT_PIPELINE_LTO");
@@ -955,7 +959,8 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
     // Protect both library and whole-pipeline tessellation builds from the optimizer.
-    const bool plain_tessellated = tessellated;
+    const bool amd_policy = AmdPipelinePolicyEnabled(instance.GetVendorID()); // AMD-320
+    const bool plain_tessellated = tessellated && !amd_policy;
     const vk::GraphicsPipelineCreateInfo pipeline_info = {
         .pNext = &pipeline_rendering_ci,
         .flags = tessellated && plain_tessellated ? vk::PipelineCreateFlagBits::eDisableOptimization
@@ -979,10 +984,14 @@ GraphicsPipeline::GraphicsPipeline(
     // Stored ordinary pipelines use the same shared stage libraries and fast link as draws.
     // Whole-pipeline prewarm recompiles both stages for every target/blend permutation and
     // does not populate the stage-library cache used when new runtime permutations appear.
-    const auto compile_policy = SharedPipelinePolicy::Select(
-        SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(),preloading),
-        tessellated && (Common::PerfFeatureEnabled(80) || !Mr14SharedTessellationEnabled(LinkTimeOptimization())),
-        tessellated, LinkTimeOptimization(), is_rect_list || is_quad_list);
+    const auto compile_policy = amd_policy
+        ? SharedPipelinePolicy::SelectAmd(
+              SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(),preloading),
+              tessellated && (Common::PerfFeatureEnabled(80) || !Mr14SharedTessellationEnabled(false)))
+        : SharedPipelinePolicy::Select(
+              SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(),preloading),
+              tessellated && (Common::PerfFeatureEnabled(80) || !Mr14SharedTessellationEnabled(LinkTimeOptimization())),
+              tessellated, LinkTimeOptimization(), is_rect_list || is_quad_list);
     if (compile_policy.libraries) {
         // PERF-017: a pipeline first needed during play is built from four separately compiled
         // libraries and linked without cross-stage optimization, which the driver does in a
@@ -1071,8 +1080,26 @@ GraphicsPipeline::GraphicsPipeline(
             BuildWatch part_watch{debug_str, i == 1 ? "pre-raster library"
                                              : i == 2 ? "fragment library"
                                                       : "interface library"};
-            auto [library_result, library] =
-                device.createGraphicsPipeline(pipeline_cache, part_infos[i]);
+            auto [library_result, library] = PipelineBinaryStore::CreateGraphics(
+                instance, device, pipeline_cache, part_infos[i]); // BIN-001
+            // AMD-OOM-001: AMD's compiler ran out of system memory (ErrorOutOfHostMemory,
+            // "LLVM ERROR: out of memory") with several builds at once, and the assertion below
+            // ended GT Sport. Wait, then retry alone (the heavy-build slot), up to six times.
+            for (int attempt = 1;
+                 attempt <= 6 && (library_result == vk::Result::eErrorOutOfHostMemory ||
+                                  library_result == vk::Result::eErrorOutOfDeviceMemory);
+                 ++attempt) {
+                LOG_WARNING(Render_Vulkan,
+                            "AMD-OOM-001: {} library of {} out of memory ({}); retry {} alone",
+                            i == 1 ? "pre-raster" : i == 2 ? "fragment" : "interface", debug_str,
+                            vk::to_string(library_result), attempt);
+                std::this_thread::sleep_for(std::chrono::milliseconds{250 * attempt});
+                HeavyBuildGate alone{!(tessellated && i == 1)};
+                auto retried = PipelineBinaryStore::CreateGraphics(instance, device,
+                                                                   pipeline_cache, part_infos[i]);
+                library_result = retried.result;
+                library = retried.value;
+            }
             ASSERT_MSG(library_result == vk::Result::eSuccess,
                        "Failed to create graphics pipeline library: {}",
                        vk::to_string(library_result));
@@ -1943,12 +1970,14 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
     bool cached_fragment = false;
 #ifdef RYTY_GPU
     static const char* const descriptor_override = std::getenv("RYGT_NVIDIA_CACHED_FRAGMENT_SETS");
+    static const char* const amd_descriptor_override = std::getenv("RYGT_AMD_CACHED_FRAGMENT_SETS");
     cached_fragment = CacheFragmentDescriptors(instance.GetVendorID(), NativeModeRequested(),
-                                                descriptor_override);
+                                                descriptor_override, amd_descriptor_override);
     if (cached_fragment) {
         static std::once_flag logged;
-        std::call_once(logged, [] {
-            LOG_INFO(Render_Vulkan, "DESC-POLICY: NVIDIA fragment sets use immutable descriptor caching; vertex push descriptors retained when supported");
+        std::call_once(logged, [vendor = instance.GetVendorID()] {
+            LOG_INFO(Render_Vulkan, "DESC-POLICY: {} fragment sets use immutable descriptor caching; vertex push descriptors retained when supported",
+                     vendor == 0x1002 ? "AMD (AMD-PERF-002)" : "NVIDIA");
         });
     }
 #endif

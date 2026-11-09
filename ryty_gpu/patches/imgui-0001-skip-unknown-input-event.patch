@@ -1,0 +1,15 @@
+diff --git a/imgui.cpp b/imgui.cpp
+index 3e3f14d4c..2c4651981 100644
+--- a/imgui.cpp
++++ b/imgui.cpp
+@@ -11412,7 +11412,9 @@ void ImGui::UpdateInputEvents(bool trickle_fast_inputs)
+         }
+         else
+         {
+-            IM_ASSERT(0 && "Unknown event!");
++            // RyGT IMGUI-001: skip it. GT Sport ended on this assertion with a garbled event in
++            // the queue (input added from another thread while the present thread reads it);
++            // the overlay must not end the game.
+         }
+     }
+ 

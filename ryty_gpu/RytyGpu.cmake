@@ -125,6 +125,8 @@ ryty_add_library(ryty_gpu libSceVideoOut
         ryty_gpu/ryty_game_patch.cpp
         # GTS-010: Scapes and photo mode pictures exported as PNG to the Pictures folder.
         ryty_gpu/gts_photo_export.cpp
+        ryty_gpu/gts_file_share.cpp
+        ryty_gpu/gts_replay_video.cpp
         # NAT-001/002: hook points in GT Sport's code for the native renderer (experimental).
         ryty_gpu/native/entry_hook.cpp
         ryty_gpu/native/gts_hooks.cpp
@@ -254,4 +256,4 @@ foreach(target IN ITEMS ryty_ngs2 ryty_ajm ryty_audio3d ryty_zlib ryty_discmap r
     target_sources(${target} PRIVATE ryty_gpu/ryty_hle_precompile.cpp)
 endforeach()
 
-target_link_libraries(ryty_gpu PRIVATE bcrypt windowscodecs ole32 shell32) # GTS-010
+target_link_libraries(ryty_gpu PRIVATE bcrypt windowscodecs ole32 shell32 mfplat mfreadwrite mfuuid mmdevapi) # GTS-010, GTS-015

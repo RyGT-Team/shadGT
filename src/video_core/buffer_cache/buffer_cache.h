@@ -337,7 +337,7 @@ private:
     bool TrySplitWriteFault(const Buffer* arena, VAddr address, u64 size, VAddr window_start,
                             VAddr window_end, u64 exact_write_size);
     /// PERF-015: TrySplitWriteFault for pages whose GPU-written bytes are all pending GDS copies.
-    bool TrySplitGdsWriteFault(VAddr address, u64 exact_write_size);
+    bool TrySplitGdsWriteFault(VAddr address, u64 exact_write_size, VAddr window_start, VAddr window_end);
     /// Removes ranges whose read-back value reached guest memory from gpu_modified_ranges
     /// (GPU thread).
     void ApplyCompletedReadbacks();

@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <array>
 #include <functional>
 #include <memory>
@@ -23,6 +24,10 @@
 #include "common/types.h"
 
 namespace Native::Rhi {
+
+// VRAM-PRESSURE-001: set when a device allocation failed even after empty blocks were
+// trimmed; the native renderer's next eviction pass then keeps no idle textures.
+inline std::atomic<bool> g_device_memory_pressure{false};
 
 enum class BackendKind : u8 { Vulkan, D3D12 };
 

@@ -611,6 +611,9 @@ void LoadScriptReplacements() {
 // pipelines only in races; in the menus some scenes draw once into a texture they keep showing.
 std::atomic<bool> g_in_race{false};
 
+
+extern "C" void RytyReplayVideoSetReplay(bool replay); // GTS-015, gts_replay_video.cpp
+
 void NoteProjectScript(const u8* data, s64 read) {
     if (read < 16 || std::memcmp(data, "ADCH012", 8) != 0) {
         return;
@@ -644,6 +647,7 @@ void NoteProjectScript(const u8* data, s64 read) {
     if (!race && std::find(std::begin(menus), std::end(menus), name) == std::end(menus)) {
         return;
     }
+    RytyReplayVideoSetReplay(name == "race_replay"); // GTS-015
     if (g_in_race.exchange(race) != race) {
         std::fprintf(stderr, "[patch] FIX-110 %.*s: %s\n", static_cast<int>(name.size()),
                      name.data(), race ? "race, new pipelines are built in the background"
@@ -803,6 +807,29 @@ void InstallScriptPatches(u8* base) {
              ParseHex("940200001d811e940200003201000000940200002601000000811c070000009402000022160000"
                       "0000407001000094020000260300000076777800000000940200001d8142940200000601000000"),
              25, ParseHex("811302000000")});
+    }
+    if (const char* menu = std::getenv("RYGT_DEBUG_MENU"); !(menu && menu[0] == '0')) {
+        // GTS-013: the Debug Menu button stays in the quick menu with GTS-012 (which makes
+        // GetVersionBuild() "no-build"). overlay_menu2's WINDOWS.onInitialize shows
+        // alias_MainMenu.alias_Button_DebugMenu where GetVersionBuild() == "debug" (or
+        // Grim3.isDebug(), or UserData::DebugMenu); that == becomes != (BINARY_OPERATOR symbol 8
+        // __eq__ -> 0x17 __ne__ in this script). VARIABLE_EVAL GetVersionBuild, CALL 0,
+        // STRING_CONST 'debug', BINARY_OPERATOR, at line 402. Every other debug check stays retail.
+        g_script_patches.push_back(
+            {"GTS-013 quick menu Debug Menu button",
+             ParseHex("260200000080d980d907000000920100000600000000920100001d80da920100000508"),
+             34, ParseHex("17")});
+        // GTS-016: the Replays menu entry the game keeps for its developer MoTeC export, which
+        // RyGT's patched gallery script (adcpatch gallery.ad) turns into "Export this Video"
+        // (GTS-019). The script adds the entry only when GetVersionBuild() == "debug" (line 465), so
+        // the retail build (GTS-012) hid it; that __eq__ (symbol 0x3b) becomes __ne__ (0x40).
+        g_script_patches.push_back(
+            {"GTS-016 Replays menu Export this Video",
+             ParseHex("d1010000260200000081558155000000"
+                      "00d101000006000000"
+                      "00d10100001d8156d101000005"
+                      "3b000000"),
+             38, ParseHex("40")});
     }
     if (!(std::getenv("RYGT_SCRIPTS") && std::getenv("RYGT_SCRIPTS")[0] == '0')) {
         LoadScriptReplacements();
@@ -2089,11 +2116,29 @@ void Install(u8* base) {
 } // namespace Gt7Cipher
 
 void InstallPhotoExport(); // GTS-010, gts_photo_export.cpp
+void InstallFileShareDelete(); // GTS-014, gts_file_share.cpp
+
+// GTS-012: a retail build. pdiext::MProductInformation::GetVersionBuild (eboot 0x10c5500) looks up
+// "VersionBuild" in the game's product information, and in this build it says "debug". The
+// scripts compare it with "debug" to switch on developer features: the Scapes spot page showed its
+// debug layer (red "WWWWWWWWWW" Meta ID / Regist ID fields and "* 0"), and Photo mode has ten such
+// checks too. The lookup's key becomes its default "no-build" (lea rdi points at that string), so
+// the lookup misses and returns "no-build", which is not "debug". RYGT_DEBUG_BUILD=1 keeps "debug".
+void InstallRetailBuild(u8* base) {
+    if (const char* env = std::getenv("RYGT_DEBUG_BUILD"); env && env[0] == '1') {
+        return;
+    }
+    // lea rdi, [rip+0xdd6595] ("VersionBuild") -> lea rdi, [rip+0xdd65a2] ("no-build")
+    Apply(base, Patch{0x10c552d, {0x48, 0x8d, 0x3d, 0x95, 0x65, 0xdd, 0x00},
+                      {0x48, 0x8d, 0x3d, 0xa2, 0x65, 0xdd, 0x00}, "GTS-012 retail build (VersionBuild)"});
+}
 
 void RytyApplyGamePatches() {
     Gt7Cipher::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));     // PERF-GT7-113
     InstallPhotoExport();
     InstallScopedMenuCompiles(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallFileShareDelete();
+    InstallRetailBuild(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallExperimentalSceneViewport(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallMenuSnapshotSessionGuard(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallIdleKeyboardClose(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));

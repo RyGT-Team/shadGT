@@ -162,6 +162,11 @@ public:
 
     /// Returns true if VK_KHR_maintenance8 is supported
     u64 AntiLagInput() const;
+
+    /// BIN-001: VK_KHR_pipeline_binary is enabled.
+    bool IsPipelineBinarySupported() const {
+        return pipeline_binary;
+    }
     void AntiLagPresent(u64 frame) const;
 
     bool IsMaintenance8Supported() const {
@@ -198,7 +203,7 @@ public:
         return depth_range_unrestricted;
     }
 
-    /// SO-001: plain pipelines are drawn with shader objects (RYGT_SHADER_OBJECT=1).
+    /// SO-001: exact RYGT_SHADER_OBJECT=1 opts into shader objects on non-AMD GPUs.
     bool IsShaderObjectEnabled() const {
         return shader_object;
     }
@@ -668,6 +673,9 @@ private:
     bool maintenance_5{};
     bool maintenance_8{};
     bool anti_lag{};
+    bool pipeline_binary{}; // BIN-001
+    bool amd_overallocation{}; // AMD-VRAM-002
+    bool memory_priority{};    // AMD-VRAM-003
     mutable u64 anti_lag_frame{};
     mutable std::mutex anti_lag_mutex;
     bool attachment_feedback_loop{};

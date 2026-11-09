@@ -101,6 +101,17 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
         VkBuffer unsafe_buffer{};
         VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
                                           &allocation, out_alloc_info);
+        // AMD-VRAM-001: out of video memory: the buffer may exceed the budget, so the driver
+        // pages less-used memory to system RAM instead of the game stopping here.
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            VmaAllocationCreateInfo over_budget = alloc_ci;
+            over_budget.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+            result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &over_budget, &unsafe_buffer,
+                                     &allocation, out_alloc_info);
+            LOG_WARNING(Render_Vulkan, "AMD-VRAM-001: video memory full: buffer of {} MB {}",
+                        buffer_ci.size >> 20,
+                        result == VK_SUCCESS ? "allocated over budget" : "still failed");
+        }
         ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
                    vk::to_string(vk::Result{result}));
         buffer = vk::Buffer{unsafe_buffer};

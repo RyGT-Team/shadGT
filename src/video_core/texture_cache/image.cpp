@@ -322,6 +322,18 @@ bool Recycle(VmaAllocator allocator, const vk::ImageCreateInfo& ci, VmaAllocatio
     return true;
 }
 
+/// AMD-VRAM-001: every image kept for reuse is destroyed, to make room when VRAM runs out.
+/// Returns the bytes freed.
+u64 DropRecycled(VmaAllocator allocator) {
+    RetiredRecycleImages retired{allocator};
+    std::scoped_lock lk{g_recycle_mutex};
+    const u64 freed = g_recycled_bytes;
+    retired.buckets.swap(g_recycled);
+    g_recycle_order.clear();
+    g_recycled_bytes = 0;
+    return freed;
+}
+
 std::optional<RecycledImage> TakeRecycled(const vk::ImageCreateInfo& ci) {
     if (!RecycleEnabled() || ci.pNext != nullptr) {
         return std::nullopt;
@@ -430,6 +442,15 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
         .pool = VK_NULL_HANDLE,
         .pUserData = nullptr,
     };
+    // AMD-VRAM-003: render targets and depth buffers are drawn to every frame, so they stay in
+    // VRAM first; textures only sampled get the default and are paged out before them. (VMA
+    // passes it to the driver only when the allocator was made with memory priority: on AMD.)
+    // Many images carry every usage (a texture may become a target), so only depth buffers and
+    // colour targets never sampled count as render targets here.
+    const bool depth_target = bool(image_ci.usage & vk::ImageUsageFlagBits::eDepthStencilAttachment);
+    const bool pure_target = (image_ci.usage & vk::ImageUsageFlagBits::eColorAttachment) &&
+                             !(image_ci.usage & vk::ImageUsageFlagBits::eSampled);
+    alloc_ci.priority = depth_target || pure_target ? 1.0f : 0.5f;
 
     const VkImageCreateInfo image_ci_unsafe = static_cast<VkImageCreateInfo>(image_ci);
     alloc_ci.pool = Vulkan::SmallImageAllocationPool(allocator, image_ci_unsafe, alloc_ci);
@@ -441,6 +462,25 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
         alloc_ci.pool = VK_NULL_HANDLE;
         result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
                                &allocation, &alloc_info);
+    }
+    // AMD-VRAM-001: out of video memory (an 8 GB RX 7600 ran out in races and the game stopped
+    // here). First the images kept for reuse go, then the allocation may exceed the budget: the
+    // driver pages less-used memory to system RAM (VK_EXT_pageable_device_local_memory), which is
+    // slower for a moment but keeps the game running.
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        const u64 freed = DropRecycled(allocator);
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
+                                &allocation, &alloc_info);
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            alloc_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+            result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
+                                    &allocation, &alloc_info);
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "AMD-VRAM-001: video memory full: {} MB of reusable images freed, image {}x{} "
+                    "{}",
+                    freed >> 20, image_ci.extent.width, image_ci.extent.height,
+                    result == VK_SUCCESS ? "allocated" : "still failed");
     }
     ASSERT_MSG(result == VK_SUCCESS,
                "Failed allocating image: error={} format={} type={} extent={}x{}x{} "

@@ -1,0 +1,23 @@
+name: RyGTS CI artifacts for renderer changes
+
+on:
+  push:
+    branches: [ryty-gpu]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: renderer-packages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    uses: RyGT-Team/RyGTS/.github/workflows/ci-package-release.yml@development
+    with:
+      renderer_sha: ${{ github.sha }}
+  diagnostics:
+    uses: RyGT-Team/RyGTS/.github/workflows/ci-package-debug.yml@development
+    with:
+      renderer_sha: ${{ github.sha }}

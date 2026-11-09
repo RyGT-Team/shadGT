@@ -14,6 +14,9 @@ int main() {
     assert(ImageLife::PresentationSlowKind("producer_job_walk"));
     assert(ImageLife::PresentationSlowKind("producer_pipeline_lock"));
     assert(ImageLife::PresentationSlowKind("fault_read_handler"));
+    assert(ImageLife::PresentationKind("unmap_memory"));
+    assert(ImageLife::PresentationSlowKind("unmap_gpu_sync"));
+    assert(ImageLife::PresentationSlowKind("unmap_sparse_finish"));
     assert(!ImageLife::PresentationSlowKind("origin_write_fault"));
     assert(!ImageLife::PresentationSlowKind(nullptr));
 }

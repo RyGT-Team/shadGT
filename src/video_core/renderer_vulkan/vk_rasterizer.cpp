@@ -6347,6 +6347,7 @@ bool Rasterizer::IsMappedStart(VAddr address) {
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
+    ImageLife::Scope unmap_scope{"unmap_memory", addr, size};
     if (Common::GuestMappingWritebackGate().ProtocolAvailable()) buffer_cache.MarkMappingUnavailable(addr, size);
     Native::SlowCallTrace<5> trace{true, "guest-unmap",
         {"native-invalidate", "import-invalidate", "buffer-invalidate", "gpu-command-sync", "mapped-ranges"}};
@@ -6354,15 +6355,18 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     tsharp_epoch.fetch_add(1, std::memory_order_release); // FIX-046
 #ifdef RYTY_GPU
     if (native) {
+        ImageLife::SlowScope span{"unmap_native", addr, size};
         native->OnUnmap(addr, size); // NAT-100
     }
 #endif
     trace.Next(1);
     if (auto* direct = buffer_cache.GetDirectMemory()) {
+        ImageLife::SlowScope span{"unmap_direct", addr, size};
         direct->OnUnmap(addr, size); // D1
     }
     trace.Next(2);
-    buffer_cache.InvalidateMemory(addr, size);
+    { ImageLife::SlowScope span{"unmap_buffer", addr, size};
+      buffer_cache.InvalidateMemory(addr, size); }
     // FIX-026: the texture cache has no cache-wide lock since upstream #5219; freeing images here
     // on a game thread raced with the GPU thread freeing the same image ("Trying to unregister an
     // already unregistered image" when starting a race). Free them on the GPU thread and wait,
@@ -6371,12 +6375,15 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     const auto release_unmapped = [&] {
         Native::SlowCallTrace<2> inner{true, "guest-unmap-gpu-work", {"texture-invalidate", "arena-release"}};
         inner.Next(0, addr, size);
-        texture_cache.UnmapMemory(addr, size);
+        { ImageLife::SlowScope span{"unmap_texture", addr, size};
+          texture_cache.UnmapMemory(addr, size); }
         inner.Next(1);
-        buffer_cache.ReleaseUnmappedArenaMemory(addr, size);
+        { ImageLife::SlowScope span{"unmap_sparse_release", addr, size};
+          buffer_cache.ReleaseUnmappedArenaMemory(addr, size); }
     };
     trace.Next(3);
     if (unmap_on_gpu_thread && !IsGpuThread()) {
+        ImageLife::SlowScope span{"unmap_gpu_sync", addr, size};
         liverpool->SendCommand<true>(release_unmapped);
     } else {
         release_unmapped();

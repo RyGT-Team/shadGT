@@ -111,6 +111,16 @@ especially on high-frequency producer and fault paths; omitted fast spans are no
 producer_pipeline_lock measures only the producer shared cache-lock acquisition call;
 it includes scheduling delay. Recording a slow span adds a small cost while the lock is
 held, and the event does not identify its holder.
+unmap_memory B/E spans record each renderer unmap's address and size. Thresholded S spans
+unmap_native, unmap_direct, unmap_buffer, unmap_gpu_sync, unmap_texture,
+unmap_sparse_release and unmap_sparse_finish report start QPC, address and size. The GPU
+sync span is present only for the synchronous command path; direct execution has no such
+span, and includes command queueing plus execution. Texture and sparse work may run on
+another thread; correlate by range and time. The full renderer span excludes the earlier
+exported BeginUnmap gate and the runtime OS unmap. The sparse-finish span surrounds
+only the existing scheduler.Finish in arena release. Spans can nest or overlap and their
+durations must not be summed; calls below 200 microseconds are absent. Full unmap spans can
+be clipped or dropped, so counts and byte totals require checking capture coverage and drops.
 The summary covers the serial Draw path only; parallel prepared paths are unsupported.
 Each summary E field a is the frame counter. B fields a..e are, in order:
 * summary_0: missing, accepted, pipeline reject, stage reject, early unmap reject.

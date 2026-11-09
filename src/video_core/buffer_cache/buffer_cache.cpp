@@ -21,6 +21,7 @@
 #include <xxhash.h>
 
 #include "common/alignment.h"
+#include "ryty_gpu/image_lifecycle.h"
 #include "common/allocation_pressure_retry.h"
 #include "common/unmapped_allocations.h"
 #include "common/io_file.h"
@@ -4159,7 +4160,7 @@ void BufferCache::ReleaseUnmappedArenaMemory(VAddr address, u64 size) {
     };
     if (!collect()) return;
     // No marker lock across GPU submission/wait: map callbacks hold the guest registry.
-    scheduler.Finish();
+    { ImageLife::SlowScope span{"unmap_sparse_finish", address, size}; scheduler.Finish(); }
     // Submission callbacks may have changed cache residency; revalidate after finishing.
     if (!collect()) return;
     std::vector<ArenaBinds> unbinds;

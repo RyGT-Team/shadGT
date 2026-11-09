@@ -89,6 +89,8 @@ ryty_add_library(ryty_gpu libSceVideoOut
         ${VIDEO_CORE}
         ${GNM_LIB}
         ${VIDEOOUT_LIB}
+        # FIX-GT7-100: the compile notice shown while the game shows no new frame.
+        src/imgui/compile_notice_layer.cpp
         src/imgui/renderer/imgui_core.cpp
         src/imgui/renderer/imgui_impl_sdl3.cpp
         src/imgui/renderer/imgui_impl_vulkan.cpp

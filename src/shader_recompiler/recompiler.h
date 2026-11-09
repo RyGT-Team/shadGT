@@ -4,6 +4,7 @@
 #pragma once
 
 #include <string>
+#include <optional>
 
 #include "common/object_pool.h"
 #include "shader_recompiler/ir/basic_block.h"
@@ -47,6 +48,14 @@ struct Pools {
 [[nodiscard]] bool HasLegacyMad(std::span<const u32> code);
 /// SHD-005: whether the program stores to memory (buffer, image or GDS writes and atomics).
 [[nodiscard]] bool HasMemoryWrites(std::span<const u32> code);
+
+/// FIX-189: the user data register holding a vertex shader's fetch shader address (the operand
+/// of its s_swappc_b64), when it calls one.
+[[nodiscard]] std::optional<u32> FetchShaderSgprBase(std::span<const u32> code);
+
+/// FIX-189: a fetch shader's length in dwords, through its s_setpc_b64, when code holds all of
+/// it. code must be followed by two readable dwords (a literal may be read past its end).
+[[nodiscard]] std::optional<size_t> FetchShaderLength(std::span<const u32> code);
 
 [[nodiscard]] bool HasSdwaCompareDestination(std::span<const u32> code);
 

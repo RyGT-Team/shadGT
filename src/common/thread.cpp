@@ -375,8 +375,25 @@ void ReleaseCompileCores() {
     compile_selection.clear();
 }
 
+// FIX-GT7-107: "every core" for compile work. With a core owner (PERF-GT7-048) the process
+// default CPU set is the game's cores but the owners' (compile cores excluded): a thread without
+// a set of its own runs there only, so compiles "widened" for a waiting draw, a catch-up or a
+// backlog left the 3 compile cores for the game's 4 (a first race filled in at ~3.9 pipelines a
+// second either way, ~7 with RYGT_COMPILE_CORES=0). Every core but the owners' then, explicitly.
+std::mutex g_wide_mutex;
+std::vector<ULONG> g_wide_ids; ///< empty: no owner, the process default is every core
+
+void SetWideCores(HANDLE thread) {
+    std::scoped_lock lk{g_wide_mutex};
+    if (g_wide_ids.empty()) {
+        CallSetThreadSelectedCpuSets(thread, nullptr, 0);
+    } else {
+        CallSetThreadSelectedCpuSets(thread, g_wide_ids.data(), ULONG(g_wide_ids.size()));
+    }
+}
+
 void AllowAllCores() {
-    CallSetThreadSelectedCpuSets(GetCurrentThread(), nullptr, 0);
+    SetWideCores(GetCurrentThread());
 }
 
 // PERF-GT7-048 (RYGT_CORE_OWNERS=<mask>: 1 command processor, 2 recorder, 4 Vulkan commands; 0 none):
@@ -493,6 +510,7 @@ struct DriverCompileThreads {
     int waits = 0;
     int catch_up = 0;
     int foreground = 0;
+    int backlog = 0; ///< FIX-GT7-106
     bool applied_wide = false;
     bool applied_low = false;
     std::atomic<bool> wide_now{false};
@@ -531,8 +549,16 @@ void ApplyCompilePriority(DriverCompileThreads::Thread& thread, bool low) {
 // for). A build a thread waits for on itself: the compile cores, below normal (it goes first). A
 // catch-up: every core, below normal (the time the game's and the renderer's threads leave).
 void ApplyCompileState(DriverCompileThreads& d) {
-    const bool wide = d.waits > 0 || (d.catch_up > 0 && d.foreground == 0);
-    const bool low = d.waits == 0 && (d.foreground > 0 || d.catch_up > 0 || CompileAlwaysLow());
+    // FIX-GT7-106: a backlog of draws on screen: every core (FIX-GT7-107), foreground or not,
+    // below normal priority: Monza's first race filled in at 7.7 pipelines a second, the same as at
+    // normal priority. RYGT_COMPILE_BACKLOG_LOW=0: the driver threads' own priority.
+    const bool wide = d.waits > 0 || d.backlog > 0 || (d.catch_up > 0 && d.foreground == 0);
+    static const bool backlog_low = [] {
+        const char* env = std::getenv("RYGT_COMPILE_BACKLOG_LOW");
+        return !(env && env[0] == '0');
+    }();
+    const bool low = d.waits == 0 && (d.backlog == 0 || backlog_low) &&
+                     (d.foreground > 0 || d.catch_up > 0 || d.backlog > 0 || CompileAlwaysLow());
     d.wide_now.store(wide, std::memory_order_relaxed);
     d.low_now.store(low, std::memory_order_relaxed);
     if (!ProcessPolicyStillAllowed()) return;
@@ -803,6 +829,13 @@ void SetCompileCatchUp(bool on) {
     ApplyCompileState(d);
 }
 
+void SetCompileBacklog(bool on) {
+    auto& d = DriverThreads();
+    std::scoped_lock lk{d.mutex};
+    d.backlog += on ? 1 : -1;
+    ApplyCompileState(d);
+}
+
 bool CompileThreadsLow() {
     // PERF-GT7-055 (RYGT_COMPILE_LOW=1): ApplyCompileState counts it in low_now under the mutex.
     return DriverThreads().low_now.load(std::memory_order_relaxed);
@@ -959,6 +992,7 @@ bool ForEachProcessThread(unsigned long, const std::function<bool(void*, unsigne
 void SetCompileCoresWide(bool) {}
 bool CompileCoresWide() { return false; }
 void SetCompileCatchUp(bool) {}
+void SetCompileBacklog(bool) {}
 bool CompileThreadsLow() { return false; }
 void BeginForegroundCompile() {}
 void EndForegroundCompile() {}

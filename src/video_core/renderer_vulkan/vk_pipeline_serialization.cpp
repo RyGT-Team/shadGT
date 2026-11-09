@@ -39,7 +39,8 @@ static constexpr u32 ShaderBinaryVersionVertexFetch = 277u + Shader::Backend::Pu
 // Shader semantic revision 0x100 invalidates binaries emitted before the MED3 quiet-NaN fix.
 // Fragment reflections use cube views; other stages keep their existing array path.
 static constexpr u32 ShaderBinaryVersionNativeCube = 279u + Shader::Backend::PushDataLayoutRevision;
-// AMD single-sample KHR barycentrics change the fragment interface and interpolation.
+// AMD single-sample KHR barycentrics (on for AMD GPUs) change the
+// fragment interface and interpolation.
 static constexpr u32 ShaderBinaryVersionSingleSampleBarycentric = 282u + Shader::Backend::PushDataLayoutRevision;
 // Tessellation modules and keys must use the same translation-time layout.
 static constexpr u32 ShaderBinaryVersionTessellationLayout = 283u + Shader::Backend::PushDataLayoutRevision;

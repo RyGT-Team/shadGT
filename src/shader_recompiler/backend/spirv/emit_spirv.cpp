@@ -679,6 +679,13 @@ std::vector<u32> EmitSPIRV(const Profile& device_profile, const RuntimeInfo& run
     if (runtime_info.hw_stage == HwStage::Fragment &&
         runtime_info.hw.fs.single_sample_barycentric) {
         profile.supports_amd_shader_explicit_vertex_parameter = false;
+        // Preserve P1/P2 arithmetic when MOV makes another component per-vertex.
+        // Otherwise the shared attribute qualifier turns prior hardware reads into P0.
+        profile.needs_manual_interpolation = true;
+    }
+    if (runtime_info.hw_stage == HwStage::Fragment &&
+        runtime_info.hw.fs.single_sample_barycentric) {
+        profile.supports_amd_shader_explicit_vertex_parameter = false;
         profile.supports_fragment_shader_barycentric = true;
         // Preserve P1/P2 arithmetic when MOV makes another component per-vertex.
         // Otherwise the shared attribute qualifier turns prior hardware reads into P0.

@@ -1237,6 +1237,8 @@ set(IMGUI src/imgui/imgui_config.h
           src/imgui/imgui_texture.h
           src/imgui/imgui_translations.cpp
           src/imgui/imgui_translations.h
+          src/imgui/compile_notice_layer.cpp
+          src/imgui/compile_notice_layer.h
           src/imgui/friends_layer.cpp
           src/imgui/friends_layer.h
           src/imgui/invitation_prompt_layer.cpp

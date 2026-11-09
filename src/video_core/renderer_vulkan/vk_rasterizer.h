@@ -22,9 +22,6 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
-#ifdef RYTY_GPU
-#include "ryty_gpu/ryty_gts_dlss.h"
-#endif
 
 namespace AmdGpu {
 struct Liverpool;
@@ -61,9 +58,6 @@ public:
     [[nodiscard]] VideoCore::TextureCache& GetTextureCache() noexcept {
         return texture_cache;
     }
-#ifdef RYTY_GPU
-    GtsDlssPass& GetTemporalDlss() { return temporalDlss; }
-#endif
 
     /// PERF-047: a direct draw's pipeline, selected on the command thread as it decodes the
     /// draw, with the user data each stage's specialization was decided on.
@@ -78,7 +72,6 @@ public:
         std::shared_ptr<const Shader::Info> seed;
     };
     struct SelectedPipeline {
-        std::array<std::shared_ptr<const void>, 3> keepalive;
         const GraphicsPipeline* pipeline{};
         /// PERF-055: a direct dispatch's compute pipeline (then `pipeline` is unused).
         bool is_compute{};
@@ -87,24 +80,27 @@ public:
         /// PERF-068: a quad list's pipeline when the recorder tessellates its quads (the
         /// triangle one is `pipeline`); the recorder decides which it draws with.
         bool is_quad_list{};
+        const GraphicsPipeline* quad_tess_pipeline{};
+        std::array<SelectedStage, Shader::MaxStageTypes> quad_tess_stages{};
+        /// PERF-GT7-031: selected for an indirect draw with these base vertex and instance
+        /// SGPRs; the recorder takes it only for the same ones.
         bool indirect{};
         u16 vertex_sgpr_offset{};
         u32 instance_sgpr_offset{};
-        const GraphicsPipeline* quad_tess_pipeline{};
-        std::array<SelectedStage, Shader::MaxStageTypes> quad_tess_stages{};
     };
     /// PERF-047: whether pipelines are selected on the command thread (draw pipe on and
     /// -DisablePerf 59 not given).
     bool SelectsPipelinesAhead() const;
     /// PERF-047: on the command thread, for a direct draw it is decoding. Nothing for draws the
     /// recorder filters out or whose pipeline depends on the recorder's state (quad lists).
-    std::optional<SelectedPipeline> SelectPipelineAhead(const DrawIndirectParams* indirect = nullptr);
+    /// PERF-GT7-031: `indirect`: for an indirect draw, with its parameters.
+    std::optional<SelectedPipeline> SelectPipelineAhead(
+        const DrawIndirectParams* indirect = nullptr);
     /// PERF-055: the same for a direct dispatch it is decoding (-DisablePerf 66: none).
     std::optional<SelectedPipeline> SelectComputePipelineAhead();
     /// NAT-030: on a game job thread whose registers Liverpool::SetThreadDrawState installed,
     /// the built pipeline of its draw, or nullptr (special draws, quad lists, not built yet).
-    const GraphicsPipeline* LookupJobPipeline(std::shared_ptr<const void>& keepalive,
-                                              const char** miss = nullptr);
+    const GraphicsPipeline* LookupJobPipeline(const char** miss = nullptr);
     /// NAT-032: a hash of the resource descriptors (V#, T#, S#) the stages read for a draw.
     static u64 SharpsHash(std::span<const Shader::Info* const> stages);
     /// NAT-032: right after LookupJobPipeline found a pipeline, the sharps its draw reads, as
@@ -218,7 +214,6 @@ public:
     }
     /// PERF-056: a used selection goes back for reuse with its vectors' capacity.
     void RecycleSelectedPipeline(SelectedPipeline&& selected) {
-        selected.keepalive = {};
         selected_recycler.Give(std::move(selected));
     }
 
@@ -251,15 +246,26 @@ public:
     /// exact_write_size: bytes a faulting CPU store writes from addr, when known (PERF-011b).
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false,
                           u64 exact_write_size = 0);
-    void OnCpuStack(VAddr addr, u64 size);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     /// FIX-079: see BufferCache::CanWriteThrough; never over images.
     bool CanWriteThrough(VAddr addr, u64 size);
+    /// PERF-106: whether CPU writes can ever go through to tracked pages (FIX-079): never in
+    /// native mode, which watches every write.
+    bool WritesThrough() const {
+#ifdef RYTY_GPU
+        return native == nullptr;
+#else
+        return true;
+#endif
+    }
     void FinishWriteThrough(VAddr page, std::span<const u8> before, VAddr store, u64 store_size);
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
     void RegisterMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);
+    /// FIX-GT7-077: Ryty mapped guest memory (call before MapMemory): GPU copies of what was mapped
+    /// there before go.
+    void OnNewMapping(VAddr addr, u64 size);
 
     u64 Flush();
     void Finish();
@@ -290,6 +296,8 @@ public:
                           bool flush = true);
     /// D5: submits fences deferred without a submit of their own (recorder out of work).
     void FlushDeferredFences();
+    /// PERF-GT7-008: the recorder ran out of work (the native renderer begins its next list).
+    void OnRecorderIdle();
     /// D6: the imported guest memory holding a range read in place, when direct mode can.
     std::optional<std::pair<const VideoCore::Buffer*, u64>> DirectReadBuffer(VAddr address,
                                                                              u64 size);
@@ -343,18 +351,17 @@ public:
     /// touch guest memory in [lo, hi) are logged all run long (NAT-130 lines), as the frame dump's
     /// events. The hooks run when this or the dump wants them.
     static std::pair<VAddr, VAddr> TraceRange();
-#ifndef NDEBUG
     bool FrameDumpActive() const noexcept {
         return frame_dump_collecting || TraceRange().first != TraceRange().second;
     }
-#else
-    constexpr bool FrameDumpActive() const noexcept { return false; }
-#endif
     /// NAT-130: whether [address, address + size) meets the traced range.
     static bool Traced(VAddr address, u64 size) {
         const auto [lo, hi] = TraceRange();
-        return lo != hi && address < hi && address + std::max<u64>(size, 1) > lo;
+        return lo != hi && ((address < hi && address + std::max<u64>(size, 1) > lo) ||
+                            TracedElsewhere(address, size));
     }
+    /// DIAG-168: more ranges after the first, separated by commas.
+    static bool TracedElsewhere(VAddr address, u64 size);
     /// NAT-117: the dumped frame's work in GPU order (passes with the targets the registers name
     /// and whether they start cleared, fills, metadata clears), written as events.txt next to
     /// the dump. Consecutive draws into the same targets are one line.
@@ -521,8 +528,14 @@ private:
     /// The pipeline of a graphics draw: the one selected ahead when it still fits the memory the
     /// recorder sees, else looked up here. With PERF-047 the draw's infos are the copies.
     const GraphicsPipeline* AcquireGraphicsPipeline(const DrawIndirectParams& params,
-                                                    bool selected_allowed,
-                                                    std::shared_ptr<const void>* owner = nullptr);
+                                                    bool selected_allowed);
+    /// FIX-198: as AcquireGraphicsPipeline selecting here, but a pipeline (and its shaders)
+    /// still building is waited for instead of the draw being skipped.
+    /// FIX-GT7-109: with a deadline, null when the draw's shaders or pipeline weren't ready by
+    /// then (the draw is skipped; they keep building on the workers).
+    const GraphicsPipeline* AcquireGraphicsPipelineWaiting(
+        const DrawIndirectParams& params,
+        std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max());
     /// Points the pipeline's stages at copies holding the given user data; with `validate`,
     /// false if a stage's flattened user data now differs from what selection used.
     /// PERF-065: the selection's flattened user data is moved into the stage (swapped).
@@ -561,8 +574,6 @@ private:
     /// MT-001: the per-draw state of one recording thread. The recorder thread uses main_ctx;
     /// worker threads of the multithreaded recorder get their own.
     struct DrawContext {
-        bool dlssNativeDraw{};
-        u64 dlssNativeUid{};
         std::array<ImageBinding, Shader::NUM_IMAGES> image_bindings;
         u32 image_binding_base = 0; // PERF-121: next free entry across the draw's stages
         /// PERF-123: each hardware stage's last image bindings, reused when the next draw's
@@ -596,13 +607,6 @@ private:
         bool needs_barrier{};
     };
     DrawContext main_ctx;
-#ifdef RYTY_GPU
-    GtsDlssPass temporalDlss;
-    void applyTemporalDlss(const GraphicsPipeline* pipeline, const RenderState& state,
-                           bool beforeDraw = false);
-    void prepareNativeHud(RenderState& state);
-#endif
-    bool TemporalOwnsDisplay();
     DrawContext* ctx = &main_ctx;
     /// DIAG-041: buffers and images of the current draw that were bound empty.
     /// DIAG-044: records the current draw or dispatch in the dependency history.
@@ -619,7 +623,6 @@ private:
     std::atomic<u32> deferred_fences{};
     std::atomic<u64> background_readbacks{}; // FIX-070
     std::atomic<s64> last_readback_fence_ns{}; // PERF-063
-    std::atomic<s64> last_native_fence_submit_ns{}; // per renderer, never shared across devices
     /// PERF-014b: deferred fences that will also bring GPU data back to guest memory.
     std::atomic<u32> readback_fences{};
     u32 draws_since_submit{};
@@ -649,11 +652,6 @@ private:
     bool frame_dump_collecting{};
     bool frame_dump_done{};
     bool frame_dump_write_old{}; // written at the next draw (not at the flip)
-#ifndef NDEBUG
-    bool debug_frame_dump_active{};
-    bool debug_frame_dump_previous_done{};
-    std::filesystem::path debug_frame_dump_dir;
-#endif
     std::filesystem::path frame_dump_dir;
     /// FIX-153 (diagnosis): render targets of the dumped frame the CPU reads back (from
     /// 0xf000000000 up), and how many flips to wait before their guest memory is saved.

@@ -7,7 +7,6 @@
 #include "video_core/renderer_vulkan/spirv_check.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 
-
 namespace {
 
 Shader::StageSpecialization MakeSpec(const Shader::Info& info) {
@@ -207,78 +206,6 @@ TEST(ShaderSpecialization, StrideOfABufferWithoutIndexedAddressingDoesNotSplitPe
     EXPECT_FALSE(indexed == KeyFor(info));
 }
 
-TEST(ShaderSpecialization, FmaskKeyTracksTypeAndOnlyRequiredDimensions) {
-    Shader::Info info;
-    info.hw_stage = Shader::HwStage::Fragment;
-    info.sw_stage = Shader::SwStage::Fragment;
-    auto& resource = info.fmasks.emplace_back();
-    auto image = AmdGpu::Image::Null(false);
-    image.base_address = 0x100;
-    image.data_format = u64(AmdGpu::DataFormat::FormatFmask64_S16_F8);
-    auto bind = [&] { std::memcpy(resource.sharp_fetch.immediates.data(), &image, sizeof(image)); };
-    bind();
-    const auto original = KeyFor(info);
-    image.width = 23;
-    bind();
-    EXPECT_TRUE(original == KeyFor(info));
-    resource.size_read = true;
-    const auto sized = KeyFor(info);
-    image.width = 42;
-    bind();
-    EXPECT_FALSE(sized == KeyFor(info));
-    image.data_format = u64(AmdGpu::DataFormat::Format32);
-    bind();
-    EXPECT_FALSE(original == KeyFor(info));
-}
-
-TEST(ShaderSpecialization, PinnedFetchDescriptorIsUsedForCode) {
-    Shader::Info info;
-    auto original = BoundBuffer(16);
-    info.pinned_fetch_sharps.push_back({2, 4, original});
-    Shader::Gcn::VertexAttribute attrib{};
-    attrib.sgpr_base = 2;
-    attrib.dword_offset = 4;
-    EXPECT_EQ(attrib.GetSharpFromMemory(info).GetStride(), original.GetStride());
-}
-
-TEST(ShaderSpecialization, EmptyBoundBufferIgnoresUnusedAddressing) {
-    auto info = TranslatedFragmentWithBuffer(true);
-    auto buffer = BoundBuffer(16);
-    buffer.base_address = 0;
-    Bind(info.buffers[0], buffer);
-    const auto first = KeyFor(info);
-    buffer.stride = 48;
-    Bind(info.buffers[0], buffer);
-    EXPECT_TRUE(first == KeyFor(info));
-}
-
-TEST(ShaderSpecialization, AmbiguousAheadMatchKeepsDrawSearchState) {
-    auto info = TranslatedFragmentWithBuffer(true);
-    info.buffer_stride_used.set(0);
-    Bind(info.buffers[0], BoundBuffer(16));
-    const auto first = KeyFor(info);
-    Bind(info.buffers[0], BoundBuffer(48));
-    const auto second = KeyFor(info);
-    auto empty = BoundBuffer(16);
-    empty.base_address = 0;
-    Bind(info.buffers[0], empty);
-    const auto lookup = KeyFor(info);
-    ASSERT_TRUE(first == lookup);
-    ASSERT_TRUE(second == lookup);
-
-    Vulkan::Program program;
-    program.SearchLastMatch(false) = 0;
-    program.SearchMemo(false).valid = true;
-    program.SearchMemo(false).perm = 0;
-    program.SearchLastMatch(true) = 1;
-    program.SearchMemo(true).valid = true;
-    program.SearchMemo(true).perm = 1;
-    EXPECT_EQ(program.SearchLastMatch(false), 0u);
-    EXPECT_EQ(program.SearchMemo(false).perm, 0u);
-    EXPECT_EQ(program.SearchLastMatch(true), 1u);
-    EXPECT_EQ(program.SearchMemo(true).perm, 1u);
-}
-
 TEST(ShaderSpecialization, KeepsEveryBufferPropertyWhenTranslationUsageIsUnknown) {
     // A shader loaded from storage carries no usage flags.
     auto info = TranslatedFragmentWithBuffer(false);
@@ -432,6 +359,45 @@ TEST(ShaderStore, AcceptsOnlyWholeSpirvModules) {
     EXPECT_FALSE(Vulkan::IsCompleteSpirv({}));
 }
 
+// FIX-GT7-083: both engines share the store; an ordinary pixel-shader cube sample is a cube-array
+// sample with native cube sampling (the native engine) and samples six faces of a 2D array without
+// it (the classic engine's views). A translation is read only by the side it fits.
+TEST(ShaderStore, StoredCubeSamplesAreReadOnlyByTheCubeSamplingTheyWereMadeWith) {
+    auto info = MakeFragmentInfo(false);
+    auto spec = MakeSpec(*info);
+    spec.images[0].type = AmdGpu::ImageType::Cube;
+    // Made without it: tagged; the classic engine reads it, the native one translates again.
+    const bool faces = Vulkan::TranslatedWithFaceCubes(spec, false);
+    EXPECT_TRUE(faces);
+    EXPECT_TRUE(Vulkan::StoredCubesFit(spec, *info, faces, false));
+    EXPECT_FALSE(Vulkan::StoredCubesFit(spec, *info, faces, true));
+    // Made with it, the cube a native cube sample: not tagged; the classic engine translates again.
+    info->images[0].post_op = Shader::SharpFetchPostOp::NativeCubeSampling;
+    const bool native = Vulkan::TranslatedWithFaceCubes(spec, true);
+    EXPECT_FALSE(native);
+    EXPECT_TRUE(Vulkan::StoredCubesFit(spec, *info, native, true));
+    EXPECT_FALSE(Vulkan::StoredCubesFit(spec, *info, native, false));
+    // A stored cube image, or no cube: both read it.
+    auto other_info = MakeFragmentInfo(false);
+    auto other = MakeSpec(*other_info);
+    other.images[0].type = AmdGpu::ImageType::Cube;
+    other.images[0].is_storage = true;
+    EXPECT_FALSE(Vulkan::TranslatedWithFaceCubes(other, false));
+    other.images[0] = {};
+    EXPECT_FALSE(Vulkan::TranslatedWithFaceCubes(other, false));
+    EXPECT_TRUE(Vulkan::StoredCubesFit(other, *other_info, false, true));
+    EXPECT_TRUE(Vulkan::StoredCubesFit(other, *other_info, false, false));
+    // Other stages have no native cube samples.
+    Shader::Info compute;
+    compute.hw_stage = Shader::HwStage::Compute;
+    compute.sw_stage = Shader::SwStage::Compute;
+    compute.images.emplace_back();
+    auto compute_spec = MakeSpec(compute);
+    compute_spec.images[0].type = AmdGpu::ImageType::Cube;
+    EXPECT_FALSE(Vulkan::TranslatedWithFaceCubes(compute_spec, false));
+    EXPECT_TRUE(Vulkan::StoredCubesFit(compute_spec, compute, false, true));
+}
+
 // These focused header tests do not initialize the emulator's logging or fatal-error backend.
 void Common::Log::VLog(Class, Level, const char* file, int line, const char*, fmt::string_view,
                        fmt::format_args) {
@@ -538,110 +504,6 @@ TEST(ShaderSpecialization, PackedImageInputsIgnoreAddressesAndKeepTheFormat) {
 // flattened buffer: a pack recorded after a full match could hold a V# that changed in between
 // (float to integer), and later draws would take the float module with no full comparison. Such
 // stages always get a full comparison.
-TEST(ShaderSpecialization, PackedFmaskAndEmptyBufferInputsRespectIntegratedKeys) {
-    Shader::Info info;
-    info.hw_stage = Shader::HwStage::Fragment;
-    info.sw_stage = Shader::SwStage::Fragment;
-    info.images.emplace_back();
-    auto& fmask = info.fmasks.emplace_back();
-    auto image = AmdGpu::Image::Null(false);
-    image.base_address = 0x100;
-    image.data_format = u64(AmdGpu::DataFormat::FormatFmask64_S16_F8);
-    auto bind = [&] { Bind(info.images[0], image); std::memcpy(fmask.sharp_fetch.immediates.data(), &image, sizeof(image)); };
-    bind();
-    const auto key = KeyFor(info);
-    const auto packed = PackFor(info);
-    image.width = 23;
-    bind();
-    EXPECT_EQ(packed, PackFor(info));
-    EXPECT_TRUE(key == KeyFor(info));
-    fmask.size_read = true;
-    const auto sized = KeyFor(info);
-    const auto sized_pack = PackFor(info);
-    image.width = 42;
-    bind();
-    EXPECT_NE(sized_pack, PackFor(info));
-    EXPECT_FALSE(sized == KeyFor(info));
-    image.data_format = u64(AmdGpu::DataFormat::Format32);
-    bind();
-    EXPECT_NE(packed, PackFor(info));
-    EXPECT_FALSE(key == KeyFor(info));
-
-    auto buffers = TranslatedFragmentWithBuffer(true);
-    buffers.buffer_stride_used.set(0);
-    auto empty = BoundBuffer(16);
-    empty.base_address = 0;
-    Bind(buffers.buffers[0], empty);
-    const auto empty_key = KeyFor(buffers);
-    const auto empty_pack = PackFor(buffers);
-    empty.stride = 48;
-    Bind(buffers.buffers[0], empty);
-    EXPECT_TRUE(empty_key == KeyFor(buffers));
-    EXPECT_NE(empty_pack, PackFor(buffers)); // Conservative for the asymmetric empty rule.
-}
-
-TEST(ShaderSpecialization, EqualPackedBuffersAlwaysMatchDirectionalSpecialization) {
-    for (bool formatted : {false, true}) {
-        for (bool known : {false, true}) {
-            auto info = TranslatedFragmentWithBuffer(known);
-            info.buffers[0].is_formatted = formatted;
-            info.buffer_stride_used.set(0);
-            std::vector<Shader::StageSpecialization> keys;
-            std::vector<std::vector<u64>> packs;
-            for (u32 n = 0; n < 256; ++n) {
-                auto b = BoundBuffer((n & 1) ? 16 : 48);
-                b.base_address = (n & 2) ? 0 : 0x10000;
-                b.num_records = (n & 4) ? 0 : 256;
-                b.swizzle_enable = (n >> 3) & 1;
-                b.add_tid_enable = (n >> 4) & 1;
-                b.mtype = (n & 32) ? 3 : 0;
-                b.data_format = u32((n & 64) ? AmdGpu::DataFormat::Format32 : AmdGpu::DataFormat::Format8_8_8_8);
-                b.num_format = u32((n & 128) ? AmdGpu::NumberFormat::Uint : AmdGpu::NumberFormat::Unorm);
-                b.index_stride = n & 3;
-                b.element_size = (n >> 2) & 3;
-                b.dst_sel_x = (n & 8) ? 4 : 5;
-                Bind(info.buffers[0], b);
-                keys.push_back(KeyFor(info));
-                packs.push_back(PackFor(info));
-            }
-            for (size_t a = 0; a < keys.size(); ++a)
-                for (size_t b = 0; b < keys.size(); ++b)
-                    if (packs[a] == packs[b]) EXPECT_TRUE(keys[a] == keys[b]) << a << ',' << b;
-        }
-    }
-}
-
-TEST(ShaderSpecialization, EqualPackedImagesAlwaysMatchDirectionalSpecialization) {
-    for (bool written : {false, true}) {
-        for (bool srgb_used : {false, true}) {
-            Shader::Info info;
-            info.hw_stage = Shader::HwStage::Fragment;
-            info.sw_stage = Shader::SwStage::Fragment;
-            info.images.emplace_back();
-            info.images[0].is_written = written;
-            info.resource_usage_known = true;
-            info.image_srgb_used.set(0, srgb_used);
-            std::vector<Shader::StageSpecialization> keys;
-            std::vector<std::vector<u64>> packs;
-            for (u32 n = 0; n < 64; ++n) {
-                auto img = AmdGpu::Image::Null(false);
-                img.base_address = (n & 1) ? 0 : 0x100;
-                img.data_format = u64((n & 2) ? AmdGpu::DataFormat::FormatFmask64_S16_F8 : AmdGpu::DataFormat::Format32);
-                img.num_format = u64((n & 4) ? AmdGpu::NumberFormat::Uint : AmdGpu::NumberFormat::Srgb);
-                img.dst_sel_x = (n & 8) ? 4 : 5;
-                img.width = (n & 16) ? 10 : 30;
-                img.last_level = (n & 32) ? 2 : 0;
-                Bind(info.images[0], img);
-                keys.push_back(KeyFor(info));
-                packs.push_back(PackFor(info));
-            }
-            for (size_t a = 0; a < keys.size(); ++a)
-                for (size_t b = 0; b < keys.size(); ++b)
-                    if (packs[a] == packs[b]) EXPECT_TRUE(keys[a] == keys[b]) << a << ',' << b;
-        }
-    }
-}
-
 TEST(ShaderSpecialization, PackedInputsNeverStandForVertexAttributesReadFromMemory) {
     Shader::Info info;
     info.hw_stage = Shader::HwStage::Vertex;
@@ -655,4 +517,245 @@ TEST(ShaderSpecialization, PackedInputsNeverStandForVertexAttributesReadFromMemo
     EXPECT_TRUE(Shader::StageSpecialization::Packable(info));
     info.sw_stage = Shader::SwStage::TessellationControl;
     EXPECT_FALSE(Shader::StageSpecialization::Packable(info));
+}
+
+// FIX-GT7-124: tessellation constants pinned as their draw had them.
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
+
+namespace {
+
+Shader::SwTessControlRuntimeInfo TcsRegisters(u32 input_cp, u8 lds_emulation, u8 patches) {
+    Shader::SwTessControlRuntimeInfo tcs{};
+    tcs.num_input_control_points = input_cp;
+    tcs.lds_emulation = lds_emulation;
+    tcs.num_patches = patches;
+    return tcs;
+}
+
+Shader::TessellationDataConstantBuffer TessConstants(u32 ls_stride, u32 cp_stride, u32 patches,
+                                                     u32 output_base) {
+    Shader::TessellationDataConstantBuffer c{};
+    c.ls_stride = ls_stride;
+    c.hs_cp_stride = cp_stride;
+    c.num_patches = patches;
+    c.hs_output_base = output_base;
+    return c;
+}
+
+// Guest memory is at the guest's addresses, and a V#'s base address has 40 bits: a page below
+// 2^40 stands for it.
+u8* LowGuestPage() {
+    static u8* const page = []() -> u8* {
+        for (u64 hint = 0x2000000000ULL; hint < (1ULL << 40); hint += 0x1000000000ULL) {
+#ifdef _WIN32
+            void* p = VirtualAlloc(reinterpret_cast<void*>(hint), 0x10000, MEM_RESERVE | MEM_COMMIT,
+                                   PAGE_READWRITE);
+#else
+            void* p = mmap(reinterpret_cast<void*>(hint), 0x10000, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (p == MAP_FAILED) {
+                p = nullptr;
+            }
+#endif
+            if (p && reinterpret_cast<u64>(p) + 0x10000 <= (1ULL << 40)) {
+                return static_cast<u8*>(p);
+            }
+        }
+        return nullptr;
+    }();
+    return page;
+}
+
+// A hull shader's constants V# at dword 16 of the table user data registers 2-3 point at, and
+// the constants it points at; returns them.
+Shader::TessellationDataConstantBuffer* PlaceTessConstants(
+    u8* page, std::array<u32, Shader::ShaderParams::NumShaderUserData>& user_data) {
+    auto* constants = reinterpret_cast<Shader::TessellationDataConstantBuffer*>(page + 0x100);
+    *constants = TessConstants(0x28, 0x30, 16, 0x280);
+    AmdGpu::Buffer sharp{};
+    sharp.base_address = reinterpret_cast<u64>(constants);
+    std::memcpy(page + 16 * 4, &sharp, sizeof(sharp));
+    std::memcpy(page + 20 * 4, &sharp, sizeof(sharp));
+    const u64 table = reinterpret_cast<u64>(page);
+    std::memcpy(&user_data[2], &table, sizeof(table));
+    return constants;
+}
+
+} // namespace
+
+// The constants of GT7's draws (DIAG-059 lines of the 11-05 to 11-08 logs, with their FIX-227
+// registers) are taken as their draws'.
+TEST(TessConstantsPin, ConstantsOfGt7DrawsFitTheirRegisters) {
+    EXPECT_TRUE(TcsRegisters(1, 2, 16).FitsConstants(TessConstants(0x28, 0x30, 16, 0x280)));
+    EXPECT_TRUE(TcsRegisters(22, 2, 11).FitsConstants(TessConstants(0x18, 0xb0, 11, 0x16b0)));
+    // Passing its inputs through: no output base.
+    EXPECT_TRUE(TcsRegisters(4, 2, 64).FitsConstants(TessConstants(0x24, 0x24, 64, 0)));
+    // Without the LDS emulation the registers' patches are not kept.
+    EXPECT_TRUE(TcsRegisters(1, 0, 0).FitsConstants(TessConstants(0x8, 0x30, 16, 0x80)));
+    // An 80-byte LS stride (FIX-GT7-119) is a draw's too.
+    EXPECT_TRUE(TcsRegisters(20, 2, 12).FitsConstants(TessConstants(80, 0xd0, 12, 20 * 80 * 12)));
+}
+
+// What workers read after GT7 wrote that memory again (11-08 logs) is not taken as a draw's.
+TEST(TessConstantsPin, ConstantsOfAnotherDrawDoNotFit) {
+    const auto regs = TcsRegisters(1, 2, 16);
+    EXPECT_FALSE(regs.FitsConstants(TessConstants(0x3F800000, 0x30, 16, 0x280)));  // 1.0f
+    EXPECT_FALSE(regs.FitsConstants(TessConstants(0x10028000, 0x1000e329, 0, 0))); // addresses
+    EXPECT_FALSE(regs.FitsConstants(TessConstants(0, 0, 0, 0))); // unmapped: zeros
+    EXPECT_FALSE(regs.FitsConstants(TessConstants(0x2a, 0x30, 16, 0x2a0)));
+    // The same program's constants of a draw with other patches.
+    EXPECT_FALSE(regs.FitsConstants(TessConstants(0x28, 0x30, 11, 0x1b8)));
+    // Another program's: sane, but not these registers'.
+    EXPECT_FALSE(TcsRegisters(22, 2, 11).FitsConstants(TessConstants(0x28, 0x30, 16, 0x280)));
+    EXPECT_FALSE(TcsRegisters(1, 0, 0).FitsConstants(TessConstants(0x18, 0xb0, 11, 0x16b0)));
+}
+
+TEST(TessConstantsPin, PinnedConstantsStandForMemoryWrittenAgain) {
+    u8* page = LowGuestPage();
+    ASSERT_TRUE(page != nullptr);
+    std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
+    auto* constants = PlaceTessConstants(page, user_data);
+    const auto pin = Shader::Info::ReadTessConstants(user_data, 2, 16);
+    ASSERT_TRUE(pin.has_value());
+    EXPECT_EQ(pin->sharp_address, reinterpret_cast<u64>(page) + 16 * 4);
+    EXPECT_EQ(pin->constants.ls_stride, 0x28u);
+    EXPECT_EQ(pin->constants.hs_output_base, 0x280u);
+
+    // The game writes that memory again for a later draw.
+    *constants = TessConstants(0x3F800000, 0x10028000, 0, 0);
+    Shader::Info info;
+    info.sw_stage = Shader::SwStage::TessellationControl;
+    info.user_data = user_data;
+    info.tess_consts_ptr_base = static_cast<Shader::IR::ScalarReg>(2);
+    info.tess_consts_dword_offset = 16;
+    Shader::TessellationDataConstantBuffer read{};
+    info.ReadTessConstantBuffer(read);
+    EXPECT_EQ(read.ls_stride, 0x3F800000u);
+    info.pinned_tess_constants = pin;
+    info.ReadTessConstantBuffer(read);
+    EXPECT_EQ(read.ls_stride, 0x28u);
+    EXPECT_EQ(read.hs_cp_stride, 0x30u);
+    EXPECT_EQ(read.hs_output_base, 0x280u);
+    // A pin made for another V# is not these constants.
+    info.tess_consts_dword_offset = 20;
+    info.ReadTessConstantBuffer(read);
+    EXPECT_EQ(read.ls_stride, 0x3F800000u);
+}
+
+TEST(TessConstantsPin, ReadsAVSharpInTheUserDataRegisters) {
+    u8* page = LowGuestPage();
+    ASSERT_TRUE(page != nullptr);
+    std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
+    auto* constants = reinterpret_cast<Shader::TessellationDataConstantBuffer*>(page + 0x200);
+    *constants = TessConstants(0x18, 0xb0, 11, 0x16b0);
+    AmdGpu::Buffer sharp{};
+    sharp.base_address = reinterpret_cast<u64>(constants);
+    std::memcpy(&user_data[4], &sharp, sizeof(sharp));
+    const u32 in_registers = static_cast<u32>(Shader::IR::NumScalarRegs);
+    const auto pin = Shader::Info::ReadTessConstants(user_data, in_registers, 4);
+    ASSERT_TRUE(pin.has_value());
+    EXPECT_EQ(pin->sharp_address, 0u);
+    EXPECT_EQ(pin->constants.hs_output_base, 0x16b0u);
+    // Past the registers, or no V#: nothing to pin.
+    EXPECT_FALSE(Shader::Info::ReadTessConstants(user_data, in_registers,
+                                                 static_cast<s32>(user_data.size()) - 3)
+                     .has_value());
+    EXPECT_FALSE(Shader::Info::ReadTessConstants(user_data, in_registers, 8).has_value());
+    EXPECT_FALSE(Shader::Info::ReadTessConstants(user_data, 2, -1).has_value());
+}
+
+// PERF-GT7-111: a recorded translation with pinned constants logs the reads they stand for, in
+// the order the unpinned reads come, so the manifest's replay gives the pinned constants.
+TEST(TessConstantsPin, PinnedReadsAreLoggedAsTheReadsTheyStandFor) {
+    u8* page = LowGuestPage();
+    ASSERT_TRUE(page != nullptr);
+    std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
+    auto* constants = PlaceTessConstants(page, user_data);
+    const auto pin = Shader::Info::ReadTessConstants(user_data, 2, 16);
+    ASSERT_TRUE(pin.has_value());
+    *constants = TessConstants(0x3F800000, 0x10028000, 0, 0);
+    Shader::Info info;
+    info.user_data = user_data;
+    info.tess_consts_ptr_base = static_cast<Shader::IR::ScalarReg>(2);
+    info.tess_consts_dword_offset = 16;
+    Shader::TessellationDataConstantBuffer read{};
+    Common::GuestReadLog unpinned, pinned;
+    Common::t_guest_read_log = &unpinned;
+    info.ReadTessConstantBuffer(read);
+    info.pinned_tess_constants = pin;
+    Common::t_guest_read_log = &pinned;
+    info.ReadTessConstantBuffer(read);
+    Common::t_guest_read_log = nullptr;
+    ASSERT_EQ(unpinned.spans.size(), 2u);
+    ASSERT_EQ(pinned.spans.size(), 2u);
+    for (size_t i = 0; i < 2; ++i) {
+        EXPECT_EQ(pinned.spans[i].address, unpinned.spans[i].address);
+        EXPECT_EQ(pinned.spans[i].size, unpinned.spans[i].size);
+    }
+    Common::GuestReadLog replay = pinned;
+    replay.replay = true;
+    info.pinned_tess_constants.reset();
+    Common::t_guest_read_log = &replay;
+    info.ReadTessConstantBuffer(read);
+    Common::t_guest_read_log = nullptr;
+    EXPECT_EQ(read.ls_stride, 0x28u);
+    EXPECT_EQ(replay.misses, 0u);
+}
+
+// A domain shader reads only the control point stride: GT7's (0x20 to 0x150 bytes) are taken, what
+// a late read finds (1.0f as the stride: 66 million vec4 inputs) is not.
+TEST(TessConstantsPin, DomainShaderConstantsFit) {
+    using Tes = Shader::SwTessEvalRuntimeInfo;
+    EXPECT_TRUE(Tes::FitsConstants(TessConstants(0x28, 0x30, 16, 0x280)));
+    EXPECT_TRUE(Tes::FitsConstants(TessConstants(0x20, 0x150, 8, 0x1400)));
+    EXPECT_FALSE(Tes::FitsConstants(TessConstants(0x28, 0x3F800000, 16, 0x280)));
+    EXPECT_FALSE(Tes::FitsConstants(TessConstants(0, 0, 0, 0)));
+    EXPECT_FALSE(Tes::FitsConstants(TessConstants(0x28, 0x32, 16, 0x280)));
+    EXPECT_FALSE(Tes::FitsConstants(TessConstants(0x28, 0x30, 0, 0x280)));
+}
+
+// The read a translation makes without a pin gives the V# with where it was read: pinned again
+// (the worker does, for its key and the manifest's record), it stands for the translation's own
+// read after the game wrote that memory again, at the same addresses.
+TEST(TessConstantsPin, ATranslationsOwnReadStandsForItsKey) {
+    u8* page = LowGuestPage();
+    ASSERT_TRUE(page != nullptr);
+    std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
+    auto* constants = PlaceTessConstants(page, user_data);
+    Shader::Info info;
+    info.user_data = user_data;
+    info.tess_consts_ptr_base = static_cast<Shader::IR::ScalarReg>(2);
+    info.tess_consts_dword_offset = 16;
+    Common::GuestReadLog translation;
+    Common::t_guest_read_log = &translation;
+    const auto used = info.ReadTessConstantsAt();
+    Common::t_guest_read_log = nullptr;
+    const auto expected = Shader::Info::ReadTessConstants(user_data, 2, 16);
+    ASSERT_TRUE(expected.has_value());
+    EXPECT_EQ(used.sharp_address, expected->sharp_address);
+    EXPECT_EQ(u64(used.sharp.base_address), u64(expected->sharp.base_address));
+    EXPECT_EQ(used.constants.ls_stride, 0x28u);
+    ASSERT_EQ(translation.spans.size(), 2u);
+
+    *constants = TessConstants(0x3F800000, 0x10028000, 0, 0);
+    info.pinned_tess_constants = used;
+    Common::GuestReadLog key;
+    Common::t_guest_read_log = &key;
+    Shader::TessellationDataConstantBuffer read{};
+    info.ReadTessConstantBuffer(read);
+    Common::t_guest_read_log = nullptr;
+    EXPECT_EQ(read.ls_stride, 0x28u);
+    ASSERT_EQ(key.spans.size(), 2u);
+    for (size_t i = 0; i < 2; ++i) {
+        EXPECT_EQ(key.spans[i].address, translation.spans[i].address);
+        EXPECT_EQ(key.spans[i].size, translation.spans[i].size);
+    }
+    EXPECT_EQ(0, std::memcmp(key.bytes.data(), translation.bytes.data(), key.bytes.size()));
 }

@@ -39,7 +39,15 @@ IR::BlockList GenerateBlocks(const IR::AbstractSyntaxList& syntax_list) {
 }
 
 void EmitControlFlowGraph(IR::Program& program, Pools& pools, Gcn::CFG& cfg,
-                          RuntimeInfo& runtime_info, const Profile& profile) {
+                          RuntimeInfo& runtime_info, const Profile& device_profile) {
+    auto profile = device_profile;
+    if (runtime_info.hw_stage == HwStage::Fragment &&
+        runtime_info.hw.fs.single_sample_barycentric) {
+        profile.supports_amd_shader_explicit_vertex_parameter = false;
+        // Preserve P1/P2 arithmetic when MOV makes another component per-vertex.
+        // Otherwise the shared attribute qualifier turns prior hardware reads into P0.
+        profile.needs_manual_interpolation = true;
+    }
     Gcn::Translator translator{program.info, runtime_info, profile};
     for (auto& block : cfg) {
         const u32 start = block.begin_index;
@@ -126,33 +134,38 @@ bool HasLaneReads(std::span<const u32> code) {
     return false;
 }
 
-bool HasLaneReadsAndLoop(std::span<const u32> code) {
+std::optional<u32> FetchShaderSgprBase(std::span<const u32> code) {
     using namespace Gcn;
-    Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
-    Gcn::GcnDecodeContext decoder;
-    bool lane_reads = false;
-    bool loop = false;
+    GcnCodeSlice slice(code.data(), code.data() + code.size());
+    GcnDecodeContext decoder;
     while (!slice.atEnd()) {
         const GcnInst inst = decoder.decodeInstruction(slice);
-        switch (inst.opcode) {
-        case Opcode::V_READLANE_B32:
-        case Opcode::V_MBCNT_LO_U32_B32:
-        case Opcode::V_MBCNT_HI_U32_B32:
-            lane_reads = true;
-            break;
-        default:
-            break;
-        }
-        if (inst.category == InstCategory::FlowControl && inst.control.sopp.simm < 0 &&
-            (inst.IsUnconditionalBranch() || inst.IsConditionalBranch())) {
-            loop = true;
+        if (inst.opcode == Opcode::S_SWAPPC_B64) {
+            return inst.src[0].code;
         }
         if (inst.opcode == Opcode::S_ENDPGM) {
             break;
         }
     }
-    return lane_reads && loop;
+    return std::nullopt;
 }
+
+std::optional<size_t> FetchShaderLength(std::span<const u32> code) {
+    using namespace Gcn;
+    GcnCodeSlice slice(code.data(), code.data() + code.size());
+    GcnDecodeContext decoder;
+    size_t bytes = 0;
+    while (!slice.atEnd() && bytes < code.size_bytes()) {
+        const GcnInst inst = decoder.decodeInstruction(slice);
+        bytes += inst.length;
+        if (inst.opcode == Opcode::S_SETPC_B64) {
+            return bytes <= code.size_bytes() ? std::optional{bytes / sizeof(u32)} : std::nullopt;
+        }
+    }
+    return std::nullopt;
+}
+
+bool HasLaneReadsAndLoop(std::span<const u32> code) {
 
 bool HasMemoryWrites(std::span<const u32> code) {
     using namespace Gcn;

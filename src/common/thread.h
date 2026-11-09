@@ -77,6 +77,11 @@ void SetCompileCatchUp(bool on);
 /// PERF-GT7-032: compile work runs below normal priority now.
 bool CompileThreadsLow();
 
+/// FIX-GT7-106: while many draws on screen wait for their pipelines (a first race: the world is
+/// missing), compile work uses every core below normal priority, even while a thread builds a
+/// pipeline it waits for. Calls nest.
+void SetCompileBacklog(bool on);
+
 /// PERF-GT7-032: around a build the calling thread does while the GPU's commands wait for it (a
 /// new compute pipeline on the command thread). Meanwhile the other compile work stays on the
 /// compile cores below normal priority (unless a draw waits for its pipeline), and the calling

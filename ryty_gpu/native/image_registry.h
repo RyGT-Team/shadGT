@@ -9,7 +9,6 @@
 // frame's jobs; render targets start empty and are GPU-only.
 
 #pragma once
-#include "ryty_gpu/native/layer_hash.h"
 
 #include <array>
 #include <atomic>
@@ -22,24 +21,10 @@
 #include <vector>
 
 #include "common/types.h"
-#include "ryty_gpu/native/recent_fills.h"
 #include "ryty_gpu/native/rhi/rhi.h"
 #include "video_core/texture_cache/image_info.h"
 
 namespace Native {
-
-struct RememberedFillReceipt {
-    explicit RememberedFillReceipt(std::shared_ptr<std::atomic<u64>> count_) : count(std::move(count_)) {
-        count->fetch_add(1, std::memory_order_relaxed);
-    }
-    ~RememberedFillReceipt() { Complete(); }
-    void Complete() {
-        if (live.exchange(false, std::memory_order_acq_rel))
-            count->fetch_sub(1, std::memory_order_relaxed);
-    }
-    std::atomic<bool> live{true};
-    std::shared_ptr<std::atomic<u64>> count;
-};
 
 /// How a view looks at an image (a T#'s format, dimensions, swizzle and subresources).
 struct ImageViewKey {
@@ -75,6 +60,9 @@ struct SourcePlace {
     /// NAT-131: where in the target the picture comes from (a layer of a layered target).
     s32 src_mip = 0;
     s32 src_layer = 0;
+    /// FIX-GT7-127: the target holds one texel per block of this block-compressed texture; width
+    /// and height count blocks.
+    bool blocks = false;
 };
 
 class ImageEntry;
@@ -88,11 +76,6 @@ class ImageEntry {
 public:
     VideoCore::ImageInfo info;
     std::unique_ptr<Rhi::Image> image;
-    /// PERF-314: a write-back's re-tiling buffers (linear and tiled scratch, tiling parameters),
-    /// kept for the next write-back of this picture instead of made each time (recorder only).
-    std::unique_ptr<Rhi::Buffer> download_linear;
-    std::unique_ptr<Rhi::Buffer> download_tiled;
-    std::unique_ptr<Rhi::Buffer> download_params;
     u32 backend_usage = 0;    ///< from the image factory
     u64 backend_features = 0; ///< from the image factory
     /// NAT-104: when the renderer last wrote the picture (its own clock; 0: never).
@@ -104,6 +87,11 @@ public:
     std::vector<SourceLink> sources;
     /// NAT-111: on a render target, the textures made of it (guarded by its sources_mutex).
     std::vector<ImageEntry*> dependents;
+    /// FIX-208: per subresource (mip * layers + layer) the clock of the newest picture a draw
+    /// put there (a draw into some layers of a layered target writes only those); empty until
+    /// such a draw, and kept for pictures of up to 16 mips and 64 layers only. Other writes
+    /// (storage, clears) count for every subresource. Guarded by sources_mutex.
+    std::vector<u64> sub_versions;
     /// NAT-111: on a texture, a source was drawn since the renderer last copied them in.
     std::atomic<bool> sources_dirty{false};
     /// NAT-108: uploads since the renderer last looked (its report of busy textures).
@@ -111,19 +99,12 @@ public:
     /// NAT-109: hash of the guest bytes last uploaded (small textures; 0: none), so a texture
     /// made stale by a write to its page that left its bytes alone is not uploaded again.
     u64 content_hash = 0;
-    LayerHashState layer_hash;
-    /// A GPU-only target cannot be checked against a CPU hash. Its initial upload can instead
-    /// establish that CPU writes to the complete backing range are already being watched.
-    bool guest_writes_tracked = false;
-    std::atomic<bool> guest_modified{false};
     /// FIX-153 (diagnosis): uploads in all, and where the last one read its bytes (0: none,
     /// 1: a region, 2: an imported buffer, 3: a gathered copy, 4: a CPU copy).
     std::atomic<u32> total_uploads{0};
     u8 upload_kind = 0;
     /// NAT-109: the GPU wrote its memory (the CPU can't tell what changed yet): upload.
     std::atomic<bool> force_upload{false};
-    // Sticky: a later CPU write does not replace untouched GPU-owned bytes.
-    std::atomic<bool> gpu_backing_written{false};
     bool from_cpu = false; ///< texture data the CPU wrote; render targets are GPU-only
     std::atomic<bool> needs_upload{false};
     std::atomic<u64> last_use{0};
@@ -133,6 +114,25 @@ public:
     /// goes. `foreign_clock`: the renderer's write clock when GPU work last wrote its memory
     /// other than into the picture.
     u64 made_frame = 0;
+    /// DIAG-197 (diagnosis): why it was last marked stale (Stale, or 255: not yet).
+    u8 last_stale = 255;
+    /// FIX-202: the renderer's write clock when a storage buffer much larger than this small
+    /// texture last wrote over it, and the clock it was uploaded again for.
+    std::atomic<u64> gpu_rewritten{0};
+    u64 rewrite_seen = 0;
+    /// FIX-221: a hash of a few samples of each layer, checked once a frame while it is used.
+    std::vector<u64> layer_samples;
+    u64 layer_check_frame = 0;
+    /// FIX-GT7-027: each layer's whole hash when the texture was last uploaded, and the next
+    /// layer the frame's check compares with memory.
+    std::vector<u64> layer_uploaded;
+    u32 layer_cursor = 0;
+    /// FIX-198: the native renderer's frame the picture was last written in, and the last frame
+    /// before that one it was written in (0: none).
+    std::atomic<u64> written_frame{0};
+    std::atomic<u64> written_frame_before{0};
+    /// DIAG-GT7-008 (diagnosis): the last frame a shader sampled it (kept with RYGT_DIAG=1).
+    std::atomic<u64> sampled_frame{0};
     std::atomic<bool> kept{false};
     std::atomic<bool> reused{false};
     std::atomic<u64> foreign_clock{0};
@@ -152,10 +152,6 @@ public:
     /// version once the rewrite is applied (later, at its next use), so targets drawn between
     /// the fill and that use still count as newer for the textures made of them.
     u64 rewrite_clock = 0;
-    // Protected by ImageRegistry::recent_fills_mutex, including CPU fault callbacks.
-    bool remembered_fill_pending = false;
-    bool remembered_fill_invalid = false;
-    std::shared_ptr<RememberedFillReceipt> remembered_fill_receipt;
     bool stencil_clear_pending = false;
     u8 stencil_clear_value = 0;
 
@@ -207,9 +203,6 @@ class ImageRegistry {
 public:
     explicit ImageRegistry(Rhi::Device& device);
     ~ImageRegistry();
-    // Recorder-only. Reuse is ordered by barriers on the same graphics queue.
-    Rhi::Buffer* AcquireUploadGatherScratch(Rhi::CommandList& list, u64 size);
-
 
     /// NAT-100: images are made by `factory` instead of from the RHI description (native mode
     /// makes them as the texture cache does: its formats and usage).
@@ -217,9 +210,6 @@ public:
         image_factory = std::move(factory);
     }
     /// NAT-100: how much of a guest range is mapped (uploads copy only that much).
-    void SetBackingValidator(std::function<bool(VAddr, u64)> validate) {
-        backing_validator = std::move(validate);
-    }
     void SetMemoryClamp(std::function<u64(VAddr, u64)> clamp) {
         memory_clamp = std::move(clamp);
     }
@@ -230,7 +220,6 @@ public:
         const Rhi::Buffer* buffer = nullptr;
         u64 offset = 0;
         u8 kind = 0; ///< FIX-153 (diagnosis): see ImageEntry::upload_kind
-        bool guest_writes_tracked = false;
         std::vector<std::unique_ptr<Rhi::Buffer>> keep; ///< alive until the GPU used them
     };
     void SetUploadSource(std::function<UploadSource(const ImageEntry&, Rhi::CommandList&)> source) {
@@ -238,8 +227,10 @@ public:
     }
     struct UploadStats {
         std::atomic<u64> gpu, cpu, unchanged;
-        std::atomic<u64> scratch_created, scratch_reused, scratch_transient;
+        std::atomic<u64> sanitized; ///< FIX-204
     };
+    /// DIAG-197 (diagnosis): the textures uploaded most since the last report, by bytes.
+    void ReportUploadTally();
     UploadStats& GetUploadStats() {
         return upload_stats;
     }
@@ -250,16 +241,13 @@ public:
     }
     /// NAT-105: every image overlapping [begin, end).
     void ForEachOverlapping(VAddr begin, VAddr end, const std::function<void(ImageEntry&)>& fn);
-    /// Full-range indexed images, once each. Callback must not reenter the registry.
-    /// Retirement must be serialized with this traversal.
-    void ForEachImage(const std::function<void(ImageEntry&)>& fn);
 
     /// The image for this layout: one already at the address with the same layout (whatever
     /// its colour format, if the texel size matches), or a new one. A texture found nowhere is
     /// queued for upload from guest memory; a render target is not. Thread-safe.
     /// OPT-010: `create` false: none when there is none yet (game job threads look ahead).
     ImageEntry* Find(const VideoCore::ImageInfo& info, bool render_target, u64 frame,
-                     bool create = true, bool exact_format = false);
+                     bool create = true);
 
     /// OPT-010: whether no picture was made or dropped over any of the ranges since generation
     /// `since` (false when the log of changes no longer reaches back that far).
@@ -278,15 +266,18 @@ public:
     /// NAT-100: whether any image starts at the address.
     bool HasImageAt(VAddr address);
     /// NAT-100: an image already at the address that `accept` takes (no new image is made).
-    ImageEntry* FindExisting(VAddr address, const std::function<bool(const ImageEntry&)>& accept,
-                             bool prefer_written = false);
+    ImageEntry* FindExisting(VAddr address, const std::function<bool(const ImageEntry&)>& accept);
 
     /// What made textures over a range stale.
     enum class Stale : u8 { CpuWrite, Unmap, GpuWrite, Count };
     /// CPU writes to guest memory (file loads, the game writing texture data): textures over the
     /// range are uploaded again before their next use.
     void Invalidate(VAddr address, u64 size, Stale why = Stale::CpuWrite);
-    void InvalidateNewMapping(VAddr address, u64 size);
+    /// FIX-GT7-077: memory was mapped at [address, address + size): its textures are uploaded
+    /// again at their next use, even when the CPU's bytes hash as before (the picture may hold
+    /// what was mapped there earlier, or zeros from while nothing was). Render targets are left
+    /// alone. Returns how many textures.
+    u32 InvalidateNewMapping(VAddr address, u64 size);
 
     /// NAT-119/120: GPU work (a shader's storage buffer, a CP fill or copy) wrote [address,
     /// address + size), with `pattern` (two dwords, repeated) when it is a fill. As the old
@@ -298,34 +289,32 @@ public:
     /// size is only what the shader may write (GT Sport binds its whole scratch pool), so such a
     /// write uploads a target again only when the buffer is about the target's size.
     void GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern, bool exact,
-                  u64 clock, u64 frame = 0, bool guest_authoritative = false);
-    void ForgetFills(VAddr address, u64 size);
-    // Image writes preserve that image's GPU-authoritative contents. They end
-    // historical fill lookup without scheduling an upload from guest memory.
-    void ForgetFillHistory(VAddr address, u64 size, const ImageEntry* authoritative = nullptr);
-    std::vector<std::pair<VAddr, VAddr>> RecentFillRanges();
-    void ExpireRecentFills(u64 frame);
-    struct FillClaim { bool valid = true; std::shared_ptr<RememberedFillReceipt> receipt; };
-    FillClaim ClaimRememberedFill(ImageEntry& entry);
+                  u64 frame, u64 clock);
     /// NAT-120: uploads the image from guest memory before its next use.
-    // Admission happens on actual image use, not on each intermediate streaming write.
-    // Duplicate requests are harmless: RecordUploads atomically consumes needs_upload.
-    void QueueUploadForUse(ImageEntry& entry) {
-        if (entry.from_cpu &&
-            entry.needs_upload.load(std::memory_order_acquire)) {
-            std::scoped_lock lock{upload_mutex};
-            pending_uploads.push_back(&entry);
-        }
-    }
     void RequestUpload(ImageEntry& entry) {
         MarkStale(entry, Stale::GpuWrite);
-        QueueUploadForUse(entry); // explicit rewrite requests must still run immediately
     }
+    /// FIX-202: a small texture a larger storage write went over since its last upload is
+    /// uploaded again (true when it was asked for).
+    bool RewrittenSmall(ImageEntry& entry);
+    /// FIX-221: a large layered texture whose layers' memory changed with no CPU write seen is
+    /// uploaded again (true when it was asked for).
+    bool LayersRewritten(ImageEntry& entry, u64 frame);
+    /// FIX-GT7-027 (diagnosis, frame dumps): how many layers' memory differs from their upload
+    /// now (-1: their upload's hashes aren't known).
+    int LayersDifferingFromUpload(const ImageEntry& entry) const;
+    static bool SmallRewritesOn();
+    static constexpr u64 SmallRewriteSize = 64 * 1024;
 
     /// NAT-109: CPU writes to [address, address + size) (a page fault: the page stops being
     /// watched); `exact` is the bytes the instruction wrote there (0: unknown). Small textures
     /// on the page are checked by hash before their next use; large ones only when written.
     void CpuWrite(VAddr address, u64 size, u64 exact);
+    /// FIX-GT7-036: what wrote over these bytes ends the fills remembered there.
+    void ForgetFills(VAddr address, u64 size);
+    /// FIX-GT7-130: whether a fill remembered since (nothing wrote there after it) covers
+    /// [address, address + size) whole.
+    bool FilledWhole(VAddr address, u64 size);
     /// NAT-109: the addresses holding the most images (address, count), for reports.
     std::vector<std::pair<VAddr, u32>> Crowded(u32 count);
 
@@ -334,22 +323,27 @@ public:
     /// has finished the work recorded so far. Returns how many went.
     /// FIX-157: `keep` may keep one past its idle time (asked with no lock held).
     u32 Evict(u64 before, const std::function<void(ImageEntry&)>& on_evict,
-              const std::function<bool(ImageEntry&)>& keep = {}, u32 max_retired = ~u32{0});
+              const std::function<bool(ImageEntry&)>& keep = {});
     /// FIX-157: whether guest memory under a picture the GPU wrote still holds what it held
     /// when the picture was last uploaded from it (its content hash).
     bool MemoryUnchanged(const ImageEntry& entry);
-    bool LayersRewritten(ImageEntry& entry, u64 frame);
     u64 Count();
 
     /// Records the uploads queued since the last call (copy from guest memory, untile, copy
     /// into the images). Returns how many images were uploaded.
-    u32 RecordUploads(Rhi::CommandList& list, bool trace_slow_calls = false);
+    /// PERF-109: `bound` are the pictures the work about to be recorded uses: textures waiting
+    /// for an upload are uploaded only then (other uploads at once, as before).
+    u32 RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* const> bound = {});
+    /// PERF-109: whether textures are uploaded when work uses them (else when marked stale).
+    static bool LazyUploads();
 
     /// Records copying an image back into a buffer in its guest layout (tiled again), for
     /// guest memory the CPU reads after the GPU wrote it.
     bool RecordDownload(Rhi::CommandList& list, ImageEntry& entry, const Rhi::Buffer& out,
-                        u64 out_offset = 0, DownloadBatch* batch = nullptr);
+                        u64 out_offset = 0, struct DownloadBatch* batch = nullptr);
+    /// PERF-GT7-045: scratch memory for downloads of up to `bytes` recorded into `batch`.
     bool BeginDownloads(DownloadBatch& batch, u64 bytes, u64 alignment);
+    /// PERF-GT7-045: tiles the downloads recorded into `batch` and copies them to their buffers.
     void FinishDownloads(Rhi::CommandList& list, DownloadBatch& batch);
 
     struct Stats {
@@ -358,6 +352,7 @@ public:
         std::atomic<u64> reused_larger; ///< NAT-113
         std::array<std::atomic<u64>, 3> stale; ///< textures marked, by Stale
         std::atomic<u64> targets_rewritten; ///< NAT-119
+        std::atomic<u64> target_parts;      ///< FIX-197: targets linked as parts of targets
     };
     const Stats& GetStats() const {
         return stats;
@@ -394,19 +389,31 @@ private:
 
     Rhi::Device& device;
     ImageFactory image_factory;
-    std::function<bool(VAddr, u64)> backing_validator;
     std::function<u64(VAddr, u64)> memory_clamp;
     std::function<void(ImageEntry&)> upload_hook;
     std::function<UploadSource(const ImageEntry&, Rhi::CommandList&)> upload_source;
     UploadStats upload_stats{};
+    struct UploadTally {
+        VAddr address = 0;
+        u32 width = 0, height = 0, levels = 0;
+        vk::Format format{};
+        u64 uploads = 0, bytes = 0, forced = 0;
+        std::array<u64, 4> why{}; ///< CPU write, unmap, GPU write, new
+    };
+    std::unordered_map<const ImageEntry*, UploadTally> upload_tally; ///< DIAG-197
     std::array<Shard, NumShards> shards;
-    // Eviction runs on the recorder only. Rotate bounded scans so a busy address
-    // shard cannot starve cold entries in the other shards.
-    u32 eviction_shard_cursor = 0;
     std::mutex upload_mutex;
+    /// FIX-GT7-036: the last fills, for targets made just after one that covers them.
+    struct RecentFill {
+        VAddr begin = 0;
+        VAddr end = 0;
+        std::array<u32, 2> pattern{};
+        u64 clock = 0;
+        u64 frame = 0;
+    };
+    std::array<RecentFill, 16> recent_fills{};
+    u32 recent_fill_next = 0;
     std::mutex recent_fills_mutex;
-    RecentFills recent_fills;
-    std::shared_ptr<std::atomic<u64>> remembered_fill_count = std::make_shared<std::atomic<u64>>(0);
     std::vector<ImageEntry*> pending_uploads;
     std::atomic<u64> generation{0}; ///< OPT-002
     /// OPT-010: the ranges of the pictures made or dropped, by the generation they made.
@@ -420,9 +427,6 @@ private:
     u64 change_count = 0;
     /// Logs the ranges, then moves the generation on.
     void NoteChanges(std::span<const std::pair<VAddr, VAddr>> ranges);
-    // Recorder-only scratch shared by sequential untile dispatch/copy pairs.
-    std::unique_ptr<Rhi::Buffer> upload_scratch;
-    std::unique_ptr<Rhi::Buffer> upload_gather_scratch;
     std::unique_ptr<Rhi::PipelineLayout> untile_layout;
     std::mutex untile_mutex;
     std::unordered_map<u64, std::unique_ptr<Rhi::Pipeline>> untile_pipelines;
@@ -439,5 +443,12 @@ std::vector<Rhi::BufferImageCopy> MipCopies(const VideoCore::ImageInfo& info);
 bool SameLayout(const VideoCore::ImageInfo& a, const VideoCore::ImageInfo& b);
 
 SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageInfo& texture);
+
+/// FIX-197: where `part` (a target of one mip) is a mip or layers of `whole` (a target of several
+/// mips or layers); mip -1: it isn't.
+SourcePlace PartOf(const VideoCore::ImageInfo& part, const VideoCore::ImageInfo& whole);
+
+/// FIX-197: RYGT_NATIVE_TARGET_PARTS=0 turns target-of-targets links off (diagnosis).
+bool TargetPartsOn();
 
 } // namespace Native

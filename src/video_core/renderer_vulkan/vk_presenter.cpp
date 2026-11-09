@@ -1,9 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "common/diagnostics.h"
 #include "common/debug.h"
-#include "common/frame_queue_trace.h"
+#include "common/diagnostics.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -18,13 +17,13 @@
 #include "imgui/notifications_layer.h"
 #include "imgui/renderer/imgui_core.h"
 #include "imgui/renderer/imgui_impl_vulkan.h"
+#include "imgui/compile_notice_layer.h" // FIX-GT7-100
 #include "imgui/shadnet_notifications_layer.h"
 #include "sdl_window.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
-#include "video_core/renderer_vulkan/vk_ui_hires.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #ifdef RYTY_GPU
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
@@ -47,15 +46,18 @@
 #include <limits>
 #include <memory>
 #include <span>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <vector>
 #include <sstream>
 #include <system_error>
 #include <vector>
 #include <imgui.h>
 #include <stb_image_write.h>
 #include <vk_mem_alloc.h>
+#include "ryty_gpu/ryty_upscale.h"
 #include "ryty_gpu/ryty_diag.h"
-#include "ryty_gpu/ryty_fsr3.h"
-#include "ryty_gpu/ryty_upscaler_status.h"
 
 namespace Vulkan {
 
@@ -125,6 +127,230 @@ static bool StretchToWindow() {
 #else
     return false;
 #endif
+}
+
+// GT7-UW: the HUD's pieces, which the F7 editor moves and resizes over the stretched picture.
+// src: where the piece is in the 16:9 HUD (0..1); dst: where it goes on the output (0..1), once
+// placed (until then it stays where the centred HUD has it). Kept in
+// user\custom_configs\hud_layout.ini beside the game.
+namespace {
+struct HudPiece {
+    std::string name;
+    float src[4];
+    bool placed = false;
+    float dst[4]{};
+};
+
+struct HudLayoutState {
+    std::mutex mutex;
+    std::vector<HudPiece> pieces;
+    bool loaded = false;
+    bool editing = false;
+    bool capture_areas = false; ///< the editor moves the pieces' areas in the HUD instead
+};
+
+HudLayoutState& HudLayout() {
+    static HudLayoutState state;
+    return state;
+}
+
+// The pieces of GT7's race HUD (in pixels of its 1920x1080 picture).
+std::vector<HudPiece> DefaultHudPieces() {
+    const auto piece = [](const char* name, float x, float y, float w, float h) {
+        return HudPiece{name, {x / 1920.0f, y / 1080.0f, w / 1920.0f, h / 1080.0f}};
+    };
+    return {
+        piece("Lap", 10, 20, 170, 115),
+        piece("Lap time", 790, 215, 340, 90),
+        piece("Track map", 1530, 5, 260, 315),
+        piece("Position", 1670, 310, 250, 200),
+        piece("Race time", 5, 990, 250, 90),
+        piece("Dashboard", 235, 920, 1120, 160),
+        piece("Course map", 1560, 790, 360, 290),
+    };
+}
+
+std::filesystem::path HudLayoutPath() {
+    return std::filesystem::path{Common::FS::GetUserPath(Common::FS::PathType::UserDir)} /
+           "custom_configs" / "hud_layout.ini";
+}
+
+void LoadHudLayout(HudLayoutState& state) {
+    state.loaded = true;
+    state.pieces = DefaultHudPieces();
+    std::ifstream file(HudLayoutPath());
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        // name|sx sy sw sh|placed dx dy dw dh
+        const size_t bar1 = line.find('|');
+        const size_t bar2 = bar1 == std::string::npos ? bar1 : line.find('|', bar1 + 1);
+        if (bar2 == std::string::npos) {
+            continue;
+        }
+        const std::string name = line.substr(0, bar1);
+        for (auto& piece : state.pieces) {
+            if (piece.name != name) {
+                continue;
+            }
+            std::istringstream src(line.substr(bar1 + 1, bar2 - bar1 - 1));
+            std::istringstream dst(line.substr(bar2 + 1));
+            float s[4];
+            int placed = 0;
+            float d[4];
+            if (src >> s[0] >> s[1] >> s[2] >> s[3]) {
+                std::copy(std::begin(s), std::end(s), piece.src);
+            }
+            if (dst >> placed >> d[0] >> d[1] >> d[2] >> d[3]) {
+                piece.placed = placed != 0;
+                std::copy(std::begin(d), std::end(d), piece.dst);
+            }
+        }
+    }
+}
+
+void SaveHudLayout(const HudLayoutState& state) {
+    std::error_code error;
+    std::filesystem::create_directories(HudLayoutPath().parent_path(), error);
+    std::ofstream file(HudLayoutPath());
+    file << "# The HUD layout of the F7 editor: name|area in the 16:9 HUD|placed, place on the "
+            "screen (0..1)\n";
+    for (const auto& piece : state.pieces) {
+        file << piece.name << '|' << piece.src[0] << ' ' << piece.src[1] << ' ' << piece.src[2]
+             << ' ' << piece.src[3] << '|' << (piece.placed ? 1 : 0) << ' ' << piece.dst[0] << ' '
+             << piece.dst[1] << ' ' << piece.dst[2] << ' ' << piece.dst[3] << '\n';
+    }
+}
+
+// Where a piece shows on the output: its place, or where the centred HUD has it.
+std::array<float, 4> HudPieceRect(const HudPiece& piece, float x0, float x1) {
+    if (piece.placed) {
+        return {piece.dst[0], piece.dst[1], piece.dst[2], piece.dst[3]};
+    }
+    const float width = x1 - x0;
+    return {x0 + piece.src[0] * width, piece.src[1], piece.src[2] * width, piece.src[3]};
+}
+
+// The horizontal span of the centred 16:9 HUD on an output of this shape.
+std::pair<float, float> HudSpan(float width, float height) {
+    const float hud = width > 0.0f ? std::min(1.0f, height * 16.0f / 9.0f / width) : 1.0f;
+    return {0.5f - hud / 2.0f, 0.5f + hud / 2.0f};
+}
+} // namespace
+
+// GT7-UW: F7 shows the HUD pieces as boxes over the picture: drag one to move it, drag its
+// corner to resize it (keeping its shape). "Edit areas" moves the boxes' areas in the HUD
+// instead (when a piece is cut off or takes in too much).
+static void DrawHudEditor(ImVec2 origin, ImVec2 size) {
+    auto& layout = HudLayout();
+    std::scoped_lock lock{layout.mutex};
+    if (!layout.loaded) {
+        LoadHudLayout(layout);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_F7, false)) {
+        layout.editing = !layout.editing;
+    }
+    if (!layout.editing || size.x <= 0.0f || size.y <= 0.0f) {
+        return;
+    }
+    const auto [x0, x1] = HudSpan(size.x, size.y);
+    auto* draw = ImGui::GetWindowDrawList();
+    const ImGuiIO& io = ImGui::GetIO();
+    // The centred HUD's outline.
+    draw->AddRect(ImVec2{origin.x + x0 * size.x, origin.y},
+                  ImVec2{origin.x + x1 * size.x, origin.y + size.y}, IM_COL32(255, 255, 255, 60));
+    constexpr float handle = 16.0f;
+    for (size_t i = 0; i < layout.pieces.size(); ++i) {
+        auto& piece = layout.pieces[i];
+        // The box: the piece on screen, or (editing areas) its area in the centred HUD.
+        std::array<float, 4> rect;
+        if (layout.capture_areas) {
+            const float width = x1 - x0;
+            rect = {x0 + piece.src[0] * width, piece.src[1], piece.src[2] * width, piece.src[3]};
+        } else {
+            rect = HudPieceRect(piece, x0, x1);
+        }
+        const ImVec2 p0{origin.x + rect[0] * size.x, origin.y + rect[1] * size.y};
+        const ImVec2 p1{p0.x + rect[2] * size.x, p0.y + rect[3] * size.y};
+        const ImU32 colour = layout.capture_areas ? IM_COL32(255, 200, 40, 230)
+                                                  : IM_COL32(60, 200, 255, 230);
+        draw->AddRectFilled(p0, p1, layout.capture_areas ? IM_COL32(255, 200, 40, 30)
+                                                         : IM_COL32(60, 200, 255, 30));
+        draw->AddRect(p0, p1, colour, 0.0f, 0, 2.0f);
+        draw->AddText(ImVec2{p0.x + 4, p0.y + 2}, colour, piece.name.c_str());
+        draw->AddTriangleFilled(ImVec2{p1.x, p1.y - handle}, p1, ImVec2{p1.x - handle, p1.y},
+                                colour);
+        ImGui::PushID(static_cast<int>(i));
+        // Moving.
+        ImGui::SetCursorScreenPos(p0);
+        ImGui::InvisibleButton("move", ImVec2{std::max(p1.x - p0.x, 4.0f),
+                                              std::max(p1.y - p0.y, 4.0f)});
+        const bool moving = ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left);
+        // Resizing (the corner), keeping the piece's shape when it is placed.
+        ImGui::SetCursorScreenPos(ImVec2{p1.x - handle, p1.y - handle});
+        ImGui::InvisibleButton("size", ImVec2{handle, handle});
+        const bool sizing = ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left);
+        if (moving || sizing) {
+            const float dx = io.MouseDelta.x / size.x;
+            const float dy = io.MouseDelta.y / size.y;
+            if (layout.capture_areas) {
+                const float width = x1 - x0;
+                if (moving) {
+                    piece.src[0] = std::clamp(piece.src[0] + dx / width, 0.0f, 1.0f - piece.src[2]);
+                    piece.src[1] = std::clamp(piece.src[1] + dy, 0.0f, 1.0f - piece.src[3]);
+                } else {
+                    // A placed piece keeps its scale: its box on the screen grows with its area.
+                    const float scale_x = piece.dst[2] / std::max(piece.src[2], 0.001f);
+                    const float scale_y = piece.dst[3] / std::max(piece.src[3], 0.001f);
+                    piece.src[2] = std::clamp(piece.src[2] + dx / width, 0.01f, 1.0f - piece.src[0]);
+                    piece.src[3] = std::clamp(piece.src[3] + dy, 0.01f, 1.0f - piece.src[1]);
+                    if (piece.placed) {
+                        piece.dst[2] = std::min(piece.src[2] * scale_x, 1.0f - piece.dst[0]);
+                        piece.dst[3] = std::min(piece.src[3] * scale_y, 1.0f - piece.dst[1]);
+                    }
+                }
+            } else {
+                if (!piece.placed) {
+                    piece.placed = true;
+                    std::copy(rect.begin(), rect.end(), piece.dst);
+                }
+                if (moving) {
+                    piece.dst[0] = std::clamp(piece.dst[0] + dx, 0.0f, 1.0f - piece.dst[2]);
+                    piece.dst[1] = std::clamp(piece.dst[1] + dy, 0.0f, 1.0f - piece.dst[3]);
+                } else {
+                    const float shape = piece.dst[3] / std::max(piece.dst[2], 0.001f);
+                    piece.dst[2] = std::clamp(piece.dst[2] + dx, 0.02f, 1.0f - piece.dst[0]);
+                    piece.dst[3] = std::min(piece.dst[2] * shape, 1.0f - piece.dst[1]);
+                }
+            }
+        }
+        ImGui::PopID();
+    }
+    // The controls.
+    ImGui::SetNextWindowPos(ImVec2{origin.x + size.x * 0.5f, origin.y + size.y * 0.42f},
+                            ImGuiCond_Appearing, ImVec2{0.5f, 0.5f});
+    ImGui::SetNextWindowBgAlpha(0.85f);
+    if (ImGui::Begin("HUD layout (F7)", nullptr,
+                     ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse |
+                         ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::TextUnformatted("Drag a box to move it, its corner to resize it.");
+        ImGui::Checkbox("Edit areas (what each box takes from the HUD)", &layout.capture_areas);
+        if (ImGui::Button("Save")) {
+            SaveHudLayout(layout);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset all")) {
+            layout.pieces = DefaultHudPieces();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Close")) {
+            SaveHudLayout(layout);
+            layout.editing = false;
+        }
+    }
+    ImGui::End();
 }
 
 static vk::Rect2D FitImage(s32 frame_width, s32 frame_height, s32 swapchain_width,
@@ -449,7 +675,7 @@ static bool WritePng(const std::filesystem::path& path, const std::span<const u8
     return stbi_write_png_to_func(callback, &file, width, height, 4, rgba.data(), 0);
 }
 
-#if defined(_WIN32) && !defined(NDEBUG)
+#ifdef _WIN32
 extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int key);
 #endif
 
@@ -461,7 +687,6 @@ extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int key);
 // per-frame draw sets, SHADGT_LOG_DRAW_SET=2).
 std::atomic<u64> g_prepared_frames{0};
 
-#ifndef NDEBUG
 static int FlashWatchMode() {
     static const int mode = [] {
         const char* env = Common::DiagEnv("SHADGT_FLASH_WATCH");
@@ -573,16 +798,10 @@ static void CheckFlashFrame(const ScreenshotReadback& readback) {
     previous_mean = mean;
     previous = std::move(rgba);
 }
-#else
-static constexpr bool FlashWatchEnabled() { return false; }
-static constexpr bool FlashWatchScreen() { return false; }
-#endif
 
 static void SavePendingScreenshot(const ScreenshotReadback& readback) {
     if (readback.paths.empty()) {
-#ifndef NDEBUG
         CheckFlashFrame(readback); // DIAG-125
-#endif
         return;
     }
 
@@ -669,14 +888,17 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
                      instance.GetAllocator(), num_images);
 #endif
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
+    pp_pass.CreateHudBuffer(instance.GetAllocator()); // GT7-UW
 
     ImGui::Layer::AddLayer(Common::Singleton<Core::Devtools::Layer>::Instance());
     ImGui::Friends::Register();
     ImGui::ShadNetNotify::Register();
     ImGui::InvitationPrompt::Register();
+    ImGui::CompileNotice::Register(); // FIX-GT7-100
 }
 
 Presenter::~Presenter() {
+    ImGui::CompileNotice::Unregister(); // FIX-GT7-100
     ImGui::InvitationPrompt::Unregister();
     ImGui::ShadNetNotify::Unregister();
     ImGui::Friends::Unregister();
@@ -810,7 +1032,7 @@ Frame* Presenter::PrepareLastFrame() {
             continue;
         }
         if (result == vk::Result::eErrorDeviceLost) {
-            instance.LogDeviceFault();
+            instance.ReportDeviceLost();
         }
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
                    "Device lost during waiting for a frame");
@@ -871,10 +1093,8 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
 
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
-    const u64 guestFrame = g_prepared_frames.fetch_add(1, std::memory_order_relaxed);
-#ifndef NDEBUG
+    g_prepared_frames.fetch_add(1, std::memory_order_relaxed); // DIAG-137
     rasterizer->FrameDumpFlip(); // NAT-116
-#endif
 #ifdef RYTY_GPU
     if (auto* native = rasterizer->Native()) {
         return PrepareNativeFrame(*native, attribute, cpu_address);
@@ -919,16 +1139,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     auto& image = texture_cache.GetImage(image_id);
     auto image_view = *image.FindView(view_info).image_view;
-    vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
+    const vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
-
-#ifdef RYTY_GPU
-    auto& temporalDlss = rasterizer->GetTemporalDlss();
-    temporalDlss.SetOutputSize({frame->width, frame->height}, attribute.attrib.pixel_format ==
-        Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq);
-    const auto temporalView = temporalDlss.PreparePresent(guestFrame, image, view_info.format);
-    if (temporalView) temporalDlss.CopyFrameGenerationInputs(guestFrame, frame->framegen_scene);
-#endif
 
     const u32 capture_game_only_count = VideoCore::ConsumeGameOnlyScreenshotRequests();
     std::optional<ScreenshotReadback> pending_screenshot;
@@ -979,36 +1191,17 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // PERF-084: the host passes record into the command buffer directly.
     const vk::CommandBuffer pass_cmdbuf = draw_scheduler.DirectCommandBuffer();
     bool scaled = false;
-    bool dlss_scaled = false;
-    vk::ImageView ui_layer_view{}; // HDR-UI
-    std::string upscaler; // FSR-204: for the window title
-    const vk::Extent2D game_size = image_size;
 #ifdef RYTY_GPU
-    const auto shown = UiHires::TakeFrame(instance, pass_cmdbuf, cpu_address, image_size,
-                                          {frame->width, frame->height}, view_info.format);
-    if (temporalView) {
-        image_view = temporalView;
-        image_size = temporalDlss.OutputSize();
-        dlss_scaled = true;
-        scaled = true;
-        upscaler = fmt::format("{} temporal", temporalDlss.BackendName());
-    } else if (shown) {
-        image_view = shown->view;
-        image_size = shown->size;
-        ui_layer_view = shown->ui;
-        dlss_scaled = shown->dlss;
-        scaled = true;
-        upscaler = shown->dlss ? "DLSS" : "high-resolution UI";
-    }
-    // ryGT: DLSS (when its plugin is on and can scale to the window size) replaces FSR.
-    if (const auto dlss_view = scaled ? image_view :
+    // ryGT: DLSS (when it is on and can scale to the target size) replaces FSR. The target is the
+    // window, or the picture times the launcher's Upscaling quality (ryty_upscale.h).
+    const vk::Extent2D upscale_target =
+        RytyUpscale::Target(image_size, {frame->width, frame->height});
+    if (const auto dlss_view =
             dlss_pass.Render(pass_cmdbuf, image.GetImage(), image_view, view_info.format,
-                             image_size, {frame->width, frame->height});
+                             image_size, upscale_target);
         dlss_view != image_view) {
         image_view = dlss_view;
         scaled = true;
-        dlss_scaled = true;
-        upscaler = "DLSS";
     }
     // ryGT: FSR 3.1 replaces FSR 1 when it is on; the RCAS settings carry over (FSR 3.1 turns
     // RCAS attenuation 0..2 into sharpness 1..0).
@@ -1017,34 +1210,25 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             fsr_settings.use_rcas ? 1.0f - fsr_settings.rcas_attenuation / 2.0f : -1.0f;
         if (const auto fsr3_view =
                 fsr3_pass.Render(pass_cmdbuf, image.GetImage(), image_view, view_info.format,
-                                 image_size, {frame->width, frame->height}, sharpness,
+                                 image_size, upscale_target, sharpness,
                                  attribute.attrib.pixel_format ==
                                      Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq);
             fsr3_view != image_view) {
             image_view = fsr3_view;
             scaled = true;
-            upscaler = RytyFsr3::ActiveVersionName();
         }
     }
 #endif
     if (!scaled) {
-        const auto before = image_view;
         image_view = fsr_pass.Render(pass_cmdbuf, image_view, image_size,
                                      {frame->width, frame->height}, fsr_settings, frame->is_hdr);
-        upscaler = image_view != before ? "FSR 1" : "no upscaling";
     }
-#ifdef RYTY_GPU
-    RytyUpscalerStatus::ReportResolution(frame->width, frame->height,
-                                          game_size.width, game_size.height, upscaler,
-                                          RytyFrameGen::Working());
-#endif
 
     // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
     // the post process pass still sRGB encoded and has to be decoded there instead.
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
-    pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, pp_settings, ui_layer_view,
-                   dlss_scaled);
+    pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, pp_settings);
 
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};
@@ -1066,86 +1250,17 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 }
 
 #ifdef RYTY_GPU
-void Presenter::PrepareHudlessReference(Frame& frame, vk::CommandBuffer cmd, vk::Format input_format) {
-    auto& snapshot = frame.framegen_scene;
-    if (!snapshot.inputs.valid || !snapshot.hudless_scene_valid) return;
-    const int timing = RytyFrameGen::BeginGpuTiming(cmd, snapshot.inputs.sequence, 1);
-    const auto output_format = swapchain.GetSurfaceFormat().format;
-    const vk::Extent2D output_size{frame.width, frame.height};
-    if (!snapshot.hudless_scene_view) {
-        snapshot.hudless_scene_view = Check<"create FG HUD-less input view">(
-            instance.GetDevice().createImageViewUnique({.image = snapshot.hudless_scene,
-                .viewType = vk::ImageViewType::e2D, .format = input_format,
-                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}}));
-    }
-    if (snapshot.hudless_output_size != output_size || snapshot.hudless_output_format != output_format) {
-        snapshot.hudless_output_view.reset();
-        snapshot.hudless_output = VideoCore::UniqueImage{instance.GetDevice(), instance.GetAllocator()};
-        snapshot.hudless_output.Create({.imageType = vk::ImageType::e2D, .format = output_format,
-            .extent = {frame.width, frame.height, 1}, .mipLevels = 1, .arrayLayers = 1,
-            .samples = vk::SampleCountFlagBits::e1,
-            .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled});
-        snapshot.hudless_output_view = Check<"create FG HUD-less output view">(
-            instance.GetDevice().createImageViewUnique({.image = snapshot.hudless_output,
-                .viewType = vk::ImageViewType::e2D, .format = output_format,
-                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}}));
-        snapshot.hudless_output_size = output_size;
-        snapshot.hudless_output_format = output_format;
-        snapshot.hudless_output_initialized = false;
-    }
-    const vk::ImageMemoryBarrier2 before{
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = snapshot.hudless_output_initialized ? vk::AccessFlagBits2::eShaderRead
-                                                            : vk::AccessFlags2{},
-        .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-        .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
-        .oldLayout = snapshot.hudless_output_initialized ? vk::ImageLayout::eShaderReadOnlyOptimal
-                                                        : vk::ImageLayout::eUndefined,
-        .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = snapshot.hudless_output,
-        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}};
-    cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &before});
-    Frame hudless;
-    hudless.width = frame.width; hudless.height = frame.height;
-    hudless.image = snapshot.hudless_output; hudless.image_view = *snapshot.hudless_output_view;
-    hudless.is_hdr = frame.is_hdr;
-    pp_pass.Render(cmd, *snapshot.hudless_scene_view, snapshot.hudless_scene_size,
-                   hudless, pp_settings, {}, false);
-    auto after = before;
-    after.srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
-    after.srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite;
-    after.dstStageMask = vk::PipelineStageFlagBits2::eComputeShader;
-    after.dstAccessMask = vk::AccessFlagBits2::eShaderRead;
-    after.oldLayout = vk::ImageLayout::eGeneral;
-    after.newLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
-    cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &after});
-    snapshot.hudless_output_initialized = true;
-    snapshot.inputs.hudless = snapshot.hudless_output;
-    snapshot.inputs.hudless_view = snapshot.hudless_output_view.get();
-    snapshot.inputs.hudless_format = output_format;
-    snapshot.inputs.hudless_size = output_size;
-    RytyFrameGen::EndGpuTiming(cmd, timing);
-}
-
 Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
                                      const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                      VAddr cpu_address) {
     // NAT-100: the picture native mode drew at the display buffer, through the same host passes.
     const VideoCore::TextureCache::ImageDesc desc{attribute, cpu_address};
     const vk::Format view_format = GetFrameViewFormat(attribute.attrib.pixel_format);
-    Frame* frame = GetRenderFrame();
-    rasterizer->GetTemporalDlss().SetOutputSize({frame->width, frame->height},
-        attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq);
-    const auto display = native.FindDisplay(desc.info, view_format, {frame->width, frame->height});
-    const auto scene_sequence = g_prepared_frames.load(std::memory_order_relaxed);
-    if (display && !display->upscaler.empty() && scene_sequence)
-        rasterizer->GetTemporalDlss().CopyFrameGenerationInputs(scene_sequence - 1,
-                                                               frame->framegen_scene, true);
+    const auto display = native.FindDisplay(desc.info, view_format);
     if (!display) {
-        return PrepareBlankFrame(false, frame);
+        return PrepareBlankFrame(false);
     }
+    Frame* frame = GetRenderFrame();
     const vk::ImageSubresourceRange single{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
         .baseMipLevel = 0,
@@ -1153,60 +1268,6 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         .baseArrayLayer = 0,
         .layerCount = 1,
     };
-#ifndef NDEBUG
-    std::optional<ScreenshotReadback> pending_screenshot;
-    const u32 screenshot_count = VideoCore::ConsumeGameOnlyScreenshotRequests();
-    if (screenshot_count) {
-        const auto paths = BuildScreenshotPaths(ScreenshotKind::GameOnly, screenshot_count);
-        const auto format = display->capture_format;
-        const bool supported = format == vk::Format::eR8G8B8A8Unorm ||
-                               format == vk::Format::eR8G8B8A8Srgb ||
-                               format == vk::Format::eB8G8R8A8Unorm ||
-                               format == vk::Format::eB8G8R8A8Srgb ||
-                               format == vk::Format::eA2R10G10B10UnormPack32 ||
-                               format == vk::Format::eA2B10G10R10UnormPack32;
-        if (!display->capture_transfer_src || !supported || !display->width || !display->height) {
-            LOG_ERROR(Render_Vulkan, "Native screenshot unavailable: format {}, transfer source {}, size {}x{}",
-                      vk::to_string(format), display->capture_transfer_src, display->width,
-                      display->height);
-        } else {
-            const bool hdr_encoded = attribute.attrib.pixel_format ==
-                                     Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq;
-            auto& readback = pending_screenshot.emplace(instance, ScreenshotKind::GameOnly, paths,
-                                                        display->width, display->height, format,
-                                                        hdr_encoded);
-            draw_scheduler.EndRendering();
-            const auto cmdbuf = draw_scheduler.DirectCommandBuffer();
-            const vk::ImageMemoryBarrier2 to_copy{
-                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
-                .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
-                .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
-                .oldLayout = vk::ImageLayout::eGeneral,
-                .newLayout = vk::ImageLayout::eTransferSrcOptimal,
-                .image = display->image,
-                .subresourceRange = single,
-            };
-            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-                .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_copy});
-            CopyImageToReadback(cmdbuf, display->image, vk::ImageLayout::eTransferSrcOptimal,
-                                readback);
-            const vk::BufferMemoryBarrier2 to_host{
-                .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
-                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-                .dstStageMask = vk::PipelineStageFlagBits2::eHost,
-                .dstAccessMask = vk::AccessFlagBits2::eHostRead,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .buffer = readback.buffer.Handle(),
-                .offset = 0,
-                .size = static_cast<u64>(readback.width) * readback.height * 4,
-            };
-            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-                .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &to_host});
-        }
-    }
-#endif
     // The display picture is read in the shader-read layout, then goes back to the general
     // layout native mode keeps its images in.
     const std::array<vk::ImageMemoryBarrier2, 2> barriers{{
@@ -1227,90 +1288,127 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
             },
         },
         {
-#ifndef NDEBUG
-            .srcStageMask = pending_screenshot ? vk::PipelineStageFlagBits2::eCopy
-                                               : vk::PipelineStageFlagBits2::eAllCommands,
-            .srcAccessMask = pending_screenshot ? vk::AccessFlagBits2::eTransferRead
-                                                : vk::AccessFlagBits2::eMemoryWrite,
-#else
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
             .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
-#endif
             .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader |
                             vk::PipelineStageFlagBits2::eComputeShader,
             .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
-#ifndef NDEBUG
-            .oldLayout = pending_screenshot ? vk::ImageLayout::eTransferSrcOptimal
-                                            : vk::ImageLayout::eGeneral,
-#else
             .oldLayout = vk::ImageLayout::eGeneral,
-#endif
             .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
             .image = display->image,
             .subresourceRange = single,
         },
     }};
     draw_scheduler.EndRendering();
+    // DIAG-164: game-only screenshots of native frames, one per frame, so a test script's
+    // "burstN" captures N consecutive frames (one-frame glitches); before, native frames had
+    // none. The display picture is still in the general layout here.
+    std::optional<ScreenshotReadback> pending_screenshot;
+    if (VideoCore::ConsumeGameOnlyScreenshotRequests() > 0 && display->width != 0 &&
+        display->height != 0) {
+        auto& readback = pending_screenshot.emplace(
+            instance, ScreenshotKind::GameOnly, BuildScreenshotPaths(ScreenshotKind::GameOnly, 1),
+            display->width, display->height, view_format,
+            attribute.attrib.pixel_format ==
+                Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq);
+        LOG_INFO(Render_Vulkan, "DIAG-164: screenshot of {:#x} (frame {})", cpu_address,
+                 DebugState.GetFrameNum());
+        const auto cmdbuf = draw_scheduler.CommandBuffer();
+        const vk::MemoryBarrier2 written{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                                   .pMemoryBarriers = &written});
+        const vk::BufferImageCopy region{
+            .imageSubresource{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .imageExtent = {display->width, display->height, 1},
+        };
+        cmdbuf.copyImageToBuffer(display->image, vk::ImageLayout::eGeneral,
+                                 readback.buffer.Handle(), region);
+        const vk::MemoryBarrier2 to_host{
+            .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+            .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                                   .pMemoryBarriers = &to_host});
+    }
     draw_scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
         .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
         .pImageMemoryBarriers = barriers.data(),
     });
-    vk::Extent2D image_size{display->width, display->height};
+    const vk::Extent2D image_size{display->width, display->height};
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
     vk::ImageView image_view = display->view;
     const vk::CommandBuffer pass_cmdbuf = draw_scheduler.DirectCommandBuffer();
     bool scaled = false;
-    bool dlss_scaled = false;
-    vk::ImageView ui_layer_view{};
-    std::string upscaler = display->upscaler; // actual Native scene reconstruction
-    const vk::Extent2D game_size = image_size;
-    if (display->output_view) {
-        image_view = display->output_view;
-        image_size = display->output_size;
-        ui_layer_view = display->ui_layer;
-        dlss_scaled = display->dlss_scaled;
-        scaled = true;
-        if (display->dlss_scaled) upscaler = "DLSS";
-        else if (upscaler.empty()) upscaler = "high-resolution UI";
-    }
-    if (const auto dlss_view =
-            scaled ? image_view
-                   : dlss_pass.Render(pass_cmdbuf, display->image, image_view, view_format,
-                                      image_size, {frame->width, frame->height});
+    const vk::Extent2D upscale_target =
+        RytyUpscale::Target(image_size, {frame->width, frame->height});
+    if (const auto dlss_view = dlss_pass.Render(pass_cmdbuf, display->image, image_view,
+                                                view_format, image_size, upscale_target);
         dlss_view != image_view) {
         image_view = dlss_view;
         scaled = true;
-        dlss_scaled = true;
-        upscaler = "DLSS";
     }
     if (!scaled && fsr_settings.enable) {
         const float sharpness =
             fsr_settings.use_rcas ? 1.0f - fsr_settings.rcas_attenuation / 2.0f : -1.0f;
         if (const auto fsr3_view =
                 fsr3_pass.Render(pass_cmdbuf, display->image, image_view, view_format, image_size,
-                                 {frame->width, frame->height}, sharpness,
+                                 upscale_target, sharpness,
                                  attribute.attrib.pixel_format ==
                                      Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq);
             fsr3_view != image_view) {
             image_view = fsr3_view;
             scaled = true;
-            upscaler = RytyFsr3::ActiveVersionName();
         }
     }
     if (!scaled) {
-        const auto before = image_view;
         image_view = fsr_pass.Render(pass_cmdbuf, image_view, image_size,
                                      {frame->width, frame->height}, fsr_settings, frame->is_hdr);
-        if (image_view != before) upscaler = "FSR 1";
     }
-    RytyUpscalerStatus::ReportResolution(frame->width, frame->height,
-                                          game_size.width, game_size.height, upscaler,
-                                          RytyFrameGen::Working());
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
-    PrepareHudlessReference(*frame, pass_cmdbuf, view_format);
-    pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, pp_settings, ui_layer_view,
-                   dlss_scaled);
+    // GT7-UW: the HUD at 16:9, centred over the stretched picture.
+    auto hud_settings = pp_settings;
+    if (display->hud_black && display->hud_white && frame->width > 0) {
+        const float hud_width = std::min(1.0f, float(frame->height) * 16.0f / 9.0f / float(frame->width));
+        hud_settings.hud_x0 = 0.5f - hud_width / 2.0f;
+        hud_settings.hud_x1 = 0.5f + hud_width / 2.0f;
+        const vk::MemoryBarrier2 hud_written{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+        };
+        pass_cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                                        .pMemoryBarriers = &hud_written});
+    }
+    // GT7-UW: the HUD pieces, as placed with the F7 editor.
+    std::vector<HostPasses::PostProcessingPass::HudWidget> hud_widgets;
+    if (display->hud_black && display->hud_white && display->hud_race) { // not in menus
+        auto& layout = HudLayout();
+        std::scoped_lock lock{layout.mutex};
+        if (!layout.loaded) {
+            LoadHudLayout(layout);
+        }
+        for (const auto& piece : layout.pieces) {
+            const auto rect = HudPieceRect(piece, hud_settings.hud_x0, hud_settings.hud_x1);
+            hud_widgets.push_back({{piece.src[0], piece.src[1], piece.src[2], piece.src[3]},
+                                   {rect[0], rect[1], rect[2], rect[3]}});
+        }
+    }
+    pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, hud_settings, display->hud_black,
+                   display->hud_white, hud_widgets);
     const vk::ImageMemoryBarrier2 back{
         .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader |
                         vk::PipelineStageFlagBits2::eComputeShader,
@@ -1328,16 +1426,12 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     });
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};
-#ifndef NDEBUG
-    if (pending_screenshot) {
+    if (pending_screenshot) { // DIAG-164
         draw_scheduler.DeferPriorityOperation(
-            [deferred_screenshot = std::move(pending_screenshot)]() mutable {
-                auto& readback = deferred_screenshot.value();
-                readback.buffer.Invalidate(0, readback.buffer.mapped_data.size());
-                SavePendingScreenshot(readback);
+            [deferred_screenshot = std::move(pending_screenshot)]() {
+                SavePendingScreenshot(deferred_screenshot.value());
             });
     }
-#endif
     frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
     frame->ready_tick = draw_scheduler.CurrentTick();
     frame->ready_scheduler = &draw_scheduler;
@@ -1347,11 +1441,30 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
 }
 #endif
 
-Frame* Presenter::PrepareBlankFrame(bool present_thread, Frame* frame) {
-    // Request a free presentation frame.
-    if (!frame) {
-        frame = GetRenderFrame();
+void Presenter::WaitFrameDrawn(const Frame* frame) {
+#ifdef RYTY_GPU
+    // FIX-193: native mode reads guest memory in place when the GPU runs the work, not when it
+    // is recorded. A flip reported (flip status, events, the previous buffer's label) before
+    // the GPU drew that frame let GT7 refill the frame's UI vertex data while the GPU had yet
+    // to read it: on the title screen, the background picture or its blurred copy drawn back
+    // over it went missing on about one frame in four (the World Map scene behind it or black
+    // showing). RYGT_NATIVE_FLIP_WAIT=0 reports flips at once as before (diagnosis).
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_FLIP_WAIT");
+        return !(env && env[0] == '0');
+    }();
+    if (!enabled || !frame || !frame->ready_scheduler || !rasterizer->Native()) {
+        return;
     }
+    frame->ready_scheduler->GetWorkSemaphore()->Wait(frame->ready_tick);
+#else
+    (void)frame;
+#endif
+}
+
+Frame* Presenter::PrepareBlankFrame(bool present_thread) {
+    // Request a free presentation frame.
+    Frame* frame = GetRenderFrame();
 
     auto& scheduler = present_thread ? present_scheduler : draw_scheduler;
     scheduler.EndRendering();
@@ -1423,21 +1536,41 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread, Frame* frame) {
     return frame;
 }
 
-void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame, u64 anti_lag_frame) {
-#ifndef NDEBUG
-    auto* trace = Common::FrameQueueTrace::current;
-    struct TracePresentScope {
-        Common::FrameQueueTrace::Row* row;
-        explicit TracePresentScope(Common::FrameQueueTrace::Row* r) : row(r) {
-            if (row)
-                row->present_begin = Common::FrameQueueTrace::Now(row->ticket);
+namespace {
+// DIAG-GT7-009: the steps of a present (ms): swapchain checks and image acquisition, the imgui
+// frame (SDL input), recording, the frame's work submitted, the flush, the submit lock, the queue
+// present. A present over 50 ms is logged by step (a Bluetooth device's removal held presents
+// for ~250 ms).
+struct PresentSteps {
+    static constexpr std::array<const char*, 7> Names{
+        "acquire", "imgui frame", "record", "frame's submit", "flush", "submit lock", "present"};
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    std::array<double, 7> ms{};
+    void Lap(size_t step) {
+        const auto now = std::chrono::steady_clock::now();
+        ms[step] += std::chrono::duration<double, std::milli>(now - last).count();
+        last = now;
+    }
+    void Report() const {
+        double total = 0.0;
+        for (const double step : ms) {
+            total += step;
         }
-        ~TracePresentScope() {
-            if (row)
-                row->present_end = Common::FrameQueueTrace::Now(row->ticket);
+        if (total < 50.0) {
+            return;
         }
-    } trace_scope{trace};
-#endif
+        std::string text;
+        for (size_t i = 0; i < ms.size(); ++i) {
+            text += fmt::format("{}{} {:.1f}", i == 0 ? "" : ", ", Names[i], ms[i]);
+        }
+        LOG_WARNING(Render_Vulkan, "DIAG-GT7-009: present took {:.1f} ms: {}", total, text);
+    }
+};
+} // namespace
+
+void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
+                        u64 anti_lag_frame) {
+    PresentSteps steps; // DIAG-GT7-009
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
@@ -1486,6 +1619,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
             return;
         }
     }
+    steps.Lap(0);
 
     // Reset fence for queue submission. Do it here instead of GetRenderFrame() because we may
     // skip frame because of slow swapchain recreation. If a frame skip occurs, we skip signal
@@ -1495,6 +1629,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
                "Unexpected error resetting present done fence: {}", vk::to_string(reset_result));
 
     ImGuiID dockId = ImGui::Core::NewFrame(is_reusing_frame);
+    steps.Lap(1);
 
     const vk::Image swapchain_image = swapchain.Image();
     const vk::ImageView swapchain_image_view = swapchain.ImageView();
@@ -1606,6 +1741,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
 
                 ImGui::SetCursorPos(ImGui::GetCursorStartPos() + offset);
                 ImGui::Image(game_texture, size);
+                if (stretch) {
+                    DrawHudEditor(ImGui::GetItemRectMin(), ImGui::GetItemRectSize());
+                }
 
                 if (EmulatorSettings.IsNullGPU()) {
                     Core::Devtools::Layer::DrawNullGpuNotice();
@@ -1678,17 +1816,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
                                vk::PipelineStageFlagBits::eAllCommands,
                                vk::DependencyFlagBits::eByRegion, {}, {}, post_barrier);
-#ifdef RYTY_GPU
-        RytyDlssG::SetFreshFrame(is_game_frame && !is_reusing_frame &&
-                                !Libraries::SystemService::IsSplashVisible());
-#endif
-#ifdef RYTY_GPU
-        swapchain.PrepareFrameGeneration(cmdbuf,
-            frame->framegen_scene.inputs.valid ? &frame->framegen_scene.inputs : nullptr,
-            is_game_frame && !is_reusing_frame && !Libraries::SystemService::IsSplashVisible());
-#else
-        swapchain.PrepareFrameGeneration(cmdbuf);
-#endif
+        swapchain.PrepareFrameGeneration(cmdbuf); // ryGT
 
         if (profiler_ctx) {
             TracyVkCollect(profiler_ctx, cmdbuf);
@@ -1697,6 +1825,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.endDebugUtilsLabelEXT();
     }
+    steps.Lap(2);
 
     // Flush vulkan commands.
     if (pending_screenshot) {
@@ -1708,58 +1837,38 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
     // PERF-084: the work the frame waits for is on the same queue, so it must be submitted
     // first (a command thread submits it after the flush that recorded it).
     if (frame->ready_scheduler) {
-#ifndef NDEBUG
-        if (trace)
-            trace->wait_begin = Common::FrameQueueTrace::Now(trace->ticket);
-#endif
         frame->ready_scheduler->WaitSubmitted(frame->ready_tick);
-#ifndef NDEBUG
-        if (trace)
-            trace->wait_end = Common::FrameQueueTrace::Now(trace->ticket);
-#endif
     }
+    steps.Lap(3);
     SubmitInfo info{};
     info.AddWait(swapchain.GetImageAcquiredSemaphore());
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
     scheduler.Flush(info);
+    steps.Lap(4);
 
     // Present to swapchain.
     {
         RYDIAG_SCOPE(Present);
-#ifndef NDEBUG
-        if (trace)
-            trace->lock_attempt = Common::FrameQueueTrace::Now(trace->ticket);
-#endif
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
-#ifndef NDEBUG
-        if (trace)
-            trace->lock_acquired = Common::FrameQueueTrace::Now(trace->ticket);
-#endif
-        const bool presented = swapchain.Present(anti_lag_frame);
-#ifndef NDEBUG
-        if (trace) {
-            trace->swapchain_return = Common::FrameQueueTrace::Now(trace->ticket);
-            trace->present_outcome = presented ? 1 : 2;
-        }
-#endif
-        if (!presented) {
+        steps.Lap(5);
+        if (!swapchain.Present(anti_lag_frame)) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
+        steps.Lap(6);
     }
+    steps.Report();
 
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
         DebugState.IncFlipFrameNum();
-        Common::NoteGameFrameCadence();
         Common::NoteGameFrame();
         RyDiag::FrameShown();
     }
 }
 
 Frame* Presenter::GetRenderFrame() {
-#ifndef NDEBUG
     // PERF-DIAG-002: how long the GPU thread waits here for a free presentation frame.
     const auto wait_start = std::chrono::steady_clock::now();
     struct WaitStats {
@@ -1787,7 +1896,6 @@ Frame* Presenter::GetRenderFrame() {
             stats.window = now;
         }
     };
-#endif
     // Wait for free presentation frames
     Frame* frame;
     {
@@ -1811,7 +1919,7 @@ Frame* Presenter::GetRenderFrame() {
     // Wait for the presentation to be finished so all frame resources are free
     while (wait() != vk::Result::eSuccess) {
         if (result == vk::Result::eErrorDeviceLost) {
-            instance.LogDeviceFault();
+            instance.ReportDeviceLost();
         }
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
                    "Device lost during waiting for a frame");
@@ -1820,13 +1928,7 @@ Frame* Presenter::GetRenderFrame() {
             continue;
         }
     }
-#ifndef NDEBUG
     record_wait();
-#endif
-#ifdef RYTY_GPU
-    frame->framegen_scene.inputs = {}; // never reuse another scene's metadata on a blank frame
-    frame->framegen_scene.hudless_scene_valid = false;
-#endif
 
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
         frame->is_hdr != swapchain.GetHDR()) {

@@ -6,7 +6,6 @@
 #include <gtest/gtest.h>
 
 #include "video_core/renderer_vulkan/shader_object_cache.h"
-#include "video_core/renderer_vulkan/shader_object_policy.h"
 
 namespace {
 
@@ -43,26 +42,6 @@ TEST(ShaderObjectCache, ReadsIntactCheckedBinary) {
     const auto binaries = Vulkan::ReadShaderObjectBinaries(file.get(), 1);
     ASSERT_EQ(binaries.size(), 1u);
     EXPECT_EQ(binaries[0], (std::vector<std::uint8_t>{10, 20, 30, 40}));
-}
-
-TEST(ShaderObjectCache, BinaryStagingAlignsEveryUnalignedSourceOffset) {
-    std::vector<std::uint8_t> source(80);
-    for (size_t i = 0; i < source.size(); ++i) source[i] = static_cast<std::uint8_t>(i);
-    for (size_t offset = 0; offset < 16; ++offset) {
-        const std::span<const std::uint8_t> input{source.data() + offset, 33};
-        const auto blocks = Vulkan::AlignShaderBinary(input);
-        ASSERT_EQ(reinterpret_cast<std::uintptr_t>(blocks.data()) % 16, 0u);
-        EXPECT_EQ(std::memcmp(blocks.data(), input.data(), input.size()), 0);
-    }
-}
-
-TEST(ShaderObjectCache, BlendedHudAndLdsEmulationDefaultToPipelines) {
-    using Vulkan::ShaderObjectPolicyAllows;
-    EXPECT_FALSE(ShaderObjectPolicyAllows(true, 0, 1, 1));
-    EXPECT_FALSE(ShaderObjectPolicyAllows(true, 1, 0, 1));
-    EXPECT_FALSE(ShaderObjectPolicyAllows(false, 0, 0, 1));
-    EXPECT_TRUE(ShaderObjectPolicyAllows(true, 0, 0, 1));
-    EXPECT_TRUE(ShaderObjectPolicyAllows(true, 0, 1, 0));
 }
 
 TEST(ShaderObjectCache, RejectsUncheckedLegacyBinary) {

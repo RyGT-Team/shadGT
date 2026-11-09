@@ -281,7 +281,8 @@ Id EmitImageQueryDimensions(EmitContext& ctx, IR::Inst* inst, u32 handle, Id lod
     const Id image = ctx.OpLoad(texture.image_type, texture.id);
     const Id zero = ctx.u32_zero_value;
     const auto mips{[&] { return has_mips ? ctx.OpImageQueryLevels(ctx.U32[1], image) : zero; }};
-    const bool uses_lod{texture.view_type != AmdGpu::ImageType::Color2DMsaa && !texture.is_storage};
+    // FIX-GT7-125: no level for any multisampled view.
+    const bool uses_lod{!IsMsaaView(texture.view_type) && !texture.is_storage};
     const auto query{[&](Id type) {
         return uses_lod ? ctx.OpImageQuerySizeLod(type, image, lod)
                         : ctx.OpImageQuerySize(type, image);

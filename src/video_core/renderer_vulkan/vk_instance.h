@@ -21,6 +21,9 @@ VK_DEFINE_HANDLE(VmaAllocator)
 
 namespace Vulkan {
 
+/// DIAG-243 (RYGT_DEVICE_FAULT=1): the renderer's recent draws, logged when the device is lost.
+void NoteDrawForFault(u64 pipeline_hash, u32 info);
+
 struct SharedShaderObjects {
     SharedShaderObjects() = default;
     SharedShaderObjects(const SharedShaderObjects&) = delete;
@@ -56,6 +59,10 @@ public:
 
     /// DIAG-206: logs the driver's report of what faulted, once, after the device was lost.
     void LogDeviceFault() const;
+
+    /// DIAG-243: once, after a lost device: VK_EXT_device_fault's report (with
+    /// RYGT_DEVICE_FAULT=1) and the last draws the renderer recorded.
+    void ReportDeviceLost() const;
 
     /// Returns the Vulkan instance
     vk::Instance GetInstance() const {

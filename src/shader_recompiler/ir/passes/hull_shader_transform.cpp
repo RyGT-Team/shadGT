@@ -1,10 +1,10 @@
-#include "common/recoverable.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <unordered_map>
 #include "common/assert.h"
-#include "common/logging/log.h"
+#include "common/recoverable.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/attribute.h"
 #include "shader_recompiler/ir/breadth_first_search.h"
@@ -150,19 +150,17 @@ static void InitTessConstants(IR::ScalarReg sharp_ptr_base, s32 sharp_dword_offs
                               TessellationDataConstantBuffer& tess_constants) {
     info.tess_consts_ptr_base = sharp_ptr_base;
     info.tess_consts_dword_offset = sharp_dword_offset;
-    info.ReadTessConstantBuffer(tess_constants);
-    // A per-control-point LDS stride cannot exceed all 64 KiB of LDS.
-    // Reject before using it for IR addresses or declaring enormous SPIR-V arrays.
-    if (tess_constants.hs_cp_stride > 64u * 1024u) {
-        LOG_WARNING(Render_Vulkan,
-            "TESS-CONSTANT-REJECT: shader {:#x} stage {} ptr {} dword {} capture {}; "
-            "constants {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
-            info.pgm_hash, u32(info.sw_stage), u32(sharp_ptr_base), sharp_dword_offset,
-            Common::t_read_capture ? Common::t_read_capture->Id() : 0,
-            tess_constants.ls_stride, tess_constants.hs_cp_stride, tess_constants.num_patches,
-            tess_constants.hs_output_base, tess_constants.patch_const_size,
-            tess_constants.patch_const_base, tess_constants.patch_output_size);
-        throw Common::RecoverableFailure{"Tessellation control-point stride exceeds 64 KiB LDS"};
+    // FIX-GT7-124: its key, and the manifest's record of its reads, are made from these.
+    info.tess_constants_used = info.ReadTessConstantsAt();
+    tess_constants = info.tess_constants_used->constants;
+    // FIX-GT7-124: read late on a worker, constants of another draw end the translation (the
+    // worker knows where they are now, and the draw queues it again with its own).
+    const bool fits = runtime_info.sw_stage == SwStage::TessellationControl
+                          ? runtime_info.sw.tcs.FitsConstants(tess_constants)
+                          : SwTessEvalRuntimeInfo::FitsConstants(tess_constants);
+    if (info.check_tess_constants && !fits) {
+        info.tess_constants_stale = true;
+        throw Common::RecoverableFailure("FIX-GT7-124: tessellation constants of another draw");
     }
     runtime_info.InitFromTessConstants(tess_constants);
     return;
@@ -419,12 +417,24 @@ void HullShaderTransform(IR::Program& program, const RuntimeInfo& runtime_info) 
 
                 const u32 num_dwords = u32(opcode) - u32(IR::Opcode::StoreBufferU32) + 1;
 
+                // TESS-001: the launcher's Tessellation option off (RYGT_TESSELLATION=0) draws
+                // tessellated surfaces flat: every factor is limited to 1, so each patch is drawn
+                // as its own triangles with no added detail. A factor of 0 or less still culls the
+                // patch, as the game asks. (Skipping these draws instead would lose the cars: GT7
+                // draws their bodies tessellated in the colour pass.)
+                static const bool flat = [] {
+                    const char* env = std::getenv("RYGT_TESSELLATION");
+                    return env && env[0] == '0';
+                }();
                 const auto GetValue = [&](IR::Value data) -> IR::F32 {
+                    IR::F32 value;
                     if (auto* inst = data.TryInst();
                         inst && inst->GetOpcode() == IR::Opcode::BitCastU32F32) {
-                        return IR::F32{inst->Arg(0)};
+                        value = IR::F32{inst->Arg(0)};
+                    } else {
+                        value = ir.BitCast<IR::F32, IR::U32>(IR::U32{data});
                     }
-                    return ir.BitCast<IR::F32, IR::U32>(IR::U32{data});
+                    return flat ? IR::F32{ir.FPMin(value, ir.Imm32(1.0f))} : value;
                 };
 
                 auto get_factor_attr = [&](u32 gcn_factor_idx) -> IR::Patch {

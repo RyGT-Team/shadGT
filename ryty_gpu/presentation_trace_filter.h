@@ -3,7 +3,7 @@
 namespace ImageLife {
 inline bool PresentationSlowKind(const char* kind) {
     if (!kind) return false;
-    constexpr const char* allowed[] = {"producer_job_walk", "producer_pipeline_lookup",
+    constexpr const char* allowed[] = {"producer_pipeline_lock", "producer_job_walk", "producer_pipeline_lookup",
         "producer_draw_prepare", "fault_early_fence", "fault_guard", "fault_read_handler"};
     for (const char* name : allowed) if (std::strcmp(kind, name) == 0) return true;
     return false;

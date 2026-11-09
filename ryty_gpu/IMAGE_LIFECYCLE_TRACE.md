@@ -98,7 +98,7 @@ valid new image index when the call fails; queue-present includes the existing D
 Condition-variable waits can wake early or spuriously and do not prove deliberate pacing.
 Presentation-only mode also retains upload_take, upload_free_before_reclaim,
 upload_free_after_reclaim, upload_retiring, upload_create_buffer, and prepared_summary_0..3.
-It also retains thresholded slow events producer_job_walk, producer_pipeline_lookup,
+It also retains thresholded slow events producer_job_walk, producer_pipeline_lookup, producer_pipeline_lock,
 producer_draw_prepare, fault_early_fence, fault_guard and fault_read_handler. S fields a,
 b and c contain start QPC and two context values. Producer context is packet pointer, or
 job pointer and walk endpoint for producer_job_walk. Fence and guard context is fault page
@@ -108,6 +108,9 @@ the early-fence and guard scopes apply only to non-GPU threads. Packet pointers 
 These events include only calls lasting at least 200 microseconds; nested spans and shared
 thread/QPC timing support correlation, not proof of causation. Active tracing adds overhead,
 especially on high-frequency producer and fault paths; omitted fast spans are not zero work.
+producer_pipeline_lock measures only the producer shared cache-lock acquisition call;
+it includes scheduling delay. Recording a slow span adds a small cost while the lock is
+held, and the event does not identify its holder.
 The summary covers the serial Draw path only; parallel prepared paths are unsupported.
 Each summary E field a is the frame counter. B fields a..e are, in order:
 * summary_0: missing, accepted, pipeline reject, stage reject, early unmap reject.

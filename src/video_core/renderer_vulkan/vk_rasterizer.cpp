@@ -20,6 +20,7 @@
 #include "common/path_util.h"
 #include "common/perf_monitor.h"
 #include "ryty_gpu/native/slow_call_trace.h"
+#include "ryty_gpu/image_lifecycle.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/guest_hash.h"
@@ -349,7 +350,8 @@ const GraphicsPipeline* Rasterizer::LookupJobPipeline(std::shared_ptr<const void
     }
     // A quad list's pipeline here is the triangle-list one (PERF-068: the command thread selects
     // both and the recorder picks); its tessellated twin is looked up the same way when needed.
-    std::shared_lock lk{pipeline_cache.LookupMutex()}; // NAT-031: job threads at once
+    std::shared_lock lk{pipeline_cache.LookupMutex(), std::defer_lock};
+    { ImageLife::SlowScope trace{"producer_pipeline_lock"}; lk.lock(); } // NAT-031
     const auto* pipeline = pipeline_cache.LookupBuiltPipeline({});
     keepalive = pipeline_cache.KeepAlive(pipeline);
     if (!pipeline && miss) {

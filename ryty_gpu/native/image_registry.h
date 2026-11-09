@@ -376,7 +376,8 @@ private:
     const Rhi::Pipeline* TilingPipeline(const VideoCore::ImageInfo& info, bool tiler);
     void LinkTexture(ImageEntry& texture);
     void LinkTarget(ImageEntry& target);
-    void MarkStale(ImageEntry& entry, Stale why);
+    void MarkStale(ImageEntry& entry, Stale why, u64 origin = 0, VAddr address = 0,
+                   u64 size = 0, u64 exact = 0);
     /// FIX-157: something else wrote a kept picture's memory.
     void MarkReused(ImageEntry& entry);
     /// FIX-157: GPU work wrote part of a picture's memory other than into the picture.

@@ -11,6 +11,7 @@
 #include "core/guest_hash.h"
 #include "core/memory.h"
 #include "ryty_gpu/native/image_registry.h"
+#include "ryty_gpu/image_lifecycle.h"
 #include "ryty_gpu/native/upload_scratch_capacity.h"
 #include "ryty_gpu/native/gpu_checkpoints.h"
 #include "ryty_gpu/native/slow_call_trace.h"
@@ -481,6 +482,11 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         }
         shard.images.emplace(info.guest_address, std::move(entry));
         IndexEntry(*result);
+        if (result->from_cpu && info.guest_size >= (4ull << 20)) {
+            ImageLife::Scope created{"texture_entry_create", ImageLife::Handle(result),
+                                     info.guest_address, info.guest_size};
+            if (created.Active()) created.Finish(result->image->NativeHandle());
+        }
         const std::pair<VAddr, VAddr> range{info.guest_address,
                                             info.guest_address + std::max<u64>(info.guest_size, 1)};
         NoteChanges({&range, 1}); // OPT-002, OPT-010
@@ -852,6 +858,13 @@ u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_
             // OPT-010: one a job thread found since the scan stays.
             if (gone.contains(it->second.get()) &&
                 it->second->last_use.load(std::memory_order_relaxed) < before) {
+                const auto& entry = it->second;
+                if (entry->from_cpu && entry->info.guest_size >= (4ull << 20)) {
+                    ImageLife::Scope evicted{"texture_entry_evict", ImageLife::Handle(entry.get()),
+                                             entry->info.guest_address, entry->info.guest_size,
+                                             entry->total_uploads.load(std::memory_order_relaxed)};
+                    if (evicted.Active()) evicted.Finish(entry->image->NativeHandle());
+                }
                 taken.push_back(std::move(it->second));
                 it = shard.images.erase(it);
             } else {
@@ -913,7 +926,8 @@ u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_
     return static_cast<u32>(taken.size());
 }
 
-void ImageRegistry::MarkStale(ImageEntry& entry, Stale why) {
+void ImageRegistry::MarkStale(ImageEntry& entry, Stale why, u64 origin, VAddr address,
+                              u64 size, u64 exact) {
 #ifndef NDEBUG
     ++stats.stale[static_cast<u32>(why)];
 #endif
@@ -932,6 +946,12 @@ void ImageRegistry::MarkStale(ImageEntry& entry, Stale why) {
         entry.force_upload.store(true, std::memory_order_relaxed);
     }
     const bool already_dirty = entry.needs_upload.exchange(true);
+    if (entry.from_cpu && entry.info.guest_size >= (4ull << 20)) {
+        ImageLife::Scope stale{"texture_entry_stale", ImageLife::Handle(&entry),
+                               static_cast<u64>(why), origin, address, size};
+        if (stale.Active()) stale.Finish(exact, (already_dirty ? 1ull : 0ull) |
+            (entry.force_upload.load(std::memory_order_relaxed) ? 2ull : 0ull));
+    }
 #ifndef NDEBUG
     const u32 prior_uploads = entry.total_uploads.load(std::memory_order_relaxed);
     if (!already_dirty && entry.from_cpu && entry.info.guest_size >= (4ull << 20) &&
@@ -1011,7 +1031,7 @@ void ImageRegistry::Invalidate(VAddr address, u64 size, Stale why) {
     recent_fills.Forget(address, size);
     ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
         if (entry.from_cpu) {
-            MarkStale(entry, why);
+            MarkStale(entry, why, 1, address, size);
         } else {
             entry.guest_modified.store(true, std::memory_order_seq_cst);
             if (entry.remembered_fill_receipt &&
@@ -1031,7 +1051,7 @@ void ImageRegistry::Invalidate(VAddr address, u64 size, Stale why) {
 void ImageRegistry::InvalidateNewMapping(VAddr address, u64 size) {
     ForgetFills(address, size);
     ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
-        if (entry.from_cpu) MarkStale(entry, Stale::Unmap);
+        if (entry.from_cpu) MarkStale(entry, Stale::Unmap, 2, address, size);
     });
 }
 
@@ -1108,7 +1128,7 @@ bool ImageRegistry::LayersRewritten(ImageEntry& entry, u64 frame) {
         [&](u32 layer, u64 offset, u64 bytes) {
             return Core::HashGuestBytes(entry.info.guest_address + layer * layer_size + offset, bytes);
         }, samples, whole);
-    if (changed) MarkStale(entry, Stale::CpuWrite);
+    if (changed) MarkStale(entry, Stale::CpuWrite, 5);
     return changed;
 }
 
@@ -1190,7 +1210,7 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
                     }
                 }
 #endif
-                MarkStale(entry, Stale::GpuWrite);
+                MarkStale(entry, Stale::GpuWrite, 4, address, size, exact ? 1 : 0);
 #ifndef NDEBUG
                 static std::atomic<u32> logged{};
                 if (const u32 n = logged++; n < 40 || n % 2000 == 0) {
@@ -1306,7 +1326,7 @@ void ImageRegistry::CpuWrite(VAddr address, u64 size, u64 exact) {
                 }
             }
 #endif
-            MarkStale(entry, Stale::CpuWrite);
+            MarkStale(entry, Stale::CpuWrite, 3, address, size, exact);
         }
     });
 }
@@ -1464,6 +1484,12 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
         trace.Next(3);
         constexpr u64 HashedSize = 4ull << 20;
         const bool forced = entry->force_upload.exchange(false);
+        if (entry->from_cpu && size >= (4ull << 20)) {
+            ImageLife::Scope selected{"texture_entry_upload", ImageLife::Handle(entry),
+                                      info.guest_address, size, forced ? 1ull : 0ull};
+            if (selected.Active()) selected.Finish(entry->total_uploads.load(std::memory_order_relaxed),
+                                                    entry->write_version.load(std::memory_order_relaxed));
+        }
         // FIX-157: render targets of any size (what their memory held when made).
         if ((size <= HashedSize || !entry->from_cpu) && memory_clamp &&
             memory_clamp(info.guest_address, size) == size) {

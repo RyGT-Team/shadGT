@@ -54,6 +54,23 @@ work until its return, and can enclose the CPU stages. Events may cross capture 
 or be dropped when the shared ring fills; sizes below the threshold are not represented.
 Selection does not report a final source kind: a missing CPU child does not identify which
 other route was selected, especially with capture-boundary clipping or dropped events.
+For CPU-origin entries of at least 4 MiB, texture_entry_create/evict B fields are entry
+pointer, guest address, size and (eviction only) total uploads; E field a is image handle.
+texture_entry_upload B fields are entry pointer, guest address, size and consumed force
+flag; E fields are prior total uploads and write version. texture_source_entry B fields
+are selection ID, entry pointer, prior uploads, write version and foreign clock; E field a
+is image handle. Counters are observational atomic snapshots, not a synchronized state.
+texture_entry_stale B fields are entry pointer, reason (0 CPU, 1 unmap, 2 GPU), origin,
+address and size; E fields are exact and flags (bit 0 previously dirty, bit 1 force set).
+Origin 1 is Invalidate, 2 new mapping, 3 CpuWrite, 4 GpuWrote, 5 layer check, and 0 is
+another caller without supplied range. CpuWrite exact is a byte extent from its address,
+zero meaning unknown; GpuWrote exact is a boolean. Entry pointers and image handles can
+be reused: use creation/eviction chronology, and treat identities as ambiguous when the
+capture starts mid-lifetime, ends early or drops events. These events do not prove bytes
+changed. Repeated stale events may be frequent and consume the shared bounded ring.
+Stale event timing follows the dirty-state exchange and concurrent upload/stale events
+can appear reordered; the observed force flag can race its consumption. Do not infer a
+total causal order from event timestamps or the force snapshot alone.
 Frame-prepared B fields are sequence and guest address; timestamps are correlation anchors,
 not a guaranteed one-to-one link between the sequence and present pointer.
 

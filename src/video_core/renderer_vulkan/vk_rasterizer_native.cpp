@@ -1204,6 +1204,13 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
         ImageLife::Scope selection{size >= 4_MB, "texture_source_select", address, size,
             (u64(entry.info.size.width) << 32) | entry.info.size.height,
             u64(entry.info.props.is_tiled), static_cast<u64>(entry.info.pixel_format)};
+        if (selection.Active() && entry.from_cpu) {
+            ImageLife::Scope identity{"texture_source_entry", selection.Id(), ImageLife::Handle(&entry),
+                entry.total_uploads.load(std::memory_order_relaxed),
+                entry.write_version.load(std::memory_order_relaxed),
+                entry.foreign_clock.load(std::memory_order_relaxed)};
+            identity.Finish(entry.image->NativeHandle());
+        }
         const auto cpu_source = [&](u64 reason) {
             Native::ImageRegistry::UploadSource staged;
             if (size == 0 || size > 64_MB) return staged;

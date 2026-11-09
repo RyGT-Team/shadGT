@@ -16,6 +16,7 @@
 
 #include "common/diagnostics.h"
 #include "ryty_gpu/image_lifecycle.h"
+#include "ryty_gpu/wait_trace.h"
 #include "common/guest_clock.h"
 #include "common/mapping_writeback_gate.h"
 #include "common/logging/log.h"
@@ -613,13 +614,25 @@ static bool SerializedMapProtocolAvailable() {
 
 extern "C" __declspec(dllexport) void RytyGpuUnmapMemory(u64 address, u64 size) {
     auto& gate = Common::GuestMappingWritebackGate();
-    if (gate.ProtocolAvailable()) gate.BeginUnmap(address, size);
+    static thread_local std::array<ImageLife::WaitAggregate, 2> unmap_export_phases{};
+    const auto phase_start = [] { return ImageLife::Enabled("unmap_phase_summary") ? ImageLife::Timestamp() : 0; };
+    const auto phase_end = [&](unsigned role, u64 start) {
+        unmap_export_phases[role - 6].Add("unmap_phase_summary", ImageLife::Handle(&gate), role,
+                                           start, start ? ImageLife::Timestamp() : 0);
+    };
+    if (gate.ProtocolAvailable()) {
+        const auto start = phase_start();
+        gate.BeginUnmap(address, size);
+        phase_end(6, start);
+    }
 #ifndef NDEBUG
     if (Native::WatchedTexture(address, address + size)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: Ryty unmaps {:#x}+{:#x}", address, size);
     }
 #endif
+    const auto start = phase_start();
     Core::RytyMemory::NoteMappingChange(address, size);
+    phase_end(7, start);
     if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
         rasterizer->UnmapMemory(address, size);
     }

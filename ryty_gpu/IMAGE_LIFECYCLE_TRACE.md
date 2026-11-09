@@ -52,8 +52,10 @@ metadata queries and event emission, so its duration includes diagnostic overhea
 
 Upload-only captures include unmap_memory spans (address, requested size) and unmap_phase_summary
 aggregates for phases 1 native invalidation, 2 direct-memory invalidation, 3 buffer invalidation,
-4 synchronous GPU-command cleanup or inline cleanup, and 5 mapped-range removal. unmap_memory
-begins after the export's BeginUnmap and NoteMappingChange work. Phase 4 includes command queue,
+4 synchronous GPU-command cleanup or inline cleanup, and 5 mapped-range removal. Export phases
+6 BeginUnmap (when the gate protocol is available) and 7 NoteMappingChange are identified by the
+gate pointer instead of the rasterizer pointer. unmap_memory begins after these export phases.
+Phase 4 includes command queue,
 wait and CPU cleanup on the synchronous path; it is not GPU execution time. Subtracting callback
 time from a runtime batch duration does not isolate OS mapping time. Each summary covers 256 completed phase
 calls on one thread, with a wait_summary_window child giving first/last timestamps; totals cannot

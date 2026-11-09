@@ -55,6 +55,8 @@ int main() {
       ImageLife::WaitAggregate a;
       for (unsigned i=0;i<256;++i) { const auto start=ImageLife::Timestamp(); a.Add("unmap_phase_summary",77,4,start,start+1); }
       const auto start=ImageLife::Timestamp(); Sleep(2); a.Add("unmap_phase_summary",77,4,start,ImageLife::Timestamp()); }
+    { ImageLife::WaitAggregate a;
+      for (unsigned i=0;i<256;++i) { const auto start=ImageLife::Timestamp(); a.Add("unmap_phase_summary",78,6,start,start+1); } }
     { ImageLife::Scope sentinel{"present"}; }
     std::snprintf(path,sizeof(path),"logs/image-lifecycle-%lu.csv",GetCurrentProcessId());
     for(unsigned i=0;i<600 && !(f=std::fopen(path,"r"));++i) Sleep(50);
@@ -62,7 +64,7 @@ int main() {
     bool route=false, fallback=false, probe=false, alias=false, unwanted=false, done=false;
     bool nodrops=false, take=false, before=false, after=false, retiring=false, create=false;
     bool allocation=false, heap=false, block=false, queue_summary=false, queue_detail=false, direct_hold=false, window=false;
-    bool unmap=false, unmap_summary=false, unmap_detail=false; char line[1024];
+    bool unmap=false, unmap_summary=false, unmap_detail=false, export_summary=false; char line[1024];
     for(unsigned i=0;i<100 && !done;++i) {
         f=std::fopen(path,"r"); assert(f);
         while(std::fgets(line,sizeof(line),f)) {
@@ -85,6 +87,7 @@ int main() {
             unmap |= std::strstr(line,",B,") && std::strstr(line,",unmap_memory,123,456,");
             unmap_summary |= std::strstr(line,",B,") && std::strstr(line,",unmap_phase_summary,77,4,256,256,1");
             unmap_detail |= std::strstr(line,",B,") && std::strstr(line,",unmap_phase_detail,77,4,");
+            export_summary |= std::strstr(line,",B,") && std::strstr(line,",unmap_phase_summary,78,6,256,256,1");
             if (const char* p=std::strstr(line,",wait_summary_window,")) {
                 unsigned long long parent=0, first=0, last=0;
                 window |= std::sscanf(p,",wait_summary_window,%llu,%llu,%llu",&parent,&first,&last)==3 &&
@@ -98,5 +101,5 @@ int main() {
     assert(done && route && fallback && probe && alias && !unwanted);
     assert(nodrops && take && before && after && retiring && create && allocation && heap && block);
     assert(queue_summary && queue_detail && direct_hold && window);
-    assert(unmap && unmap_summary && unmap_detail);
+    assert(unmap && unmap_summary && unmap_detail && export_summary);
 }

@@ -1143,7 +1143,7 @@ std::unique_ptr<Image> VulkanDevice::CreateImage(const ImageDesc& desc) {
 std::unique_ptr<Image> VulkanDevice::CreateImageFrom(const VkImageCreateInfo& image_ci,
                                                     const ImageDesc& desc) {
     ImageLife::Scope trace{"native_image_create_from", image_ci.extent.width, image_ci.extent.height,
-                           image_ci.format, image_ci.usage,
+                           static_cast<std::uint64_t>(image_ci.format), image_ci.usage,
                            (u64(image_ci.arrayLayers) << 32) | image_ci.mipLevels};
 #ifndef NDEBUG
     const auto allocation_start = std::chrono::steady_clock::now();
@@ -1160,7 +1160,7 @@ std::unique_ptr<Image> VulkanDevice::CreateImageFrom(const VkImageCreateInfo& im
           image = VK_NULL_HANDLE;
           allocation = nullptr;
           ImageLife::Scope allocate{"native_vma_create", image_ci.extent.width, image_ci.extent.height,
-                                    image_ci.format, image_ci.usage};
+                                    static_cast<std::uint64_t>(image_ci.format), image_ci.usage};
           VkResult status = vmaCreateImage(
               allocator, &image_ci, &alloc_ci, &image, &allocation, nullptr);
           if (status != VK_SUCCESS && alloc_ci.pool) {

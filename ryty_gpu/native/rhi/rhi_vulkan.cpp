@@ -1,4 +1,5 @@
 #include "ryty_gpu/native/rhi/completed_owner_release.h"
+#include "ryty_gpu/image_lifecycle.h"
 #include "ryty_gpu/native/descriptor_update_batch.h"
 #include "ryty_gpu/native/rhi/descriptor_batch_test_spv.h"
 #include "ryty_gpu/native/rhi/gpu_timing_lease.h"
@@ -662,7 +663,9 @@ VulkanBuffer::~VulkanBuffer() {
     });
 }
 VulkanImage::~VulkanImage() {
+    ImageLife::Scope retired{"native_image_retire", ImageLife::Handle(static_cast<VkImage>(image))};
     device.Retire([alloc = device.allocator, image = image, allocation = allocation] {
+        ImageLife::Scope destroyed{"native_image_destroy", ImageLife::Handle(static_cast<VkImage>(image))};
 #ifndef NDEBUG
         const auto destroy_start = std::chrono::steady_clock::now();
 #endif
@@ -679,7 +682,11 @@ VulkanImage::~VulkanImage() {
     });
 }
 VulkanImageView::~VulkanImageView() {
-    device.Retire([dev = device.device, view = view] { dev.destroyImageView(view); });
+    ImageLife::Scope retired{"native_view_retire", ImageLife::Handle(static_cast<VkImageView>(view))};
+    device.Retire([dev = device.device, view = view] {
+        ImageLife::Scope destroyed{"native_view_destroy", ImageLife::Handle(static_cast<VkImageView>(view))};
+        dev.destroyImageView(view);
+    });
 }
 VulkanSampler::~VulkanSampler() {
     device.Retire([dev = device.device, sampler = sampler] { dev.destroySampler(sampler); });
@@ -1086,6 +1093,9 @@ void VulkanDevice::UseExternalTimeline(Fence* fence, std::function<u64()> curren
 }
 
 std::unique_ptr<Image> VulkanDevice::CreateImage(const ImageDesc& desc) {
+    ImageLife::Scope trace{"native_image_create", desc.width, desc.height,
+                           static_cast<u64>(ToVk(desc.format)), desc.usage,
+                           (u64(desc.layers) << 32) | desc.mips};
     const vk::Format format = ToVk(desc.format);
     vk::ImageUsageFlags usage{};
     if (desc.usage & ImageUsageSampled) usage |= vk::ImageUsageFlagBits::eSampled;
@@ -1124,11 +1134,16 @@ std::unique_ptr<Image> VulkanDevice::CreateImage(const ImageDesc& desc) {
         !(limits.sampleCounts & image_ci.samples)) {
         return nullptr;
     }
-    return CreateImageFrom(image_ci, desc);
+    auto created = CreateImageFrom(image_ci, desc);
+    if (trace.Active()) trace.Finish(created ? created->NativeHandle() : 0);
+    return created;
 }
 
 std::unique_ptr<Image> VulkanDevice::CreateImageFrom(const VkImageCreateInfo& image_ci,
                                                     const ImageDesc& desc) {
+    ImageLife::Scope trace{"native_image_create_from", image_ci.extent.width, image_ci.extent.height,
+                           image_ci.format, image_ci.usage,
+                           (u64(image_ci.arrayLayers) << 32) | image_ci.mipLevels};
 #ifndef NDEBUG
     const auto allocation_start = std::chrono::steady_clock::now();
 #endif
@@ -1143,12 +1158,21 @@ std::unique_ptr<Image> VulkanDevice::CreateImageFrom(const VkImageCreateInfo& im
         [&] {
           image = VK_NULL_HANDLE;
           allocation = nullptr;
+          ImageLife::Scope allocate{"native_vma_create", image_ci.extent.width, image_ci.extent.height,
+                                    image_ci.format, image_ci.usage};
           VkResult status = vmaCreateImage(
               allocator, &image_ci, &alloc_ci, &image, &allocation, nullptr);
           if (status != VK_SUCCESS && alloc_ci.pool) {
             alloc_ci.pool = VK_NULL_HANDLE;
             status = vmaCreateImage(
                 allocator, &image_ci, &alloc_ci, &image, &allocation, nullptr);
+          }
+          if (allocate.Active() && status == VK_SUCCESS) {
+              VmaAllocationInfo info{};
+              vmaGetAllocationInfo(allocator, allocation, &info);
+              allocate.Finish(ImageLife::Handle(image), info.size);
+          } else {
+              allocate.Finish(ImageLife::Handle(image), static_cast<u64>(status));
           }
           return AllocationResult{status};
         },
@@ -1177,13 +1201,17 @@ std::unique_ptr<Image> VulkanDevice::CreateImageFrom(const VkImageCreateInfo& im
     TraceResourceChurn("allocate", "image", reinterpret_cast<u64>(image), allocation_info.size,
                        allocation_start, desc.name);
 #endif
-    InitImageLayout(image, AspectOf(static_cast<vk::Format>(image_ci.format)));
+    { ImageLife::Scope init{"native_image_init_layout", ImageLife::Handle(image)};
+      InitImageLayout(image, AspectOf(static_cast<vk::Format>(image_ci.format))); }
+    trace.Finish(ImageLife::Handle(image));
     return std::make_unique<VulkanImage>(*this, desc, image, allocation);
 }
 
 std::unique_ptr<ImageView> VulkanDevice::CreateImageView(const Image* image,
                                                          const ImageViewDesc& desc) {
     const auto* vulkan_image = static_cast<const VulkanImage*>(image);
+    ImageLife::Scope trace{"native_view_create", ImageLife::Handle(static_cast<VkImage>(vulkan_image->image)),
+                           desc.base_mip, desc.mips, desc.base_layer, desc.layers};
     const Format format = desc.format == Format::Undefined ? vulkan_image->desc.format : desc.format;
     const vk::ImageViewUsageCreateInfo usage_info{
         .usage = desc.storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled,
@@ -1207,6 +1235,7 @@ std::unique_ptr<ImageView> VulkanDevice::CreateImageView(const Image* image,
     if (result != vk::Result::eSuccess) {
         return nullptr;
     }
+    trace.Finish(ImageLife::Handle(static_cast<VkImageView>(view)));
     return std::make_unique<VulkanImageView>(*this, view);
 }
 

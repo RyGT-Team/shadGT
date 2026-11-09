@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "ryty_gpu/image_lifecycle.h"
 
 // Implement vma functions
 #define VMA_IMPLEMENTATION
@@ -41,6 +42,9 @@ VmaPool SmallImageAllocationPool(VmaAllocator allocator, const VkImageCreateInfo
     std::scoped_lock lock{small_image_pools_mutex};
     auto& cache = small_image_pool_cache[allocator];
     if (const auto found = cache.find(key); found != cache.end()) return found->second;
+    ImageLife::Scope query{"image_memory_requirements", image.extent.width, image.extent.height,
+                           static_cast<u64>(image.format), image.usage,
+                           (u64(image.arrayLayers) << 32) | image.mipLevels};
     // Query once per complete resource configuration: compressed images must be
     // classified by their allocation footprint, not uncompressed pixel dimensions.
     const auto& functions = allocator->GetVulkanFunctions();
@@ -65,6 +69,7 @@ VmaPool SmallImageAllocationPool(VmaAllocator allocator, const VkImageCreateInfo
         functions.vkDestroyImage(allocator->m_hDevice, temporary, allocator->GetAllocationCallbacks());
     }
     const auto footprint = std::max(requirements.size, requirements.alignment);
+    query.Finish(footprint, requires_dedicated);
     if (requires_dedicated || footprint > (4ULL << 20)) {
         cache.emplace(key, VK_NULL_HANDLE);
         return VK_NULL_HANDLE;

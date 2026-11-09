@@ -702,8 +702,10 @@ Presenter::~Presenter() {
 
     const vk::Device device = instance.GetDevice();
     for (auto& frame : present_frames) {
-        vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
-        device.destroyImageView(frame.image_view);
+        { ImageLife::Scope trace{"presenter_image_destroy", ImageLife::Handle(static_cast<VkImage>(frame.image))};
+          vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation); }
+        { ImageLife::Scope trace{"presenter_view_destroy", ImageLife::Handle(static_cast<VkImageView>(frame.image_view))};
+          device.destroyImageView(frame.image_view); }
         device.destroyFence(frame.present_done);
     }
 }
@@ -718,9 +720,11 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
         ImGui::Vulkan::RemoveTexture(frame->imgui_texture);
     }
     if (frame->image_view) {
+        ImageLife::Scope trace{"presenter_view_destroy", ImageLife::Handle(static_cast<VkImageView>(frame->image_view))};
         device.destroyImageView(frame->image_view);
     }
     if (frame->image) {
+        ImageLife::Scope trace{"presenter_image_destroy", ImageLife::Handle(static_cast<VkImage>(frame->image))};
         vmaDestroyImage(instance.GetAllocator(), frame->image, frame->allocation);
     }
 
@@ -749,8 +753,17 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     VkImage unsafe_image{};
     VkImageCreateInfo unsafe_image_info = static_cast<VkImageCreateInfo>(image_info);
 
+    ImageLife::Scope image_trace{"presenter_image_create", width, height,
+                                 static_cast<u64>(format), unsafe_image_info.usage, frame->id};
     VkResult result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &alloc_info,
                                      &unsafe_image, &frame->allocation, nullptr);
+    if (image_trace.Active() && result == VK_SUCCESS) {
+        VmaAllocationInfo info{};
+        vmaGetAllocationInfo(instance.GetAllocator(), frame->allocation, &info);
+        image_trace.Finish(ImageLife::Handle(unsafe_image), info.size);
+    } else {
+        image_trace.Finish(ImageLife::Handle(unsafe_image), static_cast<u64>(result));
+    }
     if (result != VK_SUCCESS) [[unlikely]] {
         LOG_CRITICAL(Render_Vulkan, "Failed allocating texture with error {}",
                      vk::to_string(vk::Result{result}));
@@ -771,7 +784,9 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
             .layerCount = 1,
         },
     };
+    ImageLife::Scope view_trace{"presenter_view_create", ImageLife::Handle(unsafe_image)};
     auto view = Check<"create frame image view">(device.createImageView(view_info));
+    view_trace.Finish(ImageLife::Handle(static_cast<VkImageView>(view)));
     frame->image_view = view;
     frame->width = width;
     frame->height = height;

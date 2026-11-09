@@ -30,6 +30,7 @@ struct Scope {
                    std::uint64_t c=0, std::uint64_t d=0, std::uint64_t e=0)
         : kind(name), id(Begin(name,a,b,c,d,e)) {}
     ~Scope() { End(id,kind); }
+    bool Active() const { return id != 0; }
     void Finish(std::uint64_t a=0, std::uint64_t b=0) { if(id) { End(id,kind,a,b); id=0; } }
 };
 }
@@ -39,7 +40,7 @@ inline void Initialize() {}
 inline std::uint64_t Begin(const char*,std::uint64_t=0,std::uint64_t=0,std::uint64_t=0,std::uint64_t=0,std::uint64_t=0) { return 0; }
 inline void End(std::uint64_t,const char*,std::uint64_t=0,std::uint64_t=0) {}
 struct SlowScope { explicit SlowScope(const char*,std::uint64_t=0,std::uint64_t=0,std::uint64_t=0) {} void Finish() {} };
-struct Scope { explicit Scope(const char*,std::uint64_t=0,std::uint64_t=0,std::uint64_t=0,std::uint64_t=0,std::uint64_t=0) {} void Finish(std::uint64_t=0,std::uint64_t=0) {} };
+struct Scope { explicit Scope(const char*,std::uint64_t=0,std::uint64_t=0,std::uint64_t=0,std::uint64_t=0,std::uint64_t=0) {} bool Active() const { return false; } void Finish(std::uint64_t=0,std::uint64_t=0) {} };
 }
 #endif
 

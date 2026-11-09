@@ -530,11 +530,7 @@ private:
     } pipe_read_ahead_stats{};
     /// Queues the state of the graphics draw being decoded when its pipeline registers
     /// changed, and reads ahead while new pipelines keep appearing.
-    void OfferDrawState(u64 sequence
-#ifndef NDEBUG
-        , ReadAheadPair::Metadata metadata = {}
-#endif
-    );
+    void OfferDrawState();
     /// Reads the commands ahead of the command thread and queues the new draw states found.
     void PipeReadAhead();
 
@@ -576,13 +572,18 @@ private:
     /// Records a draw or dispatch together with the registers written since the previous one.
     /// `direct_draw`: a draw packet with its counts in the packet (PERF-047 selects its pipeline
     /// here, while decoding).
-    struct IndirectSgprs { u16 vertex; u16 instance; };
+    /// PERF-GT7-031: an indirect draw's base vertex and instance SGPRs (its pipeline is
+    /// selected ahead with them).
+    struct IndirectSgprs {
+        u16 vertex;
+        u16 instance;
+    };
     void RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bool direct_draw = false,
-                    std::optional<IndirectSgprs> indirect = std::nullopt);
+                    const IndirectSgprs* indirect = nullptr);
     /// MT-005: set by the indexed direct draw packets for the next RecordDraw (its index offset).
     std::optional<u32> staged_index_offset;
     /// Waits for the recorder thread to finish, before the command thread uses the rasterizer.
-    bool WaitsYieldToRecorder() const;
+    bool WaitsYieldToRecorder() const; ///< PERF-GT7-046
     void SyncRecorder(std::string_view reason);
     /// Whether [address, address + size) overlaps a command buffer being decoded.
     bool WritesLiveCommands(VAddr address, u64 size) const;
@@ -636,20 +637,22 @@ private:
         std::vector<u32> ccb_buffer;
         std::queue<Task::Handle> submits{};
         ComputeProgram cs_state{};
-        std::atomic<u32> pending{}; // Compute submissions awaiting decode.
-        u32 parked{}; // Accessed only by the command thread.
+        std::atomic<u32> pending{};
+        u32 parked{};
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
-    std::atomic<u32> num_mapped_queues{1u}; // GFX is always available.
+    std::atomic<u32> num_mapped_queues{1u}; // GFX is always available
+
     bool ComputeQueueRunnable() const {
-        const u32 count = num_mapped_queues.load(std::memory_order_acquire);
-        for (u32 q = 1; q < count; ++q) {
+        const u32 queues = num_mapped_queues.load(std::memory_order_acquire);
+        for (u32 q = 1; q < queues; ++q) {
             const auto& queue = mapped_queues[q];
-            if (!queue.parked && queue.pending.load(std::memory_order_relaxed)) return true;
+            if (queue.parked == 0 && queue.pending.load(std::memory_order_relaxed) != 0) {
+                return true;
+            }
         }
         return false;
     }
-    u32 gfx_packets_since_yield{};
 
     VAddr indirect_args_addr{};
     u32 num_counter_pairs{};
@@ -681,6 +684,7 @@ private:
     // the draw pipe runs. num_tasks counts the ones the command thread has not decoded yet.
     std::atomic<u32> num_submits{};
     std::atomic<u32> num_tasks{};
+    u32 gfx_packets_since_yield{};
     std::atomic<u32> num_commands{};
     std::atomic<bool> submit_done{};
     std::mutex submit_mutex;

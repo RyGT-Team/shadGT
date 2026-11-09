@@ -896,12 +896,15 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                                VAddr cpu_address) {
     const u64 guestFrame = g_prepared_frames.fetch_add(1, std::memory_order_relaxed);
     { ImageLife::Scope trace{"frame_prepared", guestFrame, cpu_address}; }
+    ImageLife::Scope prepare_trace{"presentation_prepare_frame", guestFrame, cpu_address};
 #ifndef NDEBUG
     rasterizer->FrameDumpFlip(); // NAT-116
 #endif
 #ifdef RYTY_GPU
     if (auto* native = rasterizer->Native()) {
-        return PrepareNativeFrame(*native, attribute, cpu_address);
+        auto* frame = PrepareNativeFrame(*native, attribute, cpu_address);
+        prepare_trace.Finish(ImageLife::Handle(frame));
+        return frame;
     }
 #endif
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
@@ -1086,6 +1089,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     frame->ready_scheduler = &draw_scheduler;
     SubmitInfo info{};
     draw_scheduler.Flush(info);
+    prepare_trace.Finish(ImageLife::Handle(frame));
     return frame;
 }
 
@@ -1913,6 +1917,7 @@ Frame* Presenter::GetRenderFrame() {
     // Wait for free presentation frames
     Frame* frame;
     {
+        ImageLife::Scope trace{"presentation_free_queue"};
         std::unique_lock lock{free_mutex};
         free_cv.wait(lock, [this] { return !free_queue.empty(); });
         LOG_DEBUG(Render_Vulkan, "Got render frame, remaining {}", free_queue.size() - 1);
@@ -1920,12 +1925,14 @@ Frame* Presenter::GetRenderFrame() {
         // Take the frame from the queue
         frame = free_queue.front();
         free_queue.pop();
+        trace.Finish(ImageLife::Handle(frame));
     }
 
     const vk::Device device = instance.GetDevice();
     vk::Result result{};
 
     const auto wait = [&]() {
+        ImageLife::Scope trace{"presentation_frame_fence", ImageLife::Handle(frame)};
         result = device.waitForFences(frame->present_done, false, std::numeric_limits<u64>::max());
         return result;
     };

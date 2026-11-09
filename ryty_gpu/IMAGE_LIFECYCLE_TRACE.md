@@ -85,3 +85,16 @@ The trace records CPU wall time and does not identify GPU waits or reflection ta
 Compare to an external QPC-aligned capture and measure opt-in overhead against a matched trace-off
 Release run.
 
+Set `RYGT_IMAGE_TRACE_PRESENT_ONLY=1` before process startup alongside the main trace opt-in
+to retain only `present`, `frame_prepared`, and the explicitly listed `presentation_*` stages:
+prepare_frame, free_queue, frame_fence, swapchain_acquire, queue_present, wait_request,
+wait_flip_rate, and tick_sleep. The CSV header reports `present_only`. Slow fault/wait spans
+and image/texture events are omitted. With the option absent, the original full trace remains.
+PrepareFrame E field a identifies the returned frame; queue and fence events identify the
+frame where available. The wait labels measure time in the existing calls, including lock
+acquisition where applicable; they do not establish that a GPU or frame limiter caused a delay.
+Free-queue timing includes mutex acquisition and queue removal. Acquire E field b is not a
+valid new image index when the call fails; queue-present includes the existing DLSS-G markers.
+Condition-variable waits can wake early or spuriously and do not prove deliberate pacing.
+As with other spans, capture boundaries or a full ring can leave incomplete pairs.
+

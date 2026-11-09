@@ -1,5 +1,6 @@
 // DIAG-378-GTS: bounded opt-in CPU lifecycle capture for Windows RyGTS.
 #include "ryty_gpu/image_lifecycle.h"
+#include "ryty_gpu/presentation_trace_filter.h"
 #if defined(_WIN32) && defined(RYTY_GPU)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -22,6 +23,7 @@ struct Event {
     char phase{};
 };
 struct State {
+    bool present_only = false;
     std::atomic<bool> open{false};
     std::atomic<std::uint64_t> active{0}, next{0}, dropped{0}, ids{0};
     std::unique_ptr<Event[]> events{new Event[Capacity]};
@@ -57,9 +59,9 @@ DWORD WINAPI Worker(void* raw) {
     QueryPerformanceCounter(&s->end);
     while(s->active.load()!=0) Sleep(1);
     if (auto* f=_wfopen(s->output,L"w")) {
-        std::fprintf(f,"# pid=%lu,qpc_frequency=%lld,start=%lld,end=%lld,capacity=%llu,attempted=%llu,dropped=%llu,slow_threshold_us=200\n",
+        std::fprintf(f,"# pid=%lu,qpc_frequency=%lld,start=%lld,end=%lld,capacity=%llu,attempted=%llu,dropped=%llu,slow_threshold_us=200,present_only=%u\n",
                      GetCurrentProcessId(),s->frequency.QuadPart,s->start.QuadPart,s->end.QuadPart,
-                     Capacity,s->next.load(),s->dropped.load());
+                     Capacity,s->next.load(),s->dropped.load(),s->present_only ? 1u : 0u);
         std::fprintf(f,"qpc,tid,phase,id,kind,a,b,c,d,e\n");
         const auto count=(std::min)(s->next.load(),Capacity);
         for(std::uint64_t i=0;i<count;++i) {
@@ -77,6 +79,9 @@ void Initialize() {
     char enabled[3]{};
     if(GetEnvironmentVariableA("RYGT_IMAGE_LIFECYCLE_TRACE",enabled,sizeof(enabled))!=1 || enabled[0]!='1') return;
     auto* s=new State;
+    char present_only[3]{};
+    s->present_only = GetEnvironmentVariableA("RYGT_IMAGE_TRACE_PRESENT_ONLY", present_only,
+                                               sizeof(present_only)) == 1 && present_only[0] == '1';
     wchar_t exe[MAX_PATH]{};
     const DWORD length=GetModuleFileNameW(nullptr,exe,MAX_PATH);
     if(!length || length>=MAX_PATH) { delete s; return; }
@@ -98,7 +103,7 @@ void Initialize() {
 }
 std::uint64_t Begin(const char* kind,std::uint64_t a,std::uint64_t b,std::uint64_t c,std::uint64_t d,std::uint64_t e) {
     State* s=state;
-    if(!s || !s->open.load()) return 0;
+    if(!s || !s->open.load() || (s->present_only && !PresentationKind(kind))) return 0;
     const auto id=s->ids.fetch_add(1)+1;
     return Append('B',id,kind,a,b,c,d,e) ? id : 0;
 }
@@ -107,13 +112,13 @@ void End(std::uint64_t id,const char* kind,std::uint64_t a,std::uint64_t b) {
 }
 std::uint64_t SlowStart() {
     State* s=state;
-    if(!s || !s->open.load()) return 0;
+    if(!s || !s->open.load() || s->present_only) return 0;
     LARGE_INTEGER q{}; QueryPerformanceCounter(&q);
     return q.QuadPart;
 }
 void SlowEnd(std::uint64_t start,const char* kind,std::uint64_t address,std::uint64_t size) {
     State* s=state;
-    if(!start || !s || !s->open.load()) return;
+    if(!start || !s || !s->open.load() || s->present_only) return;
     LARGE_INTEGER q{}; QueryPerformanceCounter(&q);
     if(q.QuadPart-start >= s->frequency.QuadPart/5000)
         Append('S',0,kind,start,address,size);

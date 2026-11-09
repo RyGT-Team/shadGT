@@ -17,6 +17,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "ryty_gpu/ryty_diag.h"
+#include "ryty_gpu/image_lifecycle.h"
 #ifdef RYTY_GPU
 #include "ryty_gpu/ryty_pro_mode.h"
 #endif
@@ -538,9 +539,11 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             if (early_allowed()) {
                 std::unique_lock lock{mutex};
                 if (requests.empty()) {
+                    ImageLife::Scope trace{"presentation_wait_request"};
                     request_cv.wait_until(lock, next_tick,
                                           [&] { return token.stop_requested() || !requests.empty(); });
                 } else if (const auto allowed = flip_allowed_at(); Clock::now() < allowed) {
+                    ImageLife::Scope trace{"presentation_wait_flip_rate"};
                     request_cv.wait_until(lock, std::min(next_tick, allowed));
                 }
                 lock.unlock();
@@ -567,6 +570,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             }
             now = Clock::now();
             if (now < next_tick) {
+                ImageLife::Scope trace{"presentation_tick_sleep"};
                 Common::AccurateSleep(next_tick - now, nullptr, false);
             }
         }

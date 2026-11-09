@@ -13,6 +13,7 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
+#include "ryty_gpu/image_lifecycle.h"
 
 namespace Vulkan {
 
@@ -169,6 +170,7 @@ void Swapchain::RecreateSurface() {
 }
 
 bool Swapchain::AcquireNextImage() {
+    ImageLife::Scope acquire_trace{"presentation_swapchain_acquire"};
     vk::Device device = instance.GetDevice();
 #ifdef RYTY_GPU
     vk::Result result =
@@ -182,6 +184,7 @@ bool Swapchain::AcquireNextImage() {
         device.acquireNextImageKHR(swapchain, std::numeric_limits<u64>::max(),
                                    image_acquired[frame_index], VK_NULL_HANDLE, &image_index);
 #endif
+    acquire_trace.Finish(static_cast<u64>(result), image_index);
 
     switch (result) {
     case vk::Result::eSuccess:
@@ -216,6 +219,7 @@ bool Swapchain::Present(u64 anti_lag_frame) {
     };
 
     instance.AntiLagPresent(anti_lag_frame); // PERF-210
+    ImageLife::Scope present_trace{"presentation_queue_present", image_index, anti_lag_frame};
 #ifdef RYTY_GPU
     RytyDlssG::PresentStart();
     auto result = framegen.Active() ? framegen.Present(instance.GetPresentQueue(), present_info)
@@ -224,6 +228,7 @@ bool Swapchain::Present(u64 anti_lag_frame) {
 #else
     auto result = instance.GetPresentQueue().presentKHR(present_info);
 #endif
+    present_trace.Finish(static_cast<u64>(result));
     // FIX-218: a lost surface or exclusive fullscreen (Alt+Tab) recreates the swapchain too,
     // instead of stopping the game; a lost surface is replaced as well.
     if (result == vk::Result::eErrorSurfaceLostKHR) {

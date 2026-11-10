@@ -596,7 +596,12 @@ GraphicsPipeline::GraphicsPipeline(
     };
 
     const vk::PipelineViewportDepthClipControlCreateInfoEXT clip_control = {
-        .negativeOneToOne = key.clip_space == AmdGpu::ClipSpace::MinusWToW,
+        // FIX-GTS-443: 0..1 when the vertex shader converts the depth. A geometry shader's
+        // pipeline keeps -1..1: only the hardware vertex stage converts, and with a geometry
+        // shader the vertex shader runs as the export stage. (Shader objects never have one.)
+        .negativeOneToOne = key.clip_space == AmdGpu::ClipSpace::MinusWToW &&
+                            (instance.UsesDepthClipControl() ||
+                             infos[u32(Shader::SwStage::Geometry)] != nullptr),
     };
 
     const vk::PipelineViewportStateCreateInfo viewport_info = {
@@ -902,9 +907,15 @@ GraphicsPipeline::GraphicsPipeline(
     constexpr vk::PipelineDepthStencilStateCreateInfo depth_stencil_info = {};
 
     // SO-017: GT7 HUD and menu blending use conventional pipelines by default.
-    static const u32 so_skip = [] {
+    // FIX-GTS-449: not on NVIDIA. There a shader-object draw that follows pipeline draws can lose
+    // its colour output while its depth is written (GT Sport's garage floor drew black, and grass
+    // tufts showed through the road in races): state valid by the spec, validation clean, AMD
+    // correct. With blended draws on shader objects too, nearly no draw follows a pipeline, and
+    // both were gone (caches off, Nürburgring start). SO-015 had already fixed the HUD sprites
+    // SO-017 was for. RYGT_SO_SKIP still overrides.
+    static const u32 so_skip = [vendor = instance.GetVendorID()] {
         const char* env = std::getenv("RYGT_SO_SKIP");
-        u32 bits = env ? u32(std::strtoul(env, nullptr, 0)) : 1u;
+        u32 bits = env ? u32(std::strtoul(env, nullptr, 0)) : (vendor == 0x10de ? 0u : 1u);
         if (std::FILE* file = std::fopen("so_skip.txt", "r")) {
             char text[32]{};
             if (std::fgets(text, sizeof(text), file)) bits = u32(std::strtoul(text, nullptr, 0));
@@ -928,7 +939,76 @@ GraphicsPipeline::GraphicsPipeline(
     if (sdata.multisampling.alphaToCoverageEnable) kinds |= 2;
     if (color_blending.logicOpEnable) kinds |= 4;
     if (!infos[u32(Shader::SwStage::Fragment)]) kinds |= 16;
-    if (ShaderObjectPolicyAllows(so_candidate, lds_emulation, kinds, so_skip) &&
+    // DIAG-GTS-431: RYGT_SO_SKIP_HASHES=<hex,hex,...> keeps pipelines containing any of these
+    // shader programs (any stage) off shader objects, to test one draw's shaders on their own.
+    static const std::vector<u64> so_skip_hashes = [] {
+        std::vector<u64> hashes;
+        if (const char* env = std::getenv("RYGT_SO_SKIP_HASHES"); env && *env) {
+            std::string list{env};
+            for (size_t pos = 0; pos < list.size();) {
+                const size_t end = std::min(list.find(',', pos), list.size());
+                hashes.push_back(std::strtoull(list.substr(pos, end - pos).c_str(), nullptr, 16));
+                pos = end + 1;
+            }
+            LOG_WARNING(Render_Vulkan, "DIAG-GTS-431: {} shader programs kept off shader objects",
+                        hashes.size());
+        }
+        return hashes;
+    }();
+    const bool hash_skipped = !so_skip_hashes.empty() && std::ranges::any_of(infos, [](const auto* info) {
+        return info && std::ranges::find(so_skip_hashes, info->pgm_hash) != so_skip_hashes.end();
+    });
+    // DIAG-GTS-432: RYGT_SO_HASH_MASK / RYGT_SO_HASH_VALUE (hex) let only pipelines whose mixed
+    // shader hash h has (h & mask) == value use shader objects, to bisect which pipeline's
+    // shader objects break something. The mixed hash and the decision are logged per pipeline.
+    // DIAG-GTS-440: RYGT_SO_HASH_TERMS="mask:value,mask:value,..." (hex) is the same filter with
+    // several terms; a pipeline uses shader objects when any term matches. It replaces the
+    // MASK/VALUE pair when set, so two groups of pipelines can be bisected at once.
+    static const std::vector<std::pair<u64, u64>> so_hash_filter = [] {
+        std::vector<std::pair<u64, u64>> terms;
+        if (const char* list = std::getenv("RYGT_SO_HASH_TERMS"); list && *list) {
+            const char* p = list;
+            while (*p) {
+                char* end = nullptr;
+                const u64 m = std::strtoull(p, &end, 16);
+                if (end == p) break;
+                p = end;
+                u64 v = 0;
+                if (*p == ':') {
+                    v = std::strtoull(p + 1, &end, 16);
+                    p = end;
+                }
+                if (m) terms.emplace_back(m, v & m);
+                while (*p == ',' || *p == ' ' || *p == ';') ++p;
+            }
+        } else {
+            const char* mask = std::getenv("RYGT_SO_HASH_MASK");
+            const char* value = std::getenv("RYGT_SO_HASH_VALUE");
+            const u64 m = mask && *mask ? std::strtoull(mask, nullptr, 16) : 0;
+            const u64 v = value && *value ? std::strtoull(value, nullptr, 16) : 0;
+            if (m) terms.emplace_back(m, v);
+        }
+        for (const auto& [m, v] : terms) {
+            LOG_WARNING(Render_Vulkan, "DIAG-GTS-432: shader objects where (h & {:#x}) == {:#x}", m, v);
+        }
+        return terms;
+    }();
+    bool hash_filtered = false;
+    if (!so_hash_filter.empty()) {
+        u64 h = 0x9E3779B97F4A7C15ULL;
+        for (const auto* info : infos) {
+            h = (h ^ (info ? info->pgm_hash : 0)) * 0x100000001B3ULL;
+            h ^= h >> 29;
+        }
+        hash_filtered = std::ranges::none_of(
+            so_hash_filter, [h](const auto& t) { return (h & t.first) == t.second; });
+        if (so_candidate) {
+            LOG_INFO(Render_Vulkan, "DIAG-GTS-432: {} h={:#018x} {}", GetDebugString(), h,
+                     hash_filtered ? "pipeline" : "shader objects");
+        }
+    }
+    if (!hash_skipped && !hash_filtered &&
+        ShaderObjectPolicyAllows(so_candidate, lds_emulation, kinds, so_skip) &&
         (key.num_samples <= 1 || !sdata.multisampling.sampleShadingEnable)) {
         const auto& raster = raster_chain.get<vk::PipelineRasterizationStateCreateInfo>();
         so_state.topology = topology;
@@ -939,7 +1019,8 @@ GraphicsPipeline::GraphicsPipeline(
                                  : vk::ProvokingVertexModeEXT::eLastVertex;
         so_state.depth_clamp = raster.depthClampEnable != VK_FALSE;
         so_state.depth_clip = key.depth_clip_enable != 0;
-        so_state.negative_one_to_one = key.clip_space == AmdGpu::ClipSpace::MinusWToW;
+        so_state.negative_one_to_one = key.clip_space == AmdGpu::ClipSpace::MinusWToW &&
+                                       instance.UsesDepthClipControl(); // FIX-GTS-443
         // SO-015: as the pipeline's: only when the pixel shader writes alpha to target 0 (else
         // the coverage came from an undefined alpha: HUD sprites and the menu cursor vanished).
         so_state.alpha_to_coverage = sdata.multisampling.alphaToCoverageEnable != VK_FALSE;
@@ -948,6 +1029,29 @@ GraphicsPipeline::GraphicsPipeline(
         so_state.attachments = key.num_color_attachments;
         so_state.patch_control_points = tessellated || is_rect_list || is_quad_list
                                             ? tessellation_state.patchControlPoints : 0;
+        // DIAG-GTS-442: RYGT_SO_CLIP_SPACE=0 forces shader-object draws to 0..1 depth, 1 to
+        // -1..1 (default: the guest's clip space, as the pipeline). With the hash filter on, the
+        // chosen pipelines' depth state is logged: a shader-object draw wrote depth slightly
+        // nearer than the same surface drawn by a pipeline (garage floor, grass on the road).
+        static const int so_clip_space = [] {
+            const char* env = std::getenv("RYGT_SO_CLIP_SPACE");
+            return env && (env[0] == '0' || env[0] == '1') ? env[0] - '0' : -1;
+        }();
+        if (so_clip_space >= 0) {
+            so_state.negative_one_to_one = so_clip_space == 1;
+        }
+        if (!so_hash_filter.empty()) {
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-GTS-442: {} clip_space={} neg1to1={} clamp={} (key {}) clip={} "
+                        "clip_control={} clip_enable_ext={} samples={} polygon={} provoking={} "
+                        "topology={}",
+                        GetDebugString(), u32(key.clip_space), so_state.negative_one_to_one,
+                        so_state.depth_clamp, u32(key.depth_clamp_enable), so_state.depth_clip,
+                        instance.IsDepthClipControlSupported(),
+                        instance.IsDepthClipEnableSupported(), u32(so_state.samples),
+                        u32(so_state.polygon_mode), u32(so_state.provoking),
+                        u32(so_state.topology));
+        }
         if (CreateShaderObjects(modules, sdata, attachments,
                                 infos[u32(Shader::SwStage::Fragment)] != nullptr,
                                 independent_sets)) return;
@@ -1841,6 +1945,12 @@ void GraphicsPipeline::BindShaderObjects(
     if (!p || p->provoking != s.provoking) {
         cmd.setProvokingVertexModeEXT(s.provoking);
     }
+    // FIX-GTS-425: with VK_NV_framebuffer_mixed_samples enabled, a shader-object draw must set
+    // the coverage modulation mode (VUID-vkCmdDrawIndexed-None-07644); it was never set, so it
+    // was undefined on every shader-object draw. Pipelines leave it at NONE.
+    if (!p && instance.IsNvFramebufferMixedSamples()) {
+        cmd.setCoverageModulationModeNV(vk::CoverageModulationModeNV::eNone);
+    }
     if (instance.IsLogicOpSupported() &&
         (!p || p->logic_op_enable != s.logic_op_enable || p->logic_op != s.logic_op)) {
         cmd.setLogicOpEnableEXT(s.logic_op_enable);
@@ -1850,6 +1960,22 @@ void GraphicsPipeline::BindShaderObjects(
         const auto same = [&](const auto& a, const auto& b) {
             return std::equal(a.begin(), a.begin() + s.attachments, b.begin());
         };
+        // DIAG-GTS-448: with RYGT_SO_TOGGLE_STATE=1, a bind after a pipeline first sets the
+        // opposite blend enables on all 8 targets (and real equations on all 8), then the real ones.
+        static const bool toggle_state = [] {
+            const char* env = std::getenv("RYGT_SO_TOGGLE_STATE");
+            return env && env[0] == '1';
+        }();
+        if (!p && toggle_state) {
+            std::array<vk::Bool32, AmdGpu::NUM_COLOR_BUFFERS> flipped{};
+            for (u32 i = 0; i < flipped.size(); ++i) {
+                flipped[i] = s.blend_enable[i] ? VK_FALSE : VK_TRUE;
+            }
+            cmd.setColorBlendEnableEXT(0u, vk::ArrayProxy<const vk::Bool32>{flipped});
+            cmd.setColorBlendEquationEXT(
+                0u, vk::ArrayProxy<const vk::ColorBlendEquationEXT>{s.equations});
+            cmd.setColorBlendEnableEXT(0u, vk::ArrayProxy<const vk::Bool32>{s.blend_enable});
+        }
         if (!p || p->attachments < s.attachments || !same(p->blend_enable, s.blend_enable)) {
             cmd.setColorBlendEnableEXT(0, s.attachments, s.blend_enable.data());
         }
@@ -1903,9 +2029,30 @@ void GraphicsPipeline::GetVertexInputs(
             .format = format,
             .offset = 0,
         });
+        // DIAG-GTS-427: a guest stride (up to 16383) above the device's limit (2048 on NVIDIA)
+        // makes the vertex input undefined; validation saw 16023 once in a GT Sport race.
+        if (const u32 stride = buffer.GetStride();
+            stride > instance.GetImageLimits().maxVertexInputBindingStride) {
+            static std::atomic<u32> logged{};
+            if (const u32 n = ++logged; n <= 20 || n % 1000 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "DIAG-GTS-427: vs {:#x} attribute {} stride {} > limit {} (base {:#x}, "
+                            "step {}, {} times)",
+                            vs_info.pgm_hash, semantic, stride,
+                            instance.GetImageLimits().maxVertexInputBindingStride,
+                            u64(buffer.base_address), u32(step_rate), n);
+            }
+        }
+        // FIX-GTS-430: a stride above the limit is undefined behaviour; a GT Sport race passed
+        // 16256 for an attribute with no buffer (base 0) 16 times right before a device loss.
+        // Such a binding gets stride 0 (valid: every vertex reads the same element).
+        const u32 bound_stride =
+            buffer.GetStride() > instance.GetImageLimits().maxVertexInputBindingStride
+                ? 0u
+                : buffer.GetStride();
         bindings.push_back(Binding{
             .binding = semantic,
-            .stride = buffer.GetStride(),
+            .stride = bound_stride,
             .inputRate = step_rate == InstanceIdType::None ? vk::VertexInputRate::eVertex
                                                            : vk::VertexInputRate::eInstance,
         });
@@ -2014,7 +2161,14 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
     }
 #endif
     push_set = NoPushSet;
+    // DIAG-GTS-426: RYGT_PUSH_DESCRIPTORS=0 gives graphics pipelines no push set (every stage
+    // binds allocated sets), to test the push path and to get validation past its push crash.
+    static const bool push_descriptors = [] {
+        const char* env = std::getenv("RYGT_PUSH_DESCRIPTORS");
+        return !(env && env[0] == '0');
+    }();
     for (const auto sw : {Shader::SwStage::Fragment, Shader::SwStage::Vertex}) {
+        if (!push_descriptors) break;
         if (cached_fragment && sw == Shader::SwStage::Fragment) continue;
         const u32 set = Shader::Backend::StageSet(u32(sw));
         if (!set_bindings[set].empty() && set_descriptors[set] < instance.MaxPushDescriptors()) {

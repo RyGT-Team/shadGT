@@ -736,6 +736,18 @@ void EmitContext::DefineVertexBlock() {
     const std::array<Id, 8> zero{f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value,
                                  f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value};
     output_position = DefineVariable(F32[4], spv::BuiltIn::Position, spv::StorageClass::Output);
+    // FIX-GTS-441: GT Sport draws a surface, then draws over it again with a different vertex
+    // shader and a less-or-equal depth test, relying on bit-identical positions. A shader object
+    // and a pipeline are compiled separately, so without Invariant their positions could differ
+    // in the last bits: with one of the two on shader objects, the garage floor z-fought (flickered
+    // or vanished). RYGT_INVARIANT_POSITION=0 leaves the decoration out.
+    static const bool invariant_position = [] {
+        const char* env = std::getenv("RYGT_INVARIANT_POSITION");
+        return !(env && env[0] == '0');
+    }();
+    if (invariant_position) {
+        Decorate(output_position, spv::Decoration::Invariant);
+    }
     // AMD-307: the stage that feeds the rasterizer also writes the position to two locations the
     // pixel shader reads interpolated and per vertex (see DefineAmdPerVertexAttribs).
     if (profile.vertex_order_check &&

@@ -493,6 +493,13 @@ bool Instance::CreateDevice() {
     }
     custom_border_color = add_extension(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
     depth_clip_control = add_extension(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
+    // FIX-GTS-443 (off by default: it broke the cars' tessellation and fixed nothing): with
+    // RYGT_DEPTH_CLIP_CONTROL=0, -1..1 depth is converted in the vertex shader (as without the
+    // extension). The extension stays enabled: shader objects then set 0..1.
+    if (const char* env = std::getenv("RYGT_DEPTH_CLIP_CONTROL"); env && env[0] == '0') {
+        depth_clip_in_shader = true;
+        LOG_INFO(Render_Vulkan, "FIX-GTS-443: -1..1 depth converted in the vertex shader");
+    }
     depth_clip_enable = add_extension(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
     vertex_input_dynamic_state = add_extension(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
     // SO-001: VK_EXT_shader_object. Plain pipelines (no tessellation or geometry shader) are drawn
@@ -566,7 +573,14 @@ bool Instance::CreateDevice() {
                     static_cast<VkPhysicalDevice>(physical_device), &maintenance_features);
                 shader_independent_sets = maintenance11_features.maintenance11 != VK_FALSE;
             }
-            shader_object = shader_independent_sets;
+            // DIAG-GTS-428: RYGT_SO_WITHOUT_MAINT11=1 keeps shader objects on without
+            // VK_KHR_maintenance11 (no independent-set shader objects), e.g. under RenderDoc,
+            // which does not expose it.
+            static const bool without_maint11 = [] {
+                const char* env = std::getenv("RYGT_SO_WITHOUT_MAINT11");
+                return env && env[0] == '1';
+            }();
+            shader_object = shader_independent_sets || without_maint11;
         }
         const char* tess = std::getenv("RYGT_SHADER_OBJECT_TESS");
         shader_object_tessellation = shader_object && !(tess && tess[0] == '0');

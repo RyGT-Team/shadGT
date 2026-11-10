@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
+#include <vector>
 #include <fmt/format.h>
 #include "common/recoverable.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
@@ -239,7 +241,42 @@ void ConvertPositionToClipSpace(EmitContext& ctx) {
     ctx.OpStore(ptr(2), b2);
 }
 
+// DIAG-GTS-447 (diagnosis): RYGT_DIAG_FS_CONST=<hex program hash>[,...] makes those pixel shaders
+// write magenta (1, 0, 1, 1) to every float colour output at the end: whether a draw's output
+// reaches its targets at all (a shader-object draw on NVIDIA left GT Sport's floor black).
+static bool DiagConstantOutput(u64 hash) {
+    static const std::vector<u64> hashes = [] {
+        std::vector<u64> list;
+        const char* env = std::getenv("RYGT_DIAG_FS_CONST");
+        for (const char* at = env ? env : ""; *at;) {
+            char* end = nullptr;
+            const u64 value = std::strtoull(at, &end, 16);
+            if (end == at) break;
+            list.push_back(value);
+            at = *end == ',' ? end + 1 : end;
+        }
+        return list;
+    }();
+    return std::ranges::find(hashes, hash) != hashes.end();
+}
+
 void EmitEpilogue(EmitContext& ctx) {
+    if (ctx.hw_stage == HwStage::Fragment && DiagConstantOutput(ctx.info.pgm_hash)) {
+        const std::array<float, 4> magenta{1.0f, 0.0f, 1.0f, 1.0f};
+        for (const auto& output : ctx.frag_outputs) {
+            if (!Sirit::ValidId(output.id) || output.is_integer ||
+                output.component_type.value != ctx.F32[1].value) {
+                continue;
+            }
+            for (u32 c = 0; c < output.num_components && c < 4; ++c) {
+                const Id target = output.num_components == 1
+                                      ? output.id
+                                      : ctx.OpAccessChain(output.pointer_type, output.id,
+                                                          ctx.ConstU32(c));
+                ctx.OpStore(target, ctx.ConstF32(magenta[c]));
+            }
+        }
+    }
     if (ctx.hw_stage == HwStage::Fragment && ctx.runtime_info.hw.fs.color_buffers[0].hdr_ui_alpha1) {
         const auto& info = ctx.frag_outputs[0];
         if (Sirit::ValidId(info.id) && !info.is_integer && info.num_components == 4 &&

@@ -167,6 +167,9 @@ vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type);
 #else
 #define NATIVE_DIAGNOSTIC(...) __VA_ARGS__
 #endif
+// DIAG-GTS-423: snapshot-lease counters count in Release too; they only run on the opt-in
+// lease path (RYGT_NATIVE_SNAPSHOT_LEASE=1) and feed the Release lease summary in Report().
+#define LEASE_COUNT(...) __VA_ARGS__
 namespace Ryty::Camera {
 bool RaceViewActive(); // ryty_camera_runtime.cpp (WIDE-003)
 bool RaceViewFrozen(); // the race is paused (WIDE-005)
@@ -1670,11 +1673,12 @@ struct NativeRenderer::SnapshotUploadMemo {
     struct FailedProof { u64 address{}, size{}, epoch{}; };
     std::array<FailedProof, 64> failed{};
     u32 failed_cursor{};
-#ifndef NDEBUG
+    // DIAG-GTS-423: the lease counters exist in Release too (LEASE_COUNT).
     u64 lease_hits{}, lease_bytes{}, lease_armed{}, lease_rejected{};
     u64 lease_unavailable{}, lease_poisoned{}, lease_mapping_rejected{}, lease_stack_rejected{};
     u64 lease_protection_rejected{}, lease_capacity_rejected{}, lease_first_use_deferred{}, lease_idle_retired{};
     u64 lease_backing_reused{}, lease_backing_queries{};
+#ifndef NDEBUG
     std::array<u64, 9> poison_cause_calls{}, poison_cause_bytes{};
 #endif
     void Clear() { memo.Clear(); hints.Clear(); tokens.Reset(); }
@@ -3530,6 +3534,34 @@ void NativeRenderer::BindGraphics(Stream& s, const GraphicsPipeline& pipeline,
         cmdbuf.Run([bound, owner, known, previous, shaders](vk::CommandBuffer cmd) {
             bound->BindShaderObjects(cmd, known ? &previous : nullptr, known ? &shaders : nullptr);
         });
+        // DIAG-GTS-446 (diagnosis, RYGT_SO_RESEND_STATE=1): after a pipeline, a shader-object bind
+        // records all the dynamic state and the vertex input again, after the bind. On NVIDIA a
+        // shader-object draw right after a pipeline draw drew black (GT Sport's garage floor, after
+        // a depth-only pre-pass pipeline) though its state was valid; this did not change it.
+        static const bool resend_state = [] {
+            const char* env = std::getenv("RYGT_SO_RESEND_STATE");
+            return env && env[0] == '1';
+        }();
+        // DIAG-GTS-448: RYGT_SO_TOGGLE_STATE=1 first sets every colour target's write mask to
+        // nothing and back, in case the driver skips a write-mask call with the value it thinks
+        // it has (the floor drew depth but no colour after a depth-only pipeline pass).
+        static const bool toggle_state = [] {
+            const char* env = std::getenv("RYGT_SO_TOGGLE_STATE");
+            return env && env[0] == '1';
+        }();
+        if (!known && toggle_state && r.instance.IsDynamicColorWriteMaskSupported()) {
+            const ColorWriteMasks none{};
+            cmdbuf.setColorWriteMaskEXT(0, none);
+            s.dynamic.Invalidate();
+            s.dynamic.Commit(r.instance, cmdbuf);
+        }
+        if (!known && resend_state) {
+            s.dynamic.Invalidate();
+            s.dynamic.Commit(r.instance, cmdbuf);
+            if (r.instance.IsVertexInputDynamicState() && s.vertex_state_known) {
+                cmdbuf.setVertexInputEXT(s.input_bindings, s.attributes);
+            }
+        }
         if (!known) s.pipelines.Invalidate();
         // FIX-GTS-420/421: a shader-object bind forgets the push constants and descriptor sets
         // OPT-014 remembers (binding_commands), so the next PushBindings issues them again.
@@ -7053,17 +7085,17 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
                         [&] { return protocol.ReadMapping(true); }, lease_frame);
                 });
                 if (fast) {
-                    NATIVE_DIAGNOSTIC(++cache.lease_hits);
-                    NATIVE_DIAGNOSTIC(cache.lease_bytes += size);
+                    LEASE_COUNT(++cache.lease_hits);
+                    LEASE_COUNT(cache.lease_bytes += size);
                     NATIVE_DIAGNOSTIC(++stats.snapshot_memo_hits);
                     NATIVE_DIAGNOSTIC(stats.snapshot_upload_bytes_saved += size);
                     return *fast;
                 }
             }
             if (!stack_allowed) {
-                NATIVE_DIAGNOSTIC(++cache.lease_stack_rejected);
+                LEASE_COUNT(++cache.lease_stack_rejected);
             } else if (!cache.poison.Safe(*source_pages)) {
-                NATIVE_DIAGNOSTIC(++cache.lease_poisoned);
+                LEASE_COUNT(++cache.lease_poisoned);
 #ifndef NDEBUG
                 if (SnapshotLease::PoisonTraceRequested()) {
                     const u32 causes = protocol.causes ? protocol.causes(address, size) : 0;
@@ -7080,7 +7112,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
                 // This rejects only an optimization. Do not query, pin or
                 // change page protection for a range we cannot own; the exact
                 // comparison/copy path below remains authoritative.
-                NATIVE_DIAGNOSTIC(++cache.lease_capacity_rejected);
+                LEASE_COUNT(++cache.lease_capacity_rejected);
             } else {
                 const auto state = protocol.ReadMapping(false);
                 const bool failed_before = std::ranges::any_of(cache.failed, [&](const auto& item) {
@@ -7093,10 +7125,10 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
                     if (const auto known = cache.leases.KnownBacking(source, state)) {
                         eligible = *known;
                         known_backing = true;
-                        NATIVE_DIAGNOSTIC(++cache.lease_backing_reused);
+                        LEASE_COUNT(++cache.lease_backing_reused);
                     } else {
                         eligible = protocol.Query(source);
-                        NATIVE_DIAGNOSTIC(++cache.lease_backing_queries);
+                        LEASE_COUNT(++cache.lease_backing_queries);
                     }
                     source_pin.reset(SnapshotLease::Good(eligible) ?
                         protocol.pin(source_pages->address, source_pages->size) : nullptr);
@@ -7120,7 +7152,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
                             if (receipt) {
                                 capture_before = *receipt;
                                 receipt_matches = true;
-                                NATIVE_DIAGNOSTIC(++cache.lease_backing_reused);
+                                LEASE_COUNT(++cache.lease_backing_reused);
                             }
                         }
                         if (receipt_matches) {
@@ -7189,10 +7221,10 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
                                     source, source, eligible, current, cache.poison.Safe(*source_pages));
                                 if (receipt) {
                                     capture_before = *receipt;
-                                    NATIVE_DIAGNOSTIC(++cache.lease_backing_reused);
+                                    LEASE_COUNT(++cache.lease_backing_reused);
                                 } else {
                                     capture_before = protocol.Query(source);
-                                    NATIVE_DIAGNOSTIC(++cache.lease_backing_queries);
+                                    LEASE_COUNT(++cache.lease_backing_queries);
                                 }
                             }
                         }
@@ -7210,16 +7242,16 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
                                     source_pages->address + source_pages->size);
                             source_pin.reset();
                             reject_mapping();
-                            NATIVE_DIAGNOSTIC(++cache.lease_protection_rejected);
+                            LEASE_COUNT(++cache.lease_protection_rejected);
                         }
                     } else {
                         reject_mapping();
-                        NATIVE_DIAGNOSTIC(++cache.lease_mapping_rejected);
+                        LEASE_COUNT(++cache.lease_mapping_rejected);
                     }
                 }
             }
         } else if (SnapshotLease::Requested()) {
-            NATIVE_DIAGNOSTIC(if (!candidate) ++cache.lease_first_use_deferred;
+            LEASE_COUNT(if (!candidate) ++cache.lease_first_use_deferred;
                               else ++cache.lease_unavailable);
         }
         // This callback runs only after an exact comparison/capture established
@@ -7246,10 +7278,10 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
             capture_committed = certified_lease.has_value();
             source_pin.reset(); // Never retain a registry pin across Allocate/Splice/GPU waits.
             if (!certified_lease) {
-                NATIVE_DIAGNOSTIC(++cache.lease_rejected);
+                LEASE_COUNT(++cache.lease_rejected);
                 return;
             }
-            NATIVE_DIAGNOSTIC(++cache.lease_armed);
+            LEASE_COUNT(++cache.lease_armed);
         };
         const auto certify = [&](size_t slot, bool exact) {
             cache.tokens.Forget(static_cast<unsigned>(slot));
@@ -10994,7 +11026,7 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
         v.buffers.push_back(found ? found->first : vk::Buffer{});
         v.offsets.push_back(found ? found->second : 0);
         v.sizes.push_back(found ? size : 0);
-        v.strides.push_back(guest.GetStride());
+        v.strides.push_back(guest.GetStride() > r.instance.GetImageLimits().maxVertexInputBindingStride ? 0u : guest.GetStride()); // FIX-GTS-430
 #ifndef NDEBUG
         if (GeometryTrace::current) {
             GeometryTrace::Record("vertex_resolved", GeometryTrace::current,
@@ -12499,6 +12531,30 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
         }
     }
 }
+
+#if !defined(NDEBUG)
+// DIAG-208: purple pixels of the garage cockpit view, and what each draw left there.
+// FIX-GTS-422: restored; the shadgt7 merge dropped these, which broke Debug builds only.
+namespace {
+constexpr VAddr TracedTarget = 0x1005000000;
+constexpr std::array<std::pair<s32, s32>, 4> TracedPixels{
+    {{266, 190}, {538, 306}, {273, 195}, {571, 322}}};
+constexpr u64 PixelTraceDraws = 8192;
+struct PixelTrace {
+    std::unique_ptr<Native::Rhi::Buffer> buffer;
+    std::vector<std::pair<u64, u64>> hashes;
+    // DIAG-GTS-429: a pixel-trace.txt next to GTSport.exe ("<target hex> <x> <y> <w> <h>"),
+    // read when a dump starts, traces that rectangle of that target after each draw instead.
+    bool armed{};
+    bool rect{};
+    VAddr target{};
+    s32 x{}, y{};
+    u32 w{}, h{};
+    u64 capacity{};
+    u64 buffer_size{};
+} g_pixel_trace;
+} // namespace
+#endif
 
 void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect) {
     std::scoped_lock lock{mutex};
@@ -15426,7 +15482,72 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         const char* env = std::getenv("RYGT_PIXEL_TRACE");
         return env && env[0] == '1';
     }();
-    if (pixel_trace && r.FrameDumpCollecting() && targets.colors[0] &&
+    if (r.FrameDumpCollecting() && !g_pixel_trace.armed) {
+        g_pixel_trace.armed = true;
+        g_pixel_trace.rect = false;
+        static const auto trace_file =
+            Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path() / "pixel-trace.txt";
+        if (std::ifstream in{trace_file}) {
+            std::string target_text;
+            s32 x{}, y{};
+            u32 w{}, h{};
+            if (in >> target_text >> x >> y >> w >> h && w && h && x >= 0 && y >= 0) {
+                g_pixel_trace.target = std::strtoull(target_text.c_str(), nullptr, 16);
+                g_pixel_trace.x = x;
+                g_pixel_trace.y = y;
+                g_pixel_trace.w = w;
+                g_pixel_trace.h = h;
+                g_pixel_trace.capacity = std::min<u64>(PixelTraceDraws, (256ull << 20) / (u64(w) * h * 4));
+                g_pixel_trace.rect = g_pixel_trace.capacity != 0;
+                LOG_WARNING(Render_Vulkan, "DIAG-GTS-429: pixel trace of {:#x} at {},{} {}x{} ({} draws)",
+                            g_pixel_trace.target, x, y, w, h, g_pixel_trace.capacity);
+            }
+        }
+    }
+    // DIAG-GTS-445: the traced target may also be the depth buffer (its depth aspect, 32-bit).
+    const bool trace_depth = g_pixel_trace.rect && targets.depth &&
+                             targets.depth->info.guest_address == g_pixel_trace.target &&
+                             !(targets.colors[0] &&
+                               targets.colors[0]->info.guest_address == g_pixel_trace.target);
+    const Native::ImageEntry* const traced =
+        trace_depth ? targets.depth : targets.colors[0];
+    if (g_pixel_trace.rect && r.FrameDumpCollecting() && traced &&
+        traced->info.guest_address == g_pixel_trace.target &&
+        g_pixel_trace.hashes.size() < g_pixel_trace.capacity &&
+        u64(g_pixel_trace.x) + g_pixel_trace.w <= traced->info.size.width &&
+        u64(g_pixel_trace.y) + g_pixel_trace.h <= traced->info.size.height) {
+        const u64 stride = u64(g_pixel_trace.w) * g_pixel_trace.h * 4;
+        const u64 size = stride * g_pixel_trace.capacity;
+        if (!g_pixel_trace.buffer || g_pixel_trace.buffer_size != size) {
+            g_pixel_trace.buffer = device->CreateBuffer(
+                {.size = size,
+                 .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageTransferDst,
+                 .memory = Native::Rhi::MemoryKind::Readback,
+                 .name = "pixel trace rect"});
+            g_pixel_trace.buffer_size = g_pixel_trace.buffer ? size : 0;
+        }
+        if (g_pixel_trace.buffer && g_pixel_trace.buffer->Mapped()) {
+            EndRendering();
+            GlobalBarrier();
+            const vk::BufferImageCopy copy{
+                .bufferOffset = g_pixel_trace.hashes.size() * stride,
+                .imageSubresource{.aspectMask = trace_depth ? vk::ImageAspectFlagBits::eDepth
+                                                            : vk::ImageAspectFlagBits::eColor,
+                                  .mipLevel = 0,
+                                  .baseArrayLayer = 0,
+                                  .layerCount = 1},
+                .imageOffset = {g_pixel_trace.x, g_pixel_trace.y, 0},
+                .imageExtent = {g_pixel_trace.w, g_pixel_trace.h, 1}};
+            stream.cmd.copyImageToBuffer(
+                vk::Image{Handle<VkImage_T>(traced->image->NativeHandle())},
+                vk::ImageLayout::eGeneral,
+                vk::Buffer{Handle<VkBuffer_T>(g_pixel_trace.buffer->NativeHandle())}, copy);
+            GlobalBarrier();
+            const auto* vs = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+            const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+            g_pixel_trace.hashes.emplace_back(vs ? vs->pgm_hash : 0, ps ? ps->pgm_hash : 0);
+        }
+    } else if (!g_pixel_trace.rect && pixel_trace && r.FrameDumpCollecting() && targets.colors[0] &&
         targets.colors[0]->info.guest_address == TracedTarget &&
         g_pixel_trace.hashes.size() < PixelTraceDraws) {
         if (!g_pixel_trace.buffer) {
@@ -16831,7 +16952,7 @@ bool NativeRenderer::PrepareVertices(PreparedDraw& p, const AmdGpu::Regs& regs,
         v.buffers.push_back(found ? found->first : vk::Buffer{});
         v.offsets.push_back(found ? found->second : 0);
         v.sizes.push_back(found ? size : 0);
-        v.strides.push_back(guest.GetStride());
+        v.strides.push_back(guest.GetStride() > r.instance.GetImageLimits().maxVertexInputBindingStride ? 0u : guest.GetStride()); // FIX-GTS-430
     }
     p.indexed = is_indexed;
     p.index_offset = index_offset;
@@ -19142,7 +19263,7 @@ void NativeRenderer::ReleaseUnusedWatches() {
         // their own lifetime, and all live owners below still retain watches.
         const auto idle = snapshot_upload_memo->leases.ReleaseUnused(
             frame + (frame != UINT64_MAX), 120);
-        NATIVE_DIAGNOSTIC(snapshot_upload_memo->lease_idle_retired += idle.count);
+        LEASE_COUNT(snapshot_upload_memo->lease_idle_retired += idle.count);
         for (size_t i = 0; i < idle.count; ++i) {
             const auto range = idle.ranges[i];
             retired_watch_ranges.emplace_back(range.address, range.address + range.size);
@@ -20463,7 +20584,26 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
             }
         }
     }
-    if (!g_pixel_trace.hashes.empty()) {
+    g_pixel_trace.armed = false; // the next dump reads pixel-trace.txt again
+    if (g_pixel_trace.rect && !g_pixel_trace.hashes.empty()) {
+        // DIAG-GTS-429: draw i's rectangle is bytes [i*w*h*4, (i+1)*w*h*4) of pixel-trace.bin.
+        const u64 stride = u64(g_pixel_trace.w) * g_pixel_trace.h * 4;
+        {
+            std::ofstream out{dir / "pixel-trace.txt"};
+            out << fmt::format("rect target {:#x} x {} y {} w {} h {} draws {}\n",
+                               g_pixel_trace.target, g_pixel_trace.x, g_pixel_trace.y,
+                               g_pixel_trace.w, g_pixel_trace.h, g_pixel_trace.hashes.size());
+            for (size_t i = 0; i < g_pixel_trace.hashes.size(); ++i) {
+                out << fmt::format("{} vs {:#x} ps {:#x}\n", i, g_pixel_trace.hashes[i].first,
+                                   g_pixel_trace.hashes[i].second);
+            }
+        }
+        if (std::FILE* file = std::fopen((dir / "pixel-trace.bin").string().c_str(), "wb")) {
+            std::fwrite(g_pixel_trace.buffer->Mapped(), 1, stride * g_pixel_trace.hashes.size(), file);
+            std::fclose(file);
+        }
+        g_pixel_trace.hashes.clear();
+    } else if (!g_pixel_trace.hashes.empty()) {
         std::ofstream out{dir / "pixel-trace.txt"};
         const auto* words = reinterpret_cast<const u32*>(g_pixel_trace.buffer->Mapped());
         for (size_t i = 0; i < g_pixel_trace.hashes.size(); ++i) {
@@ -21087,6 +21227,49 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
     stats.null_reasons = {};
     stats.phase_ns = {};
     (void)cpu_writes;
+#else
+    // DIAG-GTS-423: Release keeps only the snapshot-lease summary, and only when the lease is
+    // requested (RYGT_NATIVE_SNAPSHOT_LEASE=1), so the reuse status can be read without a Debug
+    // renderer. A Debug renderer uses ucrtbased and cannot share file descriptors with the
+    // Release runtime, so it fails at launch in a Release install.
+    if (!SnapshotLease::Requested() || !snapshot_upload_memo) {
+        return;
+    }
+    static auto last_lease_report = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_lease_report < std::chrono::seconds{10}) {
+        return;
+    }
+    last_lease_report = now;
+    auto& cache = *snapshot_upload_memo;
+#ifdef _WIN32
+    static bool module_notice_reported = false;
+    SnapshotLease::FirstModuleNotice notice{};
+    if (!module_notice_reported && SnapshotLease::ReadFirstModuleNotice(notice)) {
+        char name[512]{};
+        WideCharToMultiByte(CP_UTF8, 0, notice.name, -1, name, sizeof(name), nullptr, nullptr);
+        LOG_INFO(Render_Vulkan,
+                 "DIAG-353 snapshot module revocation: reason={} name={} base={:#x} size={}",
+                 notice.reason, name, notice.base, notice.size);
+        module_notice_reported = true;
+    }
+#endif
+    LOG_INFO(Render_Vulkan,
+             "PERF-349 snapshot leases: hits={} bytes={} armed={} rejected={} unavailable={} "
+             "poisoned={} first-use={} proof-reused={} proof-queries={} early-write={} "
+             "module-change={} driver={}",
+             cache.lease_hits, cache.lease_bytes, cache.lease_armed, cache.lease_rejected,
+             cache.lease_unavailable, cache.lease_poisoned, cache.lease_first_use_deferred,
+             cache.lease_backing_reused, cache.lease_backing_queries,
+             SnapshotLease::early_unsafe.load(), SnapshotLease::modules_changed.load(),
+             !SnapshotLease::driver_ready.load() ? "waiting"
+             : SnapshotLease::driver_grace_used.load() ? "grace" : "ready");
+    cache.lease_hits = cache.lease_bytes = cache.lease_armed = cache.lease_rejected = 0;
+    cache.lease_unavailable = cache.lease_poisoned = cache.lease_mapping_rejected = 0;
+    cache.lease_stack_rejected = cache.lease_protection_rejected = cache.lease_capacity_rejected = 0;
+    cache.lease_first_use_deferred = 0;
+    cache.lease_idle_retired = 0;
+    cache.lease_backing_reused = cache.lease_backing_queries = 0;
 #endif
 }
 

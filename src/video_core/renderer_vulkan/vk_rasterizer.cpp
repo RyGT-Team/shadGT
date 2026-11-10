@@ -6955,6 +6955,12 @@ void Rasterizer::UpdateDepthStencilState() const {
         if (gequal_always && op == vk::CompareOp::eGreaterOrEqual) {
             op = vk::CompareOp::eAlways;
         }
+        // DIAG-GTS-445 (diagnosis, RYGT_DIAG_LEQUAL_ALWAYS=1): LESS_EQUAL depth tests always pass
+        // (whether a shader-object draw after a pipeline depth pre-pass fails its depth test).
+        static const bool lequal_always = Common::DiagEnv("RYGT_DIAG_LEQUAL_ALWAYS") != nullptr;
+        if (lequal_always && op == vk::CompareOp::eLessOrEqual) {
+            op = vk::CompareOp::eAlways;
+        }
         dynamic_state.SetDepthCompareOp(op);
     }
 

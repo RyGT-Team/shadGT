@@ -193,6 +193,13 @@ public:
     bool IsDepthClipControlSupported() const {
         return depth_clip_control;
     }
+    /// FIX-GTS-443: true when draws use the extension's -1..1 depth; false when the vertex shader
+    /// converts the depth itself (no extension, or RYGT_DEPTH_CLIP_CONTROL unset). A pipeline gets
+    /// the extension's state baked in, a shader object sets it dynamically, and the two gave
+    /// slightly different depth for the same position on NVIDIA (garage floor and grass z-fought).
+    bool UsesDepthClipControl() const {
+        return depth_clip_control && !depth_clip_in_shader;
+    }
 
     /// Returns true when VK_EXT_depth_clip_enable is supported
     bool IsDepthClipEnableSupported() const {
@@ -336,6 +343,12 @@ public:
     /// VK_AMD_mixed_attachment_samples is supported
     bool IsMixedDepthSamplesSupported() const {
         return nv_framebuffer_mixed_samples || amd_mixed_attachment_samples;
+    }
+
+    /// Returns true if VK_NV_framebuffer_mixed_samples is enabled (FIX-GTS-425: shader-object
+    /// draws must then set the coverage modulation mode themselves).
+    bool IsNvFramebufferMixedSamples() const {
+        return nv_framebuffer_mixed_samples;
     }
 
     /// Returns true if VK_AMD_mixed_attachment_samples is supported
@@ -676,6 +689,7 @@ private:
     u32 amd_vertex_order{}; ///< AMD-311
     bool device_fault{}; // DIAG-206
     bool depth_clip_control{};
+    bool depth_clip_in_shader{}; ///< FIX-GTS-443
     bool depth_clip_enable{};
     bool dynamic_state_3{};
     bool shader_object{}; ///< SO-001

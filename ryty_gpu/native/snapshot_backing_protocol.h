@@ -40,7 +40,20 @@ inline constinit std::atomic<bool> driver_ready{false};
 #ifdef _WIN32
 inline constinit std::atomic<HMODULE> driver_module{nullptr};
 inline constinit std::atomic<std::uint64_t> driver_next_poll{0};
+inline constinit std::atomic<std::uint64_t> driver_first_poll{0};
 #endif
+// PERF-GTS-424: some NVIDIA drivers (seen on 32.0.16.1742) never load nvrtum64.dll into the
+// game, so FIX-354's wait never ended and reuse never started. After this many ms of polling
+// without it, reuse is admitted anyway; if the DLL loads later, the module guard revokes reuse
+// and snapshots go back to copying. RYGT_SNAPSHOT_DRIVER_GRACE_MS=0 waits forever (FIX-354).
+inline constinit std::atomic<bool> driver_grace_used{false};
+inline std::uint64_t DriverGraceMs() {
+    static const std::uint64_t ms = [] {
+        const char* value = std::getenv("RYGT_SNAPSHOT_DRIVER_GRACE_MS");
+        return value && *value ? std::strtoull(value, nullptr, 10) : std::uint64_t{30000};
+    }();
+    return ms;
+}
 inline bool DriverReady() {
 #ifdef _WIN32
     const auto vendor = driver_vendor.load(std::memory_order_acquire);
@@ -50,11 +63,20 @@ inline bool DriverReady() {
     const auto now = GetTickCount64();
     auto next = driver_next_poll.load(std::memory_order_relaxed);
     if (now < next || !driver_next_poll.compare_exchange_strong(next, now + 100, std::memory_order_relaxed)) return false;
+    std::uint64_t first = 0;
+    driver_first_poll.compare_exchange_strong(first, now, std::memory_order_relaxed);
+    if (!first) first = now;
     HMODULE module{};
     const auto error = GetLastError();
     const bool found = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"nvrtum64.dll", &module) != FALSE;
     SetLastError(error);
-    if (!found) return false;
+    if (!found) {
+        const auto grace = DriverGraceMs();
+        if (!grace || now - first < grace) return false;
+        driver_grace_used.store(true, std::memory_order_release);
+        driver_ready.store(true, std::memory_order_release);
+        return true;
+    }
     driver_module.store(module, std::memory_order_release);
     driver_ready.store(true, std::memory_order_release);
     return true;
@@ -62,7 +84,8 @@ inline bool DriverReady() {
     return false;
 #endif
 }
-#if defined(_WIN32) && !defined(NDEBUG)
+// DIAG-GTS-423: the first revoking module is recorded in Release too.
+#if defined(_WIN32)
 // LDR_DLL_NOTIFICATION_DATA has identical loaded/unloaded member layouts.
 struct ModuleNoticeString { USHORT length; USHORT maximum_length; const wchar_t* buffer; };
 struct ModuleNoticeData { ULONG flags; const ModuleNoticeString* full_name; const ModuleNoticeString* base_name; void* base; ULONG size; };
@@ -246,7 +269,7 @@ struct BackingProtocol {
         // Loader callback: no allocations, locks, logging or calls into another
         // DLL. Any module change permanently returns this experiment to copying.
         modules_changed.store(true, std::memory_order_seq_cst);
-#ifndef NDEBUG
+#if 1 // DIAG-GTS-423: recorded in Release too (no allocation, lock or call)
         unsigned expected = 0;
         if (first_module_state.compare_exchange_strong(expected, 1, std::memory_order_relaxed)) {
             first_module_notice.reason = reason;

@@ -9,13 +9,25 @@
 #include <queue>
 #include <semaphore>
 #include <thread>
+#include <atomic>
 #include "ryty_gpu/workload_trace.h"
 #include "ryty_gpu/wait_trace.h"
-struct TestCommandQueue {
+#include "video_core/amdgpu/command_entry.h"
+namespace Common { inline bool PerfFeatureEnabled(int) { return true; } }
+struct TestDrawPipe {
+    std::atomic<bool>* sender_returned{};
+    void RunUrgentIfExclusive() {}
+    void Push(Common::UniqueFunction<void> fn) { fn(); while(sender_returned && !sender_returned->load()) std::this_thread::yield(); }
+};
+struct Liverpool {
     std::mutex submit_mutex; std::condition_variable submit_cv;
-    std::queue<std::function<void()>> command_queue; unsigned num_commands{};
+    std::queue<AmdGpu::CommandEntry> command_queue; std::atomic<unsigned> num_commands{};
+    TestDrawPipe* draw_pipe{}; unsigned commands_recorded{};
+    void SyncRecorder(const char*) {}
+    void ProcessCommands();
 #include "send-command-under-test.inc"
 };
+#include "process-commands-under-test.inc"
 int main() {
     SetEnvironmentVariableA("RYGT_IMAGE_LIFECYCLE_TRACE","1");
     SetEnvironmentVariableA("RYGT_IMAGE_TRACE_UPLOAD_ONLY","1");
@@ -58,20 +70,26 @@ int main() {
     }
     { ImageLife::Scope omitted{"origin_write_fault"}; }
     std::uint64_t command_parent=0;
-    { TestCommandQueue queue; bool invoked=false;
+    { Liverpool queue; bool invoked=false; std::atomic<bool> sender_returned{false};
+      TestDrawPipe pipe{&sender_returned}; queue.draw_pipe=&pipe;
       std::thread worker([&] { std::unique_lock lk{queue.submit_mutex};
         queue.submit_cv.wait(lk,[&] { return !queue.command_queue.empty(); });
-        auto fn=std::move(queue.command_queue.front()); queue.command_queue.pop(); lk.unlock(); fn(); });
+        lk.unlock(); queue.ProcessCommands(); });
       ImageLife::Scope unmap{"unmap_memory",123,456};
       command_parent=unmap.Id(); assert(command_parent);
       queue.SendCommand<true>([&] { invoked=true; },unmap.Id());
-      assert(invoked && queue.num_commands==1); worker.join();
+      sender_returned=true; assert(invoked); worker.join();
       invoked=false;
+      queue.draw_pipe=nullptr;
       std::thread worker2([&] { std::unique_lock lk{queue.submit_mutex};
         queue.submit_cv.wait(lk,[&] { return !queue.command_queue.empty(); });
-        auto fn=std::move(queue.command_queue.front()); queue.command_queue.pop(); lk.unlock(); fn(); });
-      queue.SendCommand<true>([&] { invoked=true; });
-      assert(invoked && queue.num_commands==2); worker2.join();
+        lk.unlock(); queue.ProcessCommands(); });
+      queue.SendCommand<true>([&] { invoked=true; },unmap.Id());
+      assert(invoked); worker2.join();
+      std::atomic<unsigned> async_count{};
+      std::thread a([&] { for(unsigned i=0;i<64;++i) queue.SendCommand([&]{++async_count;}); });
+      std::thread b([&] { for(unsigned i=0;i<64;++i) queue.SendCommand([&]{++async_count;}); });
+      a.join(); b.join(); queue.ProcessCommands(); assert(async_count==128 && queue.num_commands==0);
     }
     { ImageLife::WaitAggregate a;
       for (unsigned i=0;i<256;++i) { const auto start=ImageLife::Timestamp(); a.Add("queue_wait_summary",42,1,start,start+1,false,3); }
@@ -92,7 +110,7 @@ int main() {
     bool nodrops=false, take=false, before=false, after=false, retiring=false, create=false;
     bool allocation=false, heap=false, block=false, queue_summary=false, queue_detail=false, direct_hold=false, window=false;
     bool unmap=false, unmap_summary=false, unmap_detail=false, export_summary=false;
-    bool command_submit=false, command_callback=false; char line[1024];
+    bool command_submit=false, command_callback=false, handoff_push=false, handoff_direct=false; char line[1024];
     for(unsigned i=0;i<100 && !done;++i) {
         f=std::fopen(path,"r"); assert(f);
         while(std::fgets(line,sizeof(line),f)) {
@@ -134,6 +152,13 @@ int main() {
                     std::sscanf(p,",unmap_command_callback,%llu,%llu,%llu,%llu,%llu",&id,&begin,&end,&returned,&tid)==5 &&
                     id==command_parent && begin && begin<=end && end<=returned && tid && tid!=GetCurrentThreadId();
             }
+            if (const auto* p=std::strstr(line,",unmap_command_handoff,")) {
+                unsigned long long id=0,dequeued=0,begin=0,end=0,mode=0;
+                const bool valid=std::strstr(line,",B,") &&
+                    std::sscanf(p,",unmap_command_handoff,%llu,%llu,%llu,%llu,%llu",&id,&dequeued,&begin,&end,&mode)==5 &&
+                    id==command_parent && dequeued && dequeued<=begin && begin<=end;
+                handoff_push |= valid && mode==1; handoff_direct |= valid && mode==2;
+            }
             done |= std::strstr(line,",B,") && std::strstr(line,",present,");
         }
         std::fclose(f); if(!done) Sleep(50);
@@ -142,5 +167,5 @@ int main() {
     assert(nodrops && take && before && after && retiring && create && allocation && heap && block);
     assert(queue_summary && queue_detail && direct_hold && window);
     assert(unmap && unmap_summary && unmap_detail && export_summary);
-    assert(command_submit && command_callback);
+    assert(command_submit && command_callback && handoff_push && handoff_direct);
 }

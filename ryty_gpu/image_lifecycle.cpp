@@ -15,7 +15,7 @@
 
 namespace ImageLife {
 namespace {
-constexpr std::uint64_t Capacity=131072;
+constexpr std::uint64_t Capacity=262144;
 struct Event {
     std::atomic<bool> committed{false};
     std::uint64_t qpc{}, id{}, a{}, b{}, c{}, d{}, e{};

@@ -24,6 +24,7 @@
 #include <unordered_set>
 #include <vector>
 #include <queue>
+#include <utility>
 
 #include "common/assert.h"
 #include "common/slot_vector.h"
@@ -31,6 +32,7 @@
 #include "common/recycling_pool.h"
 #include "common/unique_function.h"
 #include "ryty_gpu/image_lifecycle.h"
+#include "video_core/amdgpu/command_entry.h"
 #include "video_core/amdgpu/cb_db_extent.h"
 #include "video_core/amdgpu/read_ahead_states.h"
 #include "common/read_capture.h"
@@ -40,6 +42,7 @@
 namespace Vulkan {
 class Rasterizer;
 }
+
 
 namespace Libraries::VideoOut {
 struct VideoOutPort;
@@ -203,7 +206,7 @@ public:
                     func();
                     if (trace_id) timing.callback_end=ImageLife::Timestamp();
                     sem.release();
-                });
+                }, trace_id);
                 ++num_commands;
                 submit_cv.notify_one();
                 if (trace_id) timing.enqueued=ImageLife::Timestamp();
@@ -712,7 +715,7 @@ private:
     std::atomic<bool> submit_done{};
     std::mutex submit_mutex;
     std::condition_variable_any submit_cv;
-    std::queue<Common::UniqueFunction<void>> command_queue{};
+    std::queue<CommandEntry> command_queue{};
     std::thread::id gpu_id;
 #ifdef __linux__
     u32 gpu_tid;

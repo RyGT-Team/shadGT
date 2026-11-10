@@ -1460,24 +1460,35 @@ void Liverpool::ProcessCommands() {
     // Process incoming commands with high priority
     while (num_commands) {
         Common::UniqueFunction<void> callback{};
+        std::uint64_t trace_id{};
         {
             std::scoped_lock lk{submit_mutex};
-            callback = std::move(command_queue.front());
+            callback = std::move(command_queue.front().callback);
+            trace_id = command_queue.front().trace_id;
             command_queue.pop();
             --num_commands;
         }
+        const auto dequeued = trace_id ? ImageLife::Timestamp() : 0;
+        std::uint64_t handoff_begin{}, handoff_end{}, mode{};
         if (record) {
             ++commands_recorded;
             // PERF-063: flips and fault flushes read no guest memory for the window's work (a
             // barrier for the buffer stage all the same).
             if (draw_pipe) {
+                if (trace_id) { mode=1; handoff_begin=ImageLife::Timestamp(); }
                 draw_pipe->Push(std::move(callback));
+                if (trace_id) handoff_end=ImageLife::Timestamp();
             } else {
+                if (trace_id) { mode=2; handoff_begin=ImageLife::Timestamp(); }
                 callback();
+                if (trace_id) handoff_end=ImageLife::Timestamp();
             }
         } else {
+            if (trace_id) { mode=2; handoff_begin=ImageLife::Timestamp(); }
             callback();
+            if (trace_id) handoff_end=ImageLife::Timestamp();
         }
+        if (trace_id) { ImageLife::Scope handoff{"unmap_command_handoff",trace_id,dequeued,handoff_begin,handoff_end,mode}; }
     }
 }
 

@@ -72,6 +72,13 @@ includes command-thread and draw-pipe transit. Callback may start before the sen
 post-unlock. unmap_command_inline B contains unmap ID, address and size for the no-queue
 branch. These events also appear in unrestricted full captures. Missing/zero timestamps or
 dropped records indicate clipped observations. Additional tracing has observer overhead.
+unmap_command_handoff B contains request ID, command dequeue QPC sampled after releasing
+the submit mutex, handoff-start QPC, handoff-end QPC, and mode (1 recorder Push, 2 direct
+callback). The row TID is the command thread. Push time includes queue backpressure;
+the callback can complete before Push returns. Queue entries carry an ID even when tracing is
+off, increasing their footprint; no clocks or trace records run for ID zero. The ring holds
+262144 records and allocates approximately 22 MiB on 64-bit Windows only when tracing is
+enabled. Monitor the reported drop count; larger capacity does not guarantee full coverage.
 B fields are owner pointer, role, count (256), total QPC ticks and maximum QPC ticks; E field a
 counts try-lock busy outcomes. Direct roles: 1 FindBuffer, 2 ReleaseHeldAfterSplice,
 The associated wait_summary_window B fields are summary ID, first start QPC, last end QPC.

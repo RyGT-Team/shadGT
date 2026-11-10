@@ -1,13 +1,13 @@
 # Notes for agents working on shadGT
 
-## RYGT_* switches need a description line
+## RYGT_* and SHADGT_* switches need a description line
 
 The RyGT launcher's Advanced page lists the renderer's experimental switches by reading
-`libSceVideoOut.prx` as a file: every `"RYGT_..."` string the renderer passes to `getenv`
+`libSceVideoOut.prx` as a file: every `"RYGT_..."` or `"SHADGT_..."` string the renderer passes to `getenv`
 (or `Common::DiagEnv`) becomes a row. The hover tooltip, editor and heading come from metadata
 strings in the same DLL, kept in **`src/video_core/rygt_switches.cpp`**.
 
-**When you add a switch** (a new `getenv("RYGT_...")`, in `src/` or `ryty_gpu/`), add one line to
+**When you add a switch** (a new `getenv("RYGT_...")` or `getenv("SHADGT_...")`, in `src/` or `ryty_gpu/`), add one line to
 `RyGT_SwitchDescriptions` in that file, under the matching group comment:
 
 ```cpp

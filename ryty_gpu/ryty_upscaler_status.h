@@ -61,9 +61,17 @@ inline void ReportResolution(unsigned output_width, unsigned output_height,
         upscaler.erase(dot, end == std::string::npos ? end : end - dot);
     }
     if (upscaler.starts_with("XeSS")) upscaler = "XeSS";
-    if (upscaler.empty() || upscaler == "no upscaling" || upscaler == "high-resolution UI")
-        upscaler = "No upscaling";
-    if (generating_frames) upscaler += " FG";
+    // FIX-GTS-439: the title shows the upscaler only when one is active; without one (and without
+    // frame generation) it is just the window title. An empty status tells the window thread so.
+    if (upscaler.empty() || upscaler == "no upscaling" || upscaler == "high-resolution UI") {
+        if (!generating_frames) {
+            Report({});
+            return;
+        }
+        upscaler = "Frame generation";
+    } else if (generating_frames) {
+        upscaler += " FG";
+    }
     std::string status = upscaler + " {window}, " + std::to_string(output_width) + "x" +
                          std::to_string(output_height) + " From " + std::to_string(width) + "x" +
                          std::to_string(height);

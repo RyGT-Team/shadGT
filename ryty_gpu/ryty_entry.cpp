@@ -121,7 +121,8 @@ void RunWindowThread() {
         if (const auto status = Vulkan::RytyUpscalerStatus::Take()) { // FSR-204
             int width = 0, height = 0;
             SDL_GetWindowSizeInPixels(window.GetSDLWindow(), &width, &height);
-            std::string title = window_title + " " + *status;
+            // FIX-GTS-439: no upscaler active: the plain title, no status.
+            std::string title = status->empty() ? window_title : window_title + " " + *status;
             if (const auto at = title.find("{window}"); at != std::string::npos) {
                 title.replace(at, 8, std::to_string(width) + "x" + std::to_string(height));
             }

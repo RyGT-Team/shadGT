@@ -151,6 +151,7 @@ std::uint64_t Timestamp() {
     State* s=state; if (!s || !s->open.load()) return 0;
     LARGE_INTEGER q{}; QueryPerformanceCounter(&q); return q.QuadPart;
 }
+std::uint64_t ThreadId() { return GetCurrentThreadId(); }
 std::uint64_t SlowThresholdTicks() { return state ? state->frequency.QuadPart / 5000 : 0; }
 std::uint64_t Begin(const char* kind,std::uint64_t a,std::uint64_t b,std::uint64_t c,std::uint64_t d,std::uint64_t e) {
     State* s=state;

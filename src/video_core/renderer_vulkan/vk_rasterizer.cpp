@@ -6398,8 +6398,9 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     const auto gpu_start = phase_start();
     if (unmap_on_gpu_thread && !IsGpuThread()) {
         ImageLife::SlowScope span{"unmap_gpu_sync", addr, size};
-        liverpool->SendCommand<true>(release_unmapped);
+        liverpool->SendCommand<true>(release_unmapped, unmap_scope.Id());
     } else {
+        ImageLife::Scope inline_trace{"unmap_command_inline", unmap_scope.Id(), addr, size};
         release_unmapped();
     }
     phase_end(4, gpu_start);

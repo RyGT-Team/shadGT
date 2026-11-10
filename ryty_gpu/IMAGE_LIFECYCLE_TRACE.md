@@ -63,6 +63,15 @@ be clipped to frames. unmap_phase_detail records individual spans at least 200 m
 Different unmap calls and phases can overlap across threads; do not sum as a critical path.
 
 Upload-only captures also contain queue_wait_summary and direct_wait_summary/direct_hold_summary.
+For synchronous unmaps, unmap_command_submit B contains unmap ID, sender start QPC,
+submit mutex acquisition QPC, enqueue/notify QPC, and post-unlock QPC.
+unmap_command_callback B contains unmap ID, callback start QPC, callback end QPC,
+sender semaphore-return QPC, and callback OS thread ID. Both records are emitted by the
+sender after semaphore return; the row thread ID is the sender. Enqueue-to-callback time
+includes command-thread and draw-pipe transit. Callback may start before the sender records
+post-unlock. unmap_command_inline B contains unmap ID, address and size for the no-queue
+branch. These events also appear in unrestricted full captures. Missing/zero timestamps or
+dropped records indicate clipped observations. Additional tracing has observer overhead.
 B fields are owner pointer, role, count (256), total QPC ticks and maximum QPC ticks; E field a
 counts try-lock busy outcomes. Direct roles: 1 FindBuffer, 2 ReleaseHeldAfterSplice,
 The associated wait_summary_window B fields are summary ID, first start QPC, last end QPC.

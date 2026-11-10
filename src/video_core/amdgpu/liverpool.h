@@ -30,6 +30,7 @@
 #include "common/types.h"
 #include "common/recycling_pool.h"
 #include "common/unique_function.h"
+#include "ryty_gpu/image_lifecycle.h"
 #include "video_core/amdgpu/cb_db_extent.h"
 #include "video_core/amdgpu/read_ahead_states.h"
 #include "common/read_capture.h"
@@ -175,19 +176,45 @@ public:
     bool CommandThreadFaultIsUrgent();
 
     template <bool wait_done = false>
-    void SendCommand(auto&& func) {
+    void SendCommand(auto&& func, std::uint64_t trace_id = 0) {
         if constexpr (wait_done) {
+            if (!trace_id) {
+                std::binary_semaphore sem{0};
+                {
+                    std::scoped_lock lk{submit_mutex};
+                    command_queue.emplace([&sem, &func] {
+                        func();
+                        sem.release();
+                    });
+                    ++num_commands;
+                    submit_cv.notify_one();
+                }
+                sem.acquire();
+                return;
+            }
             std::binary_semaphore sem{0};
+            struct Timing { std::uint64_t begin{}, acquired{}, enqueued{}, unlocked{}, callback_begin{}, callback_end{}, returned{}, callback_tid{}; } timing;
+            if (trace_id) timing.begin=ImageLife::Timestamp();
             {
                 std::scoped_lock lk{submit_mutex};
-                command_queue.emplace([&sem, &func] {
+                if (trace_id) timing.acquired=ImageLife::Timestamp();
+                command_queue.emplace([&sem, &func, &timing, trace_id] {
+                    if (trace_id) { timing.callback_begin=ImageLife::Timestamp(); timing.callback_tid=ImageLife::ThreadId(); }
                     func();
+                    if (trace_id) timing.callback_end=ImageLife::Timestamp();
                     sem.release();
                 });
                 ++num_commands;
                 submit_cv.notify_one();
+                if (trace_id) timing.enqueued=ImageLife::Timestamp();
             }
+            if (trace_id) timing.unlocked=ImageLife::Timestamp();
             sem.acquire();
+            if (trace_id) {
+                timing.returned=ImageLife::Timestamp();
+                ImageLife::Scope submit{"unmap_command_submit",trace_id,timing.begin,timing.acquired,timing.enqueued,timing.unlocked};
+                ImageLife::Scope callback{"unmap_command_callback",trace_id,timing.callback_begin,timing.callback_end,timing.returned,timing.callback_tid};
+            }
         } else {
             std::scoped_lock lk{submit_mutex};
             command_queue.emplace(std::move(func));

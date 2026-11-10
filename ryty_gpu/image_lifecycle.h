@@ -15,6 +15,7 @@ bool Enabled(const char* kind);
 bool ContentProbeEnabled();
 bool AliasProbeEnabled();
 std::uint64_t Timestamp();
+std::uint64_t ThreadId();
 std::uint64_t SlowThresholdTicks();
 std::uint64_t Begin(const char* kind, std::uint64_t a=0, std::uint64_t b=0,
                     std::uint64_t c=0, std::uint64_t d=0, std::uint64_t e=0);
@@ -50,6 +51,7 @@ inline bool Enabled(const char*) { return false; }
 inline bool ContentProbeEnabled() { return false; }
 inline bool AliasProbeEnabled() { return false; }
 inline std::uint64_t Timestamp() { return 0; }
+inline std::uint64_t ThreadId() { return 0; }
 inline std::uint64_t SlowThresholdTicks() { return 0; }
 inline std::uint64_t Begin(const char*,std::uint64_t=0,std::uint64_t=0,std::uint64_t=0,std::uint64_t=0,std::uint64_t=0) { return 0; }
 inline void End(std::uint64_t,const char*,std::uint64_t=0,std::uint64_t=0) {}

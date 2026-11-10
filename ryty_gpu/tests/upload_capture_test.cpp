@@ -3,8 +3,19 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <queue>
+#include <semaphore>
+#include <thread>
 #include "ryty_gpu/workload_trace.h"
 #include "ryty_gpu/wait_trace.h"
+struct TestCommandQueue {
+    std::mutex submit_mutex; std::condition_variable submit_cv;
+    std::queue<std::function<void()>> command_queue; unsigned num_commands{};
+#include "send-command-under-test.inc"
+};
 int main() {
     SetEnvironmentVariableA("RYGT_IMAGE_LIFECYCLE_TRACE","1");
     SetEnvironmentVariableA("RYGT_IMAGE_TRACE_UPLOAD_ONLY","1");
@@ -46,6 +57,22 @@ int main() {
       take.Finish(0, 16);
     }
     { ImageLife::Scope omitted{"origin_write_fault"}; }
+    std::uint64_t command_parent=0;
+    { TestCommandQueue queue; bool invoked=false;
+      std::thread worker([&] { std::unique_lock lk{queue.submit_mutex};
+        queue.submit_cv.wait(lk,[&] { return !queue.command_queue.empty(); });
+        auto fn=std::move(queue.command_queue.front()); queue.command_queue.pop(); lk.unlock(); fn(); });
+      ImageLife::Scope unmap{"unmap_memory",123,456};
+      command_parent=unmap.Id(); assert(command_parent);
+      queue.SendCommand<true>([&] { invoked=true; },unmap.Id());
+      assert(invoked && queue.num_commands==1); worker.join();
+      invoked=false;
+      std::thread worker2([&] { std::unique_lock lk{queue.submit_mutex};
+        queue.submit_cv.wait(lk,[&] { return !queue.command_queue.empty(); });
+        auto fn=std::move(queue.command_queue.front()); queue.command_queue.pop(); lk.unlock(); fn(); });
+      queue.SendCommand<true>([&] { invoked=true; });
+      assert(invoked && queue.num_commands==2); worker2.join();
+    }
     { ImageLife::WaitAggregate a;
       for (unsigned i=0;i<256;++i) { const auto start=ImageLife::Timestamp(); a.Add("queue_wait_summary",42,1,start,start+1,false,3); }
       const auto start=ImageLife::Timestamp(); Sleep(2); a.Add("queue_wait_summary",42,1,start,ImageLife::Timestamp(),false,3);
@@ -64,7 +91,8 @@ int main() {
     bool route=false, fallback=false, probe=false, alias=false, unwanted=false, done=false;
     bool nodrops=false, take=false, before=false, after=false, retiring=false, create=false;
     bool allocation=false, heap=false, block=false, queue_summary=false, queue_detail=false, direct_hold=false, window=false;
-    bool unmap=false, unmap_summary=false, unmap_detail=false, export_summary=false; char line[1024];
+    bool unmap=false, unmap_summary=false, unmap_detail=false, export_summary=false;
+    bool command_submit=false, command_callback=false; char line[1024];
     for(unsigned i=0;i<100 && !done;++i) {
         f=std::fopen(path,"r"); assert(f);
         while(std::fgets(line,sizeof(line),f)) {
@@ -94,6 +122,18 @@ int main() {
                           parent && first && last>=first;
             }
             direct_hold |= std::strstr(line,",B,") && std::strstr(line,",direct_hold_detail,44,2,");
+            if (const auto* p=std::strstr(line,",unmap_command_submit,")) {
+                unsigned long long id=0,begin=0,acquired=0,enqueued=0,unlocked=0;
+                command_submit |= std::strstr(line,",B,") &&
+                    std::sscanf(p,",unmap_command_submit,%llu,%llu,%llu,%llu,%llu",&id,&begin,&acquired,&enqueued,&unlocked)==5 &&
+                    id==command_parent && begin && begin<=acquired && acquired<=enqueued && enqueued<=unlocked;
+            }
+            if (const auto* p=std::strstr(line,",unmap_command_callback,")) {
+                unsigned long long id=0,begin=0,end=0,returned=0,tid=0;
+                command_callback |= std::strstr(line,",B,") &&
+                    std::sscanf(p,",unmap_command_callback,%llu,%llu,%llu,%llu,%llu",&id,&begin,&end,&returned,&tid)==5 &&
+                    id==command_parent && begin && begin<=end && end<=returned && tid && tid!=GetCurrentThreadId();
+            }
             done |= std::strstr(line,",B,") && std::strstr(line,",present,");
         }
         std::fclose(f); if(!done) Sleep(50);
@@ -102,4 +142,5 @@ int main() {
     assert(nodrops && take && before && after && retiring && create && allocation && heap && block);
     assert(queue_summary && queue_detail && direct_hold && window);
     assert(unmap && unmap_summary && unmap_detail && export_summary);
+    assert(command_submit && command_callback);
 }

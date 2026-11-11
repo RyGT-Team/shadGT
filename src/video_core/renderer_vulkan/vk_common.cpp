@@ -16,6 +16,7 @@ VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 #include <atomic>
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include "video_core/renderer_vulkan/image_allocation.h"
@@ -91,6 +92,49 @@ void DestroySmallImageAllocationPools(VmaAllocator allocator) {
     if (it == small_image_pools.end()) return;
     for (const auto& [type, pool] : it->second) if (pool) vmaDestroyPool(allocator, pool);
     small_image_pools.erase(it);
+}
+// PERF-GTS-466: each texture the native renderer uploads from guest memory gets a new upload
+// buffer, freed once the GPU has used it. With 32 MB default blocks, a buffer over 16 MB is a
+// driver allocation of its own and smaller ones open and close blocks, so a race allocated and
+// freed driver memory on the recorder thread all the time (vkAllocateMemory up to 295 ms, ~80 ms
+// typical, in the Nsight trace of 2026-11-11). This pool keeps its first blocks for the session.
+namespace {
+constexpr VkDeviceSize kUploadPoolBlock = 256ULL << 20;
+std::mutex upload_pools_mutex;
+std::map<VmaAllocator, std::map<uint32_t, VmaPool>> upload_pools;
+}
+VmaPool UploadBufferPool(VmaAllocator allocator, const VkBufferCreateInfo& buffer,
+                         const VmaAllocationCreateInfo& allocation) {
+    static const size_t min_blocks = [] {
+        const char* env = std::getenv("RYGT_NATIVE_UPLOAD_POOL_MB");
+        const long long mb = env ? std::atoll(env) : 0;
+        return mb > 0 ? size_t((VkDeviceSize(mb) << 20) + kUploadPoolBlock - 1) / kUploadPoolBlock
+                      : size_t{0};
+    }();
+    if (min_blocks == 0 || buffer.size > kUploadPoolBlock || buffer.pNext) return VK_NULL_HANDLE;
+    uint32_t type = 0;
+    if (vmaFindMemoryTypeIndexForBufferInfo(allocator, &buffer, &allocation, &type) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+    std::scoped_lock lock{upload_pools_mutex};
+    auto& pool = upload_pools[allocator][type];
+    if (!pool) {
+        const VmaPoolCreateInfo info{.memoryTypeIndex = type, .blockSize = kUploadPoolBlock,
+                                     .minBlockCount = min_blocks};
+        if (vmaCreatePool(allocator, &info, &pool) != VK_SUCCESS) {
+            pool = VK_NULL_HANDLE;
+            upload_pools[allocator].erase(type);
+            return VK_NULL_HANDLE;
+        }
+        vmaSetPoolName(allocator, pool, "Upload buffers (PERF-GTS-466)");
+    }
+    return pool;
+}
+void DestroyUploadBufferPools(VmaAllocator allocator) {
+    std::scoped_lock lock{upload_pools_mutex};
+    const auto it = upload_pools.find(allocator);
+    if (it == upload_pools.end()) return;
+    for (const auto& [type, pool] : it->second) if (pool) vmaDestroyPool(allocator, pool);
+    upload_pools.erase(it);
 }
 static std::atomic<vk::DeviceSize> g_empty_vma_bytes_freed{};
 vk::DeviceSize EmptyVmaBytesFreed() {

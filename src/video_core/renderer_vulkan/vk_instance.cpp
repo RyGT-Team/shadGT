@@ -280,6 +280,7 @@ Instance::~Instance() {
     ImGui::Core::Shutdown(GetDevice());
     VideoCore::ClearRecycledImages(allocator);
     DestroySmallImageAllocationPools(allocator);
+    DestroyUploadBufferPools(allocator); // PERF-GTS-466
     vmaDestroyAllocator(allocator);
 }
 

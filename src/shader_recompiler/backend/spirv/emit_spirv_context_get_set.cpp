@@ -395,6 +395,24 @@ Id EmitGetTessGenericAttribute(EmitContext& ctx, Id vertex_index, Id attr_index,
             ctx.OpULessThan(ctx.U1[1], comp_index, ctx.ConstU32(4u)));
         const Id from_scratch = ctx.OpLogicalOr(ctx.U1[1], ctx.OpLogicalNot(ctx.U1[1], attr_valid),
             ctx.OpLogicalNot(ctx.U1[1], in_range));
+        if (ctx.profile.lds_read_counters != 0) {
+            // DIAG-GTS-459: count this read, and whether it leaves the patch (a vertex past the
+            // patch's own control points, which only the writer pass's scratch can serve).
+            const u64 slot = ctx.info.pgm_hash % 64;
+            const auto counter = [&](u64 offset) {
+                return ctx.OpConvertUToPtr(ctx.physical_pointer_type_u32,
+                                           ctx.Constant(ctx.U64, ctx.profile.lds_read_counters +
+                                                                     slot * 8 + offset));
+            };
+            const Id scope = ctx.ConstU32(u32(spv::Scope::Device));
+            const Id semantics = ctx.u32_zero_value;
+            ctx.OpAtomicIAdd(ctx.U32[1], counter(0), scope, semantics, ctx.u32_one_value);
+            const Id outside = ctx.OpLogicalAnd(ctx.U1[1], attr_valid,
+                                                ctx.OpLogicalNot(ctx.U1[1], in_range));
+            ctx.OpAtomicIAdd(ctx.U32[1], counter(4), scope, semantics,
+                             ctx.OpSelect(ctx.U32[1], outside, ctx.u32_one_value,
+                                          ctx.u32_zero_value));
+        }
         const Id own_label = ctx.OpLabel();
         const Id scratch_label = ctx.OpLabel();
         const Id valid_label = ctx.OpLabel();

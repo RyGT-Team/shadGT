@@ -76,6 +76,9 @@ struct Profile {
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};
     bool supports_shader_stencil_export{};
+    /// DIAG-GTS-459 (RYGT_DIAG_LDS_READS=1): GPU address of 64 slots of two u32 counters a hull
+    /// shader's emulated LDS reads add to (reads, reads outside the patch); 0: off.
+    u64 lds_read_counters{};
 
     bool operator==(const Profile&) const = default;
 };

@@ -23,6 +23,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <source_location>
 #include <span>
 #include <tuple>
 #include <unordered_map>
@@ -423,13 +424,16 @@ private:
     std::chrono::steady_clock::time_point ring_ab_start{};
     u64 ring_ab_window{};
     bool command_priority_boosted{};
-    void EndRendering(u32 reason = 0);
+    /// DIAG-GTS-460: Diagnostics builds count the rendering scopes ended by the line that ended them.
+    void EndRendering(u32 reason = 0,
+                      std::source_location where = std::source_location::current());
     bool ContinueSmallParallelPass(const RenderState& target, u32 reason, bool safe);
     void BeginRendering(const RenderState& state);
-    void GlobalBarrier();
+    /// DIAG-GTS-451: Diagnostics builds count full barriers by the line that asked for them.
+    void GlobalBarrier(std::source_location where = std::source_location::current());
     /// NAT-140: attachment writes before it finish before attachment access after it (a pass
     /// drawing into what an earlier pass drew), without waiting for anything else.
-    void PassBarrier();
+    void PassBarrier(std::source_location where = std::source_location::current());
     /// PERF-109: `bound` are the pictures the work about to be recorded uses.
     void PrepareImages(std::span<const Native::ImageEntry* const> bound = {});
     void PrepareImages(const DrawBindings& b);

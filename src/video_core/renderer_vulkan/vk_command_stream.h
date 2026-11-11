@@ -9,6 +9,7 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <source_location>
 #include <stop_token>
 #include <type_traits>
 #include <utility>
@@ -27,6 +28,15 @@ enum class CmdTarget : u8 { Primary, Upload, Slot };
 
 /// PERF-084: the command buffer a replayed command goes to (the scheduler's command thread).
 vk::CommandBuffer ReplayCommandBuffer(Scheduler& scheduler, CmdTarget target);
+
+#if !defined(NDEBUG)
+/// DIAG-GTS-460: counts each barrier recorded through a CmdBuf by the source line that asked for
+/// it, and each dispatch (compute work after graphics work forces the GPU to drain). Defined in
+/// vk_rasterizer_native.cpp; NativeRenderer::Report prints and clears the counts every 10 s.
+void DiagNoteCmdBarrier(std::source_location where);
+void DiagNoteDispatch();
+void DiagNotePassEnd(std::source_location where);
+#endif
 
 /// PERF-084: Vulkan commands recorded on the GPU thread and replayed in order on the scheduler's
 /// command thread, which makes the Vulkan calls. In races about 12% of the recorder's time was
@@ -301,6 +311,9 @@ public:
     }
 
     void dispatch(u32 x, u32 y, u32 z) const {
+#if !defined(NDEBUG)
+        DiagNoteDispatch();
+#endif
         Call([=](vk::CommandBuffer cmd) { cmd.dispatch(x, y, z); });
     }
 
@@ -348,6 +361,9 @@ public:
     void Invoke(F&& fn) const { Call(std::forward<F>(fn)); }
 
     void dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset) const {
+#if !defined(NDEBUG)
+        DiagNoteDispatch();
+#endif
         Call([=](vk::CommandBuffer cmd) { cmd.dispatchIndirect(buffer, offset); });
     }
 
@@ -463,7 +479,12 @@ public:
                });
     }
 
-    void pipelineBarrier2(const vk::DependencyInfo& info) const {
+    void pipelineBarrier2(const vk::DependencyInfo& info,
+                          [[maybe_unused]] std::source_location where =
+                              std::source_location::current()) const {
+#if !defined(NDEBUG)
+        DiagNoteCmdBarrier(where);
+#endif
         if (!ring) {
             direct.pipelineBarrier2(info);
             return;

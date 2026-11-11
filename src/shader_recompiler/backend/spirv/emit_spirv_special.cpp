@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <vector>
 #include <fmt/format.h>
+#include "common/logging/log.h"
 #include "common/recoverable.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
@@ -37,6 +38,13 @@ static void EmitLdsEmulationPrologue(EmitContext& ctx) {
             tcs.ls_stride, num_cp, ctx.info.pgm_hash,
             ctx.info.pinned_tess_constants ? "constants of its draw"
                                            : "constants read at translation")};
+    if (ctx.profile.lds_read_counters != 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "DIAG-GTS-459: hs {:#x} (mode {}, {} input control points, LS stride {}, {} "
+                    "patches) counts its LDS reads in slot {}",
+                    ctx.info.pgm_hash, tcs.lds_emulation, num_cp, tcs.ls_stride, tcs.num_patches,
+                    ctx.info.pgm_hash % 64);
+    }
     const Id push_ptr = ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1]);
     const auto push_word = [&](u32 index) {
         return ctx.OpLoad(ctx.U32[1],
@@ -78,31 +86,59 @@ static void EmitLdsEmulationPrologue(EmitContext& ctx) {
     ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
     ctx.OpBranchConditional(writer, write_label, merge_label);
     ctx.AddLabel(write_label);
-    const Id first_invocation = ctx.OpIEqual(
-        ctx.U1[1], ctx.OpLoad(ctx.U32[1], ctx.invocation_id), ctx.u32_zero_value);
-    const Id store_label = ctx.OpLabel();
-    const Id stored_label = ctx.OpLabel();
-    ctx.OpSelectionMerge(stored_label, spv::SelectionControlMask::MaskNone);
-    ctx.OpBranchConditional(first_invocation, store_label, stored_label);
-    ctx.AddLabel(store_label);
+    // PERF-GTS-458 (RYGT_TESS_LDS_SPREAD=0: as before): the patch's invocations share the stores,
+    // control point cp by invocation cp % invocations, one vec4 store per attribute. Before, the
+    // first invocation stored every float alone (GT Sport's car bodies: 26 control points of 2
+    // attributes, 208 single-float stores a patch while 3 of 4 invocations waited).
+    static const bool spread = [] {
+        const char* env = std::getenv("RYGT_TESS_LDS_SPREAD");
+        return !(env && env[0] == '0');
+    }();
+    const Id invocation = ctx.OpLoad(ctx.U32[1], ctx.invocation_id);
+    const u32 invocations = spread ? std::max(tcs.NumOutputControlPoints(), 1u) : 1u;
     const Id in_ptr = ctx.TypePointer(spv::StorageClass::Input, ctx.F32[1]);
-    for (u32 cp = 0; cp < num_cp; ++cp) {
-        for (u32 attr = 0; attr < num_attrs; ++attr) {
-            for (u32 comp = 0; comp < 4; ++comp) {
-                const Id value = ctx.OpLoad(
-                    ctx.F32[1], ctx.OpAccessChain(in_ptr, ctx.input_attr_array, ctx.ConstU32(cp),
-                                                  ctx.ConstU32(attr), ctx.ConstU32(comp)));
-                const Id dword = ctx.OpIAdd(
+    const Id in_vec_ptr = ctx.TypePointer(spv::StorageClass::Input, ctx.F32[4]);
+    const Id physical_vec4 = ctx.TypePointer(spv::StorageClass::PhysicalStorageBuffer, ctx.F32[4]);
+    for (u32 first = 0; first < invocations && first < num_cp; ++first) {
+        // Invocation `first` stores control points first, first + invocations, ...
+        const Id mine = ctx.OpIEqual(ctx.U1[1], invocation, ctx.ConstU32(first));
+        const Id store_label = ctx.OpLabel();
+        const Id stored_label = ctx.OpLabel();
+        ctx.OpSelectionMerge(stored_label, spv::SelectionControlMask::MaskNone);
+        ctx.OpBranchConditional(mine, store_label, stored_label);
+        ctx.AddLabel(store_label);
+        for (u32 cp = first; cp < num_cp; cp += invocations) {
+            for (u32 attr = 0; attr < num_attrs; ++attr) {
+                const Id base_dword = ctx.OpIAdd(
                     ctx.U32[1],
                     ctx.OpIMul(ctx.U32[1], ctx.OpIAdd(ctx.U32[1], own, ctx.ConstU32(cp)),
                                ctx.ConstU32(num_attrs * 4)),
-                    ctx.ConstU32(attr * 4 + comp));
-                ctx.OpStore(scratch_pointer(dword), value, spv::MemoryAccessMask::Aligned, 4u);
+                    ctx.ConstU32(attr * 4));
+                if (spread) {
+                    const Id value = ctx.OpLoad(
+                        ctx.F32[4], ctx.OpAccessChain(in_vec_ptr, ctx.input_attr_array,
+                                                      ctx.ConstU32(cp), ctx.ConstU32(attr)));
+                    const Id address = ctx.OpIAdd(
+                        ctx.U64, ctx.lds_scratch_base,
+                        ctx.OpUConvert(ctx.U64, ctx.OpShiftLeftLogical(ctx.U32[1], base_dword,
+                                                                       ctx.ConstU32(2u))));
+                    ctx.OpStore(ctx.OpConvertUToPtr(physical_vec4, address), value,
+                                spv::MemoryAccessMask::Aligned, 4u);
+                    continue;
+                }
+                for (u32 comp = 0; comp < 4; ++comp) {
+                    const Id value = ctx.OpLoad(
+                        ctx.F32[1], ctx.OpAccessChain(in_ptr, ctx.input_attr_array,
+                                                      ctx.ConstU32(cp), ctx.ConstU32(attr),
+                                                      ctx.ConstU32(comp)));
+                    const Id dword = ctx.OpIAdd(ctx.U32[1], base_dword, ctx.ConstU32(comp));
+                    ctx.OpStore(scratch_pointer(dword), value, spv::MemoryAccessMask::Aligned, 4u);
+                }
             }
         }
+        ctx.OpBranch(stored_label);
+        ctx.AddLabel(stored_label);
     }
-    ctx.OpBranch(stored_label);
-    ctx.AddLabel(stored_label);
     for (u32 i = 0; Sirit::ValidId(ctx.output_tess_level_outer) && i < 4; ++i) {
         ctx.OpStore(ctx.OpAccessChain(ctx.output_f32, ctx.output_tess_level_outer, ctx.ConstU32(i)),
                     ctx.ConstF32(0.0f));

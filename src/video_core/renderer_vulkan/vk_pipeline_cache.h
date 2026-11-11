@@ -69,6 +69,10 @@ bool SaveDriverCacheAtExit();
 
 /// FIX-227: the hull shader LDS emulation mode for the current draw (0: off).
 u32 TessLdsEmulation(const AmdGpu::Regs& regs);
+class Instance;
+/// DIAG-GTS-459: the hull shaders' LDS read counters (64 slots of reads, reads outside the patch).
+u32* DiagLdsReadCounters();
+u64 DiagLdsReadCountersAddress(const Instance& instance);
 
 
 class Instance;

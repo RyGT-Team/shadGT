@@ -415,7 +415,7 @@ public:
     void DrawIndexed(u32 indices, u32 instances, u32 first_index, s32 vertex_offset,
                      u32 first_instance) override;
     void Dispatch(u32 x, u32 y, u32 z) override;
-    void Barrier(u32 wait_for, u32 hold_back) override;
+    void Barrier(u32 wait_for, u32 hold_back, std::source_location where) override;
     void CopyBuffer(const Buffer* src, u64 src_offset, const Buffer* dst, u64 dst_offset,
                     u64 size) override;
     void CopyBufferToImage(const Buffer* src, const Image* dst,
@@ -913,11 +913,20 @@ std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
     case MemoryKind::DeviceLocal:
         alloc_ci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
         break;
-    case MemoryKind::Upload:
-        alloc_ci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+    case MemoryKind::Upload: {
+        // PERF-GTS-457 (RYGT_NATIVE_UPLOAD_VRAM=1): upload memory in video memory the CPU can
+        // write (Resizable BAR), falling back to system memory when there is none left. Shaders
+        // read snapshots from upload memory: GT Sport's tessellated car bodies read their hull
+        // shader data there every draw, and over PCIe each read waited (~16 us a draw).
+        static const bool vram = [] {
+            const char* env = std::getenv("RYGT_NATIVE_UPLOAD_VRAM");
+            return env && env[0] == '1';
+        }();
+        alloc_ci.usage = vram ? VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE : VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
         alloc_ci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT |
                          VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
         break;
+    }
     case MemoryKind::Readback:
         alloc_ci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
         alloc_ci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
@@ -2189,14 +2198,14 @@ void VulkanCommandList::Dispatch(u32 x, u32 y, u32 z) {
     C().dispatch(x, y, z);
 }
 
-void VulkanCommandList::Barrier(u32 wait_for, u32 hold_back) {
+void VulkanCommandList::Barrier(u32 wait_for, u32 hold_back, std::source_location where) {
     vk::MemoryBarrier2 barrier{};
     ScopeToVk(wait_for, true, barrier.srcStageMask, barrier.srcAccessMask);
     ScopeToVk(hold_back, false, barrier.dstStageMask, barrier.dstAccessMask);
     C().pipelineBarrier2(vk::DependencyInfo{
         .memoryBarrierCount = 1,
         .pMemoryBarriers = &barrier,
-    });
+    }, where);
 }
 
 void VulkanCommandList::CopyBuffer(const Buffer* src, u64 src_offset, const Buffer* dst,

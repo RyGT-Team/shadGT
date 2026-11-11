@@ -18,6 +18,7 @@
 #include <array>
 #include <functional>
 #include <memory>
+#include <source_location>
 #include <span>
 #include <string_view>
 
@@ -450,7 +451,9 @@ public:
                              u32 first_instance) = 0;
     virtual void Dispatch(u32 x, u32 y, u32 z) = 0;
 
-    virtual void Barrier(u32 wait_for, u32 hold_back) = 0;
+    /// DIAG-GTS-460: `where` names the caller in the Diagnostics build's barrier counts.
+    virtual void Barrier(u32 wait_for, u32 hold_back,
+                         std::source_location where = std::source_location::current()) = 0;
     virtual void CopyBuffer(const Buffer* src, u64 src_offset, const Buffer* dst, u64 dst_offset,
                             u64 size) = 0;
     virtual void CopyBufferToImage(const Buffer* src, const Image* dst,

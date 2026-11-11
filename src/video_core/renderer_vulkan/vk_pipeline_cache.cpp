@@ -192,6 +192,55 @@ void PipelineCache::ReportKeyTrace() noexcept {
     } catch (...) { /* Diagnostics cannot affect rendering. */ }
 }
 #endif
+// DIAG-GTS-459 (RYGT_DIAG_LDS_READS=1): 64 slots of two u32 counters in host-visible memory
+// with a device address; hull shaders with LDS emulation add their reads to them, and the
+// native report prints them. Allocated once and never freed (diagnosis only).
+static std::atomic<u32*> g_lds_read_counters{};
+u32* DiagLdsReadCounters() {
+    return g_lds_read_counters.load(std::memory_order_acquire);
+}
+u64 DiagLdsReadCountersAddress(const Instance& instance) {
+    static const u64 address = [&]() -> u64 {
+        const char* env = std::getenv("RYGT_DIAG_LDS_READS");
+        if (!(env && env[0] == '1')) return 0;
+        const vk::Device device = instance.GetDevice();
+        constexpr vk::DeviceSize size = 64 * 8;
+        const auto [buffer_result, buffer] = device.createBuffer(vk::BufferCreateInfo{
+            .size = size,
+            .usage = vk::BufferUsageFlagBits::eStorageBuffer |
+                     vk::BufferUsageFlagBits::eShaderDeviceAddress,
+        });
+        if (buffer_result != vk::Result::eSuccess) return 0;
+        const auto requirements = device.getBufferMemoryRequirements(buffer);
+        const auto properties = instance.GetPhysicalDevice().getMemoryProperties();
+        constexpr auto wanted = vk::MemoryPropertyFlagBits::eHostVisible |
+                                vk::MemoryPropertyFlagBits::eHostCoherent;
+        u32 type = ~0u;
+        for (u32 i = 0; i < properties.memoryTypeCount; ++i) {
+            if ((requirements.memoryTypeBits & (1u << i)) &&
+                (properties.memoryTypes[i].propertyFlags & wanted) == wanted) {
+                type = i;
+                break;
+            }
+        }
+        if (type == ~0u) return 0;
+        const vk::MemoryAllocateFlagsInfo flags{
+            .flags = vk::MemoryAllocateFlagBits::eDeviceAddress};
+        const auto [memory_result, memory] = device.allocateMemory(vk::MemoryAllocateInfo{
+            .pNext = &flags, .allocationSize = requirements.size, .memoryTypeIndex = type});
+        if (memory_result != vk::Result::eSuccess) return 0;
+        if (device.bindBufferMemory(buffer, memory, 0) != vk::Result::eSuccess) return 0;
+        const auto [map_result, mapped] = device.mapMemory(memory, 0, size);
+        if (map_result != vk::Result::eSuccess) return 0;
+        std::memset(mapped, 0, size);
+        g_lds_read_counters.store(static_cast<u32*>(mapped), std::memory_order_release);
+        const u64 gpu = device.getBufferAddress(vk::BufferDeviceAddressInfo{.buffer = buffer});
+        LOG_WARNING(Render_Vulkan, "DIAG-GTS-459: hull shader LDS read counters at {:#x}", gpu);
+        return gpu;
+    }();
+    return address;
+}
+
 u32 TessLdsEmulation(const AmdGpu::Regs& regs) {
     static const u32 mode = [] {
         const char* env = std::getenv("RYGT_TESS_LDS_EMULATION");
@@ -2123,6 +2172,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // D2: read-only guest buffers are read in place through the direct-memory page table.
     profile.direct_buffers =
         VideoCore::DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported();
+    profile.lds_read_counters = DiagLdsReadCountersAddress(instance); // DIAG-GTS-459
 #ifdef RYTY_GPU
     profile.native_cube_sampling = NativeModeRequested() && instance.IsImageCubeArraySupported();
     SetNativeCubeCacheEnabled(profile.native_cube_sampling);

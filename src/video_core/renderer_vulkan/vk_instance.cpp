@@ -13,6 +13,7 @@
 #include "common/path_util.h"
 #include "common/ryty_config.h"
 #include "common/debug.h"
+#include "common/nvtx.h"
 #include "common/perf_monitor.h"
 #include "common/types.h"
 #include "core/emulator_settings.h"
@@ -1413,6 +1414,12 @@ void Instance::CollectToolingInfo() const {
         driver_id == vk::DriverId::eIntelProprietaryWindows) {
         // AMD: Causes issues with Reshade.
         // Intel: Causes crash on start.
+        return;
+    }
+    if (Common::Nvtx::NsightInjected()) {
+        // FIX-GTS-465: under Nsight Systems the injected vkGetPhysicalDeviceToolProperties calls a
+        // null next pointer (crash at start of a capture).
+        LOG_INFO(Render_Vulkan, "Nsight Systems injection present; tool properties not queried");
         return;
     }
     const auto [tools_result, tools] = physical_device.getToolProperties();

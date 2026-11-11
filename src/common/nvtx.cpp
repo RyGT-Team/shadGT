@@ -5,11 +5,22 @@
 
 #include "common/nvtx.h"
 
-#if defined(SHADGT_NVTX) && !defined(NDEBUG)
-
 #ifdef _WIN32
 #include <windows.h>
 #endif
+
+namespace Common::Nvtx {
+bool NsightInjected() {
+#ifdef _WIN32
+    return GetModuleHandleW(L"ToolsInjection64.dll") != nullptr;
+#else
+    return false;
+#endif
+}
+} // namespace Common::Nvtx
+
+#if defined(SHADGT_NVTX) && !defined(NDEBUG)
+
 #include <nvtx3/nvToolsExt.h>
 
 namespace Common::Nvtx {

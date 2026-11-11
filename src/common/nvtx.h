@@ -59,6 +59,10 @@ inline void Pop() {}
 inline void NameThread(const char*) {}
 #endif
 
+/// FIX-GTS-465: whether Nsight's injection (ToolsInjection64.dll) is in the process. Built in every
+/// flavour, since a capture can run any build.
+bool NsightInjected();
+
 /// A range on the current thread for the scope.
 class Scope {
 public:

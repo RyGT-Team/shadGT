@@ -11,7 +11,9 @@
 #include <shlobj.h>
 #include <wincodec.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -89,8 +91,23 @@ bool DecodePhoto(IWICImagingFactory* factory, const std::vector<std::uint8_t>& d
             FAILED(factory->CreateDecoderFromStream(stream.p, nullptr,
                                                     WICDecodeMetadataCacheOnDemand, &decoder)) ||
             FAILED(decoder->GetFrame(0, &frame)) ||
-            FAILED(factory->CreateFormatConverter(&converter)) ||
-            FAILED(converter->Initialize(frame.p, GUID_WICPixelFormat32bppBGRA,
+            FAILED(factory->CreateFormatConverter(&converter))) {
+            return false;
+        }
+        // GTS-010b: Scapes and photo mode save HDR tiles (48bppRGBHalf, linear scRGB, highlights
+        // far above 1.0). A plain conversion to 8 bits clips them; those are read as floats and
+        // tone-mapped (ACES fit) before the sRGB encode.
+        WICPixelFormatGUID source_format{};
+        frame->GetPixelFormat(&source_format);
+        const bool hdr = IsEqualGUID(source_format, GUID_WICPixelFormat48bppRGBHalf) ||
+                         IsEqualGUID(source_format, GUID_WICPixelFormat64bppRGBAHalf) ||
+                         IsEqualGUID(source_format, GUID_WICPixelFormat64bppRGBHalf) ||
+                         IsEqualGUID(source_format, GUID_WICPixelFormat96bppRGBFloat) ||
+                         IsEqualGUID(source_format, GUID_WICPixelFormat128bppRGBAFloat) ||
+                         IsEqualGUID(source_format, GUID_WICPixelFormat128bppRGBFloat);
+        if (FAILED(converter->Initialize(frame.p,
+                                         hdr ? GUID_WICPixelFormat128bppRGBAFloat
+                                             : GUID_WICPixelFormat32bppBGRA,
                                          WICBitmapDitherTypeNone, nullptr, 0.0,
                                          WICBitmapPaletteTypeCustom))) {
             return false;
@@ -110,7 +127,36 @@ bool DecodePhoto(IWICImagingFactory* factory, const std::vector<std::uint8_t>& d
         const UINT copy_h = std::min<UINT>(tile_h, height - y);
         std::vector<std::uint8_t> tile(size_t(tile_w) * tile_h * 4);
         const WICRect rect{0, 0, INT(tile_w), INT(tile_h)};
-        if (FAILED(converter->CopyPixels(&rect, tile_w * 4, UINT(tile.size()), tile.data()))) {
+        if (hdr) {
+            std::vector<float> linear(size_t(tile_w) * tile_h * 4);
+            if (FAILED(converter->CopyPixels(&rect, tile_w * 16, UINT(linear.size() * 4),
+                                             reinterpret_cast<BYTE*>(linear.data())))) {
+                return false;
+            }
+            // The game's own photo-mode tone curve, measured from its live view against the
+            // saved HDR data of the same frame: 8-bit output at log2(linear) = -7.8 + 0.4 * i.
+            static constexpr float curve[] = {1,   2,   3,   4,   7,   10,  14,  19,  25,
+                                              33,  41,  50,  61,  73,  85,  96,  108, 123,
+                                              140, 159, 184, 203, 222, 233, 241, 249, 252,
+                                              253, 254, 254, 254, 254, 255};
+            constexpr int points = int(sizeof(curve) / sizeof(curve[0]));
+            const auto encode = [](float v) -> std::uint8_t {
+                if (!(v > 0.0f)) return 0; // also NaN
+                const float at = (std::log2(v) + 7.8f) / 0.4f;
+                if (at <= 0.0f) return std::uint8_t(curve[0] * v / 0.0045f + 0.5f);
+                if (at >= points - 1) return 255;
+                const int i = int(at);
+                const float t = at - float(i);
+                return std::uint8_t(curve[i] + (curve[i + 1] - curve[i]) * t + 0.5f);
+            };
+            for (size_t p = 0; p < size_t(tile_w) * tile_h; ++p) {
+                tile[p * 4 + 0] = encode(linear[p * 4 + 2]); // B
+                tile[p * 4 + 1] = encode(linear[p * 4 + 1]); // G
+                tile[p * 4 + 2] = encode(linear[p * 4 + 0]); // R
+                tile[p * 4 + 3] = 0xff;
+            }
+        } else if (FAILED(converter->CopyPixels(&rect, tile_w * 4, UINT(tile.size()),
+                                                  tile.data()))) {
             return false;
         }
         for (UINT row = 0; row < copy_h; ++row) {

@@ -22,6 +22,7 @@
 
 #include "common/error.h"
 #include "common/logging/log.h"
+#include "common/nvtx.h"
 #include "common/thread.h"
 #include "ntapi.h"
 #ifdef __APPLE__
@@ -1085,6 +1086,7 @@ void SetCurrentThreadName(const char* name) {
         Libraries::Kernel::g_curthread->name = name;
     }
     SetThreadDescription(GetCurrentThread(), UTF8ToUTF16W(name).data());
+    Common::Nvtx::NameThread(name); // DIAG-GTS-463: the name in Nsight Systems traces
 }
 
 void SetThreadName(void* thread, const char* name) {

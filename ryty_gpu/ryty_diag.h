@@ -13,6 +13,7 @@
 #if !defined(NDEBUG)
 #include <intrin.h>
 #endif
+#include "common/nvtx.h"
 #include "common/types.h"
 
 namespace RyDiag {
@@ -75,7 +76,34 @@ void Record(Zone zone, u64 start, u64 end, u64 arg = 0);
 void RecordElapsed(Zone zone, std::chrono::steady_clock::duration elapsed, u64 arg = 0);
 
 /// Records a mark (a zone with no duration).
+/// DIAG-GTS-463: a zone's name in Nsight Systems traces (NVTX builds only).
+constexpr const char* NvtxName(Zone zone) {
+    switch (zone) {
+    case Zone::GameFlip: return "game flip";
+    case Zone::FrameRecorded: return "frame recorded";
+    case Zone::FrameShown: return "frame shown";
+    case Zone::ShaderCompile: return "shader compile";
+    case Zone::PipelineBuild: return "pipeline build";
+    case Zone::PipelineWait: return "draw waits for pipeline";
+    case Zone::WriteFault: return "guest write fault";
+    case Zone::FaultFlush: return "fault flush";
+    case Zone::ReadbackWait: return "fault write-back wait";
+    case Zone::Protect: return "VirtualProtect";
+    case Zone::Submit: return "vkQueueSubmit";
+    case Zone::GpuWait: return "CPU waits for GPU";
+    case Zone::CommandWait: return "command processor waits";
+    case Zone::PresentWait: return "wait for present frame";
+    case Zone::Present: return "swapchain present";
+    case Zone::GameSubmit: return "game submits GPU work";
+    case Zone::GpuEventSent: return "renderer sends event";
+    default: return "RyDiag zone";
+    }
+}
+
 inline void Mark(Zone zone, u64 arg = 0) {
+    if constexpr (Common::Nvtx::Enabled) {
+        Common::Nvtx::Mark(NvtxName(zone), arg); // DIAG-GTS-463
+    }
     if (Enabled()) {
         const u64 now = Now();
         Record(zone, now, now, arg);
@@ -110,6 +138,9 @@ class Scope {
 public:
 #if !defined(NDEBUG)
     explicit Scope(Zone zone_, u64 arg_ = 0) : zone{zone_}, arg{arg_} {
+        if constexpr (Common::Nvtx::Enabled) {
+            Common::Nvtx::Push(NvtxName(zone_), arg_); // DIAG-GTS-463
+        }
         if (Enabled()) {
             start = Now();
         }
@@ -117,6 +148,9 @@ public:
     ~Scope() {
         if (start) {
             Record(zone, start, Now(), arg);
+        }
+        if constexpr (Common::Nvtx::Enabled) {
+            Common::Nvtx::Pop();
         }
     }
     Scope(const Scope&) = delete;

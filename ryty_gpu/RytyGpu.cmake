@@ -164,6 +164,32 @@ endif()
 target_compile_definitions(ryty_gpu PRIVATE RYTY_HAS_CPU_PATCHES=1
     $<${SHADGT_DIAGNOSTICS_ON}:RYTY_DIAG=1>)
 
+# DIAG-GTS-463: NVTX ranges (common/nvtx.h, DIAG-056) in the renderer library too, for Nsight
+# Systems traces. SHADGT_NVTX_INCLUDE names the nvtx3 headers; -DRYGT_NVTX=ON finds them in the
+# newest Nsight Systems install. common/nvtx.h builds them in only without NDEBUG (Diagnostics
+# and Debug builds): Release builds stay without NVTX whatever these say.
+option(RYGT_NVTX "Find Nsight Systems' nvtx3 headers for the renderer's NVTX ranges" OFF)
+if (RYGT_NVTX AND NOT SHADGT_NVTX_INCLUDE)
+    file(TO_CMAKE_PATH "$ENV{ProgramFiles}" rygt_program_files)
+    file(GLOB rygt_nvtx_dirs LIST_DIRECTORIES true
+        "${rygt_program_files}/NVIDIA Corporation/Nsight Systems */target-windows-x64/nvtx/include")
+    if (NOT rygt_nvtx_dirs)
+        message(FATAL_ERROR "RYGT_NVTX: no Nsight Systems nvtx3 headers found; set SHADGT_NVTX_INCLUDE")
+    endif()
+    list(SORT rygt_nvtx_dirs COMPARE NATURAL ORDER DESCENDING)
+    list(GET rygt_nvtx_dirs 0 rygt_nvtx_dir)
+    set(SHADGT_NVTX_INCLUDE "${rygt_nvtx_dir}" CACHE PATH
+        "nvtx3 include directory (Nsight Systems timeline ranges)" FORCE)
+endif()
+if (SHADGT_NVTX_INCLUDE)
+    if (NOT EXISTS "${SHADGT_NVTX_INCLUDE}/nvtx3/nvToolsExt.h")
+        message(FATAL_ERROR "SHADGT_NVTX_INCLUDE has no nvtx3/nvToolsExt.h: ${SHADGT_NVTX_INCLUDE}")
+    endif()
+    target_include_directories(ryty_gpu SYSTEM PRIVATE "${SHADGT_NVTX_INCLUDE}")
+    target_compile_definitions(ryty_gpu PRIVATE SHADGT_NVTX)
+    message(STATUS "Renderer NVTX ranges: ${SHADGT_NVTX_INCLUDE} (builds without NDEBUG only)")
+endif()
+
 # Discord Rich Presence is linked into the renderer library only.
 if (ENABLE_DISCORD_RPC)
     target_sources(ryty_gpu PRIVATE src/common/discord_rpc_handler.cpp)

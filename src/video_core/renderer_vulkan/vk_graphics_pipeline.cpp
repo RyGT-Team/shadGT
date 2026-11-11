@@ -22,6 +22,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/assert.h"
+#include "common/nvtx.h"
 #include "common/elf_info.h"
 #include "common/singleton.h"
 #include "common/logging/log.h"
@@ -457,6 +458,13 @@ GraphicsPipeline::GraphicsPipeline(
     const Shader::Gcn::FetchShaderData* fetch_shader_, std::span<const vk::ShaderModule> modules,
     SerializationSupport& sdata, bool preloading)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_} {
+    // DIAG-GTS-463: graphics pipeline (or shader object set) builds; value: vs hash << 32 | ps hash.
+    const auto* nvtx_vs = infos[u32(Shader::SwStage::Vertex)];
+    const auto* nvtx_ps = infos[u32(Shader::SwStage::Fragment)];
+    Common::Nvtx::Scope nvtx{preloading ? "graphics pipeline build (preload)"
+                                        : "graphics pipeline build",
+                             (u64(nvtx_vs ? u32(nvtx_vs->pgm_hash) : 0) << 32) |
+                                 (nvtx_ps ? u32(nvtx_ps->pgm_hash) : 0)};
     if (infos[u32(Shader::SwStage::TessellationControl)]) {
         const auto& tcs = runtime_infos[u32(Shader::SwStage::TessellationControl)].sw.tcs;
         lds_emulation = tcs.lds_emulation;
@@ -1663,10 +1671,14 @@ bool GraphicsPipeline::CreateShaderObjects(
                         binary_infos[i].codeSize = binaries[i].size();
                         binary_infos[i].pCode = aligned_binaries[i].data();
                     }
-                    result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShadersEXT(
-                        instance.GetDevice(), static_cast<u32>(binary_infos.size()),
-                        reinterpret_cast<const VkShaderCreateInfoEXT*>(binary_infos.data()), nullptr,
-                        created.data());
+                    {
+                        // DIAG-GTS-463: shader objects from cached binaries (value: share key).
+                        Common::Nvtx::Scope nvtx{"vkCreateShadersEXT (binary)", share_key};
+                        result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShadersEXT(
+                            instance.GetDevice(), static_cast<u32>(binary_infos.size()),
+                            reinterpret_cast<const VkShaderCreateInfoEXT*>(binary_infos.data()),
+                            nullptr, created.data());
+                    }
                     from_binary = result == VK_SUCCESS;
                     if (!from_binary) {
                         for (VkShaderEXT& shader : created) {
@@ -1694,10 +1706,14 @@ bool GraphicsPipeline::CreateShaderObjects(
                 const bool owns_priority = lower && priority != THREAD_PRIORITY_ERROR_RETURN &&
                                            SetThreadPriority(thread, applied);
 #endif
-                result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShadersEXT(
-                    instance.GetDevice(), static_cast<u32>(create_infos.size()),
-                    reinterpret_cast<const VkShaderCreateInfoEXT*>(create_infos.data()), nullptr,
-                    created.data());
+                {
+                    // DIAG-GTS-463: shader objects compiled from SPIR-V (value: share key).
+                    Common::Nvtx::Scope nvtx{"vkCreateShadersEXT (compile)", share_key};
+                    result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShadersEXT(
+                        instance.GetDevice(), static_cast<u32>(create_infos.size()),
+                        reinterpret_cast<const VkShaderCreateInfoEXT*>(create_infos.data()),
+                        nullptr, created.data());
+                }
 #ifdef _WIN32
                 if (owns_priority && GetThreadPriority(thread) == applied) {
                     SetThreadPriority(thread, priority);

@@ -2,6 +2,7 @@
 namespace Vulkan {
 bool RytyWideScene(); // WIDE-001 (ryty_game_patch.cpp)
 }
+#include "common/nvtx.h" // DIAG-GTS-463
 #include "ryty_gpu/native/unique_upload_batch.h"
 #include "ryty_gpu/native/upload_cause.h"
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
@@ -1977,6 +1978,8 @@ bool ImageRegistry::LazyUploads() {
 
 u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* const> bound,
                                  bool trace_slow_calls) {
+    // DIAG-GTS-463: texture uploads recorded before work; value: pictures the work binds.
+    Common::Nvtx::Scope nvtx{"texture uploads", u64(bound.size())};
     SampleGuestHashCalls hash_sampling{trace_slow_calls};
     SlowCallTrace<16> trace{trace_slow_calls, "image-uploads",
         {"queue-lock", "validate", "watch-pages", "hash", "gpu-source", "cpu-allocate",

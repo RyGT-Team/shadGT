@@ -46,6 +46,7 @@
 #include "video_core/renderer_vulkan/immutable_upload_memo.h"
 #include "ryty_gpu/native/snapshot_backing_protocol.h"
 #include "video_core/renderer_vulkan/snapshot_protection_receipt.h"
+#include "common/nvtx.h" // DIAG-GTS-463
 #include "common/scope_exit.h"
 #include "video_core/renderer_vulkan/snapshot_source_hints.h"
 #include "video_core/renderer_vulkan/freshness_range_search.h"
@@ -4185,6 +4186,8 @@ void NativeRenderer::FlushWritebacks() {
     if (writebacks.empty() || !stream.list) {
         return;
     }
+    // DIAG-GTS-463: write-back batches (PERF-GTS-462); value: pictures in the batch.
+    Common::Nvtx::Scope nvtx_writebacks{"picture write-backs", u64(writebacks.size())};
     AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::WriteBacks};
     struct Timed {
         std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();

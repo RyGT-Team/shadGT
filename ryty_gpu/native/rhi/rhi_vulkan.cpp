@@ -942,18 +942,6 @@ std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
         [&] {
           buffer = VK_NULL_HANDLE;
           allocation = nullptr;
-          if (desc.memory == MemoryKind::Upload) {
-              // PERF-GTS-466: upload buffers from memory kept for the session, when the switch
-              // is on; anything the pool cannot take goes to the default blocks as before.
-              VmaAllocationCreateInfo pooled = alloc_ci;
-              pooled.pool = Vulkan::UploadBufferPool(allocator, buffer_ci, alloc_ci);
-              if (pooled.pool && vmaCreateBuffer(allocator, &buffer_ci, &pooled, &buffer,
-                                                 &allocation, &info) == VK_SUCCESS) {
-                  return AllocationResult{VK_SUCCESS};
-              }
-              buffer = VK_NULL_HANDLE;
-              allocation = nullptr;
-          }
           return AllocationResult{vmaCreateBuffer(
               allocator, &buffer_ci, &alloc_ci, &buffer, &allocation, &info)};
         },
@@ -2531,7 +2519,6 @@ static std::unique_ptr<Device> CreateStandaloneVulkanDeviceImpl(std::string* err
         .destroy =
             [device, allocator, kept_instance] {
                 Vulkan::DestroySmallImageAllocationPools(allocator);
-                Vulkan::DestroyUploadBufferPools(allocator); // PERF-GTS-466
                 vmaDestroyAllocator(allocator);
                 device.destroy();
                 delete kept_instance;

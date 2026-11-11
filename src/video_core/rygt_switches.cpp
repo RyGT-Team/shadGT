@@ -206,7 +206,6 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|RYGT_NATIVE_MIRRORS|string|Memory & VRAM|on|0 = off; v = vertex ranges only; i = index ranges only|Device-local mirrors of vertex/index data. 0 turns them off; v or i mirrors only one kind (diagnosis).",
     "RYGTSW1|RYGT_NATIVE_MIRROR_MB|int|Memory & VRAM|1024|MB|Budget in MB for vertex/index buffer mirrors in video memory.",
     "RYGTSW1|RYGT_NATIVE_UPLOAD_VRAM|flag|Memory & VRAM|off|1 = on|Puts the renderer's upload memory in video memory the CPU can write (Resizable BAR) instead of system RAM, so the GPU reads it faster (PERF-GTS-457).",
-    "RYGTSW1|RYGT_NATIVE_UPLOAD_POOL_MB|int|Memory & VRAM|off|MB, kept in 256 MB blocks (512 = two blocks)|Keeps this much upload memory for the session so texture uploads in a race need no new driver allocations, which stalled the recorder for up to 300 ms (PERF-GTS-466).",
     "RYGTSW1|RYGT_NATIVE_MIRROR_STORAGE|int|Memory & VRAM|64|MB, 0-4096|Read-only storage buffers up to this size (MB) are kept in reusable video-memory mirrors.",
     "RYGTSW1|RYGT_NATIVE_READABLE_CUT|flag|Memory & VRAM|on|0 = off|Cuts buffer bindings down to their readable part of guest memory. 0 binds the full size.",
     "RYGTSW1|RYGT_NATIVE_WRITEBACK_COPY_EACH|flag|Native recorder & sync|off|1 = on|Copies each written-back picture into guest memory at once, as before PERF-GTS-462, instead of once per batch. Slower; for comparison.",

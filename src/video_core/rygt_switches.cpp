@@ -194,7 +194,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_STAGE_WORKERS|int|Native recorder & sync|1|1-4 (clamped); only with the buffer stage|Number of buffer stage worker threads (1-4); above 1 the recorder also obtains buffers under a shared lock.",
     "RYGTSW1|SHADGT_WRITE_THROUGH|flag|Native recorder & sync|off|exactly 1 = on; -DisablePerf 103 keeps it off|CPU stores to pages with GPU-written bytes go through without waiting for the GPU (FIX-079). Opt-in: froze some sessions at scene changes.",
     // Memory & VRAM
-    "RYGTSW1|RYGT_D1_VIEW_MB|int|Memory & VRAM|256|MB per imported piece; 0 = whole allocation at once|Imports large GPU memory allocations in pieces of this many MB when first used (PERF-GT7-022); 0 pins the whole allocation.",
+    "RYGTSW1|RYGT_D1_VIEW_MB|int|Memory & VRAM|32|MB per imported piece; 0 = whole allocation at once|Imports large GPU memory allocations in pieces of this many MB when first used (PERF-GT7-022); 0 pins the whole allocation. Larger pieces stall the frame longer on each first use (PERF-GTS-467).",
     "RYGTSW1|RYGT_HOT_PAGE_FAULTS|int|Memory & VRAM|8|1..64 write faults|Number of CPU write faults before a memory page is treated as hot and stops being protected (PERF-GT7-050).",
     "RYGTSW1|RYGT_NATIVE_CHUNK_MB|int|Memory & VRAM|1|megabytes, 1-64; invalid = 1|Size of the native recorder's upload chunks in MB. Larger chunks mean fewer allocations but more memory.",
     "RYGTSW1|RYGT_NATIVE_CHUNK_TRIM|flag|Memory & VRAM|on|0 = off|Frees idle upload chunks every 150 frames. 0 keeps them (more memory).",

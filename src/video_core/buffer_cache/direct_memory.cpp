@@ -263,11 +263,14 @@ std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr addr
 namespace {
 // PERF-GT7-022 (Will Scarlett): import a bounded piece when first used rather
 // than pinning a whole multi-GiB allocation in one driver call. Zero restores
-// the original whole-allocation policy. Invalid/overflowing input uses 256 MiB.
+// the original whole-allocation policy. Invalid/overflowing input uses the default.
+// PERF-GTS-467: 32 MiB by default (was 256). The driver pins every page of an import, about
+// 0.8 ms a MB: a 256 MiB piece stalled the recorder ~200 ms in a race (Nsight trace of
+// 2026-11-11, vkAllocateMemory up to 295 ms); with 32 MiB the slowest import took 12 ms.
 u64 ViewPiece() {
     static const u64 piece = [] {
         const char* env = std::getenv("RYGT_D1_VIEW_MB");
-        u64 mb = 256;
+        u64 mb = 32;
         if (env && *env) {
             char* end = nullptr;
             errno = 0;

@@ -71,6 +71,10 @@ public:
     /// view holds it (call EnsureImported first).
     std::optional<std::pair<const Buffer*, u64>> FindBuffer(VAddr address, u64 size) const;
 
+    /// PERF-GTS-472 (RYGT_DIRECT_MIN_BYTES, default 65536, 0 off): read-only buffers no larger
+    /// than this when their shader is translated get no direct-read path and are bound as usual.
+    static u32 DirectMinBytes();
+
     /// NAT-107: the imported views holding [address, address + size) in order:
     /// fn(view buffer, offset in it, offset in the range, bytes). False (after calling fn for
     /// the parts before it) when part of the range is not imported.

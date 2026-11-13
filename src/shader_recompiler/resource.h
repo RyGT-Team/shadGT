@@ -117,10 +117,12 @@ struct BufferResource {
     bool is_formatted{};
     SharpFetchPostOp post_op{};
     u32 post_op_dw1_mask{};
+    /// PERF-GTS-472: small at translation, so the shader has no direct-read path for it.
+    bool direct_off{};
 
     /// D2: read through the direct-memory page table when the draw's table says so.
     bool IsDirectEligible() const noexcept {
-        return buffer_type == BufferType::Guest && !is_written && !is_formatted;
+        return buffer_type == BufferType::Guest && !is_written && !is_formatted && !direct_off;
     }
 
     bool IsSpecial() const noexcept {

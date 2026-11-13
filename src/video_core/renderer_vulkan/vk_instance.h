@@ -692,6 +692,7 @@ private:
     bool amd_shader_explicit_vertex_parameter{};
     u32 amd_vertex_order{}; ///< AMD-311
     bool device_fault{}; // DIAG-206
+    bool pipeline_executable_info{}; // DIAG-SHC-001
     bool depth_clip_control{};
     bool depth_clip_in_shader{}; ///< FIX-GTS-443
     bool depth_clip_enable{};

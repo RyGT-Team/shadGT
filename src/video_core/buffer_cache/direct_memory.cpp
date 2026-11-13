@@ -261,6 +261,14 @@ std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr addr
     return std::make_pair(static_cast<const Buffer*>(view.wrapper.get()), address - view.begin);
 }
 
+u32 DirectMemory::DirectMinBytes() {
+    static const u32 bytes = [] {
+        const char* env = std::getenv("RYGT_DIRECT_MIN_BYTES");
+        return env && *env ? static_cast<u32>(std::strtoul(env, nullptr, 0)) : 65536u;
+    }();
+    return bytes;
+}
+
 namespace {
 // PERF-GT7-022 (Will Scarlett): import a bounded piece when first used rather
 // than pinning a whole multi-GiB allocation in one driver call. Zero restores

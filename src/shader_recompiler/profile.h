@@ -10,6 +10,9 @@ namespace Shader {
 struct Profile {
     /// D2: guest buffers that are only read are read through the direct-memory page table.
     bool direct_buffers{};
+    /// PERF-GTS-472: buffers no larger than this (by the sharp seen at translation) get no
+    /// direct-read path; 0 keeps it for every eligible buffer.
+    u32 direct_min_bytes{};
     u32 max_viewport_width{};
     u32 max_viewport_height{};
     u32 max_shared_memory_size{};

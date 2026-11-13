@@ -157,7 +157,7 @@ u64 RecipeSignature(const Instance& instance, const Shader::Profile& p) {
     add(TranslationAbiVersion);
     add(Shader::LaneReadUnbranchEnabled());
     add(props.vendorID);
-    for (const auto v : {u64(p.direct_buffers),u64(p.max_viewport_width),u64(p.max_viewport_height),
+    for (const auto v : {u64(p.direct_buffers),u64(p.direct_min_bytes),u64(p.max_viewport_width),u64(p.max_viewport_height),
         u64(p.max_shared_memory_size),u64(p.supported_spirv),u64(p.subgroup_size),u64(p.sparse_page_shift),
         u64(p.support_int8),u64(p.support_int16),u64(p.support_int64),u64(p.support_float16),u64(p.support_float64),
         u64(p.supports_denorm_behavior_independence),u64(p.supports_rounding_mode_independence),

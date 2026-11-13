@@ -158,6 +158,12 @@ void DataBase::Open() {
                         parts += fmt::format(", {}={}", name, env[0]);
                     }
                 }
+                // PERF-GTS-472: the direct-read size floor (it also changes the stored shader
+                // info's layout).
+                if (VideoCore::DirectMemory::Enabled()) {
+                    parts += fmt::format(", direct min {}",
+                                         VideoCore::DirectMemory::DirectMinBytes());
+                }
                 // FIX-GTS-441: translations with the invariant position (the default) are kept
                 // apart from those made without it.
                 if (const char* env = std::getenv("RYGT_INVARIANT_POSITION");

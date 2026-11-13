@@ -185,6 +185,20 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
         info.readconst_types = Info::ReadConstType::None;
     }
 
+    // PERF-GTS-472: small buffers (constants) are bound as usual instead: each direct read is
+    // inlined with its fallback, and GT Sport's big pixel shaders have dozens of them, which
+    // roughly doubled the driver's compile time. Open-ended buffers keep the path.
+    if (profile.direct_buffers && profile.direct_min_bytes != 0) {
+        for (auto& buffer : info.buffers) {
+            if (!buffer.IsDirectEligible()) {
+                continue;
+            }
+            const auto sharp = buffer.GetSharp(info);
+            if (sharp.num_records != UINT32_MAX && sharp.GetSize() <= profile.direct_min_bytes) {
+                buffer.direct_off = true;
+            }
+        }
+    }
     // D2: the per-draw table of direct buffers (their guest addresses and the page table).
     if (profile.direct_buffers &&
         std::ranges::any_of(info.buffers, [](const auto& b) { return b.IsDirectEligible(); })) {

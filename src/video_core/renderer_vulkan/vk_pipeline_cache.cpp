@@ -2172,6 +2172,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // D2: read-only guest buffers are read in place through the direct-memory page table.
     profile.direct_buffers =
         VideoCore::DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported();
+    profile.direct_min_bytes = VideoCore::DirectMemory::DirectMinBytes();
     profile.lds_read_counters = DiagLdsReadCountersAddress(instance); // DIAG-GTS-459
 #ifdef RYTY_GPU
     // FIX-GTS-364: an RX 480 drew GT7 right only with the legacy 2D-array cube sampling path, so

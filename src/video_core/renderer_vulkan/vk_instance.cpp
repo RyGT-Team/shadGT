@@ -24,6 +24,7 @@
 #include "video_core/renderer_vulkan/image_allocation.h"
 #include "video_core/renderer_vulkan/single_sample_barycentric.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/pipeline_compile_log.h"
 #ifdef RYTY_GPU
 #include "ryty_gpu/ryty_dlss.h"
 #include "ryty_gpu/native/gpu_checkpoints.h"
@@ -620,11 +621,12 @@ bool Instance::CreateDevice() {
     amd_shader_explicit_vertex_parameter =
         add_extension(VK_AMD_SHADER_EXPLICIT_VERTEX_PARAMETER_EXTENSION_NAME);
     {
-        // FIX-GT7-061: KHR barycentrics are off unless asked for (the launcher's option, off by
-        // default): an RX 6600 XT failed to build shaders with them on. FIX-419-GTS: replaces
-        // AMD-314's on-by-default for RX 7000 and newer.
+        // FIX-GT7-061: an RX 6600 XT failed to build shaders with KHR barycentrics, so AMD's older
+        // compiler (RX 6000 and older) keeps them opt-in. FIX-GTS-471: RX 7000 and newer have them
+        // on by default again (AMD-314); FIX-419-GTS turned them off there too, and GT Sport's
+        // barrier blocks and stands came out as flat grey triangles on an RX 7600.
         const std::string model{GetModelName()};
-        AmdBarycentricDefault() = false;
+        AmdBarycentricDefault() = !IsAmdLegacyShaderCompiler();
         LOG_INFO(Render_Vulkan, "FIX-GT7-061: AMD barycentric fix default {} ({}), in use {}",
                  AmdBarycentricDefault() ? "on" : "off", model,
                  properties.vendorID == 0x1002 && SingleSampleBarycentricRequested());
@@ -742,6 +744,9 @@ bool Instance::CreateDevice() {
         LOG_WARNING(Render_Vulkan, "DIAG-243: VK_EXT_device_fault {}",
                     device_fault ? "enabled" : "not available");
     }
+    // DIAG-SHC-001: the driver's statistics for compiled pipelines, only for the compile log.
+    pipeline_executable_info = PipelineCompileLog::WantsExecutableProperties() &&
+                               add_extension(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
     if (shader_clock) {
         shader_clock_features = feature_chain.get<vk::PhysicalDeviceShaderClockFeaturesKHR>();
         LOG_INFO(Render_Vulkan, "- shaderSubgroupClock: {}",
@@ -1138,6 +1143,14 @@ bool Instance::CreateDevice() {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
     }
 
+    static vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable_features{
+        .pipelineExecutableInfo = true,
+    };
+    if (pipeline_executable_info) { // DIAG-SHC-001
+        auto& create_info = device_chain.get<vk::DeviceCreateInfo>();
+        executable_features.pNext = const_cast<void*>(create_info.pNext);
+        create_info.pNext = &executable_features;
+    }
     if (shader_independent_sets) {
         auto& create_info = device_chain.get<vk::DeviceCreateInfo>();
         maintenance11_features.pNext = const_cast<void*>(create_info.pNext);
@@ -1180,6 +1193,7 @@ bool Instance::CreateDevice() {
     }
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
+    PipelineCompileLog::Install(*device, pipeline_executable_info); // DIAG-SHC-001
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);

@@ -11,6 +11,7 @@
 #include "video_core/renderer_vulkan/stale_pipeline_builds.h"
 #include "video_core/renderer_vulkan/read_ahead_budget.h"
 #include "video_core/renderer_vulkan/speculative_key.h"
+#include "shader_recompiler/direct_learning.h"
 #include "shader_recompiler/lane_read_policy.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
@@ -257,6 +258,7 @@ ExitSaveRegistry<PipelineCache>& ExitCacheRegistry() {
 }
 }
 bool SaveDriverCacheAtExit() {
+    Shader::DirectLearning::Save(); // PERF-GTS-479: what this run read in place
     return ExitCacheRegistry().Invoke([](PipelineCache& cache) { cache.PersistDriverCacheForExit(); });
 }
 static PipelineCleanupWorker& PipelineRetirementWorker() {
@@ -2172,6 +2174,17 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // D2: read-only guest buffers are read in place through the direct-memory page table.
     profile.direct_buffers =
         VideoCore::DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported();
+    // PERF-GTS-479: buffers earlier runs never read in place, read before any translation.
+    if (profile.direct_buffers && Shader::DirectLearning::Enabled()) {
+        const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
+        const auto path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+                          fmt::format("{}.direct-reads", serial);
+        const size_t shaders = Shader::DirectLearning::Load(path);
+        LOG_INFO(Render_Vulkan,
+                 "PERF-GTS-479: {} shaders in {}; buffers they never read in place are "
+                 "translated without the direct-memory path (SHADGT_LEARNED_DIRECT=0: off)",
+                 shaders, path.string());
+    }
     profile.lds_read_counters = DiagLdsReadCountersAddress(instance); // DIAG-GTS-459
 #ifdef RYTY_GPU
     // FIX-GTS-364: an RX 480 drew GT7 right only with the legacy 2D-array cube sampling path, so
@@ -2374,6 +2387,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 
 PipelineCache::~PipelineCache() {
     ExitCacheRegistry().Unregister(this); // Wait for an in-flight close save before teardown.
+    Shader::DirectLearning::Save(); // PERF-GTS-479
     if (compile_pack_thread.joinable()) { // PERF-GT7-108: before the device and caches go
         compile_pack_thread.request_stop();
         compile_pack_thread.join();
@@ -5510,6 +5524,23 @@ PipelineCache::StoredListing PipelineCache::ReadStoredListing(u64 pgm_hash,
     return listing;
 }
 
+// PERF-GTS-479: a stored translation is used only when each direct candidate's path (direct or
+// SSBO only) is what this run decides, so learned buffers are translated again once, and a
+// buffer later seen read in place gets its direct path back. Without D2 the flag changes nothing.
+static bool LearnedDirectMatches(const Shader::Info& info, const Shader::Profile& profile) {
+    if (!profile.direct_buffers) {
+        return true;
+    }
+    for (u32 i = 0; i < info.buffers.size(); ++i) {
+        const auto& buffer = info.buffers[i];
+        if (buffer.IsDirectCandidate() &&
+            buffer.NoDirect() != Shader::DirectLearning::NoDirect(info.pgm_hash, i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void PipelineCache::ApplyStoredListing(StoredListing&& listing, Program& program) {
     static u64 programs = 0;
     static u64 listed = 0;
@@ -5547,6 +5578,10 @@ void PipelineCache::ApplyStoredListing(StoredListing&& listing, Program& program
         // FIX-018/020: translated before a translator fix this program needs.
         if (const auto fixed = else_scope_fixed.find(pgm_hash);
             fixed != else_scope_fixed.end() && perm_idx < fixed->second.boundary) {
+            continue;
+        }
+        // PERF-GTS-479: translated with other learned direct paths than this run's.
+        if (!LearnedDirectMatches(*info, profile)) {
             continue;
         }
         if (!entry.has_spv) {

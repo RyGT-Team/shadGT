@@ -118,8 +118,21 @@ struct BufferResource {
     SharpFetchPostOp post_op{};
     u32 post_op_dw1_mask{};
 
+    /// PERF-GTS-479: a bit of used_types no IR type uses (old stores leave it 0): this buffer's
+    /// translation has no direct-memory path, because earlier runs never read it in place. Its
+    /// draws always bind it as an SSBO.
+    static constexpr IR::Type NoDirectFlag = static_cast<IR::Type>(1u << 30);
+    bool NoDirect() const noexcept {
+        return True(used_types & NoDirectFlag);
+    }
+
     /// D2: read through the direct-memory page table when the draw's table says so.
     bool IsDirectEligible() const noexcept {
+        return buffer_type == BufferType::Guest && !is_written && !is_formatted && !NoDirect();
+    }
+
+    /// PERF-GTS-479: eligible apart from the learned flag (what the flag is decided for).
+    bool IsDirectCandidate() const noexcept {
         return buffer_type == BufferType::Guest && !is_written && !is_formatted;
     }
 

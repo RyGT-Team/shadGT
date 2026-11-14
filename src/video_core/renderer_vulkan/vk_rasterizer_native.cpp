@@ -705,7 +705,8 @@ namespace WideHud {
 enum class Place : u8 { Split, Left, Middle, Right, Bar, Fill, Count };
 struct Zone {
     float u0, v0, u1, v1;
-    s32 side;
+    s32 side;         // which third of the HUD it is: what a whole-HUD draw covers
+    s32 move;         // where it goes: -1 to the left edge, 0 stays, 1 to the right edge
     bool middle_band; // 20..80% of the height
 };
 constexpr u32 kZones = 12;
@@ -718,14 +719,14 @@ constexpr std::array<Zone, kZones> Zones = [] {
         // The race HUD's layout (UiHires::HudPieces): sides 30% wide at the top, the gauges
         // between 17% and 80% at the bottom.
         // WIDE-049 moved this to 14% too, which cut the replay's "Camera target selection"
-        // hint (one text draw over the whole HUD) in two; only the scissor/geometry boundary
-        // (FromScissor) needs 14% for the tyre diagram.
+        // hint (one text draw over the whole HUD) in two.
         const float a = r < 2 ? 0.30f : 0.17f;
         const float b = r < 2 ? 0.70f : 0.82f; // WIDE-040: was 0.80
         const float cols[4]{0.0f, a, b, 1.0f};
         for (u32 c = 0; c < 3; ++c) {
+            // WIDE-065: the bottom rows (lap time, gauges, course map) stay in the middle.
             zones[r * 3 + c] = Zone{cols[c], rows[r], cols[c + 1], rows[r + 1], s32(c) - 1,
-                                    r == 1 || r == 2};
+                                    r < 2 ? s32(c) - 1 : 0, r == 1 || r == 2};
         }
     }
     return zones;
@@ -882,18 +883,15 @@ Place FromScissor(float x0, float x1, float y0, float y1, float slack = 0.005f) 
     if (x1 - x0 >= 0.98f && y1 - y0 <= 0.20f && (y0 <= 0.01f || y1 >= 0.99f)) {
         return Place::Bar;
     }
-    // WIDE-049: the bottom left ends at 14% (was 17%): the tyre diagram's left tyres (about
-    // 18-19%, within the 2.5% slack of 17%) counted as the left side and went to the screen's
-    // edge, away from the rest of the diagram. The lap time ends at about 10%.
-    const float left = y1 <= 0.70f ? 0.30f : 0.14f;
-    // WIDE-040: the bottom right starts at 82% (was 80%): the overtake gauge's button icon
-    // (from about 78%) counted as the right side and went to the screen's edge, cut off from
-    // the gauge. The course map's panel starts at 83%.
-    const float right = y1 <= 0.70f ? 0.70f : 0.82f;
-    if (x1 <= left + slack) {
+    // WIDE-065: the bottom row (lap time, gauges, course map) stays in the 16:9 middle; only
+    // the top spreads to the edges. (It moved its sides too: under 14% and from 82% of the width.)
+    if (y1 > 0.70f) {
+        return Place::Middle;
+    }
+    if (x1 <= 0.30f + slack) {
         return Place::Left;
     }
-    if (x0 >= right - slack) {
+    if (x0 >= 0.70f - slack) {
         return Place::Right;
     }
     return Place::Middle;
@@ -16365,7 +16363,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                         const s32 px1 = hud_rect.offset.x + s32(std::lround(zone.u1 * w));
                         const s32 py0 = hud_rect.offset.y + s32(std::lround(zone.v0 * h));
                         const s32 py1 = hud_rect.offset.y + s32(std::lround(zone.v1 * h));
-                        const s32 dx = zone.side * shift;
+                        const s32 dx = zone.move * shift;
                         auto vps = viewports;
                         auto scs = scissors;
                         bool any = false;

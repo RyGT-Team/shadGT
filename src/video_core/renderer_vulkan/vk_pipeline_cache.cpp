@@ -3749,6 +3749,15 @@ void PipelineCache::QueueBackgroundBuild(const std::shared_ptr<PipelineBuild>& b
             ++prewarm_built;
 #endif
         }
+        if (build->preloading) { // FIX-GTS-468: AdoptPrewarmed takes it from pending_builds
+            try {
+                std::scoped_lock lk{prewarm_finished_mutex};
+                prewarm_finished.push_back(build);
+                prewarm_finished_any.store(true, std::memory_order_release);
+            } catch (const std::bad_alloc&) {
+                // Not adopted: it stays in pending_builds as before this fix.
+            }
+        }
         ++g_precompile_done; // PERF-098
     }, Common::PerfFeatureEnabled(79) &&
        QueueWholeTessellation(build->infos[u32(Shader::SwStage::TessellationControl)] != nullptr,
@@ -4779,6 +4788,18 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 }
             }
         }
+    } else if (!prewarm_unclaimed.empty()) {
+        // FIX-GTS-468: a stored pipeline adopted before its first draw; stored again, so the
+        // next session builds it among the first (as the PERF-038 install above does).
+        if (const auto unclaimed = prewarm_unclaimed.find(S().graphics_key);
+            unclaimed != prewarm_unclaimed.end()) {
+            auto sdata = std::move(unclaimed.value().sdata);
+            prewarm_unclaimed.erase(unclaimed);
+            if (!S().key_uses_legacy) {
+                RegisterPipelineData(S().graphics_key,
+                                     std::hash<GraphicsPipelineKey>{}(S().graphics_key), sdata);
+            }
+        }
     }
     if (is_new) retention_now = std::chrono::steady_clock::now();
     pipeline_last_use[it->second.get()] = retention_now;
@@ -5736,10 +5757,95 @@ void PipelineCache::IdlePrewarm(bool splash) {
     InstallPrewarmed(splash);
 }
 
+// FIX-GTS-468: the splash-screen precompile (GPU.precompile_shaders) builds every stored
+// pipeline (11,066 in GT Sport on this PC) into pending_builds. Only a draw moved one into
+// graphics_pipelines, so the thousands no draw used stayed in pending_builds for the whole
+// session: their pipelines and stage libraries in RAM and VRAM, out of reach of
+// TrimUnusedPipelines, which looks at graphics_pipelines only. Finished ones now move there
+// at once, unused since their build, so the retention trim releases them under pressure in
+// least-recently-built order, and a draw that needs one later finds it built.
+// Past the first SHADGT_PRECOMPILE_KEEP, a finished pipeline is destroyed at once: no draw has
+// bound it, and the driver's cache keeps what the precompile is for. Keeping ~15,000 live during
+// the splash grew the driver's video memory for shader code by ~0.7 GB, which it kept after they
+// were destroyed (RTX 4070 Laptop, 7.2 GB budget: races ran at 6.8 GB).
+// Command thread, lookup mutex held (InstallPrewarmed's callers).
+static u64 PrecompileKeep();
+void PipelineCache::AdoptPrewarmed() {
+    if (!prewarm_finished_any.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::vector<std::weak_ptr<PipelineBuild>> finished;
+    {
+        std::scoped_lock lk{prewarm_finished_mutex};
+        finished.swap(prewarm_finished);
+        prewarm_finished_any.store(false, std::memory_order_relaxed);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    size_t adopted = 0;
+    std::vector<std::shared_ptr<const void>> dropped;
+    for (const auto& weak : finished) {
+        const auto build = weak.lock();
+        if (!build) {
+            continue; // a draw took it already
+        }
+        const auto pending = pending_builds.find(build->key);
+        if (pending == pending_builds.end() || pending->second != build) {
+            continue; // taken, cancelled or replaced by a draw's own build
+        }
+        if (build->done.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
+            continue; // a draw claimed it unstarted and builds it itself
+        }
+        try {
+            build->done.get();
+        } catch (const std::exception&) {
+            pending_builds.erase(pending); // a draw builds it again the usual way
+            continue;
+        }
+        if (!build->pipeline) {
+            pending_builds.erase(pending);
+            continue;
+        }
+        if (prewarm_adopted >= PrecompileKeep() && !graphics_pipelines.contains(build->key)) {
+            ++prewarm_adopted;
+            dropped.emplace_back(std::shared_ptr<GraphicsPipeline>(std::move(build->pipeline)));
+            pending_builds.erase(pending);
+            ++adopted;
+            continue;
+        }
+        const auto [it, is_new] = graphics_pipelines.try_emplace(build->key);
+        if (!is_new && it->second) {
+            pending_builds.erase(pending); // built meanwhile by a draw
+            continue;
+        }
+        it.value() = std::move(build->pipeline);
+        pipeline_last_use[it->second.get()] = now;
+        prewarm_unclaimed.insert_or_assign(build->key, PrewarmUnclaimed{build->sdata, prewarm_adopted++});
+        prewarm_settle_dirty = true;
+        pending_builds.erase(pending);
+        ++adopted;
+    }
+    if (!dropped.empty()) {
+        // Never bound in a command buffer: no GPU work to wait for. The FIFO cleanup worker
+        // destroys them (and their stage libraries) before any module ReleasePrewarmModules queues.
+        prewarm_dropped += dropped.size();
+        PipelineRetirementWorker().Enqueue([dropped = std::move(dropped)] {});
+    }
+    if (adopted != 0) {
+        static std::atomic<u64> total{};
+        const u64 sum = total.fetch_add(adopted, std::memory_order_relaxed) + adopted;
+        if (sum / 1000 != (sum - adopted) / 1000) {
+            LOG_INFO(Render_Vulkan, "FIX-GTS-468: {} stored pipelines built ({} destroyed at once, "
+                     "kept ones go to the retention trim), {} pending builds, {} cached", sum,
+                     prewarm_dropped, pending_builds.size(), graphics_pipelines.size());
+        }
+    }
+}
+
 void PipelineCache::InstallPrewarmed(bool force) {
     if (!prewarm_enabled) {
         return;
     }
+    AdoptPrewarmed(); // FIX-GTS-468
     using namespace std::chrono_literals;
     const auto start = std::chrono::steady_clock::now();
     ReportPrewarm(start);
@@ -5795,6 +5901,7 @@ bool PipelineCache::InstallPrewarmRecord(PrewarmRecord& record) {
         auto [it, is_new] = program_cache.try_emplace(listing->pgm_hash);
         if (is_new) {
             it.value() = std::make_unique<Program>();
+            prewarm_programs.push_back(listing->pgm_hash); // FIX-GTS-468
             // Installation consumes metadata; make one private copy per program,
             // rather than mutating bytes still shared with reader threads.
             ApplyStoredListing(StoredListing{*listing}, *it.value());
@@ -5827,6 +5934,7 @@ bool PipelineCache::InstallPrewarmRecord(PrewarmRecord& record) {
             }
             permutation.module = CompileSPV(*record.spv[stage], instance.GetDevice(), instance.IsShaderObjectEnabled());
             permutation.stored = false;
+            prewarm_loaded.emplace_back(record.pgm[stage], record.perm[stage]); // FIX-GTS-468
         }
         if (!permutation.module) {
             return false;
@@ -7792,6 +7900,7 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
             if (std::holds_alternative<GraphicsPipelineKey>(key)) {
                 auto& graphics_key = std::get<GraphicsPipelineKey>(key);
                 graphics_pipelines.erase(graphics_key);
+                prewarm_unclaimed.erase(graphics_key); // FIX-GTS-468
             } else if (std::holds_alternative<ComputePipelineKey>(key)) {
                 auto& compute_key = std::get<ComputePipelineKey>(key);
                 compute_pipelines.erase(compute_key);
@@ -7872,12 +7981,24 @@ void PipelineCache::TrimUnusedPipelines() {
     const auto now = steady_clock::now();
     if (now - retention_last_scan < milliseconds{250}) return;
     retention_last_scan = now;
+    // FIX-GTS-468: system RAM counts too. Driver pipeline memory is mostly there, and with
+    // 16 GB the splash precompile's pipelines filled it while video memory still had room.
+    bool ram_pressure = false;
+    u64 ram_available = 0;
+#ifdef _WIN32
+    MEMORYSTATUSEX ram{};
+    ram.dwLength = sizeof(ram);
+    if (GlobalMemoryStatusEx(&ram)) {
+        ram_available = ram.ullAvailPhys;
+        ram_pressure = SystemRamUnderPressure(ram.ullAvailPhys, ram.ullTotalPhys);
+    }
+#endif
     // Retain reusable pipelines until the live device-local budget needs headroom.
     // VMA allocation totals omit driver-owned pipeline memory; query the driver.
-    // Without budget reporting we cannot establish pressure, so retain pipelines.
-    if (!instance.CanReportMemoryUsage()) return;
+    // Without budget reporting we cannot establish VRAM pressure (reports_budget below).
     vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget{};
-    vk::PhysicalDeviceMemoryProperties2 memory{.pNext = &budget};
+    const bool reports_budget = instance.CanReportMemoryUsage();
+    vk::PhysicalDeviceMemoryProperties2 memory{.pNext = reports_budget ? &budget : nullptr};
 #ifndef NDEBUG
     const auto budget_query_start = steady_clock::now();
 #endif
@@ -7897,16 +8018,32 @@ void PipelineCache::TrimUnusedPipelines() {
         usage_bytes += budget.heapUsage[i];
         budget_bytes += std::min<u64>(budget.heapBudget[i], heap.size);
     }
-    const bool under_pressure = PipelineRetentionUnderPressure(usage_bytes, budget_bytes);
+    const bool vram_pressure =
+        reports_budget && PipelineRetentionUnderPressure(usage_bytes, budget_bytes);
+    const bool under_pressure = vram_pressure || ram_pressure;
     std::unique_lock lock{lookup_mutex, std::try_to_lock};
     if (!lock.owns_lock()) return;
     retention_now = now;
-    if (!under_pressure) return;
     if (PipelineRetirementWorker().PendingCount() >= 512) return;
     // Queued selections hold a shared reference; retirement cannot invalidate them.
     constexpr size_t retire_batch = 128;
     const auto cutoff = now - seconds{5};
     std::vector<std::shared_ptr<const void>> retired;
+    // FIX-GTS-468: without pressure too, the precompile's pipelines no draw used go once it is
+    // done (beyond SHADGT_PRECOMPILE_KEEP); the driver's cache rebuilds one quickly if needed.
+    RetireUnclaimedPrewarm(retired);
+    // Modules only in a later pass than the last retirement: the cleanup worker is FIFO, so they
+    // are destroyed after the pipelines and stage libraries built from them.
+    if (retired.empty() && prewarm_settle_queue.empty() && !prewarm_settle_dirty &&
+        (!prewarm_loaded.empty() || !prewarm_programs.empty()) &&
+        prewarm_reader_done.load(std::memory_order_relaxed) &&
+        !PrecompileHoldsGame() &&
+        std::ranges::none_of(pending_builds, [](const auto& entry) {
+            return entry.second->preloading; // still being built: their modules stay in use
+        })) {
+        ReleasePrewarmModules();
+    }
+    if (!under_pressure && retired.empty()) return;
     const auto trim = [&](auto& cache) {
         using Entry = typename std::remove_reference_t<decltype(cache)>::value_type;
         using Key = std::remove_const_t<typename Entry::first_type>;
@@ -7927,12 +8064,17 @@ void PipelineCache::TrimUnusedPipelines() {
             if (retired.size() >= retire_batch) break;
             auto it = cache.find(key);
             pipeline_last_use.erase(it->second.get());
+            if constexpr (std::is_same_v<Key, GraphicsPipelineKey>) {
+                prewarm_unclaimed.erase(key); // FIX-GTS-468
+            }
             retired.emplace_back(std::move(it.value()));
             cache.erase(it);
         }
     };
-    trim(graphics_pipelines);
-    trim(compute_pipelines);
+    if (under_pressure) {
+        trim(graphics_pipelines);
+        trim(compute_pipelines);
+    }
     if (retired.empty()) return;
     const auto count = retired.size();
     // Includes commands already recorded in the current, not-yet-submitted batch.
@@ -7943,9 +8085,151 @@ void PipelineCache::TrimUnusedPipelines() {
             PipelineRetirementWorker().Enqueue([pipeline = std::move(pipeline)] {});
         }
     });
+    if (!under_pressure) return; // RetireUnclaimedPrewarm logs its own progress
     LOG_INFO(Render_Vulkan, "Pipeline memory pressure: {} MiB used / {} MiB budget, "
-             "2048 MiB reserve; retired {} unused pipelines, {} cached",
-             usage_bytes >> 20, budget_bytes >> 20, count,
-             graphics_pipelines.size() + compute_pipelines.size());
+             "2048 MiB reserve, {} MiB RAM free{}; retired {} unused pipelines, {} cached, "
+             "{} stored never drawn", usage_bytes >> 20, budget_bytes >> 20, ram_available >> 20,
+             ram_pressure ? " (RAM pressure)" : "", count,
+             graphics_pipelines.size() + compute_pipelines.size(), prewarm_unclaimed.size());
+}
+
+// FIX-GTS-468: the precompile made a shader module for every stage of every stored pipeline
+// (GT Sport: ~1.9 GB of SPIR-V, which the driver copies), where a normal start makes them only
+// for the stages its draws use. Once its unused pipelines are retired, a module it made that no
+// live pipeline or pending build uses goes back to the stored state; a draw that matches it loads
+// it from the store again (PERF-032). Lookup mutex held. The stage-library cache keys libraries by
+// module handle, so the modules are destroyed on the FIFO cleanup worker after the pipelines
+// (and their libraries) already queued there; a reused handle never finds a living library.
+void PipelineCache::ReleasePrewarmModules() {
+    std::unordered_set<const Shader::Info*> in_use;
+    const auto add = [&](const auto& pipeline) {
+        if (!pipeline) return;
+        for (const auto* stage : pipeline->GetStages()) {
+            if (stage) in_use.insert(stage);
+        }
+    };
+    for (const auto& [key, pipeline] : graphics_pipelines) add(pipeline);
+    for (const auto& [key, pipeline] : compute_pipelines) add(pipeline);
+    for (const auto& [key, build] : pending_builds) {
+        for (const auto* stage : build->canonical) {
+            if (stage) in_use.insert(stage);
+        }
+    }
+    for (const auto* stage : S().infos) {
+        if (stage) in_use.insert(stage);
+    }
+    std::vector<vk::ShaderModule> doomed;
+    for (const auto& [pgm_hash, perm_idx] : prewarm_loaded) {
+        const auto it = program_cache.find(pgm_hash);
+        if (it == program_cache.end() || !it->second) continue;
+        auto& program = *it->second;
+        if (perm_idx >= program.modules.size()) continue;
+        auto& permutation = program.modules[perm_idx];
+        if (!permutation.module || permutation.stored || !permutation.info ||
+            in_use.contains(permutation.info.get())) {
+            continue;
+        }
+        doomed.push_back(permutation.module);
+        permutation.module = nullptr;
+        permutation.stored = true;
+        program.match_memo.valid = false;
+        program.ahead_memo.valid = false;
+        program.last_match = program.ahead_last_match = ~size_t{0};
+    }
+    const size_t made = prewarm_loaded.size();
+    prewarm_loaded.clear();
+    prewarm_loaded.shrink_to_fit();
+    // Programs the precompile listed that no draw has used: no module (above), no metadata in
+    // use. Translations find programs by hash, and pipelines destroyed later never read their
+    // stage metadata, so a draw that needs one lists it from the store again (GetProgram).
+    size_t dropped_programs = 0;
+    for (const u64 pgm_hash : prewarm_programs) {
+        const auto it = program_cache.find(pgm_hash);
+        if (it == program_cache.end() || !it->second) continue;
+        const bool unused = std::ranges::none_of(it->second->modules, [&](const auto& m) {
+            return m.module || (m.info && in_use.contains(m.info.get()));
+        });
+        if (unused) {
+            program_cache.erase(it);
+            ++dropped_programs;
+        }
+    }
+    const size_t listed = prewarm_programs.size();
+    prewarm_programs.clear();
+    prewarm_programs.shrink_to_fit();
+    LOG_INFO(Render_Vulkan, "FIX-GTS-468: released {} of the {} shader modules and {} of the {} "
+             "programs the precompile made ({} stages in use)", doomed.size(), made,
+             dropped_programs, listed, in_use.size());
+    if (doomed.empty()) return;
+    const vk::Device device = instance.GetDevice();
+    scheduler.DeferOperation([device, doomed = std::move(doomed)]() mutable {
+        PipelineRetirementWorker().Enqueue([device, doomed = std::move(doomed)] {
+            for (const auto module : doomed) {
+                ForgetModuleCode(device, module);
+                device.destroyShaderModule(module);
+            }
+        });
+    });
+}
+
+// FIX-GTS-468: how many precompiled pipelines no draw used stay built after the precompile
+// (SHADGT_PRECOMPILE_KEEP; the most recently used ones, as the precompile builds those first).
+static u64 PrecompileKeep() {
+    static const u64 keep = [] {
+        const char* env = std::getenv("SHADGT_PRECOMPILE_KEEP");
+        if (!env || !*env) return u64{1024};
+        const long long value = std::strtoll(env, nullptr, 10);
+        return value < 0 ? ~u64{0} : u64(value);
+    }();
+    return keep;
+}
+
+// FIX-GTS-468: once the splash precompile is done, its pipelines that no draw has used, beyond
+// the first PrecompileKeep() built, are released in batches (lookup mutex held). Each one is in
+// the driver's pipeline cache, so a draw that needs it later builds it again from there.
+void PipelineCache::RetireUnclaimedPrewarm(std::vector<std::shared_ptr<const void>>& retired) {
+    if (prewarm_unclaimed.empty() || !prewarm_reader_done.load(std::memory_order_relaxed) ||
+        PrecompileHoldsGame()) {
+        return;
+    }
+    const u64 keep = PrecompileKeep();
+    if (prewarm_settle_dirty) {
+        prewarm_settle_dirty = false;
+        prewarm_settle_queue.clear();
+        for (const auto& [key, unclaimed] : prewarm_unclaimed) {
+            if (unclaimed.order >= keep) prewarm_settle_queue.push_back(key);
+        }
+    }
+    constexpr size_t batch = 256;
+    size_t taken = 0;
+    std::vector<GraphicsPipelineKey> busy;
+    while (!prewarm_settle_queue.empty() && taken < batch && busy.size() < batch) {
+        const GraphicsPipelineKey key = prewarm_settle_queue.back();
+        prewarm_settle_queue.pop_back();
+        if (!prewarm_unclaimed.contains(key)) continue; // a draw used it meanwhile
+        const auto it = graphics_pipelines.find(key);
+        if (it == graphics_pipelines.end() || !it->second) {
+            prewarm_unclaimed.erase(key);
+            continue;
+        }
+        if (it->second.use_count() != 1 || !it->second->CanRetire()) {
+            busy.push_back(key); // in use or still linking: looked at again next time
+            continue;
+        }
+        pipeline_last_use.erase(it->second.get());
+        retired.emplace_back(std::move(it.value()));
+        graphics_pipelines.erase(it);
+        prewarm_unclaimed.erase(key);
+        ++taken;
+    }
+    prewarm_settle_queue.insert(prewarm_settle_queue.begin(), busy.begin(), busy.end());
+    if (taken == 0) return;
+    prewarm_settled += taken;
+    if (prewarm_settle_queue.empty() || prewarm_settled % 2048 < taken) {
+        LOG_INFO(Render_Vulkan, "FIX-GTS-468: released {} precompiled pipelines no draw used "
+                 "(keeping {}), {} left to release, {} cached", prewarm_settled,
+                 prewarm_unclaimed.size() - prewarm_settle_queue.size(),
+                 prewarm_settle_queue.size(), graphics_pipelines.size());
+    }
 }
 }

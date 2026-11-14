@@ -315,6 +315,8 @@ private:
     struct PrewarmRecord;
     bool InstallPrewarmRecord(PrewarmRecord& record);
     void PrewarmRead(std::stop_token stop);
+    /// FEAT-GTS-470: other GPU families' stored pipelines made this GPU's (see the .cpp).
+    void ImportForeignPipelines(std::stop_token stop);
     void ReportPrewarm(std::chrono::steady_clock::time_point now);
     /// PERF-034: waits while a worker builds a pipeline, starting builds for the states the
     /// command thread queues meanwhile. Compilation is owned exclusively by the workers.

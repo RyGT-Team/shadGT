@@ -15,6 +15,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <map>
 #include <algorithm>
 #include <atomic>
 #include <array>
@@ -7570,6 +7571,15 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
     std::optional<Common::PhaseTimer> match_timer{std::in_place, Common::Phase::ProgramMatch};
     // Diagnostic for runaway permutations: why each existing permutation was rejected.
     std::string mismatch_reasons;
+    // FEAT-GTS-470 phase 1 (SHADGT_DIAG_SPEC_MISS=1): why stored permutations (from this GPU's
+    // play or from another GPU's manifest) were rejected, counted when a new one is made.
+    static const bool diag_spec_miss = [] {
+        const char* env = std::getenv("SHADGT_DIAG_SPEC_MISS");
+        return env && env[0] == '1';
+    }();
+    std::vector<const char*> spec_miss_reasons;
+    // Why a permutation was not compared at all (no reason recorded for it).
+    u32 diag_with_info = 0, diag_skipped_flags = 0, diag_no_spec = 0, diag_memo = 0;
     // PERF-044: replay the last search when its inputs are the same. -DisablePerf 56.
     static const bool memo_enabled = Common::PerfFeatureEnabled(56);
     static const bool own_ahead_match = [] {
@@ -7656,6 +7666,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
             continue;
         }
         auto& info = *permutation.info;
+        ++diag_with_info;
         info.pgm_base = params.Base();
         info.user_data = params.user_data;
         { Common::PhaseTimer flat_timer{Common::Phase::SelFlatten}; info.RefreshFlatBuf(); }
@@ -7678,19 +7689,30 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         // Let the existing worker miss path do it instead of recompiling here.
         if ((AsyncTranslation() || (regs_override && !ReadAheadNewShadersEnabled())) &&
             !info.attribute_flags_known && IsTessEmulatedDraw()) {
+            ++diag_skipped_flags;
             continue;
         }
         bool matches;
         if (memo_usable) {
             matches = perm_idx == memo.perm;
+            ++diag_memo;
         } else {
             std::optional<Common::PhaseTimer> spec_timer{std::in_place, Common::Phase::SelSpec};
             const auto spec = TryMatchingSpecialization(info, runtime_info, profile, binding);
             spec_timer.reset();
             if (!spec) {
+                ++diag_no_spec;
                 continue;
             }
             matches = permutation.spec == *spec;
+            if (!matches && diag_spec_miss) {
+                u32 index{};
+                const char* reason = permutation.spec.FirstDifference(*spec, index);
+                reason = reason ? reason : "none";
+                if (std::ranges::find(spec_miss_reasons, reason) == spec_miss_reasons.end()) {
+                    spec_miss_reasons.push_back(reason);
+                }
+            }
             if (!matches && program->modules.size() >= 4 && mismatch_reasons.size() < 600) {
                 u32 index{};
                 const char* reason = permutation.spec.FirstDifference(*spec, index);
@@ -7744,6 +7766,44 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         ++queued_state_stats.new_shader_deferred;
 #endif
         return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
+    }
+    if (diag_spec_miss && !regs_override) {
+        // FEAT-GTS-470 phase 1: a draw needs a translation no stored permutation gives, counted
+        // per stage and reason, once per program and set of reasons (the async path asks again
+        // every draw until its translation is ready).
+        static std::map<std::string, u64> reasons;
+        static std::unordered_set<u64> seen;
+        static u64 misses = 0, without_any = 0;
+        u64 seen_key = params.hash;
+        for (const char* reason : spec_miss_reasons) seen_key = HashCombine(seen_key, XXH3_64bits(reason, std::strlen(reason)));
+        if (seen.insert(seen_key).second) {
+            ++misses;
+            if (spec_miss_reasons.empty()) {
+                ++without_any;
+                // Which of the four: no permutation with metadata, all skipped for missing
+                // attribute flags (tessellated), no buildable specialization, decided by the memo.
+                const char* why = diag_with_info == 0 ? "no permutation"
+                                  : diag_skipped_flags == diag_with_info ? "attribute flags"
+                                  : diag_no_spec != 0 ? "no specialization"
+                                  : diag_memo != 0 ? "memo" : "other";
+                ++reasons[fmt::format("{}/none: {}", hw_stage, why)];
+                static u32 listed = 0;
+                if (++listed <= 1000) {
+                    LOG_WARNING(Render_Vulkan, "FEAT-GTS-470 nothing to compare: {} {:016x} {} "
+                                "(permutations {}, with metadata {})", hw_stage, params.hash, why,
+                                program->modules.size(), diag_with_info);
+                }
+            }
+            for (const char* reason : spec_miss_reasons) {
+                ++reasons[fmt::format("{}/{}", hw_stage, reason)];
+            }
+            if (misses <= 20 || misses % 100 == 0) {
+                std::string summary;
+                for (const auto& [name, count] : reasons) summary += fmt::format(" {}={}", name, count);
+                LOG_WARNING(Render_Vulkan, "FEAT-GTS-470: {} new translations, {} with no stored "
+                            "permutation to compare; rejected because:{}", misses, without_any, summary);
+            }
+        }
     }
     if (AsyncTranslation()) {
         // FIX-078: a translation the workers made for these inputs.

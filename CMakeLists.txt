@@ -134,7 +134,9 @@ endif()
 # generate git revision information
 include("${CMAKE_CURRENT_SOURCE_DIR}/externals/cmake-modules/GetGitRevisionDescription.cmake")
 get_git_head_revision(GIT_REF_SPEC GIT_REV)
-git_describe(GIT_DESC --always --long)
+# FIX-GTS-418: shadgt7's release tags (gt7-*) came in with its history; describing from them
+# named a GT7 release in GT Sport's watermark. Without them the description is the commit.
+git_describe(GIT_DESC --always --long --exclude "gt7-*")
 # --dirty would count the patches externals/CMakeLists.txt applies to VMA, so every build but the
 # first one of a clone would say dirty. A submodule on another commit still counts.
 execute_process(COMMAND "${GIT_EXECUTABLE}" status --porcelain --untracked-files=no --ignore-submodules=dirty

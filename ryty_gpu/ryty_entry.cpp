@@ -296,7 +296,7 @@ std::string BuildWatermark() {
     if (Common::g_is_release || (env && env[0] == '0')) {
         return {};
     }
-    return fmt::format("GT Sport | {}", Common::g_scm_desc);
+    return fmt::format("GT Sport | shadGT {}", Common::g_scm_desc); // FIX-GTS-418: shadGT's revision
 }
 
 std::string g_watermark;

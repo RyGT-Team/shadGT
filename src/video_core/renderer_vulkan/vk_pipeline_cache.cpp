@@ -878,6 +878,20 @@ static void SlowMotionThread(std::stop_token stop) {
     }
 }
 
+// FEAT-GTS-469: the manifest pre-translation's progress, for its bar (ryty_entry.cpp).
+static std::atomic<u64> g_pretranslate_total{};
+static std::atomic<u64> g_pretranslate_done{};
+static std::atomic<bool> g_pretranslate_active{};
+// FEAT-GTS-469: from the thread's start to its end (including its first wait), so the splash
+// precompile can wait for it and compile what it translated.
+static std::atomic<bool> g_pretranslate_pending{};
+
+PrecompileProgress GetPretranslateProgress() {
+    const u64 total = g_pretranslate_total.load(std::memory_order_relaxed);
+    const u64 done = std::min(total, g_pretranslate_done.load(std::memory_order_relaxed));
+    return {total, done, g_pretranslate_active.load(std::memory_order_relaxed)};
+}
+
 PrecompileProgress GetPrecompileProgress() {
     const u64 total = g_precompile_total.load(std::memory_order_relaxed);
     const u64 done = std::min(total, g_precompile_done.load(std::memory_order_relaxed));
@@ -1579,6 +1593,7 @@ void PipelineCache::VerifyManifest(std::stop_token stop) {
 // (UnoccupiedShaderSlot, FIX-271), and programs the store has are never touched.
 void PipelineCache::PretranslateManifest(std::stop_token stop) {
     Common::SetCurrentThreadName("shadGT:Pretranslate");
+    SCOPE_EXIT { g_pretranslate_pending = false; }; // FEAT-GTS-469
     SleepUnlessStopped(stop, std::chrono::seconds{2});
     if (stop.stop_requested() || !use_stored_shaders || !Storage::DataBase::Instance().IsOpened()) {
         LOG_WARNING(Render_Vulkan, "PERF-GT7-117: no shader store, nothing pre-translated");
@@ -1590,6 +1605,10 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
         if (entry.path().extension() == ".rec") files.push_back(entry.path());
     }
     std::sort(files.begin(), files.end());
+    g_pretranslate_total = files.size(); // FEAT-GTS-469
+    g_pretranslate_done = 0;
+    g_pretranslate_active = !files.empty();
+    SCOPE_EXIT { g_pretranslate_active = false; };
     const auto start_time = std::chrono::steady_clock::now();
     std::atomic<size_t> next{0};
     std::atomic<u32> stored{0}, already{0}, unreplayed{0}, failed{0}, no_code{0}, duplicate{0};
@@ -1600,10 +1619,15 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
         std::vector<Shader::StageSpecialization> specs;
     };
     std::unordered_map<u64, Stored> programs;
+    // FEAT-GTS-469: while the splash precompile holds the game for it, every logical processor
+    // translates at normal priority; during play a few low-priority threads, as before.
+    const bool held = PrecompileHoldsGame();
     const auto work = [&] {
-        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+        Common::SetCurrentThreadPriority(held ? Common::ThreadPriority::Normal
+                                              : Common::ThreadPriority::Low);
         Shader::Pools pools;
         for (size_t i = next++; i < files.size() && !stop.stop_requested(); i = next++) {
+            ++g_pretranslate_done; // FEAT-GTS-469: counted as taken up
             ManifestRecord r;
             if (!ReadManifestRecord(files[i], r) || !ManifestRecordUsable(r)) {
                 ++failed;
@@ -1681,7 +1705,8 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
             ++stored;
         }
     };
-    const u32 count = std::clamp<u32>(std::thread::hardware_concurrency() / 4, 1, 4);
+    const u32 count = held ? std::max(1u, std::thread::hardware_concurrency())
+                           : std::clamp<u32>(std::thread::hardware_concurrency() / 4, 1, 4);
     std::vector<std::thread> threads;
     for (u32 t = 0; t < count; ++t) {
         threads.emplace_back([&work] {
@@ -2282,11 +2307,13 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             if (use_stored_shaders) LoadElseScopeFixed();
             if (pretranslate_wanted && use_stored_shaders) { // PERF-GT7-117
                 try {
+                    g_pretranslate_pending = true; // FEAT-GTS-469, before the precompile starts
                     pretranslate_thread = std::jthread([this](std::stop_token stop) {
                         try { PretranslateManifest(stop); }
                         catch (const std::exception& e) { LOG_WARNING(Render_Vulkan, "PERF-GT7-117: pre-translation stopped: {}", e.what()); }
                     });
                 } catch (const std::exception& e) {
+                    g_pretranslate_pending = false;
                     LOG_WARNING(Render_Vulkan, "PERF-GT7-117: pre-translation unavailable: {}", e.what());
                 }
             }
@@ -5630,6 +5657,17 @@ void PipelineCache::PrewarmRead(std::stop_token stop) {
     g_precompile_done = 0;
     LOG_WARNING(Render_Vulkan, "PERF-038: building {} stored pipelines in the background",
                 keys.size());
+    // FEAT-GTS-469: with the manifest pre-translation on, its translations are made first (the
+    // game waits on the splash screen for both): a stored pipeline whose shaders it translates
+    // is then built here instead of being skipped for missing SPIR-V. Translation alone can't
+    // compile anything: the driver compiles pipelines, which need a draw's state (stored keys).
+    if (g_pretranslate_pending.load()) {
+        LOG_WARNING(Render_Vulkan, "FEAT-GTS-469: the precompile waits for the manifest pre-translation");
+        while (g_pretranslate_pending.load() && !stop.stop_requested()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        }
+        if (stop.stop_requested()) return;
+    }
     const auto read_start = std::chrono::steady_clock::now();
     // miniz uses one mutable archive cursor. Independent files can be read in parallel.
     const unsigned readers = EmulatorSettings.IsPipelineCacheArchived() ? 1u :

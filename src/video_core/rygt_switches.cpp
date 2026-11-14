@@ -375,6 +375,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_DLSS_TEMPORAL|flag|NVIDIA|GPU.dlss_enabled setting|exactly 1 = on, any other value = off|Overrides whether temporal DLSS upscaling is used; when on, the half-rate mirror patch is not applied.",
     // Runtime
     "RYGTSW1|SHADGT_ADAPTIVE_TRIGGERS|flag|Runtime|on|0 = off (ignored when the dlssg_enabled config is on)|Telemetry-driven adaptive trigger effects for player 1 (braking slip, wheelspin, TCS); 0 turns them off.",
+    "RYGTSW1|SHADGT_HAPTICS_LOG|flag|Diagnostics & tracing|off|1 = on|Logs what the telemetry haptics see (suspension bumps, acceleration, slip, engine) twice a second while driving, to stderr. For tuning only.",
     "RYGTSW1|SHADGT_ADAPTIVE_TRIGGERS_REPLAY|flag|Runtime|off|1 = on|Adaptive trigger effects also run in replays and demos, to check them without driving. For testing.",
     "RYGTSW1|RYGT_APP0_LAYERS|string|Runtime|the update= and game= folders from RyGT.ini|folders separated by ; (the first holding a file wins)|The folders the game's /app0 is read from, in order, instead of the launcher's update and game folders. Read by the runtime (libc).",
     "RYGTSW1|SHADGT_ARCADE_MEMORY|flag|Runtime|on|0 = off; GT7 only|GT7 Arcade remembers the last course, weather and car across launches (FIX-GT7-060). 0 turns it off.",

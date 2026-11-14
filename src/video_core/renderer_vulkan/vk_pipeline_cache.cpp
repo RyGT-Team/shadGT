@@ -1654,7 +1654,7 @@ void PipelineCache::VerifyManifest(std::stop_token stop) {
                 records, same, differ, failed, no_code, with_misses);
 }
 
-// PERF-GT7-117 : SHADGT_MANIFEST_PRETRANSLATE=1 translates at start, in the background, the
+// PERF-GT7-117 : SHADGT_MANIFEST_PRETRANSLATE (on unless =0, FEAT-GTS-478) translates at start, the
 // manifest's records whose program the shader store does not have, from the local code, and
 // stores them as a draw's translation would be: the draws then find them as in a warm start
 // instead of waiting for (or skipping on) their translations. A record is stored only when every
@@ -2433,8 +2433,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             const char* env = std::getenv(name);
             return env && env[0] == '1';
         };
-        if (ManifestRecordOn() || manifest_on("SHADGT_MANIFEST_VERIFY") ||
-            manifest_on("SHADGT_MANIFEST_PRETRANSLATE")) {
+        // FEAT-GTS-478: pre-translation is on unless SHADGT_MANIFEST_PRETRANSLATE=0: a manifest
+        // from RyGTS's Set up (or this PC's own records) is translated on the splash screen.
+        const char* pretranslate = std::getenv("SHADGT_MANIFEST_PRETRANSLATE");
+        pretranslate_wanted = !(pretranslate && pretranslate[0] == '0');
+        if (ManifestRecordOn() || manifest_on("SHADGT_MANIFEST_VERIFY") || pretranslate_wanted) {
             try { MergeManifestFolders(); }
             catch (const std::exception& e) { LOG_WARNING(Render_Vulkan, "FEAT-GTS-470: manifest merge stopped: {}", e.what()); }
         }
@@ -2449,8 +2452,6 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                 LOG_WARNING(Render_Vulkan, "PERF-GT7-111: verification unavailable: {}", e.what());
             }
         }
-        const char* pretranslate = std::getenv("SHADGT_MANIFEST_PRETRANSLATE");
-        pretranslate_wanted = pretranslate && pretranslate[0] == '1';
     }
     // PERF-032: the shader store is used again, without the startup precompile Lance had removed:
     // a program's stored translations are read when a draw first uses it, and new translations

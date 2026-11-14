@@ -398,7 +398,14 @@ static_assert(std::is_trivially_copyable_v<Shader::RuntimeInfo>);
 static_assert(std::is_trivially_copyable_v<Shader::Backend::Bindings>);
 static_assert(std::is_trivially_copyable_v<Shader::Info::PinnedFetchSharp>);
 
+// FEAT-GTS-470: one manifest folder for every GPU (it was one per <vendor>-<device>). A record
+// names the GPU that recorded it (format 4); records of the older per-GPU folders take it from
+// the folder's name when they are merged in (MergeManifestFolders).
+static u32 g_manifest_vendor{}, g_manifest_device{}; // this GPU
+
 struct ManifestRecord {
+    u32 origin_vendor{}; ///< FEAT-GTS-470: the GPU that recorded it (0: unknown)
+    u32 origin_device{};
     u32 hw_stage{};
     u32 sw_stage{};
     u64 hash{};
@@ -467,10 +474,10 @@ static std::vector<u32> ReadWords(const std::filesystem::path& file) {
     return words;
 }
 
-static void WriteManifestRecord(const ManifestRecord& r, std::span<const u32> code,
-                                std::span<const u32> fetch) {
+// The record file alone (FEAT-GTS-470: MergeManifestFolders writes records without their code).
+static bool WriteManifestRecordFile(const ManifestRecord& r) {
     std::vector<u8> out(ManifestMagic, ManifestMagic + sizeof(ManifestMagic));
-    PutPod(out, u32{3});
+    PutPod(out, u32{4});
     PutPod(out, r.hw_stage);
     PutPod(out, r.sw_stage);
     PutPod(out, r.hash);
@@ -500,9 +507,12 @@ static void WriteManifestRecord(const ManifestRecord& r, std::span<const u32> co
     PutPod(out, u32(r.attributes.size()));
     for (const auto& attribute : r.attributes) PutPod(out, attribute);
     PutPod(out, r.code_base);
+    PutPod(out, r.origin_vendor); // format 4 (FEAT-GTS-470)
+    PutPod(out, r.origin_device);
     const auto file = g_manifest_dir / fmt::format("{:016x}-{:016x}.rec", r.hash, r.spv_xxh);
     std::error_code ec;
-    if (!std::filesystem::exists(file, ec)) {
+    bool written = std::filesystem::exists(file, ec);
+    if (!written) {
         std::filesystem::create_directories(file.parent_path(), ec);
         auto temporary = file;
         temporary += fmt::format(".{}", std::hash<std::thread::id>{}(std::this_thread::get_id()));
@@ -511,8 +521,20 @@ static void WriteManifestRecord(const ManifestRecord& r, std::span<const u32> co
             std::fclose(f);
             if (ok) std::filesystem::rename(temporary, file, ec);
             if (!ok || ec) std::filesystem::remove(temporary, ec);
+            written = ok && !ec;
         }
     }
+    return written;
+}
+
+static void WriteManifestRecord(const ManifestRecord& record, std::span<const u32> code,
+                                std::span<const u32> fetch) {
+    ManifestRecord r = record;
+    if (r.origin_vendor == 0) { // recorded here
+        r.origin_vendor = g_manifest_vendor;
+        r.origin_device = g_manifest_device;
+    }
+    WriteManifestRecordFile(r);
     // The local capture: the game's code, for this PC only.
     WriteWords(g_capture_dir / fmt::format("{:016x}-{:016x}.code", r.hash, r.code_xxh), code);
     if (!fetch.empty()) {
@@ -537,7 +559,7 @@ static bool ReadManifestRecord(const std::filesystem::path& file, ManifestRecord
     }
     size_t at = 8;
     u32 version = 0, pins = 0, spans = 0, bytes = 0;
-    if (!GetPod(in, at, version) || version < 1 || version > 3 ||
+    if (!GetPod(in, at, version) || version < 1 || version > 4 ||
         !GetPod(in, at, r.hw_stage) ||
         !GetPod(in, at, r.sw_stage) || !GetPod(in, at, r.hash) || !GetPod(in, at, r.code_xxh) ||
         !GetPod(in, at, r.code_words) || !GetPod(in, at, r.spv_xxh) ||
@@ -577,6 +599,9 @@ static bool ReadManifestRecord(const std::filesystem::path& file, ManifestRecord
         if (!GetPod(in, at, attribute)) return false;
     }
     if (version >= 3 && !GetPod(in, at, r.code_base)) return false;
+    if (version >= 4 && (!GetPod(in, at, r.origin_vendor) || !GetPod(in, at, r.origin_device))) {
+        return false;
+    }
     return at == in.size();
 }
 
@@ -1559,6 +1584,8 @@ void PipelineCache::VerifyManifest(std::stop_token stop) {
             ++failed;
             continue;
         }
+        // FEAT-GTS-470: another GPU's SPIR-V hash can't match one made here.
+        if (r.origin_vendor != g_manifest_vendor || r.origin_device != g_manifest_device) continue;
         ++records;
         const auto code =
             ReadWords(g_capture_dir / fmt::format("{:016x}-{:016x}.code", r.hash, r.code_xxh));
@@ -1602,6 +1629,51 @@ void PipelineCache::VerifyManifest(std::stop_token stop) {
 // instead of waiting for (or skipping on) their translations. A record is stored only when every
 // guest read replays as recorded. shadGT: an index is taken only where the store has nothing
 // (UnoccupiedShaderSlot, FIX-271), and programs the store has are never touched.
+// FEAT-GTS-470: the per-GPU folders (<vendor>-<device>) of older manifests, merged into the one
+// folder: each record rewritten there with the folder's GPU as its origin. A folder whose records
+// were all merged is renamed <vendor>-<device>.merged, so nothing is deleted.
+static void MergeManifestFolders() {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    std::vector<fs::path> folders;
+    for (const auto& entry : fs::directory_iterator(g_manifest_dir, ec)) {
+        const auto name = entry.path().filename().string();
+        unsigned vendor = 0, device = 0;
+        char rest = 0;
+        if (entry.is_directory() && name.size() == 9 &&
+            std::sscanf(name.c_str(), "%4x-%4x%c", &vendor, &device, &rest) == 2) {
+            folders.push_back(entry.path());
+        }
+    }
+    for (const auto& folder : folders) {
+        unsigned vendor = 0, device = 0;
+        std::sscanf(folder.filename().string().c_str(), "%4x-%4x", &vendor, &device);
+        u64 merged = 0, failed = 0;
+        for (const auto& entry : fs::directory_iterator(folder, ec)) {
+            if (entry.path().extension() != ".rec") continue;
+            ManifestRecord r;
+            if (!ReadManifestRecord(entry.path(), r)) {
+                ++failed;
+                continue;
+            }
+            if (r.origin_vendor == 0) {
+                r.origin_vendor = vendor;
+                r.origin_device = device;
+            }
+            if (WriteManifestRecordFile(r)) ++merged;
+            else ++failed;
+        }
+        if (failed == 0) {
+            auto renamed = folder;
+            renamed += ".merged";
+            fs::rename(folder, renamed, ec);
+        }
+        LOG_WARNING(Render_Vulkan, "FEAT-GTS-470: manifest folder {} merged: {} records, {} not "
+                    "merged{}", folder.filename().string(), merged, failed,
+                    failed ? " (folder kept)" : "");
+    }
+}
+
 // FEAT-GTS-470: a record another GPU made carries that GPU's device-dependent runtime fields; a
 // draw here builds them from this GPU's profile, so as made they never match (Radeon 610M with an
 // RTX 4070's records: 372 of 800 translations in game differed only in vertex_order_check). Made
@@ -1632,21 +1704,10 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
         if (entry.path().extension() == ".rec") files.push_back(entry.path());
     }
     std::sort(files.begin(), files.end());
-    // FEAT-GTS-470: then the records other GPUs made (the manifest's other <vendor>-<device>
-    // folders), their device-dependent fields made this GPU's (NormalizeForeignRecord).
-    // SHADGT_MANIFEST_FOREIGN=0 reads this GPU's folder only.
-    const size_t own_files = files.size();
-    if (const char* foreign = std::getenv("SHADGT_MANIFEST_FOREIGN"); !(foreign && foreign[0] == '0')) {
-        std::vector<std::filesystem::path> others;
-        for (const auto& folder : std::filesystem::directory_iterator(g_manifest_dir.parent_path(), ec)) {
-            if (!folder.is_directory() || folder.path() == g_manifest_dir) continue;
-            for (const auto& entry : std::filesystem::directory_iterator(folder.path(), ec)) {
-                if (entry.path().extension() == ".rec") others.push_back(entry.path());
-            }
-        }
-        std::sort(others.begin(), others.end());
-        files.insert(files.end(), others.begin(), others.end());
-    }
+    // FEAT-GTS-470: the folder holds every GPU's records; another GPU's are made this GPU's
+    // (NormalizeForeignRecord). SHADGT_MANIFEST_FOREIGN=0: this GPU's records only.
+    const char* foreign_env = std::getenv("SHADGT_MANIFEST_FOREIGN");
+    const bool use_foreign = !(foreign_env && foreign_env[0] == '0');
     g_pretranslate_total = files.size(); // FEAT-GTS-469
     g_pretranslate_done = 0;
     g_pretranslate_active = !files.empty();
@@ -1682,8 +1743,9 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
                 ++failed;
                 continue;
             }
-            if (i >= own_files) {
-                NormalizeForeignRecord(r, profile); // FEAT-GTS-470
+            if (r.origin_vendor != g_manifest_vendor || r.origin_device != g_manifest_device) {
+                if (!use_foreign) continue; // FEAT-GTS-470
+                NormalizeForeignRecord(r, profile);
                 ++foreign;
             }
             {
@@ -2330,9 +2392,20 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         // PERF-GT7-111: the manifest and capture folders, and the start-up verification.
         const auto cache_dir = Common::FS::GetUserPath(Common::FS::PathType::CacheDir);
         const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
-        const auto gpu = fmt::format("{:04x}-{:04x}", instance.GetVendorID(), instance.GetDeviceID());
-        g_manifest_dir = cache_dir / fmt::format("{}.manifest", serial) / gpu;
+        // FEAT-GTS-470: one folder for every GPU's records; older per-GPU folders merged into it.
+        g_manifest_vendor = instance.GetVendorID();
+        g_manifest_device = instance.GetDeviceID();
+        g_manifest_dir = cache_dir / fmt::format("{}.manifest", serial);
         g_capture_dir = cache_dir / fmt::format("{}.capture", serial);
+        const auto manifest_on = [](const char* name) {
+            const char* env = std::getenv(name);
+            return env && env[0] == '1';
+        };
+        if (manifest_on("SHADGT_MANIFEST_RECORD") || manifest_on("SHADGT_MANIFEST_VERIFY") ||
+            manifest_on("SHADGT_MANIFEST_PRETRANSLATE")) {
+            try { MergeManifestFolders(); }
+            catch (const std::exception& e) { LOG_WARNING(Render_Vulkan, "FEAT-GTS-470: manifest merge stopped: {}", e.what()); }
+        }
         const char* verify = std::getenv("SHADGT_MANIFEST_VERIFY");
         if (verify && verify[0] == '1') {
             try {

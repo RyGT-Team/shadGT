@@ -2254,8 +2254,11 @@ constexpr u64 kFatalError = 0x1796f70;
 constexpr u8 kFatalErrorPrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
                                       0x56, 0x41, 0x55, 0x41, 0x54, 0x53};
 
+std::atomic<bool> g_fatal_error_reported{false}; // read by EXIT-001
+
 void PS4_SYSV_ABI FatalErrorHook(const char* file, s32 line, const u8* message) {
     static std::atomic<u32> reported{0};
+    g_fatal_error_reported = true;
     if (reported++ >= 20) {
         return;
     }
@@ -2324,6 +2327,48 @@ void InstallFatalErrorDiag(u8* base) {
     FlushInstructionCache(GetCurrentProcess(), entry, sizeof(jump));
     std::fprintf(stderr, "[patch] DIAG-161 fatal-error message applied at %#llx\n",
                  static_cast<unsigned long long>(kFatalError));
+}
+} // namespace
+
+[[noreturn]] void RytyEndGame(int code, const char* reason); // ryty_entry.cpp
+
+namespace {
+// EXIT-001: GT Sport's main returning. On a PS4 that ends the process at once: the start-up code
+// (eboot 0xc3) passes main's result to libc's catchReturnFromMain, which raises a system exception
+// (sceKernelDebugRaiseExceptionOnReleaseMode 0xa0020001). Ryty's raise only logs, so the code
+// behind it ran: libc's exit and the game's static destructors, which no PS4 ever reaches and
+// which fault (an access violation at eboot 0x1389e46 on every quit, after the game's own
+// shutdown). The game's main returns when its main loop ends: the player quit (the
+// Top Screen's Exit with RyGTS's script patch) or a fatal error shut the game down (DIAG-161).
+// The call now ends the process the way closing the window does (RytyEndGame), with exit code 0
+// for a quit and 1 after a fatal error.
+constexpr u64 kMainReturnedCall = 0xc3;        // call catchReturnFromMain
+constexpr u64 kCatchReturnFromMain = 0x1d178f0; // its import stub
+// mov edi, eax; mov ebx, eax; call; mov edi, ebx; call exit; ud2
+constexpr u8 kMainReturnedBefore[] = {0x89, 0xc7, 0x89, 0xc3, 0xe8};
+constexpr u8 kMainReturnedAfter[] = {0x89, 0xdf, 0xe8};
+
+[[noreturn]] void PS4_SYSV_ABI MainReturnedHook(s32 status) {
+    const bool fatal = g_fatal_error_reported.load();
+    std::fprintf(stderr, "[game] main returned %d%s\n", status,
+                 fatal ? " after a fatal error" : "");
+    RytyEndGame(fatal ? 1 : status, "[game] main returned");
+}
+
+void InstallCleanExit(u8* base) {
+    const u8* call = base + kMainReturnedCall + kTextRvaShift;
+    if (std::memcmp(call - 4, kMainReturnedBefore, sizeof(kMainReturnedBefore)) != 0 ||
+        std::memcmp(call + 5, kMainReturnedAfter, sizeof(kMainReturnedAfter)) != 0 ||
+        call[12] != 0x0f || call[13] != 0x0b) {
+        return; // not GT Sport v1.69's start-up code
+    }
+    u8* stub = AllocNear(base);
+    if (!stub) {
+        std::fprintf(stderr, "[patch] EXIT-001: no memory near the game's code for the hook\n");
+        return;
+    }
+    RedirectCall(base, stub, kMainReturnedCall, kCatchReturnFromMain,
+                 reinterpret_cast<void*>(&MainReturnedHook), "EXIT-001 clean exit when main returns");
 }
 } // namespace
 
@@ -3197,6 +3242,7 @@ void RytyApplyGamePatches() {
     InstallTextEntryDiag(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
 #endif
     InstallFatalErrorDiag(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallCleanExit(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     if (!(std::getenv("RYGT_DECALS") && std::getenv("RYGT_DECALS")[0] == '0')) {
         SyncDecals();
     }

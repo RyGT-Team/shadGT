@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstdlib>
 #include <mutex>
 #include <span>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <magic_enum/magic_enum.hpp>
@@ -19,6 +22,15 @@
 #include "shader_recompiler/runtime_info.h"
 
 namespace Shader::Backend::SPIRV {
+
+bool DirectLoadGroupsEnabled() {
+    // SHADGT_DIRECT_LOAD_GROUPS=0 gives every read its own branch again (a separate store).
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_DIRECT_LOAD_GROUPS");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
 namespace {
 
 static constexpr spv::ExecutionMode GetInputPrimitiveType(AmdGpu::PrimitiveType type) {
@@ -152,8 +164,132 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
     }
 }
 
+// PERF-GTS-473: instructions a buffer read is never moved past: side effects, GDS counters, and
+// writes of registers or goto variables (a read of them must stay on its side of the write).
+static bool StopsDirectGroup(const IR::Inst& inst) {
+    switch (inst.GetOpcode()) {
+    case IR::Opcode::Phi:
+    case IR::Opcode::DataAppend:
+    case IR::Opcode::DataConsume:
+    case IR::Opcode::SetScalarRegister:
+    case IR::Opcode::SetVectorRegister:
+    case IR::Opcode::SetVirtualRegister:
+    case IR::Opcode::SetGotoVariable:
+    case IR::Opcode::SetScc:
+    case IR::Opcode::SetExec:
+    case IR::Opcode::SetVcc:
+    case IR::Opcode::SetVccLo:
+    case IR::Opcode::SetVccHi:
+    case IR::Opcode::SetM0:
+        return true;
+    default:
+        return inst.MayHaveSideEffects();
+    }
+}
+
+// PERF-GTS-473: whether a value can be defined before the group's first read. Values from before
+// the group (earlier in the block, other blocks, immediates) are; one defined in the block after
+// the first read is if it has no side effects and its own arguments are (it is then emitted
+// early, in `chain`).
+static bool DefinedBeforeGroup(const IR::Value& value, const std::vector<IR::Inst*>& members,
+                               const std::unordered_set<const IR::Inst*>& pending,
+                               const std::unordered_set<const IR::Inst*>& hoisted,
+                               std::vector<const IR::Inst*>& chain, u32 depth) {
+    if (value.IsImmediate()) {
+        return true;
+    }
+    const IR::Inst* inst = value.Inst();
+    if (std::ranges::find(members, inst) != members.end()) {
+        return false; // defined only after the group's branch
+    }
+    if (!pending.contains(inst) || hoisted.contains(inst) ||
+        std::ranges::find(chain, inst) != chain.end()) {
+        return true;
+    }
+    if (depth > 16 || StopsDirectGroup(*inst)) {
+        return false;
+    }
+    for (size_t i = 0; i < inst->NumArgs(); ++i) {
+        if (!DefinedBeforeGroup(inst->Arg(i), members, pending, hoisted, chain, depth + 1)) {
+            return false;
+        }
+    }
+    chain.push_back(inst);
+    return true;
+}
+
+// PERF-GTS-473: a direct-eligible buffer read gets one direct/SSBO branch with the reads of the
+// same buffer that follow it in the block, instead of a branch each: a 4x4 matrix read through
+// four dwordx4 loads was 16 branches, each loading the table word and bounds again. Only reads
+// are moved, and only past instructions without side effects (no stores, atomics, barriers or
+// discards between), so every read returns what it did before. The address math a later read
+// needs is emitted before the branch; everything else keeps its order after it.
+static bool EmitDirectLoadGroup(EmitContext& ctx, IR::Block::iterator head,
+                                IR::Block::iterator end, u32 handle,
+                                std::unordered_set<const IR::Inst*>& emitted) {
+    constexpr size_t max_scan = 96;
+    constexpr size_t max_members = 32;
+    std::vector<IR::Inst*> members{&*head};
+    std::unordered_set<const IR::Inst*> pending;
+    std::unordered_set<const IR::Inst*> hoisted;
+    size_t scanned = 0;
+    for (auto it = std::next(head); it != end && scanned < max_scan; ++it, ++scanned) {
+        IR::Inst& inst = *it;
+        if (emitted.contains(&inst)) {
+            continue; // emitted early by an earlier group
+        }
+        if (StopsDirectGroup(inst)) {
+            break;
+        }
+        if (GroupableDirectLoad(ctx, inst) == handle) {
+            std::vector<const IR::Inst*> chain;
+            bool ready = true;
+            for (size_t i = 0; i < inst.NumArgs() && ready; ++i) {
+                ready = DefinedBeforeGroup(inst.Arg(i), members, pending, hoisted, chain, 0);
+            }
+            if (ready) {
+                hoisted.insert(chain.begin(), chain.end());
+                members.push_back(&inst);
+                if (members.size() == max_members) {
+                    break;
+                }
+                continue;
+            }
+        }
+        pending.insert(&inst);
+    }
+    if (members.size() < 2) {
+        return false;
+    }
+    // Address math of the later reads, in block order.
+    for (auto it = std::next(head); &*it != members.back(); ++it) {
+        if (hoisted.contains(&*it)) {
+            EmitInst(ctx, &*it);
+            emitted.insert(&*it);
+        }
+    }
+    std::vector<DirectLoadDesc> descs;
+    std::vector<EmitContext::DirectPart> parts;
+    descs.reserve(members.size());
+    for (IR::Inst* member : members) {
+        descs.push_back(DescribeDirectLoad(ctx, member));
+        parts.insert(parts.end(), descs.back().parts.begin(), descs.back().parts.end());
+    }
+    const std::vector<Id> values = ctx.EmitDirectLoads(handle, parts);
+    size_t first = 0;
+    for (size_t i = 0; i < members.size(); ++i) {
+        const size_t count = descs[i].parts.size();
+        members[i]->SetDefinition<Id>(
+            descs[i].combine(std::span<const Id>(values).subspan(first, count)));
+        first += count;
+        emitted.insert(members[i]);
+    }
+    return true;
+}
+
 void Traverse(EmitContext& ctx, const IR::Program& program) {
     IR::Block* current_block{};
+    std::unordered_set<const IR::Inst*> emitted; // PERF-GTS-473: emitted ahead of their place
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
         switch (node.type) {
         case IR::AbstractSyntaxNode::Type::Block: {
@@ -163,8 +299,17 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             }
             current_block = node.data.block;
             ctx.AddLabel(label);
-            for (IR::Inst& inst : node.data.block->Instructions()) {
-                EmitInst(ctx, &inst);
+            auto& insts = node.data.block->Instructions();
+            emitted.clear();
+            for (auto it = insts.begin(); it != insts.end(); ++it) {
+                if (!emitted.empty() && emitted.contains(&*it)) {
+                    continue;
+                }
+                if (const auto handle = GroupableDirectLoad(ctx, *it);
+                    handle && EmitDirectLoadGroup(ctx, it, insts.end(), *handle, emitted)) {
+                    continue;
+                }
+                EmitInst(ctx, &*it);
             }
             ctx.first_to_last_label_map[label.value] = ctx.last_label;
             break;

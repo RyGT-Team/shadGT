@@ -82,6 +82,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_COMPILE_LOW|flag|Shader compiling|off|1 = on (test)|Keeps driver compile and translate threads below normal priority whenever no draw waits for its pipeline (PERF-GT7-055 test).",
     "RYGTSW1|SHADGT_COMPILE_NOTICE|flag|Shader compiling|on|0 = off|Shows an on-screen notice when draws have waited over 0.5 s for shaders to compile, so it isn't mistaken for a crash; 0 hides it.",
     "RYGTSW1|SHADGT_COMPILE_PRIORITY|choice|Shader compiling|below the game's priority in races|normal = keep compile threads at normal priority|In races, shader translations and pipeline builds run below the game's priority (PERF-310); 'normal' keeps them level.",
+    "RYGTSW1|SHADGT_DIRECT_LOAD_GROUPS|flag|Shader compiling|on|0 = off (uses a separate shader store)|Reads of one buffer in a row share one direct-memory branch, so translated shaders are smaller and drivers compile them faster (PERF-GTS-473).",
     "RYGTSW1|SHADGT_GPL|flag|Shader compiling|on|0 = off|Uses shared pipeline libraries with fast linking for tessellated pipelines (PERF-GT7-040 port); 0 turns them off.",
     "RYGTSW1|SHADGT_MANIFEST_PRETRANSLATE|flag|Shader compiling|off|1 = on (needs the shader store)|At start, pre-translates shaders listed in the recorded manifest on a background thread (PERF-GT7-117).",
     "RYGTSW1|SHADGT_MANIFEST_RECORD|flag|Shader compiling|off|1 = on|Writes a manifest record (and a local capture of the code) for each translated shader, for later pre-translation (PERF-GT7-111).",

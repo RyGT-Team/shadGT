@@ -10,6 +10,7 @@
 #include "common/scm_rev.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
+#include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/lane_read_policy.h"
 
 #include "video_core/buffer_cache/direct_memory.h"
@@ -173,6 +174,10 @@ void DataBase::Open() {
                 if (const char* env = std::getenv("SHADGT_TESS_LDS_SPREAD");
                     !(env && env[0] == '0')) {
                     parts += ", lds spread";
+                }
+                // PERF-GTS-473: direct buffer reads that share one branch per run of reads.
+                if (Shader::Backend::SPIRV::DirectLoadGroupsEnabled()) {
+                    parts += ", direct groups";
                 }
                 // DIAG-GTS-447: constant-output diagnosis shaders get a store of their own.
                 if (const char* env = std::getenv("SHADGT_DIAG_FS_CONST"); env && *env) {

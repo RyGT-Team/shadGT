@@ -75,23 +75,48 @@ Id EmitReadConst(EmitContext& ctx, IR::Inst* inst, Id addr, Id offset) {
     }
 }
 
-Id EmitReadConstBuffer(EmitContext& ctx, u32 handle, Id index) {
+// PERF-GTS-473: a read of a direct-eligible buffer is described as parts (the SSBO read captured
+// by value), so that EmitDirectLoads can put the reads of one buffer behind a single branch.
+static Id SingleDirectValue(std::span<const Id> values) {
+    return values[0];
+}
+
+static Id FinishDirectLoad(EmitContext& ctx, const DirectLoadDesc& desc) {
+    const std::vector<Id> values = ctx.EmitDirectLoads(desc.handle, desc.parts);
+    return desc.combine(values);
+}
+
+static DirectLoadDesc DescribeReadConstBuffer(EmitContext& ctx, u32 handle, Id index) {
     const auto& buffer = ctx.buffers[handle];
     const Id guest_index = index; // D2: dword index from the guest base address
     if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         index = ctx.OpIAdd(ctx.U32[1], index, offset);
     }
-    const auto [id, pointer_type] = buffer.Alias(PointerType::U32);
-    const auto ssbo_load = [&] {
-        const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index)};
-        return ctx.OpLoad(ctx.U32[1], ptr);
-    };
+    const auto alias = buffer.Alias(PointerType::U32);
+    const Id id = alias.id;
+    const Id pointer_type = alias.pointer_type;
+    const Id byte = ctx.OpShiftLeftLogical(ctx.U32[1], guest_index, ctx.ConstU32(2U));
+    DirectLoadDesc desc{.handle = handle, .combine = SingleDirectValue};
+    desc.parts.push_back({byte, 4, ctx.U32[1], ctx.physical_pointer_type_u32,
+                          [&ctx, id, pointer_type, index] {
+                              const Id ptr{ctx.OpAccessChain(pointer_type, id,
+                                                             ctx.u32_zero_value, index)};
+                              return ctx.OpLoad(ctx.U32[1], ptr);
+                          }});
+    return desc;
+}
+
+Id EmitReadConstBuffer(EmitContext& ctx, u32 handle, Id index) {
     if (ctx.IsDirectBuffer(handle)) {
-        const Id byte = ctx.OpShiftLeftLogical(ctx.U32[1], guest_index, ctx.ConstU32(2U));
-        return ctx.EmitDirectLoad(handle, byte, 4, ctx.U32[1], ctx.physical_pointer_type_u32,
-                                  ssbo_load);
+        return FinishDirectLoad(ctx, DescribeReadConstBuffer(ctx, handle, index));
     }
-    return ssbo_load();
+    const auto& buffer = ctx.buffers[handle];
+    if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
+        index = ctx.OpIAdd(ctx.U32[1], index, offset);
+    }
+    const auto [id, pointer_type] = buffer.Alias(PointerType::U32);
+    const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index)};
+    return ctx.OpLoad(ctx.U32[1], ptr);
 }
 
 Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
@@ -514,76 +539,126 @@ void EmitSetPatch(EmitContext& ctx, IR::Patch patch, Id value) {
 }
 
 template <u32 N, PointerType alias>
-static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
+static DirectLoadDesc DescribeLoadBufferB32xN(EmitContext& ctx, u32 handle, Id address) {
     const auto& spv_buffer = ctx.buffers[handle];
     const Id guest_index = address; // D2: dword index from the guest base address
     if (const Id offset = spv_buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
+    const Id scalar_type = alias == PointerType::U32 ? ctx.U32[1] : ctx.F32[1];
+    const Id vector_type = alias == PointerType::U32 ? ctx.U32[N] : ctx.F32[N];
+    const auto buffer_alias = spv_buffer.Alias(alias);
+    const Id id = buffer_alias.id;
+    const Id pointer_type = buffer_alias.pointer_type;
+    const Id physical_type = alias == PointerType::U32 ? ctx.physical_pointer_type_u32
+                                                       : ctx.physical_pointer_type_f32;
+    DirectLoadDesc desc{.handle = handle};
+    for (u32 i = 0; i < N; i++) {
+        const Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
+        const Id guest_i =
+            i == 0 ? guest_index : ctx.OpIAdd(ctx.U32[1], guest_index, ctx.ConstU32(i));
+        const Id byte_i = ctx.OpShiftLeftLogical(ctx.U32[1], guest_i, ctx.ConstU32(2U));
+        desc.parts.push_back({byte_i, 4, scalar_type, physical_type,
+                              [&ctx, id, pointer_type, index_i, scalar_type] {
+                                  const Id ptr_i = ctx.OpAccessChain(
+                                      pointer_type, id, ctx.u32_zero_value, index_i);
+                                  return ctx.OpLoad(scalar_type, ptr_i);
+                              }});
+    }
+    desc.combine = [&ctx, vector_type](std::span<const Id> values) {
+        return N == 1 ? values[0] : ctx.OpCompositeConstruct(vector_type, values);
+    };
+    return desc;
+}
+
+template <u32 N, PointerType alias>
+static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
+    if (ctx.IsDirectBuffer(handle)) {
+        return FinishDirectLoad(ctx, DescribeLoadBufferB32xN<N, alias>(ctx, handle, address));
+    }
+    const auto& spv_buffer = ctx.buffers[handle];
+    if (const Id offset = spv_buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
+        address = ctx.OpIAdd(ctx.U32[1], address, offset);
+    }
     const auto& data_types = alias == PointerType::U32 ? ctx.U32 : ctx.F32;
     const auto [id, pointer_type] = spv_buffer.Alias(alias);
-    const bool direct = ctx.IsDirectBuffer(handle);
 
     boost::container::static_vector<Id, N> ids;
     for (u32 i = 0; i < N; i++) {
         const Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
-        const auto ssbo_load = [&] {
-            const Id ptr_i = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index_i);
-            return ctx.OpLoad(data_types[1], ptr_i);
-        };
-        if (direct) {
-            const Id guest_i =
-                i == 0 ? guest_index : ctx.OpIAdd(ctx.U32[1], guest_index, ctx.ConstU32(i));
-            const Id byte_i = ctx.OpShiftLeftLogical(ctx.U32[1], guest_i, ctx.ConstU32(2U));
-            ids.push_back(ctx.EmitDirectLoad(
-                handle, byte_i, 4, data_types[1],
-                alias == PointerType::U32 ? ctx.physical_pointer_type_u32
-                                          : ctx.physical_pointer_type_f32,
-                ssbo_load));
-            continue;
-        }
-        ids.push_back(ssbo_load());
+        const Id ptr_i = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index_i);
+        ids.push_back(ctx.OpLoad(data_types[1], ptr_i));
     }
 
     const Id result = N == 1 ? ids[0] : ctx.OpCompositeConstruct(data_types[N], ids);
     return result;
 }
 
-Id EmitLoadBufferU8(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
+// PERF-GTS-473: a narrow or wide read of a direct-eligible buffer (U8, U16, U64).
+static DirectLoadDesc DescribeLoadBufferScalar(EmitContext& ctx, u32 handle, Id address,
+                                               PointerSize size, PointerType alias, Id type,
+                                               Id physical_type, u32 bytes, u32 byte_shift) {
     const auto& spv_buffer = ctx.buffers[handle];
-    const Id guest_byte = address;
+    const Id guest_index = address;
+    if (const Id offset = spv_buffer.Offset(size); Sirit::ValidId(offset)) {
+        address = ctx.OpIAdd(ctx.U32[1], address, offset);
+    }
+    const auto buffer_alias = spv_buffer.Alias(alias);
+    const Id id = buffer_alias.id;
+    const Id pointer_type = buffer_alias.pointer_type;
+    const Id byte = byte_shift == 0 ? guest_index
+                                    : ctx.OpShiftLeftLogical(ctx.U32[1], guest_index,
+                                                             ctx.ConstU32(byte_shift));
+    // U64's access chain indexes with a 64-bit zero, as before.
+    const Id zero = alias == PointerType::U64 ? ctx.u64_zero_value : ctx.u32_zero_value;
+    DirectLoadDesc desc{.handle = handle, .combine = SingleDirectValue};
+    desc.parts.push_back({byte, bytes, type, physical_type,
+                          [&ctx, id, pointer_type, address, type, zero] {
+                              const Id ptr{ctx.OpAccessChain(pointer_type, id, zero, address)};
+                              return ctx.OpLoad(type, ptr);
+                          }});
+    return desc;
+}
+
+static DirectLoadDesc DescribeLoadBufferU8(EmitContext& ctx, u32 handle, Id address) {
+    return DescribeLoadBufferScalar(ctx, handle, address, PointerSize::B8, PointerType::U8,
+                                    ctx.U8, ctx.physical_pointer_type_u8, 1, 0);
+}
+
+static DirectLoadDesc DescribeLoadBufferU16(EmitContext& ctx, u32 handle, Id address) {
+    return DescribeLoadBufferScalar(ctx, handle, address, PointerSize::B16, PointerType::U16,
+                                    ctx.U16, ctx.physical_pointer_type_u16, 2, 1);
+}
+
+static DirectLoadDesc DescribeLoadBufferU64(EmitContext& ctx, u32 handle, Id address) {
+    return DescribeLoadBufferScalar(ctx, handle, address, PointerSize::B64, PointerType::U64,
+                                    ctx.U64, ctx.physical_pointer_type_u64, 8, 3);
+}
+
+Id EmitLoadBufferU8(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
+    if (ctx.IsDirectBuffer(handle) && Sirit::ValidId(ctx.physical_pointer_type_u8)) {
+        return FinishDirectLoad(ctx, DescribeLoadBufferU8(ctx, handle, address));
+    }
+    const auto& spv_buffer = ctx.buffers[handle];
     if (const Id offset = spv_buffer.Offset(PointerSize::B8); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U8);
-    const auto ssbo_load = [&] {
-        const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
-        return ctx.OpLoad(ctx.U8, ptr);
-    };
-    if (ctx.IsDirectBuffer(handle) && Sirit::ValidId(ctx.physical_pointer_type_u8)) {
-        return ctx.EmitDirectLoad(handle, guest_byte, 1, ctx.U8, ctx.physical_pointer_type_u8,
-                                  ssbo_load);
-    }
-    return ssbo_load();
+    const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
+    return ctx.OpLoad(ctx.U8, ptr);
 }
 
 Id EmitLoadBufferU16(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
+    if (ctx.IsDirectBuffer(handle) && Sirit::ValidId(ctx.physical_pointer_type_u16)) {
+        return FinishDirectLoad(ctx, DescribeLoadBufferU16(ctx, handle, address));
+    }
     const auto& spv_buffer = ctx.buffers[handle];
-    const Id guest_index = address;
     if (const Id offset = spv_buffer.Offset(PointerSize::B16); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U16);
-    const auto ssbo_load = [&] {
-        const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
-        return ctx.OpLoad(ctx.U16, ptr);
-    };
-    if (ctx.IsDirectBuffer(handle) && Sirit::ValidId(ctx.physical_pointer_type_u16)) {
-        const Id byte = ctx.OpShiftLeftLogical(ctx.U32[1], guest_index, ctx.ConstU32(1U));
-        return ctx.EmitDirectLoad(handle, byte, 2, ctx.U16, ctx.physical_pointer_type_u16,
-                                  ssbo_load);
-    }
-    return ssbo_load();
+    const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
+    return ctx.OpLoad(ctx.U16, ptr);
 }
 
 Id EmitLoadBufferU32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
@@ -603,22 +678,85 @@ Id EmitLoadBufferU32x4(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address)
 }
 
 Id EmitLoadBufferU64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
+    if (ctx.IsDirectBuffer(handle)) {
+        return FinishDirectLoad(ctx, DescribeLoadBufferU64(ctx, handle, address));
+    }
     const auto& spv_buffer = ctx.buffers[handle];
-    const Id guest_index = address;
     if (const Id offset = spv_buffer.Offset(PointerSize::B64); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U64);
-    const auto ssbo_load = [&] {
-        const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u64_zero_value, address)};
-        return ctx.OpLoad(ctx.U64, ptr);
-    };
-    if (ctx.IsDirectBuffer(handle)) {
-        const Id byte = ctx.OpShiftLeftLogical(ctx.U32[1], guest_index, ctx.ConstU32(3U));
-        return ctx.EmitDirectLoad(handle, byte, 8, ctx.U64, ctx.physical_pointer_type_u64,
-                                  ssbo_load);
+    const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u64_zero_value, address)};
+    return ctx.OpLoad(ctx.U64, ptr);
+}
+
+std::optional<u32> GroupableDirectLoad(const EmitContext& ctx, const IR::Inst& inst) {
+    switch (inst.GetOpcode()) {
+    case IR::Opcode::ReadConstBuffer:
+    case IR::Opcode::LoadBufferU32:
+    case IR::Opcode::LoadBufferU32x2:
+    case IR::Opcode::LoadBufferU32x3:
+    case IR::Opcode::LoadBufferU32x4:
+    case IR::Opcode::LoadBufferF32:
+    case IR::Opcode::LoadBufferF32x2:
+    case IR::Opcode::LoadBufferF32x3:
+    case IR::Opcode::LoadBufferF32x4:
+    case IR::Opcode::LoadBufferU64:
+        break;
+    case IR::Opcode::LoadBufferU8:
+        if (!Sirit::ValidId(ctx.physical_pointer_type_u8)) {
+            return std::nullopt;
+        }
+        break;
+    case IR::Opcode::LoadBufferU16:
+        if (!Sirit::ValidId(ctx.physical_pointer_type_u16)) {
+            return std::nullopt;
+        }
+        break;
+    default:
+        return std::nullopt;
     }
-    return ssbo_load();
+    if (!inst.Arg(0).IsImmediate()) {
+        return std::nullopt;
+    }
+    const u32 handle = inst.Arg(0).U32();
+    if (!ctx.CanGroupDirectLoads(handle)) {
+        return std::nullopt;
+    }
+    return handle;
+}
+
+DirectLoadDesc DescribeDirectLoad(EmitContext& ctx, IR::Inst* inst) {
+    const u32 handle = inst->Arg(0).U32();
+    const Id address = ctx.Def(inst->Arg(1));
+    switch (inst->GetOpcode()) {
+    case IR::Opcode::ReadConstBuffer:
+        return DescribeReadConstBuffer(ctx, handle, address);
+    case IR::Opcode::LoadBufferU8:
+        return DescribeLoadBufferU8(ctx, handle, address);
+    case IR::Opcode::LoadBufferU16:
+        return DescribeLoadBufferU16(ctx, handle, address);
+    case IR::Opcode::LoadBufferU32:
+        return DescribeLoadBufferB32xN<1, PointerType::U32>(ctx, handle, address);
+    case IR::Opcode::LoadBufferU32x2:
+        return DescribeLoadBufferB32xN<2, PointerType::U32>(ctx, handle, address);
+    case IR::Opcode::LoadBufferU32x3:
+        return DescribeLoadBufferB32xN<3, PointerType::U32>(ctx, handle, address);
+    case IR::Opcode::LoadBufferU32x4:
+        return DescribeLoadBufferB32xN<4, PointerType::U32>(ctx, handle, address);
+    case IR::Opcode::LoadBufferU64:
+        return DescribeLoadBufferU64(ctx, handle, address);
+    case IR::Opcode::LoadBufferF32:
+        return DescribeLoadBufferB32xN<1, PointerType::F32>(ctx, handle, address);
+    case IR::Opcode::LoadBufferF32x2:
+        return DescribeLoadBufferB32xN<2, PointerType::F32>(ctx, handle, address);
+    case IR::Opcode::LoadBufferF32x3:
+        return DescribeLoadBufferB32xN<3, PointerType::F32>(ctx, handle, address);
+    case IR::Opcode::LoadBufferF32x4:
+        return DescribeLoadBufferB32xN<4, PointerType::F32>(ctx, handle, address);
+    default:
+        UNREACHABLE_MSG("PERF-GTS-473: {} is not a direct buffer read", inst->GetOpcode());
+    }
 }
 
 Id EmitLoadBufferF32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {

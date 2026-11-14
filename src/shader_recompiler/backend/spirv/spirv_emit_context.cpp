@@ -4,6 +4,7 @@
 
 #include "common/assert.h"
 #include "common/div_ceil.h"
+#include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -1495,6 +1496,71 @@ Id EmitContext::EmitDirectLoad(u32 handle, Id byte_offset, u32 bytes, Id result_
 
     AddLabel(merge_label);
     return OpPhi(result_type, value, direct_label, fallback_value, fallback_label);
+}
+
+bool EmitContext::CanGroupDirectLoads(u32 handle) const {
+    return DirectLoadGroupsEnabled() && IsDirectBuffer(handle) &&
+           !(info.hw_stage == HwStage::Compute &&
+             info.buffers[handle].post_op == SharpFetchPostOp::ReadConstPointer);
+}
+
+std::vector<Id> EmitContext::EmitDirectLoads(u32 handle, const std::vector<DirectPart>& parts) {
+    std::vector<Id> values;
+    values.reserve(parts.size());
+    if (parts.size() == 1 || !CanGroupDirectLoads(handle)) {
+        for (const DirectPart& part : parts) {
+            values.push_back(EmitDirectLoad(handle, part.byte_offset, part.bytes,
+                                            part.result_type, part.physical_pointer_type,
+                                            part.fallback));
+        }
+        return values;
+    }
+    // The same table word picks the path for every read of the buffer, so one branch serves
+    // them all; inside it each read is exactly what EmitDirectLoad does.
+    const u32 entry = 4 + handle * 4;
+    const Id direct_label = OpLabel();
+    const Id fallback_label = OpLabel();
+    const Id merge_label = OpLabel();
+    const Id valid = OpINotEqual(U1[1], DirectTableWord(entry + 3), u32_zero_value);
+    OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    OpBranchConditional(valid, direct_label, fallback_label);
+
+    AddLabel(direct_label);
+    const Id base = DirectTableAddress(entry);
+    const Id size = DirectTableWord(entry + 2);
+    std::vector<Id> direct_values;
+    direct_values.reserve(parts.size());
+    for (const DirectPart& part : parts) {
+        const Id end = OpIAdd(U32[1], part.byte_offset, ConstU32(part.bytes));
+        const Id in_bounds =
+            OpLogicalAnd(U1[1], OpULessThanEqual(U1[1], end, size),
+                         OpUGreaterThanEqual(U1[1], end, part.byte_offset));
+        const Id address =
+            OpSelect(U64, in_bounds, OpIAdd(U64, base, OpUConvert(U64, part.byte_offset)),
+                     u64_zero_value);
+        const Id device = OpFunctionCall(U64, direct_translate, address);
+        direct_values.push_back(OpLoad(part.result_type,
+                                       OpConvertUToPtr(part.physical_pointer_type, device),
+                                       spv::MemoryAccessMask::Aligned, std::min(part.bytes, 4u)));
+    }
+    const Id direct_end = last_label;
+    OpBranch(merge_label);
+
+    AddLabel(fallback_label);
+    std::vector<Id> fallback_values;
+    fallback_values.reserve(parts.size());
+    for (const DirectPart& part : parts) {
+        fallback_values.push_back(part.fallback());
+    }
+    const Id fallback_end = last_label;
+    OpBranch(merge_label);
+
+    AddLabel(merge_label);
+    for (size_t i = 0; i < parts.size(); ++i) {
+        values.push_back(OpPhi(parts[i].result_type, direct_values[i], direct_end,
+                               fallback_values[i], fallback_end));
+    }
+    return values;
 }
 
 Id EmitContext::DefineGetBdaPointer() {

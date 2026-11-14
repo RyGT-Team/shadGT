@@ -103,6 +103,9 @@ struct PrecompileProgress {
     bool active; ///< still going
 };
 PrecompileProgress GetPrecompileProgress();
+/// FEAT-GTS-469: progress of the manifest pre-translation (PERF-GT7-117), which runs in the
+/// background while the game does (records looked at of the manifest's records).
+PrecompileProgress GetPretranslateProgress();
 /// PERF-102: the game waits on the splash screen for the precompile.
 bool PrecompileHoldsGame();
 /// PERF-103: the game runs in slow motion while pipelines it needs are compiled.
@@ -312,6 +315,17 @@ private:
     struct PrewarmRecord;
     bool InstallPrewarmRecord(PrewarmRecord& record);
     void PrewarmRead(std::stop_token stop);
+    /// FEAT-GTS-470: other GPU families' stored pipelines made this GPU's (see the .cpp).
+    void ImportForeignPipelines(std::stop_token stop);
+    /// FEAT-GTS-471: this GPU's stored pipelines as the manifest's recipe file (see the .cpp).
+    void ExportPipelineRecipes(std::stop_token stop);
+public:
+    /// FEAT-GTS-471: a stored pipeline key file and its shaders' names (program, record SPIR-V hash).
+    struct PipelineRecipe {
+        std::array<std::pair<u64, u64>, MaxShaderStages> names{};
+        std::vector<u8> pipeline;
+    };
+private:
     void ReportPrewarm(std::chrono::steady_clock::time_point now);
     /// PERF-034: waits while a worker builds a pipeline, starting builds for the states the
     /// command thread queues meanwhile. Compilation is owned exclusively by the workers.
@@ -599,6 +613,8 @@ private:
     };
     tsl::robin_map<GraphicsPipelineKey, PrewarmUnclaimed> prewarm_unclaimed;
     u64 prewarm_adopted{};
+    u64 prewarm_installed{}; ///< FEAT-GTS-470: precompile builds queued, in install order
+    bool PrecompileLibrariesOnly() const;
     u64 prewarm_dropped{};
     bool prewarm_settle_dirty{};
     std::vector<GraphicsPipelineKey> prewarm_settle_queue;
@@ -709,6 +725,11 @@ private:
                               const Shader::Backend::Bindings& binding, bool insert);
     /// FIX-078 (lookup lock held): queues a translation; false when one with the same inputs is
     /// already queued.
+    /// FEAT-GTS-470: records a stored translation on a draw's first use (record mode).
+    void RecordStoredUse(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
+                         const Shader::ShaderParams& params,
+                         const Shader::RuntimeInfo& runtime_info,
+                         const Shader::Backend::Bindings& start, size_t perm_idx);
     bool QueueTranslation(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
                           const Shader::ShaderParams& params,
                           const Shader::RuntimeInfo& runtime_info,

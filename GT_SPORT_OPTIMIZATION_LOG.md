@@ -1645,7 +1645,7 @@ and the launcher. Removed from the renderer:
   are no longer written to the store).
 - PB-1 to PB-4: the shader pack rebuild (`RebuildFromPrograms`), its replay translation hooks in
   the recompiler, and the `SHADGT_REPLAY_TEST`, `SHADGT_TEMPLATE_TEST`, `SHADGT_DUMP_STORE` and
-  `RYGT_SCAN_READS` research tools.
+  `SHADGT_SCAN_READS` research tools.
 
 Kept: PERF-032's shader store (this PC's own translations, loaded when a draw first uses them),
 PERF-076/PERF-103 compile modes and FIX-044's clock pause, which handle compiles at run time.

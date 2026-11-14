@@ -290,9 +290,9 @@ void DrawCompileNotice() {
 }
 
 // What the watermark says: the game and this renderer's revision. Empty in a tagged release, or
-// with RYGT_WATERMARK=0.
+// with SHADGT_WATERMARK=0.
 std::string BuildWatermark() {
-    const char* env = std::getenv("RYGT_WATERMARK");
+    const char* env = std::getenv("SHADGT_WATERMARK");
     if (Common::g_is_release || (env && env[0] == '0')) {
         return {};
     }
@@ -763,7 +763,7 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
         if (HostIsConvertedGame()) {
             RytyProtectGuestRedZones();
             RytyApplyGamePatches();
-            // NAT-002: hook points for the native renderer (RYGT_NATIVE_HOOKS=1).
+            // NAT-002: hook points for the native renderer (SHADGT_NATIVE_HOOKS=1).
             Native::InstallGtsHooks(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
         }
     }

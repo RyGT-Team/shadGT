@@ -6,7 +6,7 @@
 #include <cstdlib>
 namespace AmdGpu::ReadAheadPair {
 inline bool Enabled() noexcept {
-    static const bool enabled = [] { const char* v = std::getenv("RYGT_READ_AHEAD_KEY_TRACE"); return v && v[0] == '1' && v[1] == '\0'; }();
+    static const bool enabled = [] { const char* v = std::getenv("SHADGT_READ_AHEAD_KEY_TRACE"); return v && v[0] == '1' && v[1] == '\0'; }();
     return enabled;
 }
 inline std::atomic<std::uint64_t> next{1};

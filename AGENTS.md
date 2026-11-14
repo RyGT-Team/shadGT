@@ -1,17 +1,45 @@
 # Notes for agents working on shadGT
 
-## RYGT_* and SHADGT_* switches need a description line
+## Switch names: SHADGT_, RYGT_ or SHARED_ (FEAT-GTS-415)
+
+From FEAT-GTS-415 on, an environment switch is named after where it takes effect:
+
+| Prefix | Read by | Example |
+|---|---|---|
+| `SHADGT_` | only the renderer (shadGT: `src/`, `ryty_gpu/`) | `SHADGT_PARALLEL_WORKERS` |
+| `RYGT_` | only the runtime (RyGTS: `core/`, `app/`, `plugins/`) | `RYGT_LOG_DIRECTORY` |
+| `SHARED_` | both the renderer and the runtime | `SHARED_DIAG` |
+
+- **A new switch** gets the prefix of the code that reads it. Never add a new `RYGT_` switch to the
+  renderer or a `SHADGT_` one to the runtime.
+- **A switch that starts being read on the other side too** is renamed to `SHARED_` in every
+  repository (renderer, runtime, launcher, docs), and added to `SHARED` in the renderer's
+  `tools/switch_prefix.py`.
+- **The rename is a hard one**: the old names are not read any more. The launcher moves settings
+  saved under an old name to the new one (`SwitchWalker.MigratePrefixes`), so players keep them.
+- **A branch from before the rename** brings old names back on merge. Run the tool there after
+  merging; a second run changes nothing:
+
+  ```
+  python tools/switch_prefix.py --game gts --write-map switch-map.json .   # in shadGT
+  python <shadGT>/tools/switch_prefix.py --apply-map switch-map.json <RyGTS>   # the launcher and runtime
+  ```
+
+  It renames exact switch names only (not macros such as `RYGT_SWITCH_EXPORT`), in code, comments
+  and docs. `CHANGES.MD` and `CHANGELOG.md` keep the names of their time.
+
+## Every switch needs a description line
 
 The RyGT launcher's Advanced page lists the renderer's experimental switches by reading
-`libSceVideoOut.prx` as a file: every `"RYGT_..."` or `"SHADGT_..."` string the renderer passes to `getenv`
+`libSceVideoOut.prx` as a file: every `"SHADGT_..."`, `"SHARED_..."` or `"RYGT_..."` string the renderer passes to `getenv`
 (or `Common::DiagEnv`) becomes a row. The hover tooltip, editor and heading come from metadata
 strings in the same DLL, kept in **`src/video_core/rygt_switches.cpp`**.
 
-**When you add a switch** (a new `getenv("RYGT_...")` or `getenv("SHADGT_...")`, in `src/` or `ryty_gpu/`), add one line to
+**When you add a switch** (a new `getenv("SHADGT_...")` or `getenv("SHARED_...")`, in `src/` or `ryty_gpu/`), add one line to
 `RyGT_SwitchDescriptions` in that file, under the matching group comment:
 
 ```cpp
-"RYGTSW1|RYGT_EXAMPLE_SWITCH|flag|Rendering workarounds|off|1 = on, 0 = off|One sentence on what it does.",
+"RYGTSW1|SHADGT_EXAMPLE_SWITCH|flag|Rendering workarounds|off|1 = on, 0 = off|One sentence on what it does.",
 ```
 
 Fields, separated by `|` (only the description may contain `|`):

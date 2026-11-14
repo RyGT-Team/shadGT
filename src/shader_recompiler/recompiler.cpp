@@ -284,11 +284,11 @@ bool HasEmptyScopeBeforeElse(std::span<const u32> code) {
 }
 
 #ifndef NDEBUG
-// DIAG-209 (RYGT_NAN_TRACE=<hash>): that pixel shader paints the index of the first NaN among the
+// DIAG-209 (SHADGT_NAN_TRACE=<hash>): that pixel shader paints the index of the first NaN among the
 // F32 values of the block that writes RenderTarget0, in base 8 over R, G and B (digit + 1) / 8.
 static void NanTracePass(IR::Program& program, const Info& info) {
     static const u64 hash = [] {
-        const char* env = std::getenv("RYGT_NAN_TRACE");
+        const char* env = std::getenv("SHADGT_NAN_TRACE");
         return env && *env ? std::strtoull(env, nullptr, 16) : 0;
     }();
     if (hash == 0 || info.pgm_hash != hash) {

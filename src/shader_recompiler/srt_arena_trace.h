@@ -21,7 +21,7 @@ inline Counters counters;
 inline thread_local Origin origin = Origin::Other;
 inline thread_local std::uint64_t generated_bytes = 0;
 inline bool Enabled() {
-    static const bool enabled = [] { const char* v = std::getenv("RYGT_SRT_ARENA_TRACE"); return v && v[0] == '1' && v[1] == '\0'; }();
+    static const bool enabled = [] { const char* v = std::getenv("SHADGT_SRT_ARENA_TRACE"); return v && v[0] == '1' && v[1] == '\0'; }();
     return enabled;
 }
 class OriginScope {

@@ -51,14 +51,14 @@ using State = AmdGpu::Liverpool::RecorderState;
 
 #ifndef NDEBUG
 const bool g_compare = [] {
-    const char* env = std::getenv("RYGT_NATIVE_SHADOW");
+    const char* env = std::getenv("SHADGT_NATIVE_SHADOW");
     return env && env[0] == '1';
 }();
 #else
 constexpr bool g_compare = false;
 #endif
 // OPT-010: native mode prepares each draw's bindings on the job's thread (no comparisons).
-// PERF-316: on whenever the native renderer is (launcher or RYGT_NATIVE); RYGT_NATIVE_PREPARE=0
+// PERF-316: on whenever the native renderer is (launcher or SHADGT_NATIVE); SHADGT_NATIVE_PREPARE=0
 // turns it off. Decided at first use: the game's settings are not readable at load time.
 bool PrepareOn() {
     static const bool on = Vulkan::NativeRenderer::PrepareEnabled();
@@ -576,10 +576,10 @@ void Snapshot(const u32* packet, const Regs& regs, u32 epoch, bool from_parent,
 }
 
 // Records a snapshot of the state at each draw of a job.
-// NAT-030 (RYGT_NATIVE_PIPELINES=1): each draw's pipeline is looked up on the job's thread too.
+// NAT-030 (SHADGT_NATIVE_PIPELINES=1): each draw's pipeline is looked up on the job's thread too.
 #ifndef NDEBUG
 const bool g_lookups = [] {
-    const char* env = std::getenv("RYGT_NATIVE_PIPELINES");
+    const char* env = std::getenv("SHADGT_NATIVE_PIPELINES");
     return env && env[0] == '1';
 }();
 #else
@@ -1088,12 +1088,12 @@ namespace {
 // GT7-PREP: the walk of an ended job (and the draws it prepares) runs on the renderer's own
 // prepare workers instead of the game's job thread, which is on the game's critical path: there
 // the walks took about as much off the frame as the prepared draws saved the recorder.
-// RYGT_NATIVE_PREPARE_WORKERS=<n> (default 4); 0 walks on the job's thread, as before. A job
+// SHADGT_NATIVE_PREPARE_WORKERS=<n> (default 4); 0 walks on the job's thread, as before. A job
 // still queued a submission after it was queued is dropped: its commands may be reused by then
 // (the recorder then does its draws itself).
 u32 PrepareWorkers() {
     static const u32 workers = [] {
-        const char* env = std::getenv("RYGT_NATIVE_PREPARE_WORKERS");
+        const char* env = std::getenv("SHADGT_NATIVE_PREPARE_WORKERS");
         return env && *env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 4u;
     }();
     return workers;

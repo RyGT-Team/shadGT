@@ -216,10 +216,10 @@ private:
 // the process went from 11 GB to 100 GB in seconds and the driver's compiler ran out of memory.
 // Admit one heavy compile at a time: two simultaneous builds exhausted system
 // commit inside NVIDIA LLVM. -DisablePerf 79 disables this final driver-call gate.
-// PERF-172 (GT7): RYGT_TESS_BUILDS=N (2..16, default 4 since PERF-419-GTS as in shadgt7) lets
+// PERF-172 (GT7): SHADGT_TESS_BUILDS=N (2..16, default 4 since PERF-419-GTS as in shadgt7) lets
 // up to N tessellated pipelines build at once while the process commits under half the RAM and
 // 4 GB stay free, two otherwise (GT7's unoptimized tessellated pipelines, FIX-057/PERF-081, held
-// its cars back two at a time). RYGT_TESS_BUILDS=1: the shared one-at-a-time gate above applies.
+// its cars back two at a time). SHADGT_TESS_BUILDS=1: the shared one-at-a-time gate above applies.
 class HeavyBuildGate {
 public:
     explicit HeavyBuildGate(bool heavy) {
@@ -278,7 +278,7 @@ private:
         static Gate gate;
         return gate;
     }
-    /// PERF-172: RYGT_TESS_BUILDS (default 4), or 0 when it is 1 (the shared semaphore then).
+    /// PERF-172: SHADGT_TESS_BUILDS (default 4), or 0 when it is 1 (the shared semaphore then).
     static u32 Asked() {
         const u32 n = TessBuildsAsked();
         return n > 1 ? n : 0u;
@@ -335,10 +335,10 @@ static std::atomic<s64> last_pipeline_miss_ms{};
 // Tessellation never retains optimizer IR or enters LTO (previous multi-GB failures).
 // AMD-PERF-001 was reverted: RyGTS AMD-322 found that on an RX 7600 link-time data and the
 // optimized link made menu pipelines take 0.4-0.7 s and filled pipeline memory (4.4 GB), and
-// here it made loading much slower and ran out of memory. RYGT_PIPELINE_LTO=1 still trials it.
+// here it made loading much slower and ran out of memory. SHADGT_PIPELINE_LTO=1 still trials it.
 static bool LinkTimeOptimization() {
     static const bool lto = [] {
-        const char* env = std::getenv("RYGT_PIPELINE_LTO");
+        const char* env = std::getenv("SHADGT_PIPELINE_LTO");
         return env && env[0] == '1';
     }();
     return lto;
@@ -505,7 +505,7 @@ GraphicsPipeline::GraphicsPipeline(
         std::ranges::all_of(std::span{key.color_samples}.first(key.num_color_attachments),
                             [&](u8 samples) { return samples == 0 || samples == key.num_samples; });
     static const bool so_independent = [] {
-        const char* env = std::getenv("RYGT_SO_INDEPENDENT");
+        const char* env = std::getenv("SHADGT_SO_INDEPENDENT");
         return !(env && env[0] == '0');
     }();
     const bool independent_sets =
@@ -912,9 +912,9 @@ GraphicsPipeline::GraphicsPipeline(
     // tufts showed through the road in races): state valid by the spec, validation clean, AMD
     // correct. With blended draws on shader objects too, nearly no draw follows a pipeline, and
     // both were gone (caches off, Nürburgring start). SO-015 had already fixed the HUD sprites
-    // SO-017 was for. RYGT_SO_SKIP still overrides.
+    // SO-017 was for. SHADGT_SO_SKIP still overrides.
     static const u32 so_skip = [vendor = instance.GetVendorID()] {
-        const char* env = std::getenv("RYGT_SO_SKIP");
+        const char* env = std::getenv("SHADGT_SO_SKIP");
         u32 bits = env ? u32(std::strtoul(env, nullptr, 0)) : (vendor == 0x10de ? 0u : 1u);
         if (std::FILE* file = std::fopen("so_skip.txt", "r")) {
             char text[32]{};
@@ -939,11 +939,11 @@ GraphicsPipeline::GraphicsPipeline(
     if (sdata.multisampling.alphaToCoverageEnable) kinds |= 2;
     if (color_blending.logicOpEnable) kinds |= 4;
     if (!infos[u32(Shader::SwStage::Fragment)]) kinds |= 16;
-    // DIAG-GTS-431: RYGT_SO_SKIP_HASHES=<hex,hex,...> keeps pipelines containing any of these
+    // DIAG-GTS-431: SHADGT_SO_SKIP_HASHES=<hex,hex,...> keeps pipelines containing any of these
     // shader programs (any stage) off shader objects, to test one draw's shaders on their own.
     static const std::vector<u64> so_skip_hashes = [] {
         std::vector<u64> hashes;
-        if (const char* env = std::getenv("RYGT_SO_SKIP_HASHES"); env && *env) {
+        if (const char* env = std::getenv("SHADGT_SO_SKIP_HASHES"); env && *env) {
             std::string list{env};
             for (size_t pos = 0; pos < list.size();) {
                 const size_t end = std::min(list.find(',', pos), list.size());
@@ -958,15 +958,15 @@ GraphicsPipeline::GraphicsPipeline(
     const bool hash_skipped = !so_skip_hashes.empty() && std::ranges::any_of(infos, [](const auto* info) {
         return info && std::ranges::find(so_skip_hashes, info->pgm_hash) != so_skip_hashes.end();
     });
-    // DIAG-GTS-432: RYGT_SO_HASH_MASK / RYGT_SO_HASH_VALUE (hex) let only pipelines whose mixed
+    // DIAG-GTS-432: SHADGT_SO_HASH_MASK / SHADGT_SO_HASH_VALUE (hex) let only pipelines whose mixed
     // shader hash h has (h & mask) == value use shader objects, to bisect which pipeline's
     // shader objects break something. The mixed hash and the decision are logged per pipeline.
-    // DIAG-GTS-440: RYGT_SO_HASH_TERMS="mask:value,mask:value,..." (hex) is the same filter with
+    // DIAG-GTS-440: SHADGT_SO_HASH_TERMS="mask:value,mask:value,..." (hex) is the same filter with
     // several terms; a pipeline uses shader objects when any term matches. It replaces the
     // MASK/VALUE pair when set, so two groups of pipelines can be bisected at once.
     static const std::vector<std::pair<u64, u64>> so_hash_filter = [] {
         std::vector<std::pair<u64, u64>> terms;
-        if (const char* list = std::getenv("RYGT_SO_HASH_TERMS"); list && *list) {
+        if (const char* list = std::getenv("SHADGT_SO_HASH_TERMS"); list && *list) {
             const char* p = list;
             while (*p) {
                 char* end = nullptr;
@@ -982,8 +982,8 @@ GraphicsPipeline::GraphicsPipeline(
                 while (*p == ',' || *p == ' ' || *p == ';') ++p;
             }
         } else {
-            const char* mask = std::getenv("RYGT_SO_HASH_MASK");
-            const char* value = std::getenv("RYGT_SO_HASH_VALUE");
+            const char* mask = std::getenv("SHADGT_SO_HASH_MASK");
+            const char* value = std::getenv("SHADGT_SO_HASH_VALUE");
             const u64 m = mask && *mask ? std::strtoull(mask, nullptr, 16) : 0;
             const u64 v = value && *value ? std::strtoull(value, nullptr, 16) : 0;
             if (m) terms.emplace_back(m, v);
@@ -1029,12 +1029,12 @@ GraphicsPipeline::GraphicsPipeline(
         so_state.attachments = key.num_color_attachments;
         so_state.patch_control_points = tessellated || is_rect_list || is_quad_list
                                             ? tessellation_state.patchControlPoints : 0;
-        // DIAG-GTS-442: RYGT_SO_CLIP_SPACE=0 forces shader-object draws to 0..1 depth, 1 to
+        // DIAG-GTS-442: SHADGT_SO_CLIP_SPACE=0 forces shader-object draws to 0..1 depth, 1 to
         // -1..1 (default: the guest's clip space, as the pipeline). With the hash filter on, the
         // chosen pipelines' depth state is logged: a shader-object draw wrote depth slightly
         // nearer than the same surface drawn by a pipeline (garage floor, grass on the road).
         static const int so_clip_space = [] {
-            const char* env = std::getenv("RYGT_SO_CLIP_SPACE");
+            const char* env = std::getenv("SHADGT_SO_CLIP_SPACE");
             return env && (env[0] == '0' || env[0] == '1') ? env[0] - '0' : -1;
         }();
         if (so_clip_space >= 0) {
@@ -1549,11 +1549,11 @@ bool GraphicsPipeline::CreateShaderObjects(
     constexpr std::array<vk::ShaderStageFlagBits, 4> stage_bits{
         vk::ShaderStageFlagBits::eVertex, vk::ShaderStageFlagBits::eTessellationControl,
         vk::ShaderStageFlagBits::eTessellationEvaluation, vk::ShaderStageFlagBits::eFragment};
-    // SO-007: the stages are made together, linked (RYGT_SO_LINK=0: each on its own), so the
+    // SO-007: the stages are made together, linked (SHADGT_SO_LINK=0: each on its own), so the
     // driver sees the whole set as it does a pipeline's: it can merge the stages the GPU runs as
     // one program and drop what the next stage never reads. SO-006: for independent-sets layouts.
     static const bool link = [] {
-        const char* env = std::getenv("RYGT_SO_LINK");
+        const char* env = std::getenv("SHADGT_SO_LINK");
         return !(env && env[0] == '0');
     }();
     vk::ShaderCreateFlagsEXT flags{};
@@ -1630,9 +1630,9 @@ bool GraphicsPipeline::CreateShaderObjects(
             // SO-009: the driver's compiled shader objects are kept on disk (shader_objects in the cache
             // folder, one file a set, keyed by the stage code, layouts, flags, GPU and driver version)
             // and made from those binaries on later starts: the driver compiles a set only once.
-            // RYGT_SO_CACHE=0: always from SPIR-V.
+            // SHADGT_SO_CACHE=0: always from SPIR-V.
             static const bool use_cache = [] {
-                const char* env = std::getenv("RYGT_SO_CACHE");
+                const char* env = std::getenv("SHADGT_SO_CACHE");
                 return !(env && env[0] == '0');
             }();
             const auto& binary_properties = instance.ShaderObjectProperties();
@@ -1682,9 +1682,9 @@ bool GraphicsPipeline::CreateShaderObjects(
             if (!from_binary) {
                 // SO-014: AMD's driver compiles a shader object set for up to seconds of CPU time; at
                 // normal priority those compiles competed with the game's threads (game-side stalls in
-                // races). Below normal while it runs. RYGT_SO_COMPILE_PRIORITY=0: unchanged.
+                // races). Below normal while it runs. SHADGT_SO_COMPILE_PRIORITY=0: unchanged.
                 static const bool lower = [] {
-                    const char* env = std::getenv("RYGT_SO_COMPILE_PRIORITY");
+                    const char* env = std::getenv("SHADGT_SO_COMPILE_PRIORITY");
                     return !(env && env[0] == '0');
                 }();
 #ifdef _WIN32
@@ -1960,10 +1960,10 @@ void GraphicsPipeline::BindShaderObjects(
         const auto same = [&](const auto& a, const auto& b) {
             return std::equal(a.begin(), a.begin() + s.attachments, b.begin());
         };
-        // DIAG-GTS-448: with RYGT_SO_TOGGLE_STATE=1, a bind after a pipeline first sets the
+        // DIAG-GTS-448: with SHADGT_SO_TOGGLE_STATE=1, a bind after a pipeline first sets the
         // opposite blend enables on all 8 targets (and real equations on all 8), then the real ones.
         static const bool toggle_state = [] {
-            const char* env = std::getenv("RYGT_SO_TOGGLE_STATE");
+            const char* env = std::getenv("SHADGT_SO_TOGGLE_STATE");
             return env && env[0] == '1';
         }();
         if (!p && toggle_state) {
@@ -2148,8 +2148,8 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
     // Vertex pushes remain available; other backends retain their previous policy.
     bool cached_fragment = false;
 #ifdef RYTY_GPU
-    static const char* const descriptor_override = std::getenv("RYGT_NVIDIA_CACHED_FRAGMENT_SETS");
-    static const char* const amd_descriptor_override = std::getenv("RYGT_AMD_CACHED_FRAGMENT_SETS");
+    static const char* const descriptor_override = std::getenv("SHADGT_NVIDIA_CACHED_FRAGMENT_SETS");
+    static const char* const amd_descriptor_override = std::getenv("SHADGT_AMD_CACHED_FRAGMENT_SETS");
     cached_fragment = CacheFragmentDescriptors(instance.GetVendorID(), NativeModeRequested(),
                                                 descriptor_override, amd_descriptor_override);
     if (cached_fragment) {
@@ -2161,10 +2161,10 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
     }
 #endif
     push_set = NoPushSet;
-    // DIAG-GTS-426: RYGT_PUSH_DESCRIPTORS=0 gives graphics pipelines no push set (every stage
+    // DIAG-GTS-426: SHADGT_PUSH_DESCRIPTORS=0 gives graphics pipelines no push set (every stage
     // binds allocated sets), to test the push path and to get validation past its push crash.
     static const bool push_descriptors = [] {
-        const char* env = std::getenv("RYGT_PUSH_DESCRIPTORS");
+        const char* env = std::getenv("SHADGT_PUSH_DESCRIPTORS");
         return !(env && env[0] == '0');
     }();
     for (const auto sw : {Shader::SwStage::Fragment, Shader::SwStage::Vertex}) {
@@ -2176,7 +2176,7 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             break;
         }
     }
-    // PERF-GTS-374 (RYGT_DYNAMIC_BUFFER_OFFSETS=1, native mode): the sets that are not pushed
+    // PERF-GTS-374 (SHADGT_DYNAMIC_BUFFER_OFFSETS=1, native mode): the sets that are not pushed
     // take their buffers with dynamic offsets. A race draw's buffers sit at new offsets each
     // time (its constants are copied to fresh upload memory), so with the offset in the
     // descriptor nearly every draw made and wrote new sets (5% reused); with it given at the
@@ -2185,7 +2185,7 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
     set_dynamic_buffers = {};
 #ifdef RYTY_GPU
     static const bool dynamic_requested = [] {
-        const char* env = std::getenv("RYGT_DYNAMIC_BUFFER_OFFSETS");
+        const char* env = std::getenv("SHADGT_DYNAMIC_BUFFER_OFFSETS");
         // PERF-GTS-407: on unless set to something else
         return (!env || !*env || env[0] == '1') && NativeModeRequested();
     }();

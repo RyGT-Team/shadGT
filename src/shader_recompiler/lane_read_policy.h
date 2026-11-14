@@ -11,12 +11,12 @@ constexpr bool LaneReadUnbranchPolicy(const char* value) noexcept {
 }
 
 inline bool LaneReadUnbranchEnabled() noexcept {
-    static const bool enabled = LaneReadUnbranchPolicy(std::getenv("RYGT_LANE_READ_UNBRANCH"));
+    static const bool enabled = LaneReadUnbranchPolicy(std::getenv("SHADGT_LANE_READ_UNBRANCH"));
     return enabled;
 }
 
 constexpr std::string_view LaneReadStoreSuffix(bool enabled) noexcept {
-    return enabled ? "" : ", RYGT_LANE_READ_UNBRANCH=0";
+    return enabled ? "" : ", SHADGT_LANE_READ_UNBRANCH=0";
 }
 
 constexpr std::uint32_t LaneReadFixMarker(bool compute, std::uint32_t subgroup_size,

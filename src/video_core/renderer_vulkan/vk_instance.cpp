@@ -112,7 +112,7 @@ std::string GetReadableVersion(u32 version) {
 // Windows driver offers (gpuinfo.org: RX 580/RX Vega 2.0.283, RX 5700 XT/RX 6800 2.0.353), so a
 // newer card exercises the paths those cards take. It cannot change the hardware's wave size.
 // Nor the vendor ID: on a non-AMD card rdna1|rdna2 keep shader objects on, while a real Radeon
-// draws pipelines by default (FIX-GT7-136); add RYGT_SHADER_OBJECT=0 to mimic one.
+// draws pipelines by default (FIX-GT7-136); add SHADGT_SHADER_OBJECT=0 to mimic one.
 enum class SimulatedGpu { None, Gcn, Rdna1, Rdna2 };
 
 SimulatedGpu GetSimulatedGpu() {
@@ -426,8 +426,8 @@ bool Instance::CreateDevice() {
     // Optional
     maintenance_5 = add_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
     maintenance_8 = add_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
-    // PERF-210 (RYGT_ANTI_LAG=1): AMD Anti-Lag, see AntiLagUpdate.
-    if (const char* env = std::getenv("RYGT_ANTI_LAG"); env && env[0] == '1') {
+    // PERF-210 (SHADGT_ANTI_LAG=1): AMD Anti-Lag, see AntiLagUpdate.
+    if (const char* env = std::getenv("SHADGT_ANTI_LAG"); env && env[0] == '1') {
         const auto chain = physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
                                                         vk::PhysicalDeviceAntiLagFeaturesAMD>();
         anti_lag = chain.get<vk::PhysicalDeviceAntiLagFeaturesAMD>().antiLag &&
@@ -442,7 +442,7 @@ bool Instance::CreateDevice() {
     // linked (0.0 ms on average before, 27-1394 ms with it) and the driver refused many stored
     // binaries with ErrorOutOfHostMemory.
     // PERF-376-GTS: opt in only; AMD remains disabled after the observed driver failures.
-    const char* pipeline_binary_env = std::getenv("RYGT_PIPELINE_BINARIES");
+    const char* pipeline_binary_env = std::getenv("SHADGT_PIPELINE_BINARIES");
     const bool request_pipeline_binaries = properties.vendorID != 0x1002 &&
         pipeline_binary_env && pipeline_binary_env[0] == '1' && pipeline_binary_env[1] == '\0';
     if (request_pipeline_binaries && maintenance_5) {
@@ -494,9 +494,9 @@ bool Instance::CreateDevice() {
     custom_border_color = add_extension(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
     depth_clip_control = add_extension(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
     // FIX-GTS-443 (off by default: it broke the cars' tessellation and fixed nothing): with
-    // RYGT_DEPTH_CLIP_CONTROL=0, -1..1 depth is converted in the vertex shader (as without the
+    // SHADGT_DEPTH_CLIP_CONTROL=0, -1..1 depth is converted in the vertex shader (as without the
     // extension). The extension stays enabled: shader objects then set 0..1.
-    if (const char* env = std::getenv("RYGT_DEPTH_CLIP_CONTROL"); env && env[0] == '0') {
+    if (const char* env = std::getenv("SHADGT_DEPTH_CLIP_CONTROL"); env && env[0] == '0') {
         depth_clip_in_shader = true;
         LOG_INFO(Render_Vulkan, "FIX-GTS-443: -1..1 depth converted in the vertex shader");
     }
@@ -512,11 +512,11 @@ bool Instance::CreateDevice() {
     // RTX GPU lost the device while a Nurburgring race loaded (a shader that never finished) and
     // the renderer's video memory grew to 12 to 20 GB of a 6.7 GB budget at the start, with
     // frames of 300 ms to 3.5 s; with pipelines the same start had no long frames and stayed near
-    // 4 GB. RYGT_SHADER_OBJECT=1 turns them on, on any GPU; =0 and any other value leave them off.
+    // 4 GB. SHADGT_SHADER_OBJECT=1 turns them on, on any GPU; =0 and any other value leave them off.
     // SO-012: a start that wants shader objects after a lost device with shader objects on uses
     // pipelines once (the marker is removed, so the next start that wants them tries them again).
     // A start that doesn't want them leaves the marker for that next one.
-    const char* shader_object_env = std::getenv("RYGT_SHADER_OBJECT");
+    const char* shader_object_env = std::getenv("SHADGT_SHADER_OBJECT");
     const char shader_object_forced = shader_object_env ? shader_object_env[0] : '\0';
     const bool shader_object_asked = shader_object_forced == '1';
     bool after_loss = false;
@@ -531,10 +531,10 @@ bool Instance::CreateDevice() {
                                        "objects: this run builds pipelines");
         }
     } else if (shader_object_forced == '0') {
-        LOG_WARNING(Render_Vulkan, "SO-001: shader objects off (RYGT_SHADER_OBJECT=0)");
+        LOG_WARNING(Render_Vulkan, "SO-001: shader objects off (SHADGT_SHADER_OBJECT=0)");
     } else {
         LOG_WARNING(Render_Vulkan, "SO-001: shader objects off (FIX-GTS-366: off by default, "
-                                   "RYGT_SHADER_OBJECT=1 turns them on)");
+                                   "SHADGT_SHADER_OBJECT=1 turns them on)");
     }
     if (shader_object_asked && !after_loss) {
         const auto& d3 = dynamic_state_3_features;
@@ -557,9 +557,9 @@ bool Instance::CreateDevice() {
         // SO-003: tessellated pipelines too. VK_EXT_shader_object itself provides the patch
         // control point and domain origin commands its shaders need (AMD's driver reports no
         // extendedDynamicState2PatchControlPoints feature, which only pipelines need).
-        // SO-011: whenever shader objects are on (only with RYGT_SHADER_OBJECT=1 since
+        // SO-011: whenever shader objects are on (only with SHADGT_SHADER_OBJECT=1 since
         // FIX-GTS-366), tessellated pipelines are shader objects too, now that shader objects are
-        // linked, cached on disk and set only changed state. RYGT_SHADER_OBJECT_TESS=0 keeps them
+        // linked, cached on disk and set only changed state. SHADGT_SHADER_OBJECT_TESS=0 keeps them
         // pipelines.
         // SO-006: VK_KHR_maintenance11's VK_SHADER_CREATE_INDEPENDENT_SETS_BIT_KHR lets shader
         // objects use the independent-sets layouts the pipelines bind their sets with (newer
@@ -574,16 +574,16 @@ bool Instance::CreateDevice() {
                     static_cast<VkPhysicalDevice>(physical_device), &maintenance_features);
                 shader_independent_sets = maintenance11_features.maintenance11 != VK_FALSE;
             }
-            // DIAG-GTS-428: RYGT_SO_WITHOUT_MAINT11=1 keeps shader objects on without
+            // DIAG-GTS-428: SHADGT_SO_WITHOUT_MAINT11=1 keeps shader objects on without
             // VK_KHR_maintenance11 (no independent-set shader objects), e.g. under RenderDoc,
             // which does not expose it.
             static const bool without_maint11 = [] {
-                const char* env = std::getenv("RYGT_SO_WITHOUT_MAINT11");
+                const char* env = std::getenv("SHADGT_SO_WITHOUT_MAINT11");
                 return env && env[0] == '1';
             }();
             shader_object = shader_independent_sets || without_maint11;
         }
-        const char* tess = std::getenv("RYGT_SHADER_OBJECT_TESS");
+        const char* tess = std::getenv("SHADGT_SHADER_OBJECT_TESS");
         shader_object_tessellation = shader_object && !(tess && tess[0] == '0');
         if (shader_object) {
             const auto properties = physical_device.getProperties2<
@@ -593,7 +593,7 @@ bool Instance::CreateDevice() {
         LOG_WARNING(Render_Vulkan, "SO-006: shader objects with independent sets: {}",
                     shader_independent_sets ? "yes" : "no (using pipelines)");
         LOG_WARNING(Render_Vulkan,
-                    "SO-001: shader objects {} (RYGT_SHADER_OBJECT=1); tessellated pipelines {}",
+                    "SO-001: shader objects {} (SHADGT_SHADER_OBJECT=1); tessellated pipelines {}",
                     shader_object ? "on" : "not available (driver lacks a needed feature)",
                     shader_object_tessellation ? "too (SO-003)" : "as pipelines");
     }
@@ -709,7 +709,7 @@ bool Instance::CreateDevice() {
     }
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
-    const char* paging_setting = std::getenv("RYGT_PAGEABLE_VRAM");
+    const char* paging_setting = std::getenv("SHADGT_PAGEABLE_VRAM");
     const bool pageable_memory =
         (!paging_setting || paging_setting[0] != '0') &&
         feature_chain.get<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>().memoryPriority &&
@@ -723,16 +723,16 @@ bool Instance::CreateDevice() {
     memory_priority = pageable_memory; // AMD-VRAM-003
     // AMD-VRAM-002: AMD's driver may refuse device memory past the physical VRAM size by its own
     // policy; VK_AMD_memory_overallocation_behavior set to "allowed" lets it page instead (the
-    // 8 GB RX 7600 failed allocations in races). RYGT_AMD_OVERALLOCATION=0 leaves the default.
-    const char* overallocation_setting = std::getenv("RYGT_AMD_OVERALLOCATION");
+    // 8 GB RX 7600 failed allocations in races). SHADGT_AMD_OVERALLOCATION=0 leaves the default.
+    const char* overallocation_setting = std::getenv("SHADGT_AMD_OVERALLOCATION");
     amd_overallocation = properties.vendorID == 0x1002 &&
                          !(overallocation_setting && overallocation_setting[0] == '0') &&
                          add_extension(VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME);
     LOG_INFO(Render_Vulkan, "AMD-VRAM-002: memory overallocation allowed: {}", amd_overallocation);
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
-    // DIAG-243: RYGT_DEVICE_FAULT=1 enables VK_EXT_device_fault, so a lost device reports the
+    // DIAG-243: SHADGT_DEVICE_FAULT=1 enables VK_EXT_device_fault, so a lost device reports the
     // faulting address and the driver's description.
-    if (const char* env = std::getenv("RYGT_DEVICE_FAULT"); env && env[0] == '1') {
+    if (const char* env = std::getenv("SHADGT_DEVICE_FAULT"); env && env[0] == '1') {
         const auto fault_chain =
             physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
                                          vk::PhysicalDeviceFaultFeaturesEXT>();
@@ -1232,8 +1232,8 @@ void Instance::CreateAllocator() {
     // AMD-VRAM-003: VK_EXT_memory_priority was enabled, but VMA was never told, so every
     // allocation had the same priority and AMD's driver could page a render target out as
     // readily as an old texture. On AMD, VMA now passes each allocation's priority (render
-    // targets and depth high, see UniqueImage::Create). RYGT_AMD_MEMORY_PRIORITY=0 turns it off.
-    const char* priority_setting = std::getenv("RYGT_AMD_MEMORY_PRIORITY");
+    // targets and depth high, see UniqueImage::Create). SHADGT_AMD_MEMORY_PRIORITY=0 turns it off.
+    const char* priority_setting = std::getenv("SHADGT_AMD_MEMORY_PRIORITY");
     const bool use_priority = memory_priority && properties.vendorID == 0x1002 &&
                               !(priority_setting && priority_setting[0] == '0');
     LOG_INFO(Render_Vulkan, "AMD-VRAM-003: memory priorities passed to the driver: {}",
@@ -1340,12 +1340,12 @@ void Instance::CollectPhysicalMemoryInfo() {
 }
 
 // NAT-VRAM-001: the launcher's video memory setting (GPU.vram_budget_mb, 0 = Auto) or
-// RYGT_VRAM_BUDGET_MB caps the budget the texture cache's garbage collector plans with, so it
+// SHADGT_VRAM_BUDGET_MB caps the budget the texture cache's garbage collector plans with, so it
 // frees cached images the game hasn't used lately once the process uses more than the setting.
 // Auto keeps the driver-reported budget (VK_EXT_memory_budget) unchanged.
 u64 Instance::VideoMemorySettingBytes() {
     static const u64 bytes = [] {
-        if (const char* env = std::getenv("RYGT_VRAM_BUDGET_MB"); env && *env) {
+        if (const char* env = std::getenv("SHADGT_VRAM_BUDGET_MB"); env && *env) {
             return u64{std::strtoull(env, nullptr, 10)} << 20;
         }
         if (const auto value = Common::RytyGameConfigValue("vram_budget_mb")) {

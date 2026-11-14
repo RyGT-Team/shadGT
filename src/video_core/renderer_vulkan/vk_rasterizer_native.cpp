@@ -55,7 +55,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// NAT-100: native mode (RYGT_NATIVE=1, ryGT builds). Draws, dispatches and copies are recorded
+// NAT-100: native mode (SHADGT_NATIVE=1, ryGT builds). Draws, dispatches and copies are recorded
 // with the native image registry and guest memory read in place, instead of the texture and
 // buffer caches, which keep images and buffers in step with guest memory draw by draw and are
 // most of the recorder's cost. Version 0 records on the recorder thread, in GPU order, into a
@@ -169,7 +169,7 @@ vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type);
 #define NATIVE_DIAGNOSTIC(...) __VA_ARGS__
 #endif
 // DIAG-GTS-423: snapshot-lease counters count in Release too; they only run on the opt-in
-// lease path (RYGT_NATIVE_SNAPSHOT_LEASE=1) and feed the Release lease summary in Report().
+// lease path (SHADGT_NATIVE_SNAPSHOT_LEASE=1) and feed the Release lease summary in Report().
 #define LEASE_COUNT(...) __VA_ARGS__
 namespace Ryty::Camera {
 bool RaceViewActive(); // ryty_camera_runtime.cpp (WIDE-003)
@@ -198,7 +198,7 @@ enum MirrorDiagnosticReason : u32 { MirrorCandidateNew,MirrorCandidateSameFrame,
     MirrorPromotionSuccess,MirrorPromotionCapacity,MirrorNoDirect,MirrorAcquireInvalid };
 bool MirrorDiagnosticEnabled() {
 #if !defined(NDEBUG)
-    static const bool enabled=[] {const char* p=std::getenv("RYGT_NATIVE_MIRROR_DIAG");return p && p[0]=='1' && !p[1];}();
+    static const bool enabled=[] {const char* p=std::getenv("SHADGT_NATIVE_MIRROR_DIAG");return p && p[0]=='1' && !p[1];}();
     return enabled;
 #else
     return false;
@@ -240,7 +240,7 @@ void SetAheadMode(AheadContext& c,bool enabled) noexcept {
 }
 std::mutex ahead_context_mutex;
 std::unordered_map<const NativeRenderer*,std::shared_ptr<AheadContext>> ahead_contexts;
-bool AheadRequested() noexcept {static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_PRODUCER_DESCRIPTORS");return !p || (p[0]=='1' && !p[1]);}();return enabled;}
+bool AheadRequested() noexcept {static const bool enabled=[] {const char* p=std::getenv("SHADGT_PARALLEL_PRODUCER_DESCRIPTORS");return !p || (p[0]=='1' && !p[1]);}();return enabled;}
 
 std::shared_ptr<AheadContext> FindAheadBlocking(const NativeRenderer* renderer) {
     if(!AheadRequested())return {};std::scoped_lock lock{ahead_context_mutex};const auto it=ahead_contexts.find(renderer);
@@ -264,7 +264,7 @@ struct AheadPrepareGuard {
 };
 }
 namespace {
-// Experimental sidecar: enabled only by RYGT_PARALLEL_RECORDING=1. The
+// Experimental sidecar: enabled only by SHADGT_PARALLEL_RECORDING=1. The
 // renderer's recursive mutex serializes access to each sidecar; workers only
 // consume immutable pass packets and RHI device/instance handles.
 struct ParallelBindingCapture {
@@ -284,15 +284,15 @@ struct ScopedParallelBindingCapture {
 struct ProofPhaseStats {u64 count{},wall_ns{},wall_max{};};
 struct RecordPartitionMetric {u64 count{},wall_ns{};};
 bool BatchViewWalkRequested() noexcept {
-    static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_BATCH_VIEW_WALK");return p && p[0]=='1' && !p[1];}();
+    static const bool enabled=[] {const char* p=std::getenv("SHADGT_PARALLEL_BATCH_VIEW_WALK");return p && p[0]=='1' && !p[1];}();
     return enabled;
 }
 bool TransferPassesRequested() noexcept {
-    static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_TRANSFER_PASSES");return p && p[0]=='1' && !p[1];}();
+    static const bool enabled=[] {const char* p=std::getenv("SHADGT_PARALLEL_TRANSFER_PASSES");return p && p[0]=='1' && !p[1];}();
     return enabled;
 }
 bool PreparedSampledProofRequested() noexcept {
-    static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_PREPARED_VIEW_PROOF");return p && p[0]=='1' && !p[1];}();
+    static const bool enabled=[] {const char* p=std::getenv("SHADGT_PARALLEL_PREPARED_VIEW_PROOF");return p && p[0]=='1' && !p[1];}();
     return enabled;
 }
 Native::Parallel::ProofProducerRegistry prepared_proof_contexts;
@@ -469,25 +469,25 @@ ParallelRuntime* FindParallelRuntime(const NativeRenderer* renderer) {
     return cache.sidecar;
 }
 bool ParallelRecordingRequested() {
-    static const bool requested=[] {const char* p=std::getenv("RYGT_PARALLEL_RECORDING");return p&&p[0]=='1'&&p[1]=='\0';}();return requested;
+    static const bool requested=[] {const char* p=std::getenv("SHADGT_PARALLEL_RECORDING");return p&&p[0]=='1'&&p[1]=='\0';}();return requested;
 }
-bool ParallelReadonlyDescriptorEnabled() {static const bool yes=[] {const char* p=std::getenv("RYGT_PARALLEL_READONLY_DESCRIPTOR");return p && p[0]=='1' && p[1]=='\0';}();return yes;}
-bool ParallelDirectVertexEnabled() { static const bool yes=[] {const char* p=std::getenv("RYGT_PARALLEL_DIRECT_VERTEX");return p && p[0]=='1' && p[1]=='\0';}();return yes; }
-bool ParallelVertexEnabled() { static const bool yes=[] {const char* p=std::getenv("RYGT_PARALLEL_VERTEX");return p && p[0]=='1' && p[1]=='\0';}();return yes; }
-bool ParallelSmallPassBatchEnabled() { static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_SMALLPASS_BATCH");return !(p && p[0]=='0' && p[1]=='\0');}();return enabled; }
+bool ParallelReadonlyDescriptorEnabled() {static const bool yes=[] {const char* p=std::getenv("SHADGT_PARALLEL_READONLY_DESCRIPTOR");return p && p[0]=='1' && p[1]=='\0';}();return yes;}
+bool ParallelDirectVertexEnabled() { static const bool yes=[] {const char* p=std::getenv("SHADGT_PARALLEL_DIRECT_VERTEX");return p && p[0]=='1' && p[1]=='\0';}();return yes; }
+bool ParallelVertexEnabled() { static const bool yes=[] {const char* p=std::getenv("SHADGT_PARALLEL_VERTEX");return p && p[0]=='1' && p[1]=='\0';}();return yes; }
+bool ParallelSmallPassBatchEnabled() { static const bool enabled=[] {const char* p=std::getenv("SHADGT_PARALLEL_SMALLPASS_BATCH");return !(p && p[0]=='0' && p[1]=='\0');}();return enabled; }
 // Experimental indexed/MRT/depth packet. Clear admission remains separately gated.
-bool ParallelExtendedEnabled() {static const bool on=[] {const char* p=std::getenv("RYGT_PARALLEL_EXTENDED");return p && p[0]=='1' && !p[1];}();return on;}
-bool ParallelD2Enabled() { static const bool yes=[] {const char* p=std::getenv("RYGT_PARALLEL_D2"); return p && p[0]=='1' && p[1]=='\0';}();return yes; }
+bool ParallelExtendedEnabled() {static const bool on=[] {const char* p=std::getenv("SHADGT_PARALLEL_EXTENDED");return p && p[0]=='1' && !p[1];}();return on;}
+bool ParallelD2Enabled() { static const bool yes=[] {const char* p=std::getenv("SHADGT_PARALLEL_D2"); return p && p[0]=='1' && p[1]=='\0';}();return yes; }
 bool ParallelProofPhaseEnabled() {
 #if !defined(NDEBUG)
-static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_PROOF_PHASE_DIAG");return p && p[0]=='1' && !p[1];}();return enabled;
+static const bool enabled=[] {const char* p=std::getenv("SHADGT_PARALLEL_PROOF_PHASE_DIAG");return p && p[0]=='1' && !p[1];}();return enabled;
 #else
     return false;
 #endif
 }
 bool ParallelGateDiagEnabled() {
 #if !defined(NDEBUG)
-    static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_GATE_DIAG");return p&&p[0]=='1'&&p[1]=='\0';}();return enabled;
+    static const bool enabled=[] {const char* p=std::getenv("SHADGT_PARALLEL_GATE_DIAG");return p&&p[0]=='1'&&p[1]=='\0';}();return enabled;
 #else
     return false;
 #endif
@@ -500,7 +500,7 @@ thread_local ParallelEligibilityStats parallel_eligibility_stats;
 thread_local const NativeRenderer* parallel_eligibility_owner=nullptr;
 bool ParallelEligibilityEnabled() {
 #if !defined(NDEBUG)
- static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_ELIGIBILITY_DIAG");return p&&p[0]=='1';}();return enabled;
+ static const bool enabled=[] {const char* p=std::getenv("SHADGT_PARALLEL_ELIGIBILITY_DIAG");return p&&p[0]=='1';}();return enabled;
 #else
     return false;
 #endif
@@ -510,7 +510,7 @@ thread_local u64 descriptor_bind_sets[2]{}, descriptor_bind_runs[2]{}, descripto
 thread_local const NativeRenderer* descriptor_alloc_owner = nullptr;
 bool DescriptorAllocDiagEnabled() {
 #if !defined(NDEBUG)
-    static const bool enabled = [] { const char* e=std::getenv("RYGT_DESC_ALLOC_DIAG"); return e && e[0]=='1'; }();
+    static const bool enabled = [] { const char* e=std::getenv("SHADGT_DESC_ALLOC_DIAG"); return e && e[0]=='1'; }();
     return enabled;
 #else
     return false;
@@ -568,7 +568,7 @@ static std::unique_ptr<Native::Rhi::Buffer> scene_indirect_buffer;
 static std::vector<SceneIndirectArgs> scene_indirect_args;
 
 bool RytyGtsInRace();
-static bool PrepareScope(); // PERF-GTS-450: races, or menus with RYGT_NATIVE_PREPARE_MENUS=1
+static bool PrepareScope(); // PERF-GTS-450: races, or menus with SHADGT_NATIVE_PREPARE_MENUS=1
 bool RytyGtsRaceSession(); // WIDE-015
 int RytyGtsMenuScreen();   // WIDE-020
 float RytyDisplayAspect(); // GTS-009 (ryty_game_patch.cpp)
@@ -577,7 +577,7 @@ bool RytyGtsMenuSnapshotsAllowed();
 namespace {
 bool A82CaptureAfterRace() {
 #if !defined(NDEBUG)
-    static const bool enabled=[] { const char* p=std::getenv("RYGT_A82_CAPTURE_AFTER_RACE"); return p && p[0]=='1'; }();
+    static const bool enabled=[] { const char* p=std::getenv("SHADGT_A82_CAPTURE_AFTER_RACE"); return p && p[0]=='1'; }();
     if (!enabled) return true;
     static A82RaceGate gate;
     static std::atomic<bool> logged_race{}, logged_armed{};
@@ -1252,7 +1252,7 @@ bool MatchExperimentalCompositionTexture(AmdGpu::Image& sharp, const Shader::Inf
                                          const Shader::ImageResource& resource,
                                          Native::ImageRegistry& registry) {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_EXPERIMENTAL_SCENE_VIEWPORT");
+        const char* env = std::getenv("SHADGT_EXPERIMENTAL_SCENE_VIEWPORT");
         return (env && std::strcmp(env, "1") == 0) || RytyWideScene(); // WIDE-001
     }();
     static const u32 scene_width = RytySceneSize().width; // WIDE-001
@@ -1375,7 +1375,7 @@ bool MatchExperimentalCompositionTexture(AmdGpu::Image& sharp, const Shader::Inf
 }
 
 std::pair<u32, u64> DiagnosticPassOptions(u64 frame) {
-    static const char* path = Common::DiagEnv("RYGT_DIAG_PASS_FILE");
+    static const char* path = Common::DiagEnv("SHADGT_DIAG_PASS_FILE");
     static u64 last_frame = ~u64{0};
     static unsigned flags = 0;
     static unsigned long long skip = 0;
@@ -1389,11 +1389,11 @@ std::pair<u32, u64> DiagnosticPassOptions(u64 frame) {
     return {flags, skip};
 }
 
-/// DIAG-193 (diagnosis, RYGT_DIAG_HW_WATCH=<hex address>,<seconds>): a hardware write watch over
+/// DIAG-193 (diagnosis, SHADGT_DIAG_HW_WATCH=<hex address>,<seconds>): a hardware write watch over
 /// that address from that many seconds on, dumped when DIAG-184 meets a texture there.
 u64 HwWatchAddress() {
     static const u64 address = [] {
-        const char* env = Common::DiagEnv("RYGT_DIAG_HW_WATCH");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_HW_WATCH");
         return env && *env ? u64(std::strtoull(env, nullptr, 16)) : u64{0};
     }();
     return address;
@@ -1660,7 +1660,7 @@ struct PartClock {
 };
 
 u64 ChunkSize() {
-    static const u64 size = NativeChunkBytes(std::getenv("RYGT_NATIVE_CHUNK_MB"));
+    static const u64 size = NativeChunkBytes(std::getenv("SHADGT_NATIVE_CHUNK_MB"));
     return size;
 }
 constexpr u32 SpliceAfter = 512; ///< commands per list before it is run and submitted
@@ -1691,12 +1691,12 @@ struct NativeRenderer::SnapshotUploadMemo {
 
 bool NativeModeRequested() {
     // NAT-160: the launcher's renderer choice (GPU.native_renderer in the game's settings, so
-    // GTSport.exe started on its own follows it too); RYGT_NATIVE=1 or =0 overrides it.
+    // GTSport.exe started on its own follows it too); SHADGT_NATIVE=1 or =0 overrides it.
     static const bool requested = [] {
         // FIX-230: logged, with where the choice came from (GT7 does not boot without it).
-        if (const char* env = std::getenv("RYGT_NATIVE"); env && *env) {
+        if (const char* env = std::getenv("SHADGT_NATIVE"); env && *env) {
             const bool on = env[0] == '1';
-            LOG_WARNING(Render_Vulkan, "FIX-230: native renderer {} (RYGT_NATIVE={})",
+            LOG_WARNING(Render_Vulkan, "FIX-230: native renderer {} (SHADGT_NATIVE={})",
                         on ? "on" : "off", env);
             return on;
         }
@@ -1704,7 +1704,7 @@ bool NativeModeRequested() {
 #ifdef _WIN32
         // FIX-231: GT7 does not run on the old renderer (a tester's launches without the setting
         // hung or stopped at "protect region as write-only"), so GT7.exe always gets the native
-        // renderer unless RYGT_NATIVE=0 says otherwise.
+        // renderer unless SHADGT_NATIVE=0 says otherwise.
         wchar_t exe[MAX_PATH] = {};
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
         const std::wstring name{exe};
@@ -1760,19 +1760,19 @@ void NativeRenderer::DrawBindings::PrepareWriteGroups() {
 }
 
 namespace {
-// OPT-013..015 on (RYGT_NATIVE_REUSE=0 off; DIAG-GT7-003 switches it while the game runs).
+// OPT-013..015 on (SHADGT_NATIVE_REUSE=0 off; DIAG-GT7-003 switches it while the game runs).
 std::atomic<bool> g_reuse_on{[] {
-    const char* env = std::getenv("RYGT_NATIVE_REUSE");
+    const char* env = std::getenv("SHADGT_NATIVE_REUSE");
     return !(env && env[0] == '0');
 }()};
-// PERF-GT7-013..016 (RYGT_NATIVE_NEXT=1).
+// PERF-GT7-013..016 (SHADGT_NATIVE_NEXT=1).
 std::atomic<bool> g_next_on{[] {
-    const char* env = std::getenv("RYGT_NATIVE_NEXT");
+    const char* env = std::getenv("SHADGT_NATIVE_NEXT");
     return env && env[0] == '1';
 }()};
-// PERF-GT7-018 (on; RYGT_NATIVE_RING=0 off; DIAG-GT7-003 switches it while the game runs).
+// PERF-GT7-018 (on; SHADGT_NATIVE_RING=0 off; DIAG-GT7-003 switches it while the game runs).
 std::atomic<bool> g_ring_on{[] {
-    const char* env = std::getenv("RYGT_NATIVE_RING");
+    const char* env = std::getenv("SHADGT_NATIVE_RING");
     return !(env && env[0] == '0');
 }()};
 
@@ -1794,7 +1794,7 @@ bool NativeRenderer::PreparedOn() {
     return PrepareEnabled();
 }
 
-// PERF-GT7-010 (on; RYGT_NATIVE_GPU_PRIORITY=0 off since PERF-419-GTS, as in shadgt7): the
+// PERF-GT7-010 (on; SHADGT_NATIVE_GPU_PRIORITY=0 off since PERF-419-GTS, as in shadgt7): the
 // native threads run above normal priority, see Common::NativeCpuPriorityRequested.
 bool NativeRenderer::BoostOn() {
     return Common::NativeCpuPriorityRequested();
@@ -1804,7 +1804,7 @@ bool NativeRenderer::BoostOn() {
 
 bool NativeRenderer::AbOn() {
     static const bool on = [] {
-        const char* env = Common::DiagEnv("RYGT_NATIVE_AB");
+        const char* env = Common::DiagEnv("SHADGT_NATIVE_AB");
         return env && env[0] == '1';
     }();
     return on;
@@ -2130,12 +2130,12 @@ void NativeRenderer::FinishNativeFsr(const Targets& targets) {
 }
 
 // PERF-GT7-130: whether the range is not imported yet and starts in a guest mapping of at most
-// RYGT_UPLOAD_COPY_KB (default 1024; 0 turns the copies off): GT7's streamed textures, in
+// SHADGT_UPLOAD_COPY_KB (default 1024; 0 turns the copies off): GT7's streamed textures, in
 // 64 KB mappings that would each be imported as a view of their own.
 static bool InSmallUnimportedMapping(const VideoCore::DirectMemory& direct, VAddr address,
                                      u64 size) {
     static const u64 copy_below = [] {
-        const char* env = std::getenv("RYGT_UPLOAD_COPY_KB");
+        const char* env = std::getenv("SHADGT_UPLOAD_COPY_KB");
         return (env && *env ? std::strtoull(env, nullptr, 10) : 1024) << 10;
     }();
     if (copy_below == 0 ||
@@ -2265,7 +2265,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
             source.keep.push_back(std::move(wrapped));
             return source;
         }
-        // PERF-GT7-130 (RYGT_UPLOAD_COPY_KB=0 off; default 1024): GT7 streams a track's textures
+        // PERF-GT7-130 (SHADGT_UPLOAD_COPY_KB=0 off; default 1024): GT7 streams a track's textures
         // into 64 KB mappings, and each mapping was imported as a view of its own for this one
         // upload: ~0.13 ms a view in the driver, 250 to 720 views in one frame while driving
         // (frames of 50 to 150 ms), and as many releases when the game unmaps them. A texture
@@ -2315,9 +2315,9 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
         // copy instead. Existing imports and every authoritative GPU source keep
         // the original path, including partial region overlays.
         // AMD-PERF-003: AMD too (it was gated to the NVIDIA card it was tested on); AMD's
-        // driver pays the same per-view import cost. RYGT_AMD_TEXTURE_STAGING=0 turns it off.
+        // driver pays the same per-view import cost. SHADGT_AMD_TEXTURE_STAGING=0 turns it off.
         static const bool amd_staging = [] {
-            const char* env = std::getenv("RYGT_AMD_TEXTURE_STAGING");
+            const char* env = std::getenv("SHADGT_AMD_TEXTURE_STAGING");
             return !(env && env[0] == '0');
         }();
         const u32 vendor = r.instance.GetVendorID();
@@ -2507,7 +2507,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
                             "native images and guest memory read in place");
     if (auto* direct = r.buffer_cache.GetDirectMemory()) direct->HoldNativeReleases();
     static const bool learn = [] {
-        const char* value = std::getenv("RYGT_ONE_OFF_LEARN");
+        const char* value = std::getenv("SHADGT_ONE_OFF_LEARN");
         // A sampled skipped output may be an ordinary multi-pass frame, not a
         // persistent bake. Learning is investigative and must not silently turn
         // subsequent Keep Going misses into required waits at reused addresses.
@@ -2531,7 +2531,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     }
     LoadOneOffKinds(); // PERF-GT7-023
     if (const u64 address = HwWatchAddress(); address != 0) {
-        const char* env = Common::DiagEnv("RYGT_DIAG_HW_WATCH");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_HW_WATCH");
         const char* comma = std::strchr(env, ',');
         const u32 delay = comma ? u32(std::strtoul(comma + 1, nullptr, 10)) : 10;
         std::thread([address, delay] {
@@ -2623,7 +2623,7 @@ NativeRenderer::~NativeRenderer() {
 
 static bool FaultAheadEnabled() {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_NATIVE_FAULT_AHEAD");
+        const char* env = std::getenv("SHADGT_NATIVE_FAULT_AHEAD");
         return env && env[0] == '1';
     }();
     return enabled;
@@ -2673,7 +2673,7 @@ static bool IsGt7Title() {
 
 bool NativeRenderer::HudSplitOn() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_HUD_SPLIT");
+        const char* env = std::getenv("SHADGT_HUD_SPLIT");
         return IsGt7Title() && RytyDisplayAspect() > 0.0f && !(env && env[0] == '0');
     }();
     return on;
@@ -2681,7 +2681,7 @@ bool NativeRenderer::HudSplitOn() {
 
 bool NativeRenderer::HudStreamOn() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_HUD_STREAM");
+        const char* env = std::getenv("SHADGT_HUD_STREAM");
         return !(env && env[0] == '0');
     }();
     return on;
@@ -2845,9 +2845,9 @@ Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bo
     // FIX-232: an AMD driver refused BC6H images with storage use (about two million lookups
     // of a tester's session found no image: textures missing). Such an image is made without
     // the storage use (and the block-texel-view flag that goes with it): it is still sampled
-    // and copied as the game does with it. RYGT_BLOCK_NO_STORAGE_FALLBACK=1 keeps the old way.
+    // and copied as the game does with it. SHADGT_BLOCK_NO_STORAGE_FALLBACK=1 keeps the old way.
     static const bool fallback = [] {
-        const char* env = std::getenv("RYGT_BLOCK_NO_STORAGE_FALLBACK");
+        const char* env = std::getenv("SHADGT_BLOCK_NO_STORAGE_FALLBACK");
         return !(env && env[0] == '1');
     }();
     if (properties.result != vk::Result::eSuccess && fallback &&
@@ -3042,7 +3042,7 @@ vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
 namespace {
 bool NextMemoEnabled() {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_NATIVE_NEXT");
+        const char* env = std::getenv("SHADGT_NATIVE_NEXT");
         return env && env[0] == '1';
     }();
     return enabled;
@@ -3146,11 +3146,11 @@ vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
         state.max_lod.Assign(sharp.max_lod.Value());
         state.lod_bias.Assign(sharp.lod_bias.Value());
     }
-    // GFX-GT7-001 (the launcher's Texture sharpness, RYGT_TEXTURE_LOD_BIAS=<levels>): added to every
+    // GFX-GT7-001 (the launcher's Texture sharpness, SHADGT_TEXTURE_LOD_BIAS=<levels>): added to every
     // sampler's bias, negative for sharper textures. Compare samplers keep theirs: a bias sharpens
     // nothing in a shadow test.
     static const float texture_lod_bias = [this] {
-        const char* env = std::getenv("RYGT_TEXTURE_LOD_BIAS");
+        const char* env = std::getenv("SHADGT_TEXTURE_LOD_BIAS");
         const float bias = env && *env ? std::strtof(env, nullptr) : 0.0f;
         if (!std::isfinite(bias) || bias == 0.0f) {
             return 0.0f;
@@ -3199,12 +3199,12 @@ vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
 
 bool NativeRenderer::RingEnabled() {
     static const bool enabled = [] {
-        const char* value = std::getenv("RYGT_NATIVE_RING");
+        const char* value = std::getenv("SHADGT_NATIVE_RING");
         return !value || std::strcmp(value, "0") != 0;
     }();
 #ifndef NDEBUG
     static const bool compare = [] {
-        const char* value = std::getenv("RYGT_NATIVE_AB");
+        const char* value = std::getenv("SHADGT_NATIVE_AB");
         return value && value[0] == '1' && value[1] == '\0';
     }();
     if (enabled && compare) {
@@ -3230,7 +3230,7 @@ void NativeRenderer::ApplyRingPriority(bool enabled) {
     // chunk must never enqueue a control operation onto that ring directly.
     if (Scheduler::ThreadRing()) return;
     static const bool boost = [] {
-        const char* value = std::getenv("RYGT_NATIVE_GPU_PRIORITY");
+        const char* value = std::getenv("SHADGT_NATIVE_GPU_PRIORITY");
         return !(value && value[0] == '0');
     }();
     const bool wanted = enabled && boost;
@@ -3244,7 +3244,7 @@ void NativeRenderer::ApplyRingPriority(bool enabled) {
     }
 }
 
-// PERF-GTS-399 (RYGT_PARALLEL_RING=1, with RYGT_PARALLEL_RECORDING=1): the recorder's own lists
+// PERF-GTS-399 (SHADGT_PARALLEL_RING=1, with SHADGT_PARALLEL_RECORDING=1): the recorder's own lists
 // go through the command ring with parallel recording too. The ring was off in that mode, so
 // every command the recorder still records itself was a driver call on its thread (13% of its
 // CPU time in a race at Tokyo, the command thread at 12% of a core): the pass code took raw
@@ -3254,7 +3254,7 @@ void NativeRenderer::ApplyRingPriority(bool enabled) {
 // order by commands the recorder puts on the ring once the workers have ended them.
 static bool ParallelRingOn() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_PARALLEL_RING");
+        const char* env = std::getenv("SHADGT_PARALLEL_RING");
         return env && env[0] == '1' && env[1] == '\0' && ParallelRecordingRequested();
     }();
     return on;
@@ -3285,7 +3285,7 @@ void NativeRenderer::AcquireList(Stream& s) {
     static const bool logged = [enabled] {
         if (enabled && ParallelRecordingRequested())
             LOG_INFO(Render_Vulkan, "Native command ring {} while parallel recording is requested",
-                     ParallelRingOn() ? "kept on (RYGT_PARALLEL_RING=1)" : "disabled");
+                     ParallelRingOn() ? "kept on (SHADGT_PARALLEL_RING=1)" : "disabled");
         return true;
     }();
     (void)logged;
@@ -3311,7 +3311,7 @@ void NativeRenderer::AcquireList(Stream& s) {
 
 void NativeRenderer::BeginAhead() {
     static const bool reuse = [] {
-        const char* value = std::getenv("RYGT_NATIVE_REUSE");
+        const char* value = std::getenv("SHADGT_NATIVE_REUSE");
         return !(value && value[0] == '0');
     }();
     const bool intel = r.instance.IsIntel(), parallel = ParallelRecordingRequested();
@@ -3378,7 +3378,7 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
 
 bool NativeRenderer::GpuTimeOn() {
     static const bool on = [] {
-        const char* env = Common::DiagEnv("RYGT_DIAG_GPU_TIME");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_GPU_TIME");
         return env && env[0] == '1';
     }();
     return on;
@@ -3537,7 +3537,7 @@ void NativeRenderer::GpuTimeCollect() {
 }
 
 bool NativeRenderer::LdsBatchOn() {
-    static const bool on = [] { const char* p = std::getenv("RYGT_NATIVE_LDS_BATCH");
+    static const bool on = [] { const char* p = std::getenv("SHADGT_NATIVE_LDS_BATCH");
                                 return !(p && p[0] == '0'); }();
     return on;
 }
@@ -3577,7 +3577,7 @@ void NativeRenderer::BindGraphics(Stream& s, const GraphicsPipeline& pipeline,
     if (pipeline.UsesShaderObjects()) {
         ASSERT_MSG(owner && owner.get() == &pipeline, "Shader object pipeline must outlive deferred recording");
         static const bool delta = [] {
-            const char* env = std::getenv("RYGT_SO_DELTA");
+            const char* env = std::getenv("SHADGT_SO_DELTA");
             std::error_code ec;
             return !(env && env[0] == '0') && !std::filesystem::exists("so_delta.off", ec) && !ec;
         }();
@@ -3588,19 +3588,19 @@ void NativeRenderer::BindGraphics(Stream& s, const GraphicsPipeline& pipeline,
         cmdbuf.Run([bound, owner, known, previous, shaders](vk::CommandBuffer cmd) {
             bound->BindShaderObjects(cmd, known ? &previous : nullptr, known ? &shaders : nullptr);
         });
-        // DIAG-GTS-446 (diagnosis, RYGT_SO_RESEND_STATE=1): after a pipeline, a shader-object bind
+        // DIAG-GTS-446 (diagnosis, SHADGT_SO_RESEND_STATE=1): after a pipeline, a shader-object bind
         // records all the dynamic state and the vertex input again, after the bind. On NVIDIA a
         // shader-object draw right after a pipeline draw drew black (GT Sport's garage floor, after
         // a depth-only pre-pass pipeline) though its state was valid; this did not change it.
         static const bool resend_state = [] {
-            const char* env = std::getenv("RYGT_SO_RESEND_STATE");
+            const char* env = std::getenv("SHADGT_SO_RESEND_STATE");
             return env && env[0] == '1';
         }();
-        // DIAG-GTS-448: RYGT_SO_TOGGLE_STATE=1 first sets every colour target's write mask to
+        // DIAG-GTS-448: SHADGT_SO_TOGGLE_STATE=1 first sets every colour target's write mask to
         // nothing and back, in case the driver skips a write-mask call with the value it thinks
         // it has (the floor drew depth but no colour after a depth-only pipeline pass).
         static const bool toggle_state = [] {
-            const char* env = std::getenv("RYGT_SO_TOGGLE_STATE");
+            const char* env = std::getenv("SHADGT_SO_TOGGLE_STATE");
             return env && env[0] == '1';
         }();
         if (!known && toggle_state && r.instance.IsDynamicColorWriteMaskSupported()) {
@@ -3621,10 +3621,10 @@ void NativeRenderer::BindGraphics(Stream& s, const GraphicsPipeline& pipeline,
         // OPT-014 remembers (binding_commands), so the next PushBindings issues them again.
         // With shader objects and the memo on, GT Sport's grass tufts drew over the road a while
         // into a race; every run with the memo off for shader-object draws was correct.
-        // RYGT_SO_BINDINGS: always (default) at every shader-object bind; change only when the
+        // SHADGT_SO_BINDINGS: always (default) at every shader-object bind; change only when the
         // bind changes the shaders (FIX-GTS-420); keep as before.
         static const int so_bindings = [] {
-            const char* env = std::getenv("RYGT_SO_BINDINGS");
+            const char* env = std::getenv("SHADGT_SO_BINDINGS");
             const std::string_view value = env ? env : "";
             return value == "keep" ? 0 : value == "change" ? 1 : 2;
         }();
@@ -4028,10 +4028,10 @@ void NativeRenderer::PassBarrier(std::source_location where) {
 // ends, for the CPU to read (GT Sport's auto exposure), and not after every draw into it. GT7 draws
 // ~100 such pictures a frame: on its pre-race screens ~210 write-backs a frame, nearly all tiled (a
 // copy, a tiling dispatch and their barriers each) took 17% of the GPU's time in a GPU Trace.
-// RYGT_NATIVE_WRITEBACK_EACH=1: after each draw, as before.
+// SHADGT_NATIVE_WRITEBACK_EACH=1: after each draw, as before.
 void NativeRenderer::QueueWriteback(const Native::ImageEntry* entry) {
     static const bool each = [] {
-        const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_EACH");
+        const char* env = std::getenv("SHADGT_NATIVE_WRITEBACK_EACH");
         return env && env[0] == '1';
     }();
     if (each || entry->info.guest_size > 64_KB) {
@@ -4181,11 +4181,11 @@ static bool PlanDirectLinearDownload(const Native::ImageEntry& entry,
 }
 
 // FIX-150: GT Sport's small buffers from 0xf000000000 up are ones the GPU writes for the CPU
-// to read back. RYGT_NATIVE_INPLACE_FROM=<hex address> moves the limit
+// to read back. SHADGT_NATIVE_INPLACE_FROM=<hex address> moves the limit
 // (ffffffffffffffff: every written range gets a region, as before).
 static VAddr InplaceFrom() {
     static const VAddr from = [] {
-        const char* env = std::getenv("RYGT_NATIVE_INPLACE_FROM");
+        const char* env = std::getenv("SHADGT_NATIVE_INPLACE_FROM");
         return env ? static_cast<VAddr>(std::strtoull(env, nullptr, 16)) : VAddr{0xf000000000};
     }();
     return from;
@@ -4195,10 +4195,10 @@ static VAddr InplaceFrom() {
 // submission, before the fence the CPU waits for. GT7 saves a car's thumbnail this way: it copies
 // the finished 1920x1080 picture into two 1920x540 targets there, waits for the GPU and encodes
 // them to PNG, so the saved thumbnail held what that memory held before: black. GT7 draws few such
-// pictures: ten in a session with one customization. RYGT_NATIVE_WRITEBACK_CPU=0: as before.
+// pictures: ten in a session with one customization. SHADGT_NATIVE_WRITEBACK_CPU=0: as before.
 void NativeRenderer::WritebackForCpu(const Native::ImageEntry* entry) {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_CPU");
+        const char* env = std::getenv("SHADGT_NATIVE_WRITEBACK_CPU");
         return !(env && env[0] == '0');
     }();
     if (!on || entry->info.guest_address < InplaceFrom() ||
@@ -4220,10 +4220,10 @@ void NativeRenderer::WritebackForCpu(const Native::ImageEntry* entry) {
 // with no rain to draw it samples the fill right away. Those mips showed as a 64 KB block of huge
 // values at every frame of a pre-race screen, under a large halo. A fill or a copy gets its region
 // after this; a draw or dispatch has it already, and refreshes it again when this returns true.
-// RYGT_NATIVE_WRITEBACK_REFRESH=0: as before.
+// SHADGT_NATIVE_WRITEBACK_REFRESH=0: as before.
 bool NativeRenderer::SendWritebacksDue() {
     static const bool refresh = [] {
-        const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_REFRESH");
+        const char* env = std::getenv("SHADGT_NATIVE_WRITEBACK_REFRESH");
         return !(env && env[0] == '0');
     }();
     if (!refresh || !writebacks_due) {
@@ -4376,7 +4376,7 @@ void NativeRenderer::FlushWritebacks() {
         return;
     }
     static const bool batched = [] {
-        const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_BATCH");
+        const char* env = std::getenv("SHADGT_NATIVE_WRITEBACK_BATCH");
         return !(env && env[0] == '0');
     }();
     Native::DownloadBatch batch;
@@ -4399,9 +4399,9 @@ void NativeRenderer::FlushWritebacks() {
     // FinishDownloads (3 barriers, the re-tiling dispatches) and one barrier, instead of those for
     // each picture (~85 a frame in GT Sport's garage, each draining the GPU: DIAG-GTS-460). A
     // picture overlapping one whose copies wait flushes them first, so overlapping pictures keep
-    // their order. RYGT_NATIVE_WRITEBACK_COPY_EACH=1: each picture's copies at once, as before.
+    // their order. SHADGT_NATIVE_WRITEBACK_COPY_EACH=1: each picture's copies at once, as before.
     static const bool copy_each = [] {
-        const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_COPY_EACH");
+        const char* env = std::getenv("SHADGT_NATIVE_WRITEBACK_COPY_EACH");
         return env && env[0] == '1';
     }();
     struct DeferredCopies {
@@ -4659,11 +4659,11 @@ void NativeRenderer::ChunkFlushCheck() {
         return;
     }
     static const u32 feed_min = [] {
-        const char* on = std::getenv("RYGT_FEED_GPU");
+        const char* on = std::getenv("SHADGT_FEED_GPU");
         if (on && on[0] == '0') {
             return 0u;
         }
-        const char* env = std::getenv("RYGT_FEED_GPU_MIN");
+        const char* env = std::getenv("SHADGT_FEED_GPU_MIN");
         if (!env || !*env) return 32u;
         char* end = nullptr;
         const auto value = std::strtoull(env, &end, 10);
@@ -4691,7 +4691,7 @@ void NativeRenderer::ChunkFlushCheck() {
 
 void NativeRenderer::TrimIdleChunks() {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_NATIVE_CHUNK_TRIM");
+        const char* env = std::getenv("SHADGT_NATIVE_CHUNK_TRIM");
         return !(env && env[0] == '0');
     }();
     if (!enabled || frame % 150 != 0) return;
@@ -4798,7 +4798,7 @@ std::tuple<vk::Buffer, u64, u8*> NativeRenderer::Allocate(u64 size, u64 align, b
 static bool FlatUploadReuseEnabled() {
     // Diagnostic A/B control, sampled once at startup; reuse remains on by default.
     static const bool reuse_enabled = [] {
-        const char* value = std::getenv("RYGT_FLAT_UPLOAD_REUSE");
+        const char* value = std::getenv("SHADGT_FLAT_UPLOAD_REUSE");
         return !value || value[0] != '0' || value[1] != '\0';
     }();
     return reuse_enabled;
@@ -4908,11 +4908,11 @@ NativeRenderer::Region* NativeRenderer::RegionOver(VAddr address, u64 size) {
 }
 
 namespace {
-// PERF-GTS-369: room a growing region gets past the asked end; RYGT_REGION_GROW_MB (default 64,
+// PERF-GTS-369: room a growing region gets past the asked end; SHADGT_REGION_GROW_MB (default 64,
 // 0 = off, the old exact size).
 u64 RegionGrowSlack() {
     static const u64 slack = [] {
-        const char* env = std::getenv("RYGT_REGION_GROW_MB");
+        const char* env = std::getenv("SHADGT_REGION_GROW_MB");
         return u64(env && *env ? std::strtoull(env, nullptr, 10) : 64) * 1_MB;
     }();
     return slack;
@@ -4965,12 +4965,12 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
     buffer_log.Note(begin, end); // OPT-010
     // GPU-only guest allocations need not have CPU-importable backing. They still need
     // storage for shader writes (including the terrain's persistent shadow map).
-    // PERF-GT7-131 (RYGT_REGION_COPY=0 off): a region over small mappings not imported yet (a
+    // PERF-GT7-131 (SHADGT_REGION_COPY=0 off): a region over small mappings not imported yet (a
     // streamed texture's memory that a shader also writes) takes its first bytes from a copy,
     // as one over memory that cannot be imported does: these were two thirds of the imports
     // left in a driven race after PERF-GT7-130 (~0.2 ms each, hundreds in one frame).
     static const bool region_copy = [] {
-        const char* env = std::getenv("RYGT_REGION_COPY");
+        const char* env = std::getenv("SHADGT_REGION_COPY");
         return !(env && env[0] == '0');
     }();
     std::vector<Native::RegionInitRange> covered;
@@ -5107,10 +5107,10 @@ void NativeRenderer::SortRegionWrites() {
                 written->second = frame;
             }
 #if !defined(NDEBUG)
-            // FIX-184 (diagnosis, RYGT_NATIVE_MIRROR_NODROP=1): CPU-written mirrors stay (their
+            // FIX-184 (diagnosis, SHADGT_NATIVE_MIRROR_NODROP=1): CPU-written mirrors stay (their
             // pages are copied in at the next use as usual).
             static const bool no_drop = [] {
-                const char* env = std::getenv("RYGT_NATIVE_MIRROR_NODROP");
+                const char* env = std::getenv("SHADGT_NATIVE_MIRROR_NODROP");
                 return env && env[0] == '1';
             }();
             if (dynamic && no_drop) {
@@ -5174,7 +5174,7 @@ bool NativeRenderer::IsDynamic(VAddr begin, VAddr end, u64* blocked_granule, u64
     if (dynamic_granules.empty()) {
         return false;
     }
-    // PERF-GTS-386 (RYGT_MIRROR_DROP_BACKOFF=1): memory the game keeps rewriting was mirrored
+    // PERF-GTS-386 (SHADGT_MIRROR_DROP_BACKOFF=1): memory the game keeps rewriting was mirrored
     // again every 600 frames, written, and dropped again: in a race about 15 mirrors a second
     // went that way (as many as granules left the list), each drop made the mirrors beside it
     // anew (up to 1.2 GB of copies in 10 s at Tokyo) and refused the 150 or so prepared draws
@@ -5184,7 +5184,7 @@ bool NativeRenderer::IsDynamic(VAddr begin, VAddr end, u64* blocked_granule, u64
     // dropped a second time. (Doubling from 600 frames took minutes to settle: after 70 s of
     // a race the drops had only fallen from 150 to 55 in 10 s.)
     static const bool backoff = [] {
-        const char* env = std::getenv("RYGT_MIRROR_DROP_BACKOFF");
+        const char* env = std::getenv("SHADGT_MIRROR_DROP_BACKOFF");
         return !env || !*env || env[0] == '1'; // PERF-GTS-407: on unless set to something else
     }();
     for (u64 granule = begin >> 16; granule <= (end - 1) >> 16; ++granule) {
@@ -5210,7 +5210,7 @@ bool NativeRenderer::IsDynamic(VAddr begin, VAddr end, u64* blocked_granule, u64
 
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr address, u64 size) {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_NATIVE_MIRRORS");
+        const char* env = std::getenv("SHADGT_NATIVE_MIRRORS");
         return !(env && env[0] == '0');
     }();
     if (!enabled || size == 0 || size > 64_MB) {
@@ -5234,7 +5234,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr add
     // Not mirrored: a range bound in an earlier frame too gets a mirror at the start of the next
     // list (read in place until then).
     const VAddr begin = Common::AlignDown(address, 4096);
-    // FIX-180: mirrors reach 256 KB past the range they are made for (RYGT_NATIVE_MIRROR_SLACK=
+    // FIX-180: mirrors reach 256 KB past the range they are made for (SHADGT_NATIVE_MIRROR_SLACK=
     // <KB> sets it, 0 as before). With mirrors cut at the range's end, Tokyo's world geometry
     // went missing for single frames in bursts, the sky colour showing through (Lance's
     // "vertex sky explosions"; 6-19 such frames a 450 s race, none with mirrors off). Mirror
@@ -5243,7 +5243,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr add
     // the race had none (1 smaller jump in 13,000 frames), at the same speed (47-51 fps), with
     // about 105 bigger mirrors instead of 800.
     static const u64 slack = [] {
-        const char* env = std::getenv("RYGT_NATIVE_MIRROR_SLACK");
+        const char* env = std::getenv("SHADGT_NATIVE_MIRROR_SLACK");
         return (env && *env ? std::strtoull(env, nullptr, 10) : u64{256}) * 1024;
     }();
     const u64 reach = slack != 0 ? r.memory->ClampRangeSize(address, size + slack) : size;
@@ -5368,7 +5368,7 @@ void NativeRenderer::MakePendingMirrors() {
         if (found != ranges.end()) std::rotate(ranges.begin(), found, ranges.end());
     }
     static const u64 budget = [] {
-        const char* env = std::getenv("RYGT_NATIVE_MIRROR_MB");
+        const char* env = std::getenv("SHADGT_NATIVE_MIRROR_MB");
         return (env ? std::strtoull(env, nullptr, 10) : 1024) * 1_MB;
     }();
     auto* direct = r.buffer_cache.GetDirectMemory();
@@ -5377,10 +5377,10 @@ void NativeRenderer::MakePendingMirrors() {
     bool evicted = false;
     for (size_t range_index = 0; range_index < ranges.size(); ++range_index) {
         auto [begin, end] = ranges[range_index];
-        // FIX-185 (diagnosis, RYGT_NATIVE_MIRROR_REGION_GAP=<KB>): no mirror within that distance
+        // FIX-185 (diagnosis, SHADGT_NATIVE_MIRROR_REGION_GAP=<KB>): no mirror within that distance
         // of a region.
         static const u64 region_gap = [] {
-            const char* env = std::getenv("RYGT_NATIVE_MIRROR_REGION_GAP");
+            const char* env = std::getenv("SHADGT_NATIVE_MIRROR_REGION_GAP");
             return env && *env ? std::strtoull(env, nullptr, 10) * 1024 : u64{0};
         }();
         bool region_block=false,gap_block=false;
@@ -5400,7 +5400,7 @@ void NativeRenderer::MakePendingMirrors() {
             end = std::max(end, it->second.end);
             taken += it->second.end - it->second.begin;
         }
-        // PERF-GTS-388 (RYGT_MIRROR_ROUND_MB=<power of two>, 0 = off): a mirror made over
+        // PERF-GTS-388 (SHADGT_MIRROR_ROUND_MB=<power of two>, 0 = off): a mirror made over
         // existing ones copies all they held again, and the game's vertex data grows a little
         // at a time: at Tokyo 105 to 207 of the 150 to 335 mirrors made in 10 s were such
         // regrowths, and 85 to 93% of the 460 to 1210 MB copied was in a mirror already
@@ -5409,7 +5409,7 @@ void NativeRenderer::MakePendingMirrors() {
         // range is mirrorable as a whole (mapped, no region, no CPU-written granule, no CPU
         // stack); else it is made as asked.
         static const u64 round = [] {
-            const char* env = std::getenv("RYGT_MIRROR_ROUND_MB");
+            const char* env = std::getenv("SHADGT_MIRROR_ROUND_MB");
             // PERF-GTS-407: 4 MB unless set (0 = off).
             const u64 mb = env && *env ? std::strtoull(env, nullptr, 10) : 4;
             return mb != 0 && (mb & (mb - 1)) == 0 && mb <= 64 ? mb * 1_MB : u64{0};
@@ -5630,8 +5630,8 @@ void NativeRenderer::DropMirrors(VAddr address, u64 size, u32 diagnostic_reason)
 static const std::vector<std::pair<VAddr, VAddr>>& NativeInplaceRanges() {
     static const auto ranges = [] {
         std::vector<std::pair<VAddr, VAddr>> result;
-        const char* configured = std::getenv("RYGT_NATIVE_INPLACE_RANGES");
-        const char* extra = std::getenv("RYGT_NATIVE_INPLACE_EXTRA");
+        const char* configured = std::getenv("SHADGT_NATIVE_INPLACE_RANGES");
+        const char* extra = std::getenv("SHADGT_NATIVE_INPLACE_EXTRA");
         for (const char* source : {configured, extra}) {
             for (const char* at = source; at && *at;) {
                 char* end = nullptr;
@@ -5651,7 +5651,7 @@ static const std::vector<std::pair<VAddr, VAddr>>& NativeInplaceRanges() {
 
 static bool NativeInplaceWritebackEnabled() {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_NATIVE_INPLACE_WRITEBACK");
+        const char* env = std::getenv("SHADGT_NATIVE_INPLACE_WRITEBACK");
         return !env || env[0] != '0';
     }();
     return enabled;
@@ -5659,7 +5659,7 @@ static bool NativeInplaceWritebackEnabled() {
 
 static bool NativeRegionWritebackEnabled() {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_NATIVE_REGION_WRITEBACK");
+        const char* env = std::getenv("SHADGT_NATIVE_REGION_WRITEBACK");
         return !env || env[0] != '0';
     }();
     return enabled;
@@ -6031,7 +6031,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
     // PERF-GTS-390: the pages are read into ordinary memory, compared there and written to the
     // upload memory once. They were read into the upload memory and compared from it, 16 bytes
     // a memcmp call (256 calls a page): upload memory is mapped for writing only, and with
-    // RYGT_NATIVE_UPLOAD_VRAM=1 reading it reads video memory back, uncached. 1.75% of the
+    // SHADGT_NATIVE_UPLOAD_VRAM=1 reading it reads video memory back, uncached. 1.75% of the
     // recorder's CPU time in a race at Tokyo was in those calls, from dispatches alone. The
     // bytes compared and uploaded are the same as before.
     const auto cpu_copy = std::make_unique_for_overwrite<u8[]>(pages.size() * 4096);
@@ -6129,11 +6129,11 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
                                 frame - recent->second <= 600;
         const bool gpu_wrote = region.gpu_pages->erase(page) != 0;
         static const bool compare_all = [] {
-            const char* env = std::getenv("RYGT_NATIVE_REGION_COMPARE");
+            const char* env = std::getenv("SHADGT_NATIVE_REGION_COMPARE");
             return env && env[0] == '1';
         }();
         static const bool force_whole = [] {
-            const char* env = std::getenv("RYGT_NATIVE_REGION_WHOLE");
+            const char* env = std::getenv("SHADGT_NATIVE_REGION_WHOLE");
             return env && env[0] == '1';
         }();
         const u64 page_bytes = std::min<u64>(4096, region.end - page);
@@ -6223,17 +6223,17 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
 
 bool NativeRenderer::OneOffDiagOn() {
     static const bool on = [] {
-        const char* env = Common::DiagEnv("RYGT_DIAG_ONE_OFF_REDRAW");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_ONE_OFF_REDRAW");
         return (RyDiag::Enabled() && !(env && env[0] == '0')) || OneOffDiagAll();
     }();
     return on;
 }
 
 bool NativeRenderer::OneOffDiagAll() {
-    // RYGT_DIAG_ONE_OFF_REDRAW=1: also the draws that found their pipeline built (they would
+    // SHADGT_DIAG_ONE_OFF_REDRAW=1: also the draws that found their pipeline built (they would
     // have waited for it), so any race start counts, not only one whose pipelines are new.
     static const bool all = [] {
-        const char* env = Common::DiagEnv("RYGT_DIAG_ONE_OFF_REDRAW");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_ONE_OFF_REDRAW");
         return env && env[0] == '1';
     }();
     return all;
@@ -6241,7 +6241,7 @@ bool NativeRenderer::OneOffDiagAll() {
 
 bool NativeRenderer::OneOffLearnOn() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_ONE_OFF_LEARN");
+        const char* env = std::getenv("SHADGT_ONE_OFF_LEARN");
         return !(env && env[0] == '0');
     }();
     return on;
@@ -6327,10 +6327,10 @@ bool NativeRenderer::OneOffKnownHarmful() const {
     // 109's deadline, it stays wrong for good. GT7's car shadows (1024x1024 maps drawn once a
     // race) showed as dark rectangles under every car after a cold race start: ~20 of their draws
     // had given up at the 12 ms deadline. Such a draw waits for its pipeline whatever the budget;
-    // the compile pack and the pre-translation remove the wait. RYGT_ONE_OFF_HARMFUL_WAIT=0: the
+    // the compile pack and the pre-translation remove the wait. SHADGT_ONE_OFF_HARMFUL_WAIT=0: the
     // deadline for every kind, as before.
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_ONE_OFF_HARMFUL_WAIT");
+        const char* env = std::getenv("SHADGT_ONE_OFF_HARMFUL_WAIT");
         return !(env && env[0] == '0');
     }();
     if (!enabled || !OneOffLearnOn()) {
@@ -6573,7 +6573,7 @@ std::string NativeRenderer::OneOffText() {
 static u64 PlayBudgetNs() {
     static const u64 ns = [] {
         u64 ms = 12;
-        if (const char* env = std::getenv("RYGT_ONE_OFF_PLAY_BUDGET_MS"); env && *env) {
+        if (const char* env = std::getenv("SHADGT_ONE_OFF_PLAY_BUDGET_MS"); env && *env) {
             ms = std::strtoull(env, nullptr, 10);
         }
         return ms * 1000000ull;
@@ -6591,7 +6591,7 @@ bool NativeRenderer::OneOffBudgetLeft() {
     // In play the pipelines are usually known and the budget is not reached.
     static const u64 budget_ns = [] {
         u64 ms = 40; // FIX-GT7-109: 250 before, with waits as long as a compile
-        if (const char* env = std::getenv("RYGT_ONE_OFF_BUDGET_MS"); env && *env) {
+        if (const char* env = std::getenv("SHADGT_ONE_OFF_BUDGET_MS"); env && *env) {
             ms = std::strtoull(env, nullptr, 10);
         }
         return ms * 1000000ull;
@@ -6603,7 +6603,7 @@ bool NativeRenderer::OneOffBudgetLeft() {
         one_off_budget_frame = frame;
         one_off_wait_ns_frame = 0;
         // FIX-GT7-109: in play (the game at 15 frames a second or more) a frame's one-off draws
-        // wait RYGT_ONE_OFF_PLAY_BUDGET_MS in all (12 by default), never for a whole compile:
+        // wait SHADGT_ONE_OFF_PLAY_BUDGET_MS in all (12 by default), never for a whole compile:
         // a new track's race start had frames of 400-940 ms (translations and pipelines of
         // one-off pictures), races 60-120 ms ones. Loads (slow frames) keep the budget above.
         // The game's own frame count, over half a second or more.
@@ -6626,11 +6626,11 @@ bool NativeRenderer::OneOffBudgetLeft() {
 
 std::chrono::steady_clock::time_point NativeRenderer::OneOffDeadline() {
     // FIX-GT7-109: every wait ends at the frame's budget (in play or at a load), so no frame
-    // waits a whole compile (a race start had frames of 170-940 ms). RYGT_ONE_OFF_BUDGET_MS=0:
+    // waits a whole compile (a race start had frames of 170-940 ms). SHADGT_ONE_OFF_BUDGET_MS=0:
     // unbounded at loads, as before FIX-GT7-102.
     static const u64 load_ns = [] {
         u64 ms = 40;
-        if (const char* env = std::getenv("RYGT_ONE_OFF_BUDGET_MS"); env && *env) {
+        if (const char* env = std::getenv("SHADGT_ONE_OFF_BUDGET_MS"); env && *env) {
             ms = std::strtoull(env, nullptr, 10);
         }
         return ms * 1000000ull;
@@ -6667,19 +6667,19 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
     // kept: a texture the game renders for later frames, a cached shadow map, the first frame of
     // a new picture) would leave it missing for good, so such a draw waits for its pipeline. A
     // picture counts as drawn every frame when one of the last four frames drew into it.
-    // RYGT_NATIVE_WAIT_ONE_OFF=0 skips them too.
+    // SHADGT_NATIVE_WAIT_ONE_OFF=0 skips them too.
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_NATIVE_WAIT_ONE_OFF");
+        const char* env = std::getenv("SHADGT_NATIVE_WAIT_ONE_OFF");
         return !(env && env[0] == '0');
     }();
     if (!enabled) {
         one_off_hits.clear();
         return false;
     }
-    // DIAG-220 (diagnosis, RYGT_DIAG_ONE_OFF=1): why targets count as one-off: never drawn
+    // DIAG-220 (diagnosis, SHADGT_DIAG_ONE_OFF=1): why targets count as one-off: never drawn
     // into, or how many frames since they were last drawn into.
     static const bool diag = [] {
-        const char* env = Common::DiagEnv("RYGT_DIAG_ONE_OFF");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_ONE_OFF");
         return env && env[0] == '1';
     }();
     const auto note = [&](u64 gap) {
@@ -6708,10 +6708,10 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
     // work picture, a pitch of 1920) made a draw into a layout never drawn skippable: at a photo's
     // first frames the work picture's draw was skipped for its new pipeline, the frames' average
     // read the pool's memory instead (small RGBA8 menu pictures read as RGBA16F: huge values, NaN)
-    // and kept them to the end: noise blocks in every first photo. RYGT_NATIVE_ONE_OFF_LAYOUT=0:
+    // and kept them to the end: noise blocks in every first photo. SHADGT_NATIVE_ONE_OFF_LAYOUT=0:
     // any picture at the address, as before.
     static const bool same_layout_on = [] {
-        const char* env = std::getenv("RYGT_NATIVE_ONE_OFF_LAYOUT");
+        const char* env = std::getenv("SHADGT_NATIVE_ONE_OFF_LAYOUT");
         return !(env && env[0] == '0');
     }();
     // Out of play only (FIX-GT7-109): in a Monza race the rule made draws into GT7's scratch pool
@@ -6731,9 +6731,9 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
     // the location at about an eighth of its brightness, the photo (level 0) did not. The harm
     // was never learned: the texture reads its levels' memory, not those targets. Such a draw
     // is not exempted by its kind and, out of play, waits whatever the budget; in play
-    // (FIX-GT7-109) it keeps the frame's budget. RYGT_NATIVE_TEXTURE_LEVEL_WAIT=0: as before.
+    // (FIX-GT7-109) it keeps the frame's budget. SHADGT_NATIVE_TEXTURE_LEVEL_WAIT=0: as before.
     static const bool texture_levels = [] {
-        const char* env = std::getenv("RYGT_NATIVE_TEXTURE_LEVEL_WAIT");
+        const char* env = std::getenv("SHADGT_NATIVE_TEXTURE_LEVEL_WAIT");
         return !(env && env[0] == '0');
     }();
     s32 target_cb = -1; // FIX-GT7-135: the colour buffer drawn_lately looks at (-1: depth)
@@ -6797,9 +6797,9 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
         // result into it, once, before filtering it into the photo: with that draw's pipeline
         // new, it was skipped and every first photo of a game came out black (the second, its
         // pipeline built, did not). Such a draw waits as a one-off draw does, within its frame's
-        // budget (FIX-GT7-102/109). RYGT_NATIVE_WAIT_AFTER_FILL=0: as before.
+        // budget (FIX-GT7-102/109). SHADGT_NATIVE_WAIT_AFTER_FILL=0: as before.
         static const bool after_fill = [] {
-            const char* env = std::getenv("RYGT_NATIVE_WAIT_AFTER_FILL");
+            const char* env = std::getenv("SHADGT_NATIVE_WAIT_AFTER_FILL");
             return !(env && env[0] == '0');
         }();
         if (after_fill && registry->FilledWhole(address, entry->info.guest_size)) {
@@ -6818,9 +6818,9 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
         // PERF-165: a picture drawn into within the last 64 frames is redrawn regularly (GT7
         // redraws some every 9-64 frames: DIAG-220 counted up to 983 such draws in 300 frames,
         // and they waited for new pipelines as one-off pictures); a skipped draw shows at its next
-        // redraw. Never-drawn pictures still wait. RYGT_NATIVE_ONE_OFF_FRAMES=4: as before.
+        // redraw. Never-drawn pictures still wait. SHADGT_NATIVE_ONE_OFF_FRAMES=4: as before.
         static const u64 window = [] {
-            const char* env = std::getenv("RYGT_NATIVE_ONE_OFF_FRAMES");
+            const char* env = std::getenv("SHADGT_NATIVE_ONE_OFF_FRAMES");
             return env && *env ? std::strtoull(env, nullptr, 10) : u64{64};
         }();
         const bool lately = earlier != 0 && frame - earlier <= window;
@@ -6884,11 +6884,11 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
 static const std::vector<std::pair<VAddr, VAddr>>& InplaceRanges();
 static bool InPerFrameMemory(VAddr address, u64 size);
 
-/// PERF-GT7-052 (RYGT_POLL_FRAME_TEXTURES=0: watched as before): a texture of 256 KB or less in a
+/// PERF-GT7-052 (SHADGT_POLL_FRAME_TEXTURES=0: watched as before): a texture of 256 KB or less in a
 /// listed in-place range (GT7's per-frame memory) is checked each frame, not write-watched.
 bool NativeRenderer::PolledFrameTexture(VAddr address, u64 size) {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_POLL_FRAME_TEXTURES");
+        const char* env = std::getenv("SHADGT_POLL_FRAME_TEXTURES");
         return !(env && env[0] == '0');
     }();
     if (!enabled || size > 256_KB) {
@@ -6905,10 +6905,10 @@ bool NativeRenderer::PolledFrameTexture(VAddr address, u64 size) {
 /// FIX-194: written ranges up to this size have their recently CPU-written pages written back.
 constexpr u64 MaxRegionWriteback = 4_MB;
 
-/// FIX-GT7-122: where RYGT_NATIVE_INPLACE_EXTRA's ranges start in InplaceRanges().
+/// FIX-GT7-122: where SHADGT_NATIVE_INPLACE_EXTRA's ranges start in InplaceRanges().
 static size_t g_inplace_extra_from = ~size_t{0};
 
-/// FIX-172 (diagnosis, RYGT_NATIVE_INPLACE_RANGES=<hex address>+<hex size>,...): written ranges
+/// FIX-172 (diagnosis, SHADGT_NATIVE_INPLACE_RANGES=<hex address>+<hex size>,...): written ranges
 /// meeting one of these stay in guest memory too.
 static const std::vector<std::pair<VAddr, VAddr>>& InplaceRanges() {
     static const std::vector<std::pair<VAddr, VAddr>> inplace_ranges = [] {
@@ -6918,9 +6918,9 @@ static const std::vector<std::pair<VAddr, VAddr>>& InplaceRanges() {
         // which all end at that limit, meet it and grow it over most of the per-frame memory
         // (NAT-114): every CPU write then faults, ~100,000 protection calls in 2 s, and the frame
         // rate drops for the rest of the session. With a list (GT7's launcher), the tail stays in
-        // guest memory too; RYGT_NATIVE_INPLACE_EXTRA, in the same form, replaces it (empty: none).
-        const char* const ranges = std::getenv("RYGT_NATIVE_INPLACE_RANGES");
-        const char* extra = std::getenv("RYGT_NATIVE_INPLACE_EXTRA");
+        // guest memory too; SHADGT_NATIVE_INPLACE_EXTRA, in the same form, replaces it (empty: none).
+        const char* const ranges = std::getenv("SHADGT_NATIVE_INPLACE_RANGES");
+        const char* extra = std::getenv("SHADGT_NATIVE_INPLACE_EXTRA");
         if (!extra && ranges) {
             extra = "208000000+800000";
         }
@@ -6946,14 +6946,14 @@ static const std::vector<std::pair<VAddr, VAddr>>& InplaceRanges() {
 }
 
 // FIX-GT7-122: GT7's per-frame memory as listed: FIX-GT7-029's tail (the first range of
-// RYGT_NATIVE_INPLACE_EXTRA) and the listed ranges it continues ({0, 0}: no tail, or
-// RYGT_NATIVE_PERFRAME_GUARD=0). Its end moves: past the tail, to 0x209800000, on 2026-11-08, and
+// SHADGT_NATIVE_INPLACE_EXTRA) and the listed ranges it continues ({0, 0}: no tail, or
+// SHADGT_NATIVE_PERFRAME_GUARD=0). Its end moves: past the tail, to 0x209800000, on 2026-11-08, and
 // FIX-GT7-029's sequence came back: a compute write past the tail made a region, the unbounded
 // reads grew it over the per-frame memory, the regions there were refreshed a hundred times more
 // (2.8-4 s of the recorder's time in 10 s) and the game ran at 25 FPS until it was closed.
 static std::pair<VAddr, VAddr> PerFrameListed() {
     static const std::pair<VAddr, VAddr> listed = [] {
-        const char* env = std::getenv("RYGT_NATIVE_PERFRAME_GUARD");
+        const char* env = std::getenv("SHADGT_NATIVE_PERFRAME_GUARD");
         const auto& ranges = InplaceRanges();
         if ((env && env[0] == '0') || g_inplace_extra_from >= ranges.size()) {
             return std::pair<VAddr, VAddr>{0, 0};
@@ -7091,7 +7091,7 @@ void NativeRenderer::DropDuePerFrameRegions() {
 
 bool NativeRenderer::WritebackRaceDiag() {
     static const bool on = [] {
-        const char* env = Common::DiagEnv("RYGT_DIAG_WRITEBACK_RACE");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_WRITEBACK_RACE");
         return env && env[0] == '1';
     }();
     return on;
@@ -7099,7 +7099,7 @@ bool NativeRenderer::WritebackRaceDiag() {
 
 u64 NativeRenderer::SnapshotBelow() {
     static const u64 below = [] {
-        const char* env = std::getenv("RYGT_NATIVE_SNAPSHOT_BELOW");
+        const char* env = std::getenv("SHADGT_NATIVE_SNAPSHOT_BELOW");
         return env && *env ? std::strtoull(env, nullptr, 0) : u64{1_MB};
     }();
     // Race/replay buffers can depend on GPU writes not visible to a CPU snapshot.
@@ -7127,7 +7127,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
     if (memo.address == address && memo.size == size && memo.flags == flags &&
         memo.generation != buffer_generation) {
         static const bool revalidate = [] {
-            const char* env = std::getenv("RYGT_NATIVE_BUFFER_REVALIDATE");
+            const char* env = std::getenv("SHADGT_NATIVE_BUFFER_REVALIDATE");
             return !(env && env[0] == '0');
         }();
         const std::pair<VAddr, VAddr> range{address, address + size};
@@ -7192,7 +7192,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
 
 static VAddr NativeInplaceFrom() {
     static const VAddr from = [] {
-        const char* env = std::getenv("RYGT_NATIVE_INPLACE_FROM");
+        const char* env = std::getenv("SHADGT_NATIVE_INPLACE_FROM");
         return env ? static_cast<VAddr>(std::strtoull(env, nullptr, 16)) : VAddr{0xf000000000};
     }();
     return from;
@@ -7243,17 +7243,17 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     // over PCIe (the GPU was 85% busy waiting on PCIe, 55% with this; the race went from 25 to
     // 33-39 FPS). What the GPU writes there doesn't reach guest memory: GT Sport's CPU doesn't
     // read it back (the old renderer runs with buffer readbacks off too); small render targets
-    // still go back (NAT-112). RYGT_NATIVE_WRITE_REGIONS=0: written ranges in guest memory.
+    // still go back (NAT-112). SHADGT_NATIVE_WRITE_REGIONS=0: written ranges in guest memory.
     static const bool write_regions = [] {
-        const char* env = std::getenv("RYGT_NATIVE_WRITE_REGIONS");
+        const char* env = std::getenv("SHADGT_NATIVE_WRITE_REGIONS");
         return !(env && env[0] == '0');
     }();
     // FIX-150: GT Sport's small buffers from 0xf000000000 up are ones the GPU writes for the CPU
     // to read back (in a region the CPU never saw them: no rain drops on the windshield); written
-    // ranges there stay in guest memory. RYGT_NATIVE_INPLACE_FROM=<hex address> moves the limit
+    // ranges there stay in guest memory. SHADGT_NATIVE_INPLACE_FROM=<hex address> moves the limit
     // (ffffffffffffffff: every written range gets a region, as before).
     const VAddr inplace_from = NativeInplaceFrom();
-    // FIX-172 (diagnosis, RYGT_NATIVE_INPLACE_RANGES=<hex address>+<hex size>,...): written
+    // FIX-172 (diagnosis, SHADGT_NATIVE_INPLACE_RANGES=<hex address>+<hex size>,...): written
     // ranges meeting one of these stay in guest memory too.
     const auto& inplace_ranges = NativeInplaceRanges();
     const bool listed_in_place = std::ranges::any_of(inplace_ranges, [&](const auto& range) {
@@ -7268,7 +7268,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
                              u64{address - region->begin}};
         }
     }
-    // FIX-170 (diagnosis, RYGT_NATIVE_SNAPSHOT_BELOW=<bytes>): small read-only shader buffers
+    // FIX-170 (diagnosis, SHADGT_NATIVE_SNAPSHOT_BELOW=<bytes>): small read-only shader buffers
     // (constants) are copied when the draw is recorded instead of read in place by the GPU later.
     if (!mirror && !write && size <= SnapshotBelow()) {
         last_bound = Bound::InPlace;
@@ -7350,7 +7350,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
         auto& cache = *snapshot_upload_memo;
         const u64 lease_frame = frame + (frame != UINT64_MAX);
         static const bool direct_compare = [] {
-            const char* value = std::getenv("RYGT_NATIVE_SNAPSHOT_DIRECT_COMPARE");
+            const char* value = std::getenv("SHADGT_NATIVE_SNAPSHOT_DIRECT_COMPARE");
             return !value || value[0] != '0';
         }();
         const u64 readable = Native::ReadablePrefix(reinterpret_cast<const void*>(address), size);
@@ -7687,7 +7687,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GatherOnGpu(VAddr addr
     // filled 8 to 15 GB of video memory this way (6.7 GB budget): the driver paged, and frames
     // took 300 ms to 3.5 s. A list now gathers each range once.
     static const bool reuse_gathers = [] {
-        const char* env = std::getenv("RYGT_GATHER_REUSE");
+        const char* env = std::getenv("SHADGT_GATHER_REUSE");
         return !(env && env[0] == '0');
     }();
     // The open list's gathers; none when no list is open (they go with it), so a hit needs no
@@ -8114,7 +8114,7 @@ bool NativeRenderer::TargetsFromMemo(const AmdGpu::Regs& regs, const GraphicsPip
 bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline,
                                     Targets& out) {
     static const bool reuse = [] {
-        const char* env = std::getenv("RYGT_NATIVE_REUSE");
+        const char* env = std::getenv("SHADGT_NATIVE_REUSE");
         return !(env && env[0] == '0');
     }();
     const bool memo = reuse && Native::WatchedTextures().empty() && !r.FrameDumpActive();
@@ -8317,7 +8317,7 @@ void NativeRenderer::BindStagesStable(std::span<const Shader::Info* const> stage
                                       const AmdGpu::Regs& regs, bool compute, DrawBindings& b) {
     DropDuePerFrameRegions(); // FIX-GT7-122: before this work binds anything
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_NATIVE_STABLE_BINDINGS");
+        const char* env = std::getenv("SHADGT_NATIVE_STABLE_BINDINGS");
         return !env || env[0] != '0';
     }();
     if (!enabled) {
@@ -8372,11 +8372,11 @@ void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
             BindTextures(*stage, regs, texture_binding, b);
         }
     }
-    // DIAG-169 (diagnosis, RYGT_WATCH_DRAW_TEXTURE=<w>x<h>[,<w>x<h>...]): for draws sampling a
+    // DIAG-169 (diagnosis, SHADGT_WATCH_DRAW_TEXTURE=<w>x<h>[,<w>x<h>...]): for draws sampling a
     // picture of that size, what guest memory holds now under each buffer they read.
     static const std::vector<std::pair<u32, u32>> watch_sizes = [] {
         std::vector<std::pair<u32, u32>> list;
-        const char* env = Common::DiagEnv("RYGT_WATCH_DRAW_TEXTURE");
+        const char* env = Common::DiagEnv("SHADGT_WATCH_DRAW_TEXTURE");
         for (const char* at = env; at && *at;) {
             char* end = nullptr;
             const u32 w = u32(std::strtoul(at, &end, 10));
@@ -8401,10 +8401,10 @@ void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
             NoteProgramTextures(stage->pgm_hash, b); // DIAG-184 (diagnosis)
         }
     }
-    // DIAG-233 (diagnosis, RYGT_DIAG_STAGE_TEXTURES=<hex program hash>): every texture of the draws
+    // DIAG-233 (diagnosis, SHADGT_DIAG_STAGE_TEXTURES=<hex program hash>): every texture of the draws
     // using that program, once a frame (400 lines at most).
     static const u64 diag233_program = [] {
-        const char* env = Common::DiagEnv("RYGT_DIAG_STAGE_TEXTURES");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_STAGE_TEXTURES");
         return env && *env ? u64(std::strtoull(env, nullptr, 16)) : u64{0};
     }();
     static u32 diag233_lines = 0;
@@ -8473,10 +8473,10 @@ void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
                                       entry->from_cpu ? "t" : "");
         }
     }
-    // RYGT_PROBE_AFTER=<seconds>: DIAG-169/170 only from then on (the game runs at full speed
+    // SHADGT_PROBE_AFTER=<seconds>: DIAG-169/170 only from then on (the game runs at full speed
     // until the scene to look at).
     static const auto watch_from = [] {
-        const char* env = Common::DiagEnv("RYGT_PROBE_AFTER");
+        const char* env = Common::DiagEnv("SHADGT_PROBE_AFTER");
         return std::chrono::steady_clock::now() +
                std::chrono::seconds(env && *env ? std::atoi(env) : 0);
     }();
@@ -8540,7 +8540,7 @@ void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
                 }
             }
             static const bool quiet = [] {
-                const char* env = Common::DiagEnv("RYGT_PROBE_AT");
+                const char* env = Common::DiagEnv("SHADGT_PROBE_AT");
                 return env && *env; // DIAG-170 says what it needs
             }();
             if (!quiet) {
@@ -8577,14 +8577,14 @@ void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
 }
 
 void NativeRenderer::ProbeDraw(const Targets& targets, const AmdGpu::Regs& regs) {
-    // DIAG-170 (diagnosis, RYGT_PROBE_AT=<x>,<y>[,<y2>] with RYGT_WATCH_DRAW_TEXTURE): after
+    // DIAG-170 (diagnosis, SHADGT_PROBE_AT=<x>,<y>[,<y2>] with SHADGT_WATCH_DRAW_TEXTURE): after
     // each draw DIAG-169 matches, 16x16 blocks of its first colour target at (x, y) and, in
     // targets that tall, (x, y2), read back from the GPU and logged with the frame (one line
     // per frame says which display buffer it shows), to see which draw of a glitched frame
     // went wrong.
     static const std::array<u32, 3> at = [] {
         std::array<u32, 3> a{};
-        if (const char* env = Common::DiagEnv("RYGT_PROBE_AT"); env && *env) {
+        if (const char* env = Common::DiagEnv("SHADGT_PROBE_AT"); env && *env) {
             std::sscanf(env, "%u,%u,%u", &a[0], &a[1], &a[2]);
         }
         return a;
@@ -8760,19 +8760,19 @@ void NativeRenderer::StripDispatch(const DrawBindings& b) {
 }
 
 void NativeRenderer::StripImage(const Native::ImageEntry& target, bool dispatch) {
-    // DIAG-173 (diagnosis, RYGT_PROBE_STRIP=<y> RYGT_PROBE_TARGET=<hex address>; armed for one
+    // DIAG-173 (diagnosis, SHADGT_PROBE_STRIP=<y> SHADGT_PROBE_TARGET=<hex address>; armed for one
     // frame by a file named probe.now next to the user folder): after every draw into that
     // target (and dispatch storing to it), rows y..y+7 of it are read back, so each pixel of the
     // strip has its history (which draw wrote it last, and what it wrote). Written with the
-    // frame's screenshot to user\log\strip_<frame>.bin/.txt. RYGT_PROBE_TARGET=1: every
+    // frame's screenshot to user\log\strip_<frame>.bin/.txt. SHADGT_PROBE_TARGET=1: every
     // picture of at least 1280x720; =2: of at least 640x360 (y scaled to its height, as a
     // 1080-line picture's).
     static const u32 strip_y = [] {
-        const char* env = Common::DiagEnv("RYGT_PROBE_STRIP");
+        const char* env = Common::DiagEnv("SHADGT_PROBE_STRIP");
         return env && *env ? u32(std::atoi(env)) : ~0u;
     }();
     static const VAddr strip_target = [] {
-        const char* env = Common::DiagEnv("RYGT_PROBE_TARGET");
+        const char* env = Common::DiagEnv("SHADGT_PROBE_TARGET");
         return env && *env ? VAddr(std::strtoull(env, nullptr, 16)) : VAddr{0};
     }();
     if (strip_y == ~0u || strip_frame != frame || !target.image || target.info.props.is_depth) {
@@ -8877,17 +8877,17 @@ void NativeRenderer::StripFrameEnd() {
 
 void NativeRenderer::ProbeDispatch(const Shader::Info& stage, const DrawBindings& b,
                                    bool after) {
-    // DIAG-175 (diagnosis, RYGT_PROBE_DISPATCH=<hex program hash>|all,
-    // RYGT_PROBE_DISPATCH_TARGET=<hex address>): for those dispatches, texel (0,0) of the image
+    // DIAG-175 (diagnosis, SHADGT_PROBE_DISPATCH=<hex program hash>|all,
+    // SHADGT_PROBE_DISPATCH_TARGET=<hex address>): for those dispatches, texel (0,0) of the image
     // it stores to before and after it (mip 0: every layer; mips 1-7: the first 8 layers), the
     // center texel of the first 6 layers of every mip of the first 2 images it samples, and its
     // flattened user data, logged once the GPU ran it.
-    static const char* program_env = Common::DiagEnv("RYGT_PROBE_DISPATCH");
+    static const char* program_env = Common::DiagEnv("SHADGT_PROBE_DISPATCH");
     static const bool any_program = program_env && std::string_view{program_env} == "all";
     static const u64 program =
         program_env && *program_env ? u64(std::strtoull(program_env, nullptr, 16)) : u64{0};
     static const VAddr only = [] {
-        const char* env = Common::DiagEnv("RYGT_PROBE_DISPATCH_TARGET");
+        const char* env = Common::DiagEnv("SHADGT_PROBE_DISPATCH_TARGET");
         return env && *env ? VAddr(std::strtoull(env, nullptr, 16)) : VAddr{0};
     }();
     if ((!any_program && (program == 0 || stage.pgm_hash != program)) || b.stored.empty() ||
@@ -9033,7 +9033,7 @@ void NativeRenderer::ReadDispatchProbes() {
 void NativeRenderer::ProbeRefresh(const Native::ImageEntry& texture, const std::string& what) {
     static const std::pair<u32, u32> size = [] {
         std::pair<u32, u32> wh{};
-        if (const char* env = Common::DiagEnv("RYGT_DIAG_REFRESH_READ"); env && *env) {
+        if (const char* env = Common::DiagEnv("SHADGT_DIAG_REFRESH_READ"); env && *env) {
             std::sscanf(env, "%ux%u", &wh.first, &wh.second);
         }
         return wh;
@@ -9072,13 +9072,13 @@ void NativeRenderer::ProbeRefresh(const Native::ImageEntry& texture, const std::
 
 void NativeRenderer::CompareRegion(VAddr base, u64 size, u32 stride, vk::Buffer buffer,
                                    u64 offset, u64 program, bool always) {
-    // DIAG-211 (diagnosis, RYGT_DIAG_REGION_COMPARE=1 with SHADGT_WATCH_SHADERS): each distinct
+    // DIAG-211 (diagnosis, SHADGT_DIAG_REGION_COMPARE=1 with SHADGT_WATCH_SHADERS): each distinct
     // region buffer a watched shader reads (up to 24 a frame), copied from the region right
     // where the draw reads it, compared with guest memory as it was when the draw was recorded.
-    static const bool on = Common::DiagEnv("RYGT_DIAG_REGION_COMPARE") != nullptr;
-    // RYGT_DIAG_REGION_COMPARE=4: indirect arguments only (nothing else queued to crowd them out).
+    static const bool on = Common::DiagEnv("SHADGT_DIAG_REGION_COMPARE") != nullptr;
+    // SHADGT_DIAG_REGION_COMPARE=4: indirect arguments only (nothing else queued to crowd them out).
     static const bool args_only = [] {
-        const char* env = Common::DiagEnv("RYGT_DIAG_REGION_COMPARE");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_REGION_COMPARE");
         return env && env[0] == '4';
     }();
     if (!on || size == 0 || size > 512_KB || (args_only && !always) ||
@@ -9091,10 +9091,10 @@ void NativeRenderer::CompareRegion(VAddr base, u64 size, u32 stride, vk::Buffer 
         seen_frame = frame;
         seen.clear();
     }
-    // RYGT_DIAG_REGION_COMPARE=3: every 10th frame, records of 144 bytes (GT7's crowd
+    // SHADGT_DIAG_REGION_COMPARE=3: every 10th frame, records of 144 bytes (GT7's crowd
     // instances) are copied at every draw that reads them, each compared with the frame's first.
     static const bool every_draw = [] {
-        const char* env = Common::DiagEnv("RYGT_DIAG_REGION_COMPARE");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_REGION_COMPARE");
         return env && env[0] == '3';
     }();
     const bool every = every_draw && stride == 144 && frame % 10 == 0;
@@ -9204,9 +9204,9 @@ std::vector<StaleFlat> g_stale_flats;
 } // namespace
 
 void NativeRenderer::NoteStaleFlats(const Shader::Info& stage) {
-    // DIAG-237 (diagnosis, RYGT_DIAG_STALE_FLATS=1): at the end of the frame, whether guest memory
+    // DIAG-237 (diagnosis, SHADGT_DIAG_STALE_FLATS=1): at the end of the frame, whether guest memory
     // still holds what hull shaders' flattened constants were copied from when recorded.
-    static const bool on = Common::DiagEnv("RYGT_DIAG_STALE_FLATS") != nullptr;
+    static const bool on = Common::DiagEnv("SHADGT_DIAG_STALE_FLATS") != nullptr;
     if (!on || stage.sw_stage != Shader::SwStage::TessellationControl || g_stale_flats.size() >= 64) {
         return;
     }
@@ -9247,11 +9247,11 @@ void NativeRenderer::CheckStaleFlats() {
 }
 
 void NativeRenderer::CompareFlatSources(const Shader::Info& stage) {
-    // DIAG-211 (diagnosis, RYGT_DIAG_REGION_COMPARE=1 with SHADGT_WATCH_SHADERS): every 10th
+    // DIAG-211 (diagnosis, SHADGT_DIAG_REGION_COMPARE=1 with SHADGT_WATCH_SHADERS): every 10th
     // frame, each run of flattened dwords read from inside a region, as the region holds it right
     // where the draw runs, against the dwords the CPU walk copied.
     static const bool on = [] {
-        const char* env = Common::DiagEnv("RYGT_DIAG_REGION_COMPARE");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_REGION_COMPARE");
         return env != nullptr && env[0] != '4';
     }();
     const auto& src = stage.flattened_ud_src;
@@ -9332,9 +9332,9 @@ void NativeRenderer::ReadRegionCompares() {
             it = region_compares.erase(it);
             continue;
         }
-        // RYGT_DIAG_REGION_COMPARE=3: each later read of the frame against its first one.
+        // SHADGT_DIAG_REGION_COMPARE=3: each later read of the frame against its first one.
         static const bool every_draw = [] {
-            const char* env = Common::DiagEnv("RYGT_DIAG_REGION_COMPARE");
+            const char* env = Common::DiagEnv("SHADGT_DIAG_REGION_COMPARE");
             return env && env[0] == '3';
         }();
         if (every_draw && it->stride == 144 && it->frame % 10 == 0) {
@@ -9376,10 +9376,10 @@ void NativeRenderer::ReadRegionCompares() {
                 firsts.erase(firsts.begin());
             }
         }
-        // RYGT_DIAG_REGION_COMPARE=2: records of 144 bytes (GT7's crowd instances) as the GPU
+        // SHADGT_DIAG_REGION_COMPARE=2: records of 144 bytes (GT7's crowd instances) as the GPU
         // read them, every 10th frame: dwords 33 and 34 (the SH probe index) and a short hash.
         static const bool dump_records = [] {
-            const char* env = Common::DiagEnv("RYGT_DIAG_REGION_COMPARE");
+            const char* env = Common::DiagEnv("SHADGT_DIAG_REGION_COMPARE");
             return env && env[0] == '2';
         }();
         if (dump_records && it->stride == 144 && it->frame % 10 == 0) {
@@ -9505,7 +9505,7 @@ void NativeRenderer::ReadRefreshProbes() {
 
 void NativeRenderer::ProbeVolume() {
     static const VAddr address = [] {
-        const char* env = Common::DiagEnv("RYGT_DIAG_VOLUME");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_VOLUME");
         return env && *env ? VAddr(std::strtoull(env, nullptr, 16)) : VAddr{0};
     }();
     if (address == 0) {
@@ -9604,7 +9604,7 @@ void NativeRenderer::ProbeVolume() {
 
 void NativeRenderer::NoteProgramTextures(u64 program, const DrawBindings& b) {
     static const u64 watched = [] {
-        const char* env = Common::DiagEnv("RYGT_DIAG_PROGRAM_TEXTURES");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_PROGRAM_TEXTURES");
         return env && *env ? u64(std::strtoull(env, nullptr, 16)) : u64{0};
     }();
     if (watched == 0 || program != watched) {
@@ -9671,7 +9671,7 @@ void NativeRenderer::NoteProgramTextures(u64 program, const DrawBindings& b) {
 }
 
 static bool WriteHistoryOn() {
-    static const bool on = Common::DiagEnv("RYGT_DIAG_WRITE_HISTORY") != nullptr;
+    static const bool on = Common::DiagEnv("SHADGT_DIAG_WRITE_HISTORY") != nullptr;
     return on;
 }
 
@@ -9680,7 +9680,7 @@ void NativeRenderer::NoteHistory(VAddr begin, u64 size, u32 kind, u64 program) {
         return;
     }
     constexpr u64 Capacity = 1ull << 22;
-    // RYGT_DIAG_HISTORY_RANGES=<hex address>+<hex size>,...: notes over these are kept from the
+    // SHADGT_DIAG_HISTORY_RANGES=<hex address>+<hex size>,...: notes over these are kept from the
     // start too (the ring holds the last few hundred frames).
     const auto& kept_ranges = HistoryRanges();
     std::scoped_lock lock{write_history_mutex};
@@ -9699,7 +9699,7 @@ void NativeRenderer::NoteHistory(VAddr begin, u64 size, u32 kind, u64 program) {
 const std::vector<std::pair<VAddr, VAddr>>& NativeRenderer::HistoryRanges() {
     static const std::vector<std::pair<VAddr, VAddr>> kept_ranges = [] {
         std::vector<std::pair<VAddr, VAddr>> list;
-        const char* env = Common::DiagEnv("RYGT_DIAG_HISTORY_RANGES");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_HISTORY_RANGES");
         for (const char* at = env; at && *at;) {
             char* end = nullptr;
             const VAddr from = std::strtoull(at, &end, 16);
@@ -9873,7 +9873,7 @@ void NativeRenderer::ReportProgramTextures() {
 }
 
 void NativeRenderer::CheckSmallTextures() {
-    static const bool enabled = Common::DiagEnv("RYGT_DIAG_STALE_SMALL") != nullptr;
+    static const bool enabled = Common::DiagEnv("SHADGT_DIAG_STALE_SMALL") != nullptr;
     if (!enabled || frame % 120 != 0) {
         return;
     }
@@ -10035,13 +10035,13 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
     // AMD defaults to the validated descriptor-backed buffer path
     // rather than repeating guest page-table walks for each scalar constant load.
     static const bool composition_descriptors = [&] {
-        const char* env = std::getenv("RYGT_COMPOSITION_BUFFER_DESCRIPTORS");
+        const char* env = std::getenv("SHADGT_COMPOSITION_BUFFER_DESCRIPTORS");
         return env && *env ? env[0] == '1' : r.instance.GetVendorID() == 0x1002;
     }();
     const bool descriptor_composition = composition_descriptors &&
         stage.sw_stage == Shader::SwStage::Fragment && IsSceneCompositionShader(stage.pgm_hash);
     static const bool postprocess_descriptors = [&] {
-        const char* env = std::getenv("RYGT_POSTPROCESS_BUFFER_DESCRIPTORS");
+        const char* env = std::getenv("SHADGT_POSTPROCESS_BUFFER_DESCRIPTORS");
         return env && *env ? env[0] == '1' : r.instance.GetVendorID() == 0x1002;
     }();
     const bool descriptor_postprocess = postprocess_descriptors &&
@@ -10050,7 +10050,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
 #if !defined(NDEBUG)
     // Diagnostic A/B: retain shader compilation but use descriptor bindings.
     static const bool descriptor_only_a82d2fe = [] {
-        const char* value = std::getenv("RYGT_A82D2FE_DESCRIPTOR_ONLY");
+        const char* value = std::getenv("SHADGT_A82D2FE_DESCRIPTOR_ONLY");
         return value && value[0] == '1';
     }();
     const bool force_descriptor = descriptor_only_a82d2fe &&
@@ -10166,9 +10166,9 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
             const u64 base = vsharp.base_address;
             const u64 sharp_size = vsharp.GetSize();
 #if !defined(NDEBUG)
-            // DIAG-204 (RYGT_PROBE_SHADER=<hash>): that program's buffers and their first bytes.
+            // DIAG-204 (SHADGT_PROBE_SHADER=<hash>): that program's buffers and their first bytes.
             static const u64 probe_hash = [] {
-                const char* env = std::getenv("RYGT_PROBE_SHADER");
+                const char* env = std::getenv("SHADGT_PROBE_SHADER");
                 return env && *env ? std::strtoull(env, nullptr, 16) : 0;
             }();
             if (probe_hash != 0 && stage.pgm_hash == probe_hash) {
@@ -10199,7 +10199,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
             const bool bindable = base != 0 && sharp_size != 0 && !impossible && !unmapped;
             u64 size = bindable ? r.memory->ClampRangeSize(base, sharp_size) : 0;
             static const bool readable_cut = [] {
-                const char* env = std::getenv("RYGT_NATIVE_READABLE_CUT");
+                const char* env = std::getenv("SHADGT_NATIVE_READABLE_CUT");
                 return !(env && env[0] == '0');
             }();
             auto* readable_direct = r.buffer_cache.GetDirectMemory();
@@ -10210,10 +10210,10 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                 [&](u64 a, u64 n) { return Native::ReadablePrefix(reinterpret_cast<const void*>(a), n); });
             if (bindable && size != 0) {
 #if !defined(NDEBUG)
-                // FIX-174 (diagnosis, RYGT_NATIVE_WATCH_BUFFER=<hex address>+<hex size>): the
+                // FIX-174 (diagnosis, SHADGT_NATIVE_WATCH_BUFFER=<hex address>+<hex size>): the
                 // shaders that bind a buffer over that range (the first ones, then now and then).
                 static const std::pair<VAddr, VAddr> watch_buffer = [] {
-                    const char* env = Common::DiagEnv("RYGT_NATIVE_WATCH_BUFFER");
+                    const char* env = Common::DiagEnv("SHADGT_NATIVE_WATCH_BUFFER");
                     if (!env || !*env) {
                         return std::pair<VAddr, VAddr>{};
                     }
@@ -10271,7 +10271,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                 // 1848e4ed: keep bounded, read-only storage in a reusable device-local
                 // mirror. The first direct view avoids a cross-piece gather while warming it.
                 static const u64 mirror_storage = [] {
-                    const char* env = std::getenv("RYGT_NATIVE_MIRROR_STORAGE");
+                    const char* env = std::getenv("SHADGT_NATIVE_MIRROR_STORAGE");
                     if (!env || !*env) return u64{64} * 1_MB;
                     char* end = nullptr;
                     const auto mb = std::strtoull(env, &end, 10);
@@ -10323,9 +10323,9 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                         // list's upload memory (storage-aligned, kept until the list retires),
                         // instead of a device-local copy made for it. Each copy came with a
                         // transfer->compute barrier and ended rendering: ~170 GPU drains a frame
-                        // in GT Sport's garage. RYGT_COMPUTE_PREFIX_COPY=1: copy, as before.
+                        // in GT Sport's garage. SHADGT_COMPUTE_PREFIX_COPY=1: copy, as before.
                         static const bool prefix_copy = [] {
-                            const char* env = std::getenv("RYGT_COMPUTE_PREFIX_COPY");
+                            const char* env = std::getenv("SHADGT_COMPUTE_PREFIX_COPY");
                             return env && env[0] == '1';
                         }();
                         if (!prefix_copy) {
@@ -10360,7 +10360,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                     // No gather, snapshot or new buffer allocation; out-of-prefix reads
                     // retain the existing direct translation and its full bounds.
                     static const bool prefix_descriptor = [&] {
-                        const char* env = std::getenv("RYGT_COMPUTE_PREFIX_DESCRIPTOR");
+                        const char* env = std::getenv("SHADGT_COMPUTE_PREFIX_DESCRIPTOR");
                         return env && *env ? env[0] == '1' : r.instance.GetVendorID() == 0x1002;
                     }();
                     if (prefix_descriptor && stage.sw_stage == Shader::SwStage::Compute &&
@@ -10525,10 +10525,10 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         }
     }
 #if !defined(NDEBUG)
-    // DIAG-207 (RYGT_NULL_TEXTURES=<hash>:<hex slot mask>): that program's chosen texture slots
+    // DIAG-207 (SHADGT_NULL_TEXTURES=<hash>:<hex slot mask>): that program's chosen texture slots
     // are bound empty, to see which one carries a wrong colour. Recorder-side draws only.
     static const std::pair<u64, u64> null_textures = [] {
-        const char* env = std::getenv("RYGT_NULL_TEXTURES");
+        const char* env = std::getenv("SHADGT_NULL_TEXTURES");
         if (!env || !*env) {
             return std::pair<u64, u64>{0, 0};
         }
@@ -10548,11 +10548,11 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         auto tsharp = image_desc.GetSharp(stage);
         MatchExperimentalCompositionTexture(tsharp, stage, image_desc, *registry);
         {
-            // DIAG-186 (diagnosis, with RYGT_DIAG_PROGRAM_TEXTURES=<hash>): where that program's
+            // DIAG-186 (diagnosis, with SHADGT_DIAG_PROGRAM_TEXTURES=<hash>): where that program's
             // small textures' descriptors were read (guest address of the T#'s first dword), and
             // whether GPU work writes there (a region), every 120 frames.
             static const u64 watched = [] {
-                const char* env = Common::DiagEnv("RYGT_DIAG_PROGRAM_TEXTURES");
+                const char* env = Common::DiagEnv("SHADGT_DIAG_PROGRAM_TEXTURES");
                 return env && *env ? u64(std::strtoull(env, nullptr, 16)) : u64{0};
             }();
             if (watched != 0 && stage.pgm_hash == watched && frame % 120 == 0 &&
@@ -10634,9 +10634,9 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             });
             binding.unified += num_bindings;
         };
-        // DIAG-213 (diagnosis, SHADGT_WATCH_SHADERS with RYGT_DIAG_IMAGE_SLOTS=1): every 30th
+        // DIAG-213 (diagnosis, SHADGT_WATCH_SHADERS with SHADGT_DIAG_IMAGE_SLOTS=1): every 30th
         // frame, each image slot of a watched shader: its T# and what it was bound to.
-        static const bool slot_log = Common::DiagEnv("RYGT_DIAG_IMAGE_SLOTS") != nullptr &&
+        static const bool slot_log = Common::DiagEnv("SHADGT_DIAG_IMAGE_SLOTS") != nullptr &&
                                      Common::DiagEnv("SHADGT_WATCH_SHADERS") != nullptr;
         const bool log_slot = slot_log && frame % 30 == 0 && IsWatchedShader(stage.pgm_hash);
         // PERF-GT7-006: the slot's text is only made when it is logged (A, the reference, still
@@ -10710,7 +10710,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             if (memo->entry && memo->flags == memo_flags && memo->sharp == raw_sharp &&
                 memo->generation != registry->Generation() + unmap_generation) {
                 static const bool revalidate = [] {
-                    const char* env = std::getenv("RYGT_NATIVE_TEXTURE_REVALIDATE");
+                    const char* env = std::getenv("SHADGT_NATIVE_TEXTURE_REVALIDATE");
                     return !(env && env[0] == '0');
                 }();
                 const u64 registry_now = registry->Generation();
@@ -10906,9 +10906,9 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         ApplyRewrite(*entry); // NAT-120 (NAT-133: textures too)
         SyncDepthTwin(*entry); // FIX-212
         if (!storage && r.FrameDumpCollecting()) {
-            // FIX-152 (diagnosis): RYGT_FRAME_DUMP_ALL_TEXTURES=1 dumps uploaded ones too.
+            // FIX-152 (diagnosis): SHADGT_FRAME_DUMP_ALL_TEXTURES=1 dumps uploaded ones too.
             static const bool dump_all = [] {
-                const char* env = Common::DiagEnv("RYGT_FRAME_DUMP_ALL_TEXTURES");
+                const char* env = Common::DiagEnv("SHADGT_FRAME_DUMP_ALL_TEXTURES");
                 return env && env[0] == '1';
             }();
             if (dump_all || !entry->from_cpu || SceneTrace::Id()) {
@@ -10999,8 +10999,8 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             ssharp = AmdGpu::Sampler{};
         }
         if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-sampler id={} stage={} program={:#x} binding={} comparison={} compare_op={} min_lod={} max_lod={} original_bias={} sanitized_bias={} effective_bias={} effective_max_lod={} mip_filter={} min_filter={} mag_filter={} anisotropy={} clamp={}/{}/{} border={}",SceneTrace::Id(),u32(stage.sw_stage),stage.pgm_hash,binding.unified,sampler.is_depth,u32(ssharp.depth_compare_func.Value()),ssharp.MinLod(),ssharp.MaxLod(),sampler.GetSharp(stage).LodBias(),ssharp.LodBias(),std::min(ssharp.LodBias(),r.instance.MaxSamplerLodBias()),std::max(ssharp.MinLod(),ssharp.MaxLod()),u32(ssharp.mip_filter.Value()),u32(ssharp.xy_min_filter.Value()),u32(ssharp.xy_mag_filter.Value()),ssharp.MaxAniso(),u32(ssharp.clamp_x.Value()),u32(ssharp.clamp_y.Value()),u32(ssharp.clamp_z.Value()),u32(ssharp.border_color_type.Value())));
-        // DIAG-235 (diagnosis, RYGT_DIAG_HS_SAMPLERS=1): hull shader samplers, 40 at most.
-        static const bool diag235 = Common::DiagEnv("RYGT_DIAG_HS_SAMPLERS") != nullptr;
+        // DIAG-235 (diagnosis, SHADGT_DIAG_HS_SAMPLERS=1): hull shader samplers, 40 at most.
+        static const bool diag235 = Common::DiagEnv("SHADGT_DIAG_HS_SAMPLERS") != nullptr;
         static u32 diag235_lines = 0;
         if (diag235 && stage.sw_stage == Shader::SwStage::TessellationControl && diag235_lines < 40) {
             ++diag235_lines;
@@ -11035,10 +11035,10 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
 // rectangle where the car's cascade lit it, a dark band where the ground ended). A 1x1 depth image
 // at the far depth (1.0: nothing in front, as an absent shadow map means) now stands in for such
 // T#s; at 0, the strip of ground the matrix puts inside [0, 1] stayed a thin dark line across the
-// road. RYGT_NATIVE_DEPTH_STAND_IN=0: null descriptors, as before.
+// road. SHADGT_NATIVE_DEPTH_STAND_IN=0: null descriptors, as before.
 bool NativeRenderer::DepthStandInOn() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_NATIVE_DEPTH_STAND_IN");
+        const char* env = std::getenv("SHADGT_NATIVE_DEPTH_STAND_IN");
         return !(env && env[0] == '0');
     }();
     return on;
@@ -11103,10 +11103,10 @@ vk::ImageView NativeRenderer::DepthStandIn(bool array, bool may_create) {
 void NativeRenderer::EnsureAheadArena() {
     if (ahead_arena.tried) return;
     ahead_arena.tried = true;
-    // PERF-GTS-377 (RYGT_AHEAD_UPLOAD_MB, 0 = off): a race draw's constants (about 550 bytes,
+    // PERF-GTS-377 (SHADGT_AHEAD_UPLOAD_MB, 0 = off): a race draw's constants (about 550 bytes,
     // 25 to 34 MB a second) were hashed, copied to upload memory and copied again as a
     // reference by the recorder at commit: about 1.0 us of the 8.2 us a draw costs it.
-    const char* env = std::getenv("RYGT_AHEAD_UPLOAD_MB");
+    const char* env = std::getenv("SHADGT_AHEAD_UPLOAD_MB");
     // PERF-GTS-407: 128 MB unless set (0 = off).
     const u64 megabytes = env && *env ? std::strtoull(env, nullptr, 10) : 128;
     if (megabytes == 0) return;
@@ -11211,7 +11211,7 @@ bool NativeRenderer::AheadCommit(u64 position, u32 size, vk::DescriptorBufferInf
 
 static bool LongLivedSetsOn() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_LONG_LIVED_SETS");
+        const char* env = std::getenv("SHADGT_LONG_LIVED_SETS");
         // PERF-GTS-407: on unless set to something else
         const bool enabled = (!env || !*env || env[0] == '1') && !UiHires::Enabled();
         if (enabled) Native::DeadHandles::enabled.store(true, std::memory_order_release);
@@ -11220,13 +11220,13 @@ static bool LongLivedSetsOn() {
     return on;
 }
 
-// PERF-GTS-398 (with RYGT_PARALLEL_RECORDING=1; RYGT_PARALLEL_LATE_BINDINGS=0: as before): a
+// PERF-GTS-398 (with SHADGT_PARALLEL_RECORDING=1; SHADGT_PARALLEL_LATE_BINDINGS=0: as before): a
 // draw recorded by a pass worker has its descriptor sets looked up by that worker. The
 // recorder did it for every such draw (PushBindings, 9.6% of its CPU time in a race at Tokyo
 // with 87% of the draws recorded by workers), and handed over the sets.
 static bool LateBindingsOn() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_PARALLEL_LATE_BINDINGS");
+        const char* env = std::getenv("SHADGT_PARALLEL_LATE_BINDINGS");
         return !(env && env[0] == '0') && ParallelRecordingRequested();
     }();
     return on;
@@ -11414,7 +11414,7 @@ vk::DescriptorSet NativeRenderer::MakeLongSet(vk::DescriptorSetLayout layout) {
 
 bool NativeRenderer::AheadRetained(const PreparedDraw& p, size_t info_index,
                                    const vk::DescriptorBufferInfo& info) {
-    // FIX-GTS-393: with RYGT_AHEAD_UPLOAD_MB a prepared draw's constants are bound from the
+    // FIX-GTS-393: with SHADGT_AHEAD_UPLOAD_MB a prepared draw's constants are bound from the
     // ahead arena (PERF-GTS-377), not from one of the list's upload chunks. Parallel recording
     // only took a buffer info for upload memory when its buffer was one of those chunks, so
     // with the arena on it refused every draw (742,275 of 840,428 in 10 s at Tokyo, all at
@@ -11504,7 +11504,7 @@ void NativeRenderer::FlushLongSets() {
 
 void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoint bind_point,
                                   DrawBindings& b) {
-    // PERF-GTS-375 (RYGT_LONG_LIVED_SETS=1, with RYGT_DYNAMIC_BUFFER_OFFSETS=1): sets with
+    // PERF-GTS-375 (SHADGT_LONG_LIVED_SETS=1, with SHADGT_DYNAMIC_BUFFER_OFFSETS=1): sets with
     // dynamic offsets are kept across lists. A list has about 40 draws, so its own cache reused
     // 18% of them; 93% match a set of the last 10 s (DIAG-GTS-373).
     static const bool long_sets_on = LongLivedSetsOn();
@@ -11523,7 +11523,7 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     Stream& s = stream;
     const CmdBuf cmdbuf{s.cmd};
     static const bool reuse_enabled = [] {
-        const char* env = std::getenv("RYGT_NATIVE_REUSE");
+        const char* env = std::getenv("SHADGT_NATIVE_REUSE");
         return !(env && env[0] == '0');
     }();
     const bool reuse = reuse_enabled && !parallel_binding_capture;
@@ -11669,10 +11669,10 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
                 key_check = wide.high64;
             }
         }
-        // DIAG-GTS-373 (RYGT_DIAG_DESCRIPTOR_REUSE=1): what dynamic buffer offsets would buy.
+        // DIAG-GTS-373 (SHADGT_DIAG_DESCRIPTOR_REUSE=1): what dynamic buffer offsets would buy.
         // Counts only; nothing recorded changes.
         static const bool reuse_diag = [] {
-            const char* env = std::getenv("RYGT_DIAG_DESCRIPTOR_REUSE");
+            const char* env = std::getenv("SHADGT_DIAG_DESCRIPTOR_REUSE");
             return env && env[0] == '1';
         }();
         if (reuse_diag && cacheable && bind_point == vk::PipelineBindPoint::eGraphics) {
@@ -11804,7 +11804,7 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             pending->Stage(writes,set);
             // FIX-GTS-394: the staged rows too are written as dynamic buffers at offset 0 (as
             // the rows below are). They were staged as plain storage buffers at their offsets,
-            // into a set whose layout has dynamic ones (RYGT_DYNAMIC_BUFFER_OFFSETS=1).
+            // into a set whose layout has dynamic ones (SHADGT_DYNAMIC_BUFFER_OFFSETS=1).
             if(dynamic_buffers!=0)for(size_t u=pending->nw-writes.size();u<pending->nw;++u) {
                 auto& row=pending->writes[u];
                 if(!row.pBufferInfo || row.descriptorType!=vk::DescriptorType::eStorageBuffer)continue;
@@ -11906,13 +11906,13 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         }
         bind_count = 0;
     };
-    // PERF-GTS-371 (RYGT_ASYNC_DESCRIPTOR_UPDATES=1): a race draw allocates and writes about two
+    // PERF-GTS-371 (SHADGT_ASYNC_DESCRIPTOR_UPDATES=1): a race draw allocates and writes about two
     // new descriptor sets (1,040,164 sets for 514,080 draws in 10 s, 3% reused), each write a
     // driver call on the recorder. The sets are new, so nothing binds them before the binds
     // recorded below: the writes go into the command ring ahead of those binds and are made by
     // the command thread (5 to 7% busy) when it replays them.
     static const bool async_updates = [] {
-        const char* env = std::getenv("RYGT_ASYNC_DESCRIPTOR_UPDATES");
+        const char* env = std::getenv("SHADGT_ASYNC_DESCRIPTOR_UPDATES");
         return env && env[0] == '1';
     }();
     Native::CommitDescriptorBatch(updates,sets,pipeline.PushSet(),by_set,
@@ -11978,9 +11978,9 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
 }
 
 bool NativeRenderer::MirrorKind(char kind) {
-    // FIX-177 (diagnosis, RYGT_NATIVE_MIRRORS=v or i): only vertex or only index ranges mirrored.
+    // FIX-177 (diagnosis, SHADGT_NATIVE_MIRRORS=v or i): only vertex or only index ranges mirrored.
     static const char only = [] {
-        const char* env = std::getenv("RYGT_NATIVE_MIRRORS");
+        const char* env = std::getenv("SHADGT_NATIVE_MIRRORS");
         return env && (env[0] == 'v' || env[0] == 'i') ? env[0] : '\0';
     }();
     return only == '\0' || only == kind;
@@ -11999,7 +11999,7 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
     u64 near_generation = 0;
     const bool sampled = InPlaceSampled();
     static const bool probing = [] {
-        const char* env = Common::DiagEnv("RYGT_PROBE_AT");
+        const char* env = Common::DiagEnv("SHADGT_PROBE_AT");
         return env && *env; // DIAG-170
     }();
     probe_vertices.clear();
@@ -12016,9 +12016,9 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
                 (u64(index) << 32) | guest.GetStride());
         }
 #endif
-        // FIX-178 (diagnosis, RYGT_NATIVE_VERTEX_NEAR=0): every attribute looked up.
+        // FIX-178 (diagnosis, SHADGT_NATIVE_VERTEX_NEAR=0): every attribute looked up.
         static const bool near_on = [] {
-            const char* env = std::getenv("RYGT_NATIVE_VERTEX_NEAR");
+            const char* env = std::getenv("SHADGT_NATIVE_VERTEX_NEAR");
             return !(env && env[0] == '0');
         }();
         const bool near_allowed = near && near_generation == buffer_generation && [&] {
@@ -12058,10 +12058,10 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
         }
 #endif
         {
-            // DIAG-211 (diagnosis, RYGT_DIAG_REGION_COMPARE with SHADGT_WATCH_SHADERS): a watched
+            // DIAG-211 (diagnosis, SHADGT_DIAG_REGION_COMPARE with SHADGT_WATCH_SHADERS): a watched
             // shader's vertex buffers, how they are bound, every 10th frame.
             static const bool on = [] {
-                const char* env = Common::DiagEnv("RYGT_DIAG_REGION_COMPARE");
+                const char* env = Common::DiagEnv("SHADGT_DIAG_REGION_COMPARE");
                 return env != nullptr && env[0] != '4' &&
                        Common::DiagEnv("SHADGT_WATCH_SHADERS") != nullptr;
             }();
@@ -12117,12 +12117,12 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
 void NativeRenderer::CheckVertexReach(const GraphicsPipeline& pipeline, const AmdGpu::Regs& regs,
                                       bool is_indexed, u32 index_offset) {
 #if !defined(NDEBUG)
-    // FIX-181 (diagnosis, RYGT_NATIVE_VERTEX_REACH_CHECK=<n>): every n-th draw, the highest
+    // FIX-181 (diagnosis, SHADGT_NATIVE_VERTEX_REACH_CHECK=<n>): every n-th draw, the highest
     // vertex it can read (its indices read from guest memory, or its vertex count) against each
     // vertex V#'s end and the mirror bound there: draws reading past a mirror's end got zeros
     // (the tunnel explosions went away with mirrors 256 KB longer).
     static const u32 every = [] {
-        const char* env = std::getenv("RYGT_NATIVE_VERTEX_REACH_CHECK");
+        const char* env = std::getenv("SHADGT_NATIVE_VERTEX_REACH_CHECK");
         return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 0u;
     }();
     if (every == 0 || ++reach_check_counter % every != 0) {
@@ -12210,11 +12210,11 @@ void NativeRenderer::CheckVertexReach(const GraphicsPipeline& pipeline, const Am
 
 void NativeRenderer::CheckMirrorBind(Mirror& mirror, VAddr base, u64 size) {
 #if !defined(NDEBUG)
-    // FIX-179 (diagnosis, RYGT_NATIVE_MIRROR_CHECK=<n>): every n-th vertex range bound from a
+    // FIX-179 (diagnosis, SHADGT_NATIVE_MIRROR_CHECK=<n>): every n-th vertex range bound from a
     // mirror, the mirror's bytes and guest memory's bytes there are copied out side by side right
     // before the draw (the GPU's view of both at that point) and compared once the GPU is done.
     static const u32 every = [] {
-        const char* env = std::getenv("RYGT_NATIVE_MIRROR_CHECK");
+        const char* env = std::getenv("SHADGT_NATIVE_MIRROR_CHECK");
         return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 0u;
     }();
     if (every == 0) {
@@ -12414,12 +12414,12 @@ void NativeRenderer::RecordVertexIndex(const VertexIndexState& v) {
 // GT7's probe filter 0x490b6362 runs ~8 such dispatches at a time, each of a few groups: without
 // the barriers it takes 3.8 times less GPU time. A listed program must store into its images
 // without loading from them, and must not store the same texels twice in a run: their order is no
-// longer defined. RYGT_NATIVE_OVERLAP_PROGRAMS=<hex>[,...] sets the list (empty: none).
+// longer defined. SHADGT_NATIVE_OVERLAP_PROGRAMS=<hex>[,...] sets the list (empty: none).
 bool NativeRenderer::RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64 program,
                                      bool recorded, std::optional<u64> texel) const {
     static const std::vector<u64> listed = [] {
         std::vector<u64> list;
-        const char* env = std::getenv("RYGT_NATIVE_OVERLAP_PROGRAMS");
+        const char* env = std::getenv("SHADGT_NATIVE_OVERLAP_PROGRAMS");
         for (const char* at = env ? env : "490b6362"; *at;) {
             char* end = nullptr;
             const u64 value = std::strtoull(at, &end, 16);
@@ -12499,7 +12499,7 @@ bool NativeRenderer::RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64
     return false;
 }
 
-// PERF-GT7-057 (RYGT_NATIVE_SAME_TEXEL=0 turns it off): programs that read a picture they store
+// PERF-GT7-057 (SHADGT_NATIVE_SAME_TEXEL=0 turns it off): programs that read a picture they store
 // only at the texel they store, at the mip and layer words of their user data name. GT7's probe
 // filter 0xa8d4b6cd took 30-40% of the GPU's time in races: one run per probe cube, a dispatch per
 // mip [65] and face [66] (layer face + 6 * probe [67]), 42 or 48 of them, each reading cs_img3
@@ -12538,7 +12538,7 @@ bool IsSameTexelProgram(u64 program) {
 static std::optional<u64> SameTexelKey(const Shader::Info& cs,
                                        std::span<const Native::ImageEntry* const> entries) {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_NATIVE_SAME_TEXEL");
+        const char* env = std::getenv("SHADGT_NATIVE_SAME_TEXEL");
         return !(env && env[0] == '0');
     }();
     if (!on) {
@@ -12618,7 +12618,7 @@ void NativeRenderer::WrittenRange(const Native::ImageEntry* entry, const DrawnRa
 
 bool NativeRenderer::SubVersionsOn() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_NATIVE_SUB_VERSIONS"); // FIX-208 off: =0
+        const char* env = std::getenv("SHADGT_NATIVE_SUB_VERSIONS"); // FIX-208 off: =0
         return !(env && env[0] == '0');
     }();
     return on;
@@ -12659,11 +12659,11 @@ void NativeRenderer::WrittenSubresources(const Native::ImageEntry* entry, u64 at
     }
 #if !defined(NDEBUG)
     if (watched) {
-        // FIX-159 (diagnosis, RYGT_FRAME_DUMP_ON_STORE=<seconds>): from that long after start,
+        // FIX-159 (diagnosis, SHADGT_FRAME_DUMP_ON_STORE=<seconds>): from that long after start,
         // the first write of a watched picture starts a frame dump there (the frames a
         // time-triggered dump never lands on).
         static const double on_store = [] {
-            const char* env = Common::DiagEnv("RYGT_FRAME_DUMP_ON_STORE");
+            const char* env = Common::DiagEnv("SHADGT_FRAME_DUMP_ON_STORE");
             return env && *env ? std::atof(env) : -1.0;
         }();
         static const auto started = std::chrono::steady_clock::now();
@@ -12731,11 +12731,11 @@ void NativeRenderer::WrittenSubresources(const Native::ImageEntry* entry, u64 at
 }
 
 bool NativeRenderer::WholeSourcesOn() {
-    // Off unless RYGT_NATIVE_WHOLE_SOURCES=1: it did not change the black-cockpit rate it was
+    // Off unless SHADGT_NATIVE_WHOLE_SOURCES=1: it did not change the black-cockpit rate it was
     // written for (64% of frames with and without), and a whole's version counted as its parts'
     // could pick its older mip 0 over a fresher plain target of the same memory.
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_NATIVE_WHOLE_SOURCES");
+        const char* env = std::getenv("SHADGT_NATIVE_WHOLE_SOURCES");
         return env && env[0] == '1';
     }();
     return on;
@@ -12774,7 +12774,7 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
     // texture of another layout over the same memory, made of the cube target only: just the
     // target's mip 0 was copied in, the texture's other mips stayed empty, and the cockpit and
     // the crowd lit by them were black in most frames. Such a whole is brought up to date first,
-    // and all its mips are copied. RYGT_NATIVE_WHOLE_SOURCES=0 turns it off.
+    // and all its mips are copied. SHADGT_NATIVE_WHOLE_SOURCES=0 turns it off.
     static thread_local u32 refresh_depth = 0;
     if (WholeSourcesOn() && refresh_depth == 0) {
         boost::container::small_vector<Native::ImageEntry*, 8> links;
@@ -13039,7 +13039,7 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
             held[(u32(place.mip) << 16) | u32(place.layer)] = pick.version;
         }
         // DIAG-181 (diagnosis): copies into tiny textures.
-        static const bool small_links = Common::DiagEnv("RYGT_DIAG_SMALL_LINKS") != nullptr;
+        static const bool small_links = Common::DiagEnv("SHADGT_DIAG_SMALL_LINKS") != nullptr;
         static u32 small_logged = 0;
         if (small_links && texture.info.size.width <= 8 && texture.info.size.height <= 8 &&
             small_logged++ < 300) {
@@ -13078,7 +13078,7 @@ void NativeRenderer::SyncDepthTwin(Native::ImageEntry& entry) {
     // whole scene in shadow: the flickering dark band at Alsace. Vulkan copies no colour image
     // into a depth one, so the picture goes through a buffer.
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_NATIVE_DEPTH_TWINS");
+        const char* env = std::getenv("SHADGT_NATIVE_DEPTH_TWINS");
         return !(env && env[0] == '0');
     }();
     const auto& info = entry.info;
@@ -13165,7 +13165,7 @@ void NativeRenderer::SyncDepthTwin(Native::ImageEntry& entry) {
 
 bool NativeRenderer::PartSyncOn() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_NATIVE_PART_SYNC"); // FIX-210 off: =0
+        const char* env = std::getenv("SHADGT_NATIVE_PART_SYNC"); // FIX-210 off: =0
         return !(env && env[0] == '0');
     }();
     return on;
@@ -13322,17 +13322,17 @@ void NativeRenderer::SyncPartFromWholes(Native::ImageEntry& part, const DrawnRan
 
 VAddr NativeRenderer::DiagWritesAt() {
     static const VAddr at = [] {
-        const char* env = Common::DiagEnv("RYGT_DIAG_WRITES_AT");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_WRITES_AT");
         return env && *env ? VAddr(std::strtoull(env, nullptr, 16)) : VAddr{0};
     }();
     return at;
 }
 
 bool NativeRenderer::DiagFrame() const {
-    // DIAG-178 (RYGT_DIAG_WRITES_AT=<hex address>, RYGT_DIAG_WRITES_FRAME=<frame>, 2500 if not
+    // DIAG-178 (SHADGT_DIAG_WRITES_AT=<hex address>, SHADGT_DIAG_WRITES_FRAME=<frame>, 2500 if not
     // given): one frame's work touching the address, in order, up to 300 lines.
     static const u64 at_frame = [] {
-        const char* env = Common::DiagEnv("RYGT_DIAG_WRITES_FRAME");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_WRITES_FRAME");
         return env && *env ? u64(std::strtoull(env, nullptr, 0)) : u64{2500};
     }();
     return DiagWritesAt() != 0 && frame >= at_frame && diag_lines < 300;
@@ -13343,9 +13343,9 @@ void NativeRenderer::DiagWrites(const Targets* targets, const DrawBindings& b) {
         return;
     }
     const VAddr at = DiagWritesAt();
-    // RYGT_DIAG_PROGRAM=<hex hash>: that program's work too, wherever it draws.
+    // SHADGT_DIAG_PROGRAM=<hex hash>: that program's work too, wherever it draws.
     static const std::string program = [] {
-        const char* env = Common::DiagEnv("RYGT_DIAG_PROGRAM");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_PROGRAM");
         return env && *env ? std::string{env} : std::string{};
     }();
     const bool by_program = !program.empty() && diag_what.find(program) != std::string::npos;
@@ -13472,7 +13472,7 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
         return entry.info.guest_address >= 0xf000000000ULL ? 16_MB : 256_KB;
     };
     static const bool extra_cpu_writebacks = [] {
-        const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_CPU");
+        const char* env = std::getenv("SHADGT_NATIVE_WRITEBACK_CPU");
         return !(env && env[0] == '0');
     }();
     for (const auto* entry : b.sampled) {
@@ -13600,10 +13600,10 @@ void NativeRenderer::YieldToMappingChanges() {
     // stretches of recording: 250 to 390 ms at the Autopolis start (no CPU time used), and
     // the game's GPU work waited for that thread. With a mapping change waiting, the recorder
     // lets it in before its next lock; at most 4 ms, so a lock this thread already holds
-    // further up cannot deadlock it. Off unless RYGT_UNMAP_HANDOFF=1: A/B runs at Autopolis came
+    // further up cannot deadlock it. Off unless SHADGT_UNMAP_HANDOFF=1: A/B runs at Autopolis came
     // out even (the long waits are one draw building a region, not lock starvation).
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_UNMAP_HANDOFF");
+        const char* env = std::getenv("SHADGT_UNMAP_HANDOFF");
         return env && env[0] == '1';
     }();
     if (!enabled || mapping_waiters.load(std::memory_order_acquire) == 0) return;
@@ -13636,29 +13636,29 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 sidecar->prepared_proof_context=prepared_proof_contexts.FindBlocking(this);
             }
 #if !defined(NDEBUG)
-            if(const char* path=std::getenv("RYGT_PARALLEL_MODE_FILE");path && *path) {
-                const char* initial=std::getenv("RYGT_PARALLEL_INITIAL_MODE");
+            if(const char* path=std::getenv("SHADGT_PARALLEL_MODE_FILE");path && *path) {
+                const char* initial=std::getenv("SHADGT_PARALLEL_INITIAL_MODE");
                 const bool enabled=Native::Parallel::InitialMode(path,initial);
                 sidecar->applied_mode=Native::Parallel::AppliedMode(enabled);
                 sidecar->mode_controller=std::make_unique<Native::Parallel::ModeController>(std::filesystem::path(path),enabled);
             }
-            if(const char* path=std::getenv("RYGT_PARALLEL_VIEW_MODE_FILE");path && *path)
+            if(const char* path=std::getenv("SHADGT_PARALLEL_VIEW_MODE_FILE");path && *path)
                 sidecar->view_mode_controller=std::make_unique<Native::Parallel::ModeController>(std::filesystem::path(path),sidecar->view_applied_mode.Enabled());
 #endif
-            // Worker count configurable via RYGT_PARALLEL_WORKERS (default 2, range 1-8)
+            // Worker count configurable via SHADGT_PARALLEL_WORKERS (default 2, range 1-8)
             int worker_count = 2;
-            if (const char* env = std::getenv("RYGT_PARALLEL_WORKERS")) {
+            if (const char* env = std::getenv("SHADGT_PARALLEL_WORKERS")) {
                 worker_count = std::clamp(std::atoi(env), 1, 8);
             }
-            // CPU affinity masks configurable via RYGT_PARALLEL_AFFINITY (comma-separated hex masks, e.g., "0x400,0x1000" for CPUs 10,12)
+            // CPU affinity masks configurable via SHADGT_PARALLEL_AFFINITY (comma-separated hex masks, e.g., "0x400,0x1000" for CPUs 10,12)
             using AffinityMask = Native::Parallel::AffinityMask;
             std::vector<AffinityMask> worker_affinity_masks;
             bool affinity_parse_failed = false;
-            if (const char* env = std::getenv("RYGT_PARALLEL_AFFINITY")) {
+            if (const char* env = std::getenv("SHADGT_PARALLEL_AFFINITY")) {
                 std::string affinity_str(env);
                 // Check for trailing comma (trailing empty entry)
                 if (!affinity_str.empty() && affinity_str.back() == ',') {
-                    LOG_ERROR(Render_Vulkan, "RYGT_PARALLEL_AFFINITY: trailing comma (empty entry); ignoring all affinity settings");
+                    LOG_ERROR(Render_Vulkan, "SHADGT_PARALLEL_AFFINITY: trailing comma (empty entry); ignoring all affinity settings");
                     affinity_parse_failed = true;
                 }
                 size_t start = 0;
@@ -13670,14 +13670,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                     size_t mask_start = mask_str.find_first_not_of(" \t");
                     size_t mask_end = mask_str.find_last_not_of(" \t");
                     if (mask_start == std::string::npos || mask_end == std::string::npos) {
-                        LOG_ERROR(Render_Vulkan, "RYGT_PARALLEL_AFFINITY: empty mask entry at position {}", worker_affinity_masks.size());
+                        LOG_ERROR(Render_Vulkan, "SHADGT_PARALLEL_AFFINITY: empty mask entry at position {}", worker_affinity_masks.size());
                         affinity_parse_failed = true;
                         break;
                     }
                     mask_str = mask_str.substr(mask_start, mask_end - mask_start + 1);
                     // Reject negative masks (e.g., "-1")
                     if (!mask_str.empty() && mask_str[0] == '-') {
-                        LOG_ERROR(Render_Vulkan, "RYGT_PARALLEL_AFFINITY: negative mask '{}' not allowed", mask_str);
+                        LOG_ERROR(Render_Vulkan, "SHADGT_PARALLEL_AFFINITY: negative mask '{}' not allowed", mask_str);
                         affinity_parse_failed = true;
                         break;
                     }
@@ -13685,11 +13685,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                     errno = 0;
                     unsigned long long mask_val = std::strtoull(mask_str.c_str(), &endptr, 0);
                     if (endptr != mask_str.c_str() + mask_str.size()) {
-                        LOG_ERROR(Render_Vulkan, "RYGT_PARALLEL_AFFINITY: invalid mask '{}' (trailing characters)", mask_str);
+                        LOG_ERROR(Render_Vulkan, "SHADGT_PARALLEL_AFFINITY: invalid mask '{}' (trailing characters)", mask_str);
                         affinity_parse_failed = true;
                         break;
                     } else if (errno == ERANGE || mask_val == 0) {
-                        LOG_ERROR(Render_Vulkan, "RYGT_PARALLEL_AFFINITY: invalid mask '{}' (out of range or zero)", mask_str);
+                        LOG_ERROR(Render_Vulkan, "SHADGT_PARALLEL_AFFINITY: invalid mask '{}' (out of range or zero)", mask_str);
                         affinity_parse_failed = true;
                         break;
                     } else {
@@ -13699,10 +13699,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 }
             }
             if (affinity_parse_failed) {
-                LOG_ERROR(Render_Vulkan, "RYGT_PARALLEL_AFFINITY: parsing failed; ignoring all affinity settings");
+                LOG_ERROR(Render_Vulkan, "SHADGT_PARALLEL_AFFINITY: parsing failed; ignoring all affinity settings");
                 worker_affinity_masks.clear();
             } else if (!worker_affinity_masks.empty() && worker_affinity_masks.size() != static_cast<size_t>(worker_count)) {
-                LOG_WARNING(Render_Vulkan, "RYGT_PARALLEL_AFFINITY mask count ({}) does not match worker count ({}); ignoring affinity",
+                LOG_WARNING(Render_Vulkan, "SHADGT_PARALLEL_AFFINITY mask count ({}) does not match worker count ({}); ignoring affinity",
                     worker_affinity_masks.size(), worker_count);
                 worker_affinity_masks.clear();
             }
@@ -13714,7 +13714,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             sidecar->coordinator=std::make_unique<Native::Parallel::PassCoordinator>(*device,r.instance,*timeline,worker_count,32,256*1024*1024,256,worker_affinity_masks);
             if(ParallelRingOn())sidecar->coordinator->acquire_replacement=[this]{return AcquireReplacementList();}; // PERF-GTS-399
 #if !defined(NDEBUG)
-            if(const char* path=std::getenv("RYGT_PARALLEL_TRANSFER_MODE_FILE");path && *path)
+            if(const char* path=std::getenv("SHADGT_PARALLEL_TRANSFER_MODE_FILE");path && *path)
                 sidecar->transfer_mode_controller=std::make_unique<Native::Parallel::ModeController>(std::filesystem::path(path),sidecar->transfer_applied_mode.Enabled());
 #endif
             std::lock_guard sidecar_lock(parallel_sidecars_mutex);
@@ -13977,7 +13977,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         // photo's first frames that was the scratch pool's other pictures (RGBA8 menu pictures read
         // as RGBA16F: huge values, NaN) and the photo's average kept them to the end.
         static const bool empty_target = [] {
-            const char* env = std::getenv("RYGT_NATIVE_ONE_OFF_LAYOUT");
+            const char* env = std::getenv("SHADGT_NATIVE_ONE_OFF_LAYOUT");
             return !(env && env[0] == '0');
         }();
         if (empty_target && regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Disable) {
@@ -14025,10 +14025,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         .tessellate_quads = quad_list && !quad_triangles, .is_indirect = false});
 #endif
 #if !defined(NDEBUG)
-    // DIAG-152 (RYGT_NATIVE_SKIP_PS=<hex,...>): draws with these pixel shaders are skipped.
+    // DIAG-152 (SHADGT_NATIVE_SKIP_PS=<hex,...>): draws with these pixel shaders are skipped.
     static const std::vector<u64> skip_ps = [] {
         std::vector<u64> hashes;
-        if (const char* env = std::getenv("RYGT_NATIVE_SKIP_PS"); env && *env) {
+        if (const char* env = std::getenv("SHADGT_NATIVE_SKIP_PS"); env && *env) {
             const std::string list{env};
             for (size_t start = 0; start < list.size();) {
                 const size_t end = std::min(list.find(',', start), list.size());
@@ -14118,7 +14118,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
 
     // Experimental post-process resolution: only the known full-screen composition draw.
     static const bool low_composition = [] {
-        const char* env = std::getenv("RYGT_LOW_RES_COMPOSITION");
+        const char* env = std::getenv("SHADGT_LOW_RES_COMPOSITION");
         return env && env[0] == '1';
     }();
     const auto* composition_fs = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
@@ -14562,14 +14562,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         // one, or draws into what was read since; a pass that draws into pictures earlier
         // passes drew waits for their attachment writes only; other passes don't wait.
         static const bool pass_barriers = [] {
-            const char* env = std::getenv("RYGT_NATIVE_PASS_BARRIERS");
+            const char* env = std::getenv("SHADGT_NATIVE_PASS_BARRIERS");
             return !(env && env[0] == '0');
         }();
         const bool pass_change =
             !s.rendering || !(s.render == (hud_black_state ? *hud_black_state : targets.state));
-        // FIX-183 (diagnosis, RYGT_NATIVE_DRAW_BARRIER=1): a full barrier before every draw.
+        // FIX-183 (diagnosis, SHADGT_NATIVE_DRAW_BARRIER=1): a full barrier before every draw.
         static const bool draw_barrier = [] {
-            const char* env = std::getenv("RYGT_NATIVE_DRAW_BARRIER");
+            const char* env = std::getenv("SHADGT_NATIVE_DRAW_BARRIER");
             return env && env[0] == '1';
         }();
         if (draw_barrier) {
@@ -14602,11 +14602,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                                                                         : 0;
         }
 #endif
-        // DIAG-GTS-454 (diagnosis, unsafe, RYGT_DIAG_NO_DRAW_BARRIERS=1): no full barrier for a
+        // DIAG-GTS-454 (diagnosis, unsafe, SHADGT_DIAG_NO_DRAW_BARRIERS=1): no full barrier for a
         // draw that only reads what was written since the last one, to measure what those cost
         // the GPU (GT Sport's garage: ~45,000 in 10 s). Can draw wrong.
         static const bool no_draw_barriers = [] {
-            const char* env = std::getenv("RYGT_DIAG_NO_DRAW_BARRIERS");
+            const char* env = std::getenv("SHADGT_DIAG_NO_DRAW_BARRIERS");
             return env && env[0] == '1';
         }();
         const bool reads_written = !no_draw_barriers && NeedsBarrierFor(b);
@@ -14674,7 +14674,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         PendingDescriptorUpdates* pending;vk::Device device;bool committed{};
         ~PendingDrawGuard() noexcept {if(pending && !committed)pending->Flush(device,PendingDescriptorUpdates::Abandoned);}
     } pending_draw_guard{parallel?&parallel->descriptor_updates:nullptr,r.instance.GetDevice()};
-    static const bool natural_boundary_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_NATURAL_BOUNDARY");return p && p[0]=='1' && !p[1];}();
+    static const bool natural_boundary_enabled=[] {const char* p=std::getenv("SHADGT_PARALLEL_NATURAL_BOUNDARY");return p && p[0]=='1' && !p[1];}();
     bool preclosed_serial_scope=false;
     bool serial_split_started=false;
     bool serial_split_prebound=false;
@@ -14721,7 +14721,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     // NAT-161 indirect draws and GT7-UW HUD draws stay on the serial recorder.
     if(parallel && !parallel->closing && parallel->applied_mode.Enabled() && !indirect && !hud_black_state) {
 #if !defined(NDEBUG)
-        static const bool whole_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_WHOLE_PREFLIGHT");return p && p[0]=='1' && p[1]=='\0';}();
+        static const bool whole_enabled=[] {const char* p=std::getenv("SHADGT_PARALLEL_WHOLE_PREFLIGHT");return p && p[0]=='1' && p[1]=='\0';}();
         const bool whole_sample=whole_enabled && ((++parallel->whole_seq & 127u)==0);
         u64 whole_cpu_begin=0,whole_cpu_end=0;
         const bool whole_cpu_started=whole_sample && DescriptorThreadCpu100ns(whole_cpu_begin);
@@ -14745,7 +14745,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         const bool inline_safe=bool(parallel->active) && pipeline->LdsEmulation()==0 && fast_race && !fast_trace && !prohibited_clear && !has_feedback &&
             !scale_composition && !native_fsr_composition;
 #if !defined(NDEBUG)
-        static const bool serial_audit=[] {const char* p=std::getenv("RYGT_PARALLEL_SERIAL_AUDIT");return p && p[0]=='1' && p[1]=='\0';}();
+        static const bool serial_audit=[] {const char* p=std::getenv("SHADGT_PARALLEL_SERIAL_AUDIT");return p && p[0]=='1' && p[1]=='\0';}();
 #else
         constexpr bool serial_audit=false;
 #endif
@@ -15018,13 +15018,13 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 // Inspect ordinary writes in place; only the push group is copied.
                 const auto image_infos=std::span<const vk::DescriptorImageInfo>{b.images.data(),b.images.size()};
                 const auto buffer_infos=std::span<const vk::DescriptorBufferInfo>{b.buffers.data(),b.buffers.size()};
-                static const bool reuse_stage_proof=[] {const char* p=std::getenv("RYGT_PARALLEL_DRAW_PROOF_REUSE");return p && p[0]=='1' && !p[1];}();
+                static const bool reuse_stage_proof=[] {const char* p=std::getenv("SHADGT_PARALLEL_DRAW_PROOF_REUSE");return p && p[0]=='1' && !p[1];}();
                 std::optional<Native::Parallel::PerDrawStageProof<Shader::Info,Shader::MaxStageTypes-1>> stage_proof;
                 if(reuse_stage_proof)stage_proof.emplace();
-                static const bool view_proof_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_VIEW_PROOF_INDEX");return p && p[0]=='1' && !p[1];}();
-                static const bool wanted_view_filter=[] {const char* p=std::getenv("RYGT_PARALLEL_WANTED_VIEW_FILTER");return p && p[0]=='1' && !p[1];}();
+                static const bool view_proof_enabled=[] {const char* p=std::getenv("SHADGT_PARALLEL_VIEW_PROOF_INDEX");return p && p[0]=='1' && !p[1];}();
+                static const bool wanted_view_filter=[] {const char* p=std::getenv("SHADGT_PARALLEL_WANTED_VIEW_FILTER");return p && p[0]=='1' && !p[1];}();
 #if !defined(NDEBUG)
-                static const bool view_sample_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_VIEW_PROOF_SAMPLE");return p && p[0]=='1' && !p[1];}();
+                static const bool view_sample_enabled=[] {const char* p=std::getenv("SHADGT_PARALLEL_VIEW_PROOF_SAMPLE");return p && p[0]=='1' && !p[1];}();
 #else
                 constexpr bool view_sample_enabled=false;
 #endif
@@ -15163,7 +15163,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                                 if(TimedProofInvoke(parallel->proof_phases[8],phase_sample,fast_clip))continue;
                             }
                             const auto absent_slot=[&](const Shader::Info& stage,std::size_t local,std::span<const std::byte> bytes) -> bool {
-                                static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_ABSENT_GUEST");return p && p[0]=='1' && !p[1];}();
+                                static const bool enabled=[] {const char* p=std::getenv("SHADGT_PARALLEL_ABSENT_GUEST");return p && p[0]=='1' && !p[1];}();
                                 if(!enabled || write.descriptorType!=vk::DescriptorType::eStorageBuffer || local>=stage.buffers.size() ||
                                    stage.buffers.size()>(SIZE_MAX-16)/16 || bytes.size()!=16+stage.buffers.size()*16)return false;
                                 u32 words[4]{};std::memcpy(words,bytes.data()+16+local*16,sizeof(words));
@@ -15386,7 +15386,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                             SampledProofTimer phase{parallel->proof_phases[1],phase_sample};
                             if(!info.sampler || info.imageView) {descriptor_fail_reason=5;descriptor_safe=false;break;}
                             bool known=false;
-                            static const bool sampler_cache_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_SAMPLER_PROOF_CACHE");return p && p[0]=='1' && !p[1];}();
+                            static const bool sampler_cache_enabled=[] {const char* p=std::getenv("SHADGT_PARALLEL_SAMPLER_PROOF_CACHE");return p && p[0]=='1' && !p[1];}();
                             if(sampler_cache_enabled) {
                                 const auto handle_key=reinterpret_cast<u64>(static_cast<VkSampler>(info.sampler));
                                 const bool diag=ParallelGateDiagEnabled();
@@ -15410,7 +15410,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                                     if(info.imageLayout!=vk::ImageLayout::eGeneral)NATIVE_DIAGNOSTIC(++parallel->sampled_nongeneral);
                                     if(!info.imageView && !info.sampler && info.imageLayout==vk::ImageLayout::eGeneral)NATIVE_DIAGNOSTIC(++parallel->sampled_canonical_null);
                                 }
-                                static const bool absent_sampled_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_ABSENT_SAMPLED_IMAGE");return p && p[0]=='1' && !p[1];}();
+                                static const bool absent_sampled_enabled=[] {const char* p=std::getenv("SHADGT_PARALLEL_ABSENT_SAMPLED_IMAGE");return p && p[0]=='1' && !p[1];}();
                                 bool absent_sampled=false;
                                 const bool canonical_attempt=absent_sampled_enabled && !info.imageView && !info.sampler && info.imageLayout==vk::ImageLayout::eGeneral;
                                 if(canonical_attempt && ParallelGateDiagEnabled())NATIVE_DIAGNOSTIC(++parallel->absent_sampled_attempts);
@@ -15747,9 +15747,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     if (!s.lds_readers.empty() && (!lds_batch_candidate || s.lds_readers.size() >= 1024 ||
         s.lds_bytes + lds_proposed_size->size > (32ull << 20))) FlushLdsReaders(0);
     {
-        // DIAG-214 (diagnosis, RYGT_DIAG_RECORD_DRAWS=1): every 30th frame, each draw reading a
+        // DIAG-214 (diagnosis, SHADGT_DIAG_RECORD_DRAWS=1): every 30th frame, each draw reading a
         // 144-byte-stride buffer (GT7's crowd records): its programs, records, depth test, targets.
-        static const bool record_draws = Common::DiagEnv("RYGT_DIAG_RECORD_DRAWS") != nullptr;
+        static const bool record_draws = Common::DiagEnv("SHADGT_DIAG_RECORD_DRAWS") != nullptr;
         if (record_draws && b.diag_records != 0 && frame % 30 == 0) {
             std::string programs;
             for (const auto* stage : pipeline->GetStages()) {
@@ -15777,7 +15777,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
     }
     {
-        // DIAG-212 (diagnosis, RYGT_DIAG_CAPTURE=<hex program>,<every n frames>): every n-th
+        // DIAG-212 (diagnosis, SHADGT_DIAG_CAPTURE=<hex program>,<every n frames>): every n-th
         // frame, the color target the program's first draw writes, right before that draw, and
         // (in FindDisplay) the display picture the frame ends with.
         // Several programs: <hex>+<hex>+...,<n>; each one's first draw in the frame is captured.
@@ -15787,7 +15787,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         };
         static const CaptureConfig capture = [] {
             CaptureConfig c;
-            if (const char* env = Common::DiagEnv("RYGT_DIAG_CAPTURE"); env && *env) {
+            if (const char* env = Common::DiagEnv("SHADGT_DIAG_CAPTURE"); env && *env) {
                 const char* at = env;
                 char* end = nullptr;
                 while (true) {
@@ -16122,7 +16122,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
         // DIAG-243: the draws recorded last, for the report of a lost device.
         static const bool note_draws = [] {
-            const char* env = std::getenv("RYGT_DEVICE_FAULT");
+            const char* env = std::getenv("SHADGT_DEVICE_FAULT");
             return env && env[0] == '1';
         }();
         if (note_draws) {
@@ -16596,11 +16596,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         s.buffers_written = true;
     }
 
-    // DIAG-208 (RYGT_PIXEL_TRACE=1): while a frame is dumped, the scene target's traced pixels
+    // DIAG-208 (SHADGT_PIXEL_TRACE=1): while a frame is dumped, the scene target's traced pixels
     // are copied after each draw into it, to name the draw that first writes a wrong colour.
 #if !defined(NDEBUG)
     static const bool pixel_trace = [] {
-        const char* env = std::getenv("RYGT_PIXEL_TRACE");
+        const char* env = std::getenv("SHADGT_PIXEL_TRACE");
         return env && env[0] == '1';
     }();
     if (r.FrameDumpCollecting() && !g_pixel_trace.armed) {
@@ -16895,10 +16895,10 @@ void NativeRenderer::RecordIndirect(const IndirectDraw& indirect, const Indirect
 
 bool NativeRenderer::PrepareEnabled() {
     // PERF-316: on with the native renderer (+12% fps in a Time Attack on a Ryzen 5 5500 and
-    // RX 7600: the recorder records draws game job threads worked out). RYGT_NATIVE_PREPARE=0 or
+    // RX 7600: the recorder records draws game job threads worked out). SHADGT_NATIVE_PREPARE=0 or
     // =1 overrides it.
     static const bool enabled = [] {
-        if (const char* env = std::getenv("RYGT_NATIVE_PREPARE"); env && *env) {
+        if (const char* env = std::getenv("SHADGT_NATIVE_PREPARE"); env && *env) {
             return env[0] == '1' && NativeModeRequested();
         }
         return NativeModeRequested();
@@ -16984,13 +16984,13 @@ bool NativeRenderer::ChangeLog::UntouchedHolding(
     return true;
 }
 
-// PERF-GTS-405 (RYGT_PREPARED_MIRROR_EXACT=1): a mirror made or dropped turns a prepared draw
+// PERF-GTS-405 (SHADGT_PREPARED_MIRROR_EXACT=1): a mirror made or dropped turns a prepared draw
 // down only when the draw holds a mirror over that range. Any mirror change over memory the
 // draw binds did, also for the constants it reads in place and for vertices it reads in place:
 // 100 to 41,400 draws in 10 s at Tokyo, in bursts when a large mirror is made again.
 bool NativeRenderer::PreparedBuffersUntouched(const PreparedDraw& p, u64 since) const {
     static const bool mirror_exact = [] {
-        const char* env = std::getenv("RYGT_PREPARED_MIRROR_EXACT");
+        const char* env = std::getenv("SHADGT_PREPARED_MIRROR_EXACT");
         return !env || !*env || (env[0] == '1' && env[1] == '\0'); // PERF-GTS-407: on unless set to something else
     }();
     return mirror_exact
@@ -17054,12 +17054,12 @@ void NativeRenderer::FreePrepared(PreparedDraw* draw) {
     prepared_free.push_back(draw);
 }
 
-// PERF-GTS-450 (RYGT_NATIVE_PREPARE_MENUS=1): draws are prepared on the game's job threads
+// PERF-GTS-450 (SHADGT_NATIVE_PREPARE_MENUS=1): draws are prepared on the game's job threads
 // (OPT-010) outside races too. In the garage menu the recorder spent most of each car-body
 // draw resolving buffers and textures (~15-19 us a draw for ~1,900 draws a frame).
 static bool PrepareOutsideRaces() {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_NATIVE_PREPARE_MENUS");
+        const char* env = std::getenv("SHADGT_NATIVE_PREPARE_MENUS");
         return env && env[0] == '1' && env[1] == '\0';
     }();
     return enabled;
@@ -17427,7 +17427,7 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
             if(upload.info>=prefix || uploads[upload.info]) {safe=false;break;}
             uploads[upload.info]=true;
         }
-        static const bool absent_enabled=[] {const char* q=std::getenv("RYGT_PARALLEL_ABSENT_GUEST");return q && q[0]=='1' && !q[1];}();
+        static const bool absent_enabled=[] {const char* q=std::getenv("SHADGT_PARALLEL_ABSENT_GUEST");return q && q[0]=='1' && !q[1];}();
         for(size_t i=0;safe && i<prefix;++i) {
             const auto& w=b.writes[i];const auto& a=p->descriptor_actions[i];const auto& info=b.buffers[i];
             if(w.descriptorType!=vk::DescriptorType::eStorageBuffer || w.descriptorCount!=1 ||
@@ -17584,10 +17584,10 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                                     Shader::Backend::Bindings& binding, PreparedDraw& p) {
     // As BindBuffers, without its side effects.
 #if !defined(NDEBUG)
-    // DIAG-205 (RYGT_RECORDER_SHADER=<hash>): that program's draws go to the recorder, which
+    // DIAG-205 (SHADGT_RECORDER_SHADER=<hash>): that program's draws go to the recorder, which
     // reads their buffers later (tests whether the job threads read per-frame constants early).
     static const u64 recorder_hash = [] {
-        const char* env = std::getenv("RYGT_RECORDER_SHADER");
+        const char* env = std::getenv("SHADGT_RECORDER_SHADER");
         return env && *env ? std::strtoull(env, nullptr, 16) : 0;
     }();
     if (recorder_hash != 0 && stage.pgm_hash == recorder_hash) {
@@ -17598,13 +17598,13 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
     const u64 alignment = r.instance.StorageMinAlignment();
     // Match BindBuffers: prepared and recorder-side draws must choose the same path.
     static const bool composition_descriptors = [&] {
-        const char* env = std::getenv("RYGT_COMPOSITION_BUFFER_DESCRIPTORS");
+        const char* env = std::getenv("SHADGT_COMPOSITION_BUFFER_DESCRIPTORS");
         return env && *env ? env[0] == '1' : r.instance.GetVendorID() == 0x1002;
     }();
     const bool descriptor_composition = composition_descriptors &&
         stage.sw_stage == Shader::SwStage::Fragment && stage.pgm_hash == 0xb33ec4df;
     static const bool postprocess_descriptors = [&] {
-        const char* env = std::getenv("RYGT_POSTPROCESS_BUFFER_DESCRIPTORS");
+        const char* env = std::getenv("SHADGT_POSTPROCESS_BUFFER_DESCRIPTORS");
         return env && *env ? env[0] == '1' : r.instance.GetVendorID() == 0x1002;
     }();
     const bool descriptor_postprocess = postprocess_descriptors &&
@@ -17613,7 +17613,7 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
 #if !defined(NDEBUG)
     // Diagnostic A/B: retain shader compilation but use descriptor bindings.
     static const bool descriptor_only_a82d2fe = [] {
-        const char* value = std::getenv("RYGT_A82D2FE_DESCRIPTOR_ONLY");
+        const char* value = std::getenv("SHADGT_A82D2FE_DESCRIPTOR_ONLY");
         return value && value[0] == '1';
     }();
     const bool force_descriptor = descriptor_only_a82d2fe &&
@@ -17710,9 +17710,9 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
             const u64 base = vsharp.base_address;
             const u64 sharp_size = vsharp.GetSize();
 #if !defined(NDEBUG)
-            // DIAG-204 (RYGT_PROBE_SHADER=<hash>): that program's buffers and their first bytes.
+            // DIAG-204 (SHADGT_PROBE_SHADER=<hash>): that program's buffers and their first bytes.
             static const u64 probe_hash = [] {
-                const char* env = std::getenv("RYGT_PROBE_SHADER");
+                const char* env = std::getenv("SHADGT_PROBE_SHADER");
                 return env && *env ? std::strtoull(env, nullptr, 16) : 0;
             }();
             if (probe_hash != 0 && stage.pgm_hash == probe_hash) {
@@ -17743,7 +17743,7 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
             u64 size = bindable ? r.memory->ClampRangeSize(base, sharp_size) : 0;
             const u64 original_size = size;
             static const bool readable_cut = [] {
-                const char* env = std::getenv("RYGT_NATIVE_READABLE_CUT");
+                const char* env = std::getenv("SHADGT_NATIVE_READABLE_CUT");
                 return !(env && env[0] == '0');
             }();
             auto* readable_direct = r.buffer_cache.GetDirectMemory();
@@ -17986,7 +17986,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
         if (!storage && (!entry || entry->needs_upload.load(std::memory_order_relaxed))) {
             warm_upload(desc.info.guest_address, desc.info.guest_size);
         }
-        // PERF-GTS-403 (RYGT_PREPARE_MISSING_PICTURES=1): a sampled picture that is not there
+        // PERF-GTS-403 (SHADGT_PREPARE_MISSING_PICTURES=1): a sampled picture that is not there
         // yet no longer costs the whole prepared draw. GT Sport's light grid (30x17, 16
         // layers) moves by a few hundred bytes now and then, each time a new picture: every
         // lit draw of that frame (1,000 to 2,800) missed it here and took the recorder's own
@@ -17994,7 +17994,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
         // more beside such a burst. The draw keeps what was found; the recorder makes the
         // picture in GPU order at commit and fills its views in.
         static const bool leave_missing = [] {
-            const char* env = std::getenv("RYGT_PREPARE_MISSING_PICTURES");
+            const char* env = std::getenv("SHADGT_PREPARE_MISSING_PICTURES");
             // PERF-GTS-407: on unless set to something else
             return !env || !*env || (env[0] == '1' && env[1] == '\0');
         }();
@@ -18162,7 +18162,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobVertexBuffer(VAddr 
                              u64{address - region->begin}};
         }
         static const bool mirrors_on = [] {
-            const char* env = std::getenv("RYGT_NATIVE_MIRRORS");
+            const char* env = std::getenv("SHADGT_NATIVE_MIRRORS");
             return !(env && env[0] == '0');
         }();
         if (mirrors_on && size <= 64_MB) {
@@ -18328,12 +18328,12 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         {"stage-validation", "image-freshness", "sort-cpu-writes", "buffer-freshness",
          "refresh-regions", "upload-data", "image-rewrite-sources", "push-data"}};
     trace.AccumulateInto(stats.commit_phase_ns, stats.commit_phase_calls); // DIAG-GTS-372
-    // PERF-GTS-381 (RYGT_PICTURE_PREFETCH=0 off): a race draw samples about 7 pictures, and
+    // PERF-GTS-381 (SHADGT_PICTURE_PREFETCH=0 off): a race draw samples about 7 pictures, and
     // the first check to read each one's record waited for it from memory, about 80 ns each
     // (0.5 to 0.7 us a draw, DIAG-GTS-379). They are asked for now, and arrive while the
     // validation, region refreshes and uploads below run.
     static const bool prefetch_pictures = [] {
-        const char* env = std::getenv("RYGT_PICTURE_PREFETCH");
+        const char* env = std::getenv("SHADGT_PICTURE_PREFETCH");
         return !(env && env[0] == '0');
     }();
     if (prefetch_pictures) {
@@ -18378,13 +18378,13 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     for (size_t i = 0; i < image_no_before.size(); ++i) {
         image_no_before[i] = registry->untouched_no[i].load(std::memory_order_relaxed);
     }
-    // PERF-GTS-404 (RYGT_PREPARED_EVICT_EXACT=1): an eviction turns a prepared draw down only
+    // PERF-GTS-404 (SHADGT_PREPARED_EVICT_EXACT=1): an eviction turns a prepared draw down only
     // when it took a picture the draw holds. Any eviction over the draw's pictures' memory did:
     // GT Sport's light grid moves by a few hundred bytes now and then, each old copy is evicted
     // when it has gone unused, and every prepared draw sampling the current copy (over the same
     // memory) was turned down with it, 3,500 to 18,800 draws in 10 s at Tokyo.
     static const bool evict_exact = [] {
-        const char* env = std::getenv("RYGT_PREPARED_EVICT_EXACT");
+        const char* env = std::getenv("SHADGT_PREPARED_EVICT_EXACT");
         return !env || !*env || (env[0] == '1' && env[1] == '\0'); // PERF-GTS-407: on unless set to something else
     }();
     if (!(evict_exact
@@ -18544,7 +18544,7 @@ void NativeRenderer::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>*
     bool guest_authoritative = false;
     auto* direct = r.buffer_cache.GetDirectMemory();
     static const bool remember_fills = [] {
-        const char* env = std::getenv("RYGT_NATIVE_FILL_NEW_TARGETS");
+        const char* env = std::getenv("SHADGT_NATIVE_FILL_NEW_TARGETS");
         return !(env && env[0] == '0');
     }();
     if (remember_fills && pattern && direct && size && size <= 16_MB &&
@@ -18590,11 +18590,11 @@ const Native::Rhi::Buffer* NativeRenderer::PatternBuffer(u32 lo, u32 hi, u64 byt
     // FIX-GT7-123: every pattern kept its buffer, the size of the largest picture filled with it,
     // and a grown buffer's old one was never freed: in two races on 2026-11-08, 146 patterns held
     // 298 buffers, 1,487 MB of video memory (146 of 8 MB, 147 of 2 MB), never given back. The most
-    // recently used patterns are kept, up to RYGT_NATIVE_FILL_PATTERNS (64; 0: every pattern keeps
+    // recently used patterns are kept, up to SHADGT_NATIVE_FILL_PATTERNS (64; 0: every pattern keeps
     // its buffer) and 256 MB; the others, and grown buffers' old ones (with 0 too), go once the
     // GPU ran the list that last could read them.
     static const u64 keep_count = [] {
-        const char* env = std::getenv("RYGT_NATIVE_FILL_PATTERNS");
+        const char* env = std::getenv("SHADGT_NATIVE_FILL_PATTERNS");
         return env && *env ? u64{std::strtoull(env, nullptr, 10)} : u64{64};
     }();
     constexpr u64 KeepBytes = 256_MB;
@@ -18904,10 +18904,10 @@ void NativeRenderer::ReadFillShader(const Shader::Info& cs, DrawBindings& b) {
     // FIX-GT7-031: GT7's is the same shader. Without it, its fills of targets were lost: the
     // headlight shadow maps were never cleared and kept the nearest depth of every frame since
     // the race began, so the lights lit only what no object ever covered (the middle of the road).
-    // RYGT_NATIVE_GT7_FILLS=0: as before.
+    // SHADGT_NATIVE_GT7_FILLS=0: as before.
     constexpr u64 FillShaderGt7 = 0xabe484108a360b66;
     static const bool gt7_fills = [] {
-        const char* env = std::getenv("RYGT_NATIVE_GT7_FILLS");
+        const char* env = std::getenv("SHADGT_NATIVE_GT7_FILLS");
         return !(env && env[0] == '0');
     }();
     if ((cs.pgm_hash != FillShader && !(gt7_fills && cs.pgm_hash == FillShaderGt7)) ||
@@ -19082,17 +19082,17 @@ void NativeRenderer::DispatchDirect() {
 #if !defined(NDEBUG)
     const auto& diag_cs = pipeline->GetStage(Shader::SwStage::Compute);
     static const u64 capture_budget = [] {
-        const char* p=std::getenv("RYGT_A82_GPU_CAPTURE");
+        const char* p=std::getenv("SHADGT_A82_GPU_CAPTURE");
         return p && *p ? std::min<u64>(std::strtoull(p,nullptr,0),256) : u64{0};
     }();
     static const u64 capture_from = [] {
-        const char* p=std::getenv("RYGT_A82_GPU_CAPTURE_FROM_FRAME");
+        const char* p=std::getenv("SHADGT_A82_GPU_CAPTURE_FROM_FRAME");
         return p && *p ? std::strtoull(p,nullptr,0) : u64{0};
     }();
     static u64 captures=0;
     // PERF-GTS-389: read once. Asked at every dispatch it was 1.4% of the recorder's CPU time
     // in a race at Tokyo (8,000 dispatches a second; getenv takes a lock and walks the block).
-    static const char* const forced_descriptor=std::getenv("RYGT_A82D2FE_DESCRIPTOR_ONLY");
+    static const char* const forced_descriptor=std::getenv("SHADGT_A82D2FE_DESCRIPTOR_ONLY");
     const bool after_race_ready=A82CaptureAfterRace();
     if (after_race_ready && capture_budget && captures < capture_budget && frame >= capture_from &&
         diag_cs.pgm_hash == 0xa82d2fe && forced_descriptor && forced_descriptor[0]=='1' &&
@@ -19176,7 +19176,7 @@ void NativeRenderer::DispatchDirect() {
             const auto rebound=b.buffers.empty()?vk::DescriptorBufferInfo{}:b.buffers[0];
             // Only replace when the entire original logical descriptor was copied.
             // This does not rely on the hash identifying a particular SPIR-V variant.
-            const char* freeze_env=std::getenv("RYGT_A82_FREEZE_CAPTURE");
+            const char* freeze_env=std::getenv("SHADGT_A82_FREEZE_CAPTURE");
             const bool frozen=freeze_env && freeze_env[0]=='1' && !b.buffers.empty() &&
                 !diag_cs.buffers[0].is_written && descriptor.range-adjust == bytes;
             if (frozen) {
@@ -19254,7 +19254,7 @@ void NativeRenderer::DispatchDirect() {
         // CPU guest bytes may differ from the GPU descriptor; label accordingly.
 #if !defined(NDEBUG)
         static const bool capture_a82 = [] {
-            const char* p = std::getenv("RYGT_A82_INPUT_DIAG"); return p && p[0] == '1';
+            const char* p = std::getenv("SHADGT_A82_INPUT_DIAG"); return p && p[0] == '1';
         }();
         if (capture_a82 && cs.pgm_hash == 0xa82d2fe && !cs.buffers.empty() &&
             !cs.buffers[0].IsSpecial() && !b.buffers.empty()) {
@@ -19311,7 +19311,7 @@ void NativeRenderer::DispatchDirect() {
         // Opt-in: when buffer0 is an upload chunk, its already-copied bytes are
         // the bound snapshot, unlike a second read of mutable guest memory.
         static const bool inspect_snapshot=[] {
-            const char* p=std::getenv("RYGT_A82_INPUT_DIAG"); return p && p[0]=='1';
+            const char* p=std::getenv("SHADGT_A82_INPUT_DIAG"); return p && p[0]=='1';
         }();
         if (inspect_snapshot && cs.pgm_hash==0xa82d2fe && !b.buffers.empty()) {
             constexpr u64 wanted=336;
@@ -19574,9 +19574,9 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
     // map, drawn in R8G8B8A8, came out converted to 10-bit fields once a 512x512 A2B10G10R10 target
     // was left at 0x100a0b0000 (the rewards screen draws one), and the map's texture read those bits
     // as R8G8B8A8: an orange line and a rainbow shadow instead of white and grey. A view of the
-    // source's format writes the bits a guest resolve would. RYGT_NATIVE_RESOLVE_VIEW=0: as before.
+    // source's format writes the bits a guest resolve would. SHADGT_NATIVE_RESOLVE_VIEW=0: as before.
     static const bool resolve_view = [] {
-        const char* env = std::getenv("RYGT_NATIVE_RESOLVE_VIEW");
+        const char* env = std::getenv("SHADGT_NATIVE_RESOLVE_VIEW");
         return !(env && env[0] == '0');
     }();
     const auto src_format = src->image->Desc().format;
@@ -19634,7 +19634,7 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
             // Resolve through attachment views in the source format. Vulkan's
             // direct resolve requires identical image formats.
             static const bool resolve_view = [] {
-                const char* env = std::getenv("RYGT_NATIVE_RESOLVE_VIEW");
+                const char* env = std::getenv("SHADGT_NATIVE_RESOLVE_VIEW");
                 return !(env && env[0] == '0');
             }();
             const vk::Format format = static_cast<vk::Format>(src_format);
@@ -20156,7 +20156,7 @@ void NativeRenderer::WatchBind(const Native::ImageEntry& entry, const AmdGpu::Im
 }
 
 bool NativeRenderer::SeqTraced(const Native::ImageEntry* entry) const {
-    // DIAG-208 (diagnosis, RYGT_DIAG_SEQ=<hex lo>-<hex hi>[,<every>[,<count>]]): in <count>
+    // DIAG-208 (diagnosis, SHADGT_DIAG_SEQ=<hex lo>-<hex hi>[,<every>[,<count>]]): in <count>
     // frames of every <every> (4 of 600 if not given), each bind, draw, dispatch, rewrite and
     // copy-in of the pictures starting in that range, with the mips and layers it covers.
     struct Config {
@@ -20167,7 +20167,7 @@ bool NativeRenderer::SeqTraced(const Native::ImageEntry* entry) const {
     };
     static const Config config = [] {
         Config c;
-        const char* env = Common::DiagEnv("RYGT_DIAG_SEQ");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_SEQ");
         if (!env || !*env) {
             return c;
         }
@@ -20209,7 +20209,7 @@ void NativeRenderer::SeqBind(const Native::ImageEntry& entry, const AmdGpu::Imag
 
 void NativeRenderer::ProbeWatchedPictures() {
 #if !defined(NDEBUG)
-    // FIX-156 (diagnosis, RYGT_NATIVE_WATCH_TEXTURE): what the pictures at the watched address
+    // FIX-156 (diagnosis, SHADGT_NATIVE_WATCH_TEXTURE): what the pictures at the watched address
     // hold, every half second (read back from the GPU), to see when one loses its content.
     const auto& watched_list = Native::WatchedTextures();
     if (watched_list.empty()) {
@@ -20310,9 +20310,9 @@ void NativeRenderer::ProbeWatchedPictures() {
                     it->version, count ? sum / count : 0.0, lo, hi, zeros, count);
         it = probes.erase(it);
     }
-    // FIX-171 (diagnosis, RYGT_NATIVE_WATCH_EVERY=<frames>): how often (every 30 frames).
+    // FIX-171 (diagnosis, SHADGT_NATIVE_WATCH_EVERY=<frames>): how often (every 30 frames).
     static const u64 every = [] {
-        const char* env = Common::DiagEnv("RYGT_NATIVE_WATCH_EVERY");
+        const char* env = Common::DiagEnv("SHADGT_NATIVE_WATCH_EVERY");
         return env && *env ? std::max<u64>(std::strtoull(env, nullptr, 0), 1) : u64{30};
     }();
     if (frame % every != 0 || probes.size() >= (every >= 30 ? 1u : 16u)) {
@@ -20327,10 +20327,10 @@ void NativeRenderer::ProbeWatchedPictures() {
             }
             const bool packed = entry.info.pixel_format == vk::Format::eB10G11R11UfloatPack32;
             const auto& desc = entry.image->Desc();
-            // FIX-171 (RYGT_NATIVE_WATCH_RECT=x,y,w,h): of a plain picture only that rectangle.
+            // FIX-171 (SHADGT_NATIVE_WATCH_RECT=x,y,w,h): of a plain picture only that rectangle.
             static const std::array<u32, 4> rect = [] {
                 std::array<u32, 4> r{};
-                if (const char* env = Common::DiagEnv("RYGT_NATIVE_WATCH_RECT"); env && *env) {
+                if (const char* env = Common::DiagEnv("SHADGT_NATIVE_WATCH_RECT"); env && *env) {
                     std::sscanf(env, "%u,%u,%u,%u", &r[0], &r[1], &r[2], &r[3]);
                 }
                 return r;
@@ -20538,7 +20538,7 @@ void NativeRenderer::EvictImages() {
     };
     trace.Next(2);
     // PERF-GT7-005: textures the game loaded stay past their idle time, the most recently used
-    // first, up to a budget (RYGT_NATIVE_KEEP_TEXTURES_MB, 2048; 0 as before). Their pages are
+    // first, up to a budget (SHADGT_NATIVE_KEEP_TEXTURES_MB, 2048; 0 as before). Their pages are
     // watched, so a CPU write or an unmap still uploads them again at their next use. GT7's
     // license tests left the track's textures unused for over 4 s while a retry reloaded, and
     // at ~4 s into the next attempt 50-120 MB of them were made and uploaded again.
@@ -20547,7 +20547,7 @@ void NativeRenderer::EvictImages() {
     // aborted, so without the variable the budget is an eighth of the device-local budget,
     // still at most 2048 MB (about 0.9 GB on an 8 GB card).
     static const u64 texture_budget = [this] {
-        const char* env = std::getenv("RYGT_NATIVE_KEEP_TEXTURES_MB");
+        const char* env = std::getenv("SHADGT_NATIVE_KEEP_TEXTURES_MB");
         if (env && *env) {
             return std::strtoull(env, nullptr, 10) << 20;
         }
@@ -20629,9 +20629,9 @@ void NativeRenderer::EvictImages() {
             kept_texture_shard = 0;
         }
     }
-    // A loaded texture that went idle after the last full walk (RYGT_NATIVE_KEEP_NEW_IDLE=0: not).
+    // A loaded texture that went idle after the last full walk (SHADGT_NATIVE_KEEP_NEW_IDLE=0: not).
     static const bool keep_new_idle = [] {
-        const char* env = std::getenv("RYGT_NATIVE_KEEP_NEW_IDLE");
+        const char* env = std::getenv("SHADGT_NATIVE_KEEP_NEW_IDLE");
         return !(env && env[0] == '0');
     }();
     const auto keep_new_texture = [&](Native::ImageEntry& entry) {
@@ -20869,9 +20869,9 @@ static std::atomic<u64> g_fault_count{};
 
 void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
     SnapshotLease::MarkUnsafe(address, std::max<u64>(size, 1), 2);
-    // DIAG-194 (diagnosis, RYGT_DIAG_FAULT_COST=1)
+    // DIAG-194 (diagnosis, SHADGT_DIAG_FAULT_COST=1)
     static const bool timed = [] {
-        const char* env = Common::DiagEnv("RYGT_DIAG_FAULT_COST");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_FAULT_COST");
         return env && env[0] == '1';
     }();
     auto lap = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -21427,11 +21427,11 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     CheckSmallTextures(); // DIAG-182 (diagnosis)
     ReportProgramTextures(); // DIAG-184 (diagnosis)
     WatchHistoryRanges();    // DIAG-187 (diagnosis)
-    // DIAG-174 (diagnosis, RYGT_NATIVE_REUPLOAD=1): every texture the last frames used, not
+    // DIAG-174 (diagnosis, SHADGT_NATIVE_REUPLOAD=1): every texture the last frames used, not
     // made of targets, is uploaded from guest memory again before its next use (=2: only those
     // from 0x200000000 to 0x208000000, GT7's per-frame memory).
     static const int reupload = [] {
-        const char* env = std::getenv("RYGT_NATIVE_REUPLOAD");
+        const char* env = std::getenv("SHADGT_NATIVE_REUPLOAD");
         return env && *env ? std::atoi(env) : 0;
     }();
     if (reupload) {
@@ -21504,7 +21504,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
 
 u64 NativeRenderer::MirrorVerifyBudget() {
     static const u64 budget = [] {
-        const char* env = std::getenv("RYGT_NATIVE_MIRROR_VERIFY");
+        const char* env = std::getenv("SHADGT_NATIVE_MIRROR_VERIFY");
         return env && *env ? std::strtoull(env, nullptr, 10) * 1_MB : u64{0};
     }();
     return budget;
@@ -21512,10 +21512,10 @@ u64 NativeRenderer::MirrorVerifyBudget() {
 
 void NativeRenderer::VerifyMirrors() {
 #if !defined(NDEBUG)
-    // FIX-176 (diagnosis, RYGT_NATIVE_MIRROR_VERIFY=<MB a frame>): guest memory under the mirrors,
+    // FIX-176 (diagnosis, SHADGT_NATIVE_MIRROR_VERIFY=<MB a frame>): guest memory under the mirrors,
     // a few MB a frame, hashed per 64 KB granule and compared with the hash taken the last time;
     // a change no CPU write fault or copy-in accounts for means the mirror went stale unseen (the
-    // tunnel explosions went away with RYGT_NATIVE_MIRRORS=0). Such granules are logged and
+    // tunnel explosions went away with SHADGT_NATIVE_MIRRORS=0). Such granules are logged and
     // copied in again.
     const u64 budget = MirrorVerifyBudget();
     if (budget == 0 || mirrors.empty()) {
@@ -21606,14 +21606,14 @@ void NativeRenderer::VerifyMirrors() {
 
 void NativeRenderer::ProbeDisplay(const Native::ImageEntry& entry) {
 #if !defined(NDEBUG)
-    // FIX-175 (diagnosis, RYGT_NATIVE_WATCH_DISPLAY=x,y,w,h): a rectangle of each picture the
+    // FIX-175 (diagnosis, SHADGT_NATIVE_WATCH_DISPLAY=x,y,w,h): a rectangle of each picture the
     // presenter shows, read back from the GPU: the mean brightness of its top, middle and bottom
     // thirds, one line per presented frame (single-frame glitches stand out against their
     // neighbours; the game's working targets are no good for that, the next frame's work may
     // already have cleared them when a probe runs).
     static const std::array<u32, 4> rect = [] {
         std::array<u32, 4> r{};
-        if (const char* env = Common::DiagEnv("RYGT_NATIVE_WATCH_DISPLAY"); env && *env) {
+        if (const char* env = Common::DiagEnv("SHADGT_NATIVE_WATCH_DISPLAY"); env && *env) {
             std::sscanf(env, "%u,%u,%u,%u", &r[0], &r[1], &r[2], &r[3]);
         }
         return r;
@@ -21701,13 +21701,13 @@ void NativeRenderer::ProbeDisplay(const Native::ImageEntry& entry) {
 }
 
 void NativeRenderer::SnapPass(const Targets& targets) {
-    // DIAG-226 (diagnosis, RYGT_DUMP_PASS_SNAPS=<hex address>[,<hex address>...]): in a dumped frame,
+    // DIAG-226 (diagnosis, SHADGT_DUMP_PASS_SNAPS=<hex address>[,<hex address>...]): in a dumped frame,
     // each time a pass starts that draws into one of those colour targets, a copy of the targets as
     // they are then (what the passes before left), written with the dump as
     // snap_<n>_<address>_<w>x<h>_<format>.bin.
     static const std::vector<VAddr> watched = [] {
         std::vector<VAddr> list;
-        const char* env = Common::DiagEnv("RYGT_DUMP_PASS_SNAPS");
+        const char* env = Common::DiagEnv("SHADGT_DUMP_PASS_SNAPS");
         for (const char* at = env; at && *at;) {
             char* end = nullptr;
             const VAddr address = std::strtoull(at, &end, 16);
@@ -21773,10 +21773,10 @@ void NativeRenderer::SnapPass(const Targets& targets) {
 void NativeRenderer::SnapProgramMips(std::span<const Shader::Info* const> stages,
                                      const DrawBindings& b) {
     // DIAG-234 (diagnosis): in a dumped frame, every mip of the mipmapped textures in GT7's
-    // per-frame memory that draws with RYGT_DIAG_STAGE_TEXTURES's program sample, as uploaded
+    // per-frame memory that draws with SHADGT_DIAG_STAGE_TEXTURES's program sample, as uploaded
     // for them (snap_pyr_<address>_m<mip>_<w>x<h>.bin), once each.
     static const u64 program = [] {
-        const char* env = Common::DiagEnv("RYGT_DIAG_STAGE_TEXTURES");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_STAGE_TEXTURES");
         return env && *env ? u64(std::strtoull(env, nullptr, 16)) : u64{0};
     }();
     if (program == 0 || !r.FrameDumpCollecting() || pass_snaps.size() >= 160 ||
@@ -23006,7 +23006,7 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
     (void)cpu_writes;
 #else
     // DIAG-GTS-423: Release keeps only the snapshot-lease summary, and only when the lease is
-    // requested (RYGT_NATIVE_SNAPSHOT_LEASE=1), so the reuse status can be read without a Debug
+    // requested (SHADGT_NATIVE_SNAPSHOT_LEASE=1), so the reuse status can be read without a Debug
     // renderer. A Debug renderer uses ucrtbased and cannot share file descriptors with the
     // Release runtime, so it fails at launch in a Release install.
     if (!SnapshotLease::Requested() || !snapshot_upload_memo) {

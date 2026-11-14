@@ -12,11 +12,11 @@ bool overlaps(const std::vector<Range>& v, Range change){
 }
 int main(int argc,char**){
 #ifdef _WIN32
-    _putenv_s("RYGT_DRAW_PREP_MASK", "0");
-    _putenv_s("RYGT_CPU_COMPILE_MASK", "0");
+    _putenv_s("SHADGT_DRAW_PREP_MASK", "0");
+    _putenv_s("SHADGT_CPU_COMPILE_MASK", "0");
 #else
-    setenv("RYGT_DRAW_PREP_MASK", "0", 1);
-    setenv("RYGT_CPU_COMPILE_MASK", "0", 1);
+    setenv("SHADGT_DRAW_PREP_MASK", "0", 1);
+    setenv("SHADGT_CPU_COMPILE_MASK", "0", 1);
 #endif
     if(Vulkan::DrawPreparationMask()!=15 || Vulkan::CompileCpuBatchMask()!=15)
         throw std::runtime_error("production fixes depend on a debug mask");

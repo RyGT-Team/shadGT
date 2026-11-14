@@ -15,7 +15,7 @@ using Clock = std::chrono::steady_clock;
 std::mutex recording_probe_mutex;
 RecordingCostProbes recording_probes{};
 bool RecordingProbeEnabled() {
-    static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_GATE_DIAG");return p && p[0]=='1' && !p[1];}();
+    static const bool enabled=[] {const char* p=std::getenv("SHADGT_PARALLEL_GATE_DIAG");return p && p[0]=='1' && !p[1];}();
     return enabled;
 }
 struct PassProbe {

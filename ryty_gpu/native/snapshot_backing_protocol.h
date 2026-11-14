@@ -26,7 +26,7 @@ using TaggedUnsafeCallback = void (*)(std::uint64_t, std::uint64_t, std::uint32_
 inline constinit std::atomic<TaggedUnsafeCallback> published_tagged_unsafe{nullptr};
 inline bool PoisonTraceRequested() {
     static const bool enabled = [] {
-        const char* value = std::getenv("RYGT_SNAPSHOT_POISON_TRACE");
+        const char* value = std::getenv("SHADGT_SNAPSHOT_POISON_TRACE");
         return value && value[0] == '1' && !value[1];
     }();
     return enabled;
@@ -45,11 +45,11 @@ inline constinit std::atomic<std::uint64_t> driver_first_poll{0};
 // PERF-GTS-424: some NVIDIA drivers (seen on 32.0.16.1742) never load nvrtum64.dll into the
 // game, so FIX-354's wait never ended and reuse never started. After this many ms of polling
 // without it, reuse is admitted anyway; if the DLL loads later, the module guard revokes reuse
-// and snapshots go back to copying. RYGT_SNAPSHOT_DRIVER_GRACE_MS=0 waits forever (FIX-354).
+// and snapshots go back to copying. SHADGT_SNAPSHOT_DRIVER_GRACE_MS=0 waits forever (FIX-354).
 inline constinit std::atomic<bool> driver_grace_used{false};
 inline std::uint64_t DriverGraceMs() {
     static const std::uint64_t ms = [] {
-        const char* value = std::getenv("RYGT_SNAPSHOT_DRIVER_GRACE_MS");
+        const char* value = std::getenv("SHADGT_SNAPSHOT_DRIVER_GRACE_MS");
         return value && *value ? std::strtoull(value, nullptr, 10) : std::uint64_t{30000};
     }();
     return ms;
@@ -110,7 +110,7 @@ static_assert(std::atomic<UnsafeCallback>::is_always_lock_free);
 // the first snapshot is admitted. No C++ object crosses the DLL boundary.
 inline bool Requested() {
     static const bool requested = [] {
-        const char* value = std::getenv("RYGT_NATIVE_SNAPSHOT_LEASE");
+        const char* value = std::getenv("SHADGT_NATIVE_SNAPSHOT_LEASE");
         return value && value[0] == '1' && value[1] == '\0';
     }();
     return requested;

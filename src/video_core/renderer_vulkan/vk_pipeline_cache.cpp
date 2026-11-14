@@ -387,6 +387,9 @@ extern "C" __declspec(dllexport) int RytyTestTessLayoutKeys() {
 // Format 3 adds the code's guest address (shadGT translates with pgm_base at it).
 static std::filesystem::path g_manifest_dir;
 static std::filesystem::path g_capture_dir;
+// FEAT-GTS-470: <serial>-programs, the programs the launcher copies out of this PC's game files
+// (adcpatch shadercodes/shaderprep: <hash>.bin, first instruction through the 32-byte footer).
+static std::filesystem::path g_programs_dir;
 // FEAT-GTS-470: on by default (SHADGT_MANIFEST_RECORD=0 turns it off): every translation and every
 // stored one a draw first uses gets a record, so the manifest covers what was played and a
 // pre-translation after a renderer or driver update, here or on another GPU, misses less.
@@ -475,6 +478,21 @@ static std::vector<u32> ReadWords(const std::filesystem::path& file) {
         std::fclose(f);
     }
     return words;
+}
+
+// A record's code: from the local capture or, when the capture doesn't have it (a manifest from
+// elsewhere: records carry no code), from the program copied out of this PC's game files, cut to
+// the record's length and taken only when its hash is the record's (FEAT-GTS-470).
+struct ManifestRecord;
+static std::vector<u32> ReadRecordCode(u64 hash, u64 code_xxh, u32 code_words) {
+    auto code = ReadWords(g_capture_dir / fmt::format("{:016x}-{:016x}.code", hash, code_xxh));
+    if (code.size() == code_words) return code;
+    if (g_programs_dir.empty()) return {};
+    auto program = ReadWords(g_programs_dir / fmt::format("{:016x}.bin", hash));
+    if (program.size() < code_words) return {};
+    program.resize(code_words);
+    if (XXH3_64bits(program.data(), program.size() * sizeof(u32)) != code_xxh) return {};
+    return program;
 }
 
 // The record file alone (FEAT-GTS-470: MergeManifestFolders writes records without their code).
@@ -1600,7 +1618,7 @@ void PipelineCache::VerifyManifest(std::stop_token stop) {
         if (r.origin_vendor != g_manifest_vendor || r.origin_device != g_manifest_device) continue;
         ++records;
         const auto code =
-            ReadWords(g_capture_dir / fmt::format("{:016x}-{:016x}.code", r.hash, r.code_xxh));
+            ReadRecordCode(r.hash, r.code_xxh, r.code_words); // FEAT-GTS-470
         if (code.size() != r.code_words) {
             ++no_code;
             continue;
@@ -1774,7 +1792,7 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
                 }
             }
             const auto code =
-                ReadWords(g_capture_dir / fmt::format("{:016x}-{:016x}.code", r.hash, r.code_xxh));
+                ReadRecordCode(r.hash, r.code_xxh, r.code_words); // FEAT-GTS-470
             if (code.size() != r.code_words) {
                 ++no_code;
                 continue;
@@ -2409,6 +2427,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         g_manifest_device = instance.GetDeviceID();
         g_manifest_dir = cache_dir / fmt::format("{}.manifest", serial);
         g_capture_dir = cache_dir / fmt::format("{}.capture", serial);
+        g_programs_dir = cache_dir / fmt::format("{}-programs", serial); // FEAT-GTS-470
         const auto manifest_on = [](const char* name) {
             const char* env = std::getenv(name);
             return env && env[0] == '1';

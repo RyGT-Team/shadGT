@@ -583,6 +583,37 @@ private:
     std::atomic<u64> prewarm_read{};
     std::atomic<u64> prewarm_total{};
     std::atomic<bool> prewarm_reader_done{};
+    /// FIX-GTS-468: stored pipelines the workers finished building. The command thread moves
+    /// them from pending_builds into graphics_pipelines (AdoptPrewarmed), where the retention
+    /// trim can release the ones no draw uses; left in pending_builds they were never released.
+    std::mutex prewarm_finished_mutex;
+    std::vector<std::weak_ptr<PipelineBuild>> prewarm_finished;
+    std::atomic<bool> prewarm_finished_any{};
+    /// FIX-GTS-468: adopted stored pipelines no draw has used yet. The first draw that uses
+    /// one stores its key again, as a draw taking it from pending_builds did (PERF-038).
+    /// `order` is the adoption order (about most recently used first): once the precompile is
+    /// done, those past SHADGT_PRECOMPILE_KEEP are released (RetireUnclaimedPrewarm).
+    struct PrewarmUnclaimed {
+        GraphicsPipeline::SerializationSupport sdata;
+        u64 order{};
+    };
+    tsl::robin_map<GraphicsPipelineKey, PrewarmUnclaimed> prewarm_unclaimed;
+    u64 prewarm_adopted{};
+    u64 prewarm_dropped{};
+    bool prewarm_settle_dirty{};
+    std::vector<GraphicsPipelineKey> prewarm_settle_queue;
+    u64 prewarm_settled{};
+    void AdoptPrewarmed();
+    void RetireUnclaimedPrewarm(std::vector<std::shared_ptr<const void>>& retired);
+    /// FIX-GTS-468: the shader modules the precompile made (program hash, permutation). Once its
+    /// unused pipelines are retired, the modules no live pipeline uses go back to being stored
+    /// (loaded again on first use), as before the precompile.
+    std::vector<std::pair<u64, size_t>> prewarm_loaded;
+    /// FIX-GTS-468: programs the precompile listed (decoded shader metadata for every stored
+    /// program; a normal start lists only the ones its draws use). Dropped with the modules when
+    /// nothing uses them; a draw lists them from the store again (GetProgram).
+    std::vector<u64> prewarm_programs;
+    void ReleasePrewarmModules();
     /// PERF-076: new graphics pipelines build in the background while their draws are skipped.
     static bool AsyncPipelines();
     static bool WritesMemory(const std::array<const Shader::Info*, MaxShaderStages>& infos);

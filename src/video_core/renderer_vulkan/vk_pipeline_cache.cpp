@@ -380,17 +380,20 @@ extern "C" __declspec(dllexport) int RytyTestTessLayoutKeys() {
 // PERF-GT7-111 : the precompile manifest. A record per translation queued for a worker:
 // its inputs and the guest reads it made (descriptors, the SRT walker's output: values, no code),
 // and its SPIR-V's hash. The code and the fetch shader go to a local capture, never into a record.
-// SHADGT_MANIFEST_RECORD=1 writes them; SHADGT_MANIFEST_VERIFY=1 translates every record again at
-// start from the capture, replaying the reads, and compares the SPIR-V.
+// SHADGT_MANIFEST_RECORD (on unless =0) writes them; SHADGT_MANIFEST_VERIFY=1 translates every
+// record again at start from the capture, replaying the reads, and compares the SPIR-V.
 // shadGT: the frontend runs in QueueTranslation under the draw's state (OwnedTranslation), so its
 // reads are logged there and the record is written by the worker once the SPIR-V is made.
 // Format 3 adds the code's guest address (shadGT translates with pgm_base at it).
 static std::filesystem::path g_manifest_dir;
 static std::filesystem::path g_capture_dir;
+// FEAT-GTS-470: on by default (SHADGT_MANIFEST_RECORD=0 turns it off): every translation and every
+// stored one a draw first uses gets a record, so the manifest covers what was played and a
+// pre-translation after a renderer or driver update, here or on another GPU, misses less.
 static bool ManifestRecordOn() {
     static const bool on = [] {
         const char* env = std::getenv("SHADGT_MANIFEST_RECORD");
-        return env && env[0] == '1';
+        return !(env && env[0] == '0');
     }();
     return on;
 }
@@ -830,10 +833,17 @@ bool PrecompileHoldsGame() {
     return g_precompile_hold.load(std::memory_order_relaxed);
 }
 
+// FEAT-GTS-470: when the hold was taken, for the splash's length in the log.
+static std::atomic<s64> g_precompile_hold_since_ms{};
+
 static void ReleasePrecompileHold() {
     if (g_precompile_hold.exchange(false)) {
         Common::GuestClock::ReleaseHold();
-        LOG_WARNING(Render_Vulkan, "PERF-102: precompile done; the game continues");
+        const s64 since = g_precompile_hold_since_ms.load();
+        const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        LOG_WARNING(Render_Vulkan, "PERF-102: precompile done after {:.1f} s; the game continues",
+                    since ? double(now - since) / 1000.0 : 0.0);
     }
 }
 
@@ -1107,6 +1117,8 @@ struct PipelineCache::PipelineBuild {
     std::atomic<bool> urgent{};
     // PERF-038: a stored pipeline built in the background (no runtime shader state needed).
     bool preloading{};
+    // FEAT-GTS-470: a precompile build of only the stage libraries (PrecompileLibrariesOnly).
+    bool libraries_only{};
     // PERF-076: a new pipeline its draws skip until a worker has built it.
     bool async{};
     u32 required_waiters{}; // lookup mutex only; never touched by compiler workers
@@ -2401,7 +2413,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             const char* env = std::getenv(name);
             return env && env[0] == '1';
         };
-        if (manifest_on("SHADGT_MANIFEST_RECORD") || manifest_on("SHADGT_MANIFEST_VERIFY") ||
+        if (ManifestRecordOn() || manifest_on("SHADGT_MANIFEST_VERIFY") ||
             manifest_on("SHADGT_MANIFEST_PRETRANSLATE")) {
             try { MergeManifestFolders(); }
             catch (const std::exception& e) { LOG_WARNING(Render_Vulkan, "FEAT-GTS-470: manifest merge stopped: {}", e.what()); }
@@ -2997,8 +3009,22 @@ void PipelineCache::FinishBuild(PipelineBuild& build) {
           if (diag) {
               --g_diag_in_flight;
               ++g_diag_built;
-              g_diag_build_us += u64(std::chrono::duration_cast<std::chrono::microseconds>(
+              const u64 us = u64(std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - diag_start).count());
+              g_diag_build_us += us;
+              if (!build.preloading) {
+                  // Built for play, not by the precompile: their cost is what a player sees.
+                  static std::atomic<u64> count{}, total_us{}, max_us{};
+                  total_us += us;
+                  u64 seen = max_us.load();
+                  while (us > seen && !max_us.compare_exchange_weak(seen, us)) {}
+                  if (const u64 c = ++count; c % 50 == 0) {
+                      LOG_WARNING(Render_Vulkan, "PRECOMPILE-DIAG in game: {} pipelines built, "
+                                  "{:.0f} ms each on average, longest {:.0f} ms", c,
+                                  double(total_us.load()) / 1000.0 / double(c),
+                                  double(max_us.load()) / 1000.0);
+                  }
+              }
           }
       };
       const bool foreground = build.urgent.load(std::memory_order_acquire);
@@ -3008,6 +3034,8 @@ void PipelineCache::FinishBuild(PipelineBuild& build) {
       // build's shared libraries.
       g_pipeline_build_urgent = foreground;
       SCOPE_EXIT { g_pipeline_build_urgent = false; };
+      g_pipeline_libraries_only = build.libraries_only; // FEAT-GTS-470
+      SCOPE_EXIT { g_pipeline_libraries_only = false; };
       try {
         build.pipeline = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, build.key, *pipeline_cache, build.infos,
@@ -4757,6 +4785,16 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
         std::shared_ptr<PipelineBuild> build;
         bool predicted = false;
         auto pending = pending_builds.find(S().graphics_key);
+        if (pending != pending_builds.end() && pending->second->libraries_only) {
+            // FEAT-GTS-470: a precompile build of the stage libraries only has no pipeline to
+            // draw with: dropped (or left to finish) and this draw builds its own as usual.
+            if (CancelBuild(*pending->second) ||
+                pending->second->done.wait_for(std::chrono::seconds{0}) ==
+                    std::future_status::ready) {
+                pending_builds.erase(pending);
+            }
+            pending = pending_builds.end();
+        }
         if (pending != pending_builds.end() &&
             (pending->second->preloading || pending->second->async)) {
             auto stored = pending->second;
@@ -5935,6 +5973,8 @@ void PipelineCache::PrewarmRead(std::stop_token stop) {
 #ifdef RYTY_GPU
     // PERF-102: the game waits on the splash screen until the precompile is done.
     if (!g_precompile_hold.exchange(true)) {
+        g_precompile_hold_since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
         Common::GuestClock::TakeHold();
         LOG_WARNING(Render_Vulkan, "PERF-102: the game waits on the splash screen for the precompile");
     }
@@ -6165,6 +6205,23 @@ void PipelineCache::IdlePrewarm(bool splash) {
 // were destroyed (RTX 4070 Laptop, 7.2 GB budget: races ran at 6.8 GB).
 // Command thread, lookup mutex held (InstallPrewarmed's callers).
 static u64 PrecompileKeep();
+
+// FEAT-GTS-470 (opt-in, SHADGT_PRECOMPILE_LIBRARIES_ONLY=1): past the pipelines the precompile
+// keeps (SHADGT_PRECOMPILE_KEEP), compile only their stage libraries and skip the link. Radeon
+// 610M, 3,000 pipelines: splash 414 -> 142 s, but play built 487 pipelines at 871 ms each
+// (longest 4.2 s) against 294 at 221 ms (1.5 s): AMD's driver cache keeps linked pipelines, so a
+// link at the splash makes the game's one cheap. Off by default: hitches in play cost more than
+// a first splash.
+bool PipelineCache::PrecompileLibrariesOnly() const {
+    static const int forced = [] {
+        const char* env = std::getenv("SHADGT_PRECOMPILE_LIBRARIES_ONLY");
+        return env && *env ? (env[0] == '0' ? 0 : 1) : -1;
+    }();
+    const bool libraries =
+        SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(), true);
+    return libraries && forced == 1;
+}
+
 void PipelineCache::AdoptPrewarmed() {
     if (!prewarm_finished_any.load(std::memory_order_acquire)) {
         return;
@@ -6200,8 +6257,9 @@ void PipelineCache::AdoptPrewarmed() {
             pending_builds.erase(pending);
             continue;
         }
-        if (prewarm_adopted >= PrecompileKeep() && !graphics_pipelines.contains(build->key)) {
-            ++prewarm_adopted;
+        if (build->libraries_only ||
+            (prewarm_adopted >= PrecompileKeep() && !graphics_pipelines.contains(build->key))) {
+            prewarm_adopted += build->libraries_only ? 0 : 1;
             dropped.emplace_back(std::shared_ptr<GraphicsPipeline>(std::move(build->pipeline)));
             pending_builds.erase(pending);
             ++adopted;
@@ -6365,6 +6423,8 @@ bool PipelineCache::InstallPrewarmRecord(PrewarmRecord& record) {
     S().graphics_key = record.key;
     auto build = MakePipelineBuild();
     build->preloading = true;
+    // FEAT-GTS-470: past the pipelines the precompile keeps, only the stage libraries (AMD).
+    build->libraries_only = PrecompileLibrariesOnly() && ++prewarm_installed > PrecompileKeep();
     build->sdata = record.sdata;
     pending_builds.emplace(record.key, build);
     QueueBackgroundBuild(build);
@@ -7154,8 +7214,8 @@ bool PipelineCache::AsyncTranslation() const {
     return enabled && translate_workers != nullptr;
 }
 
-// FEAT-GTS-470: with recording on (SHADGT_MANIFEST_RECORD=1), a draw's first use of a stored
-// translation records it too. A record was written only when a translation was made, so
+// FEAT-GTS-470: with recording on (the default; SHADGT_MANIFEST_RECORD=0 off), a draw's first use
+// of a stored translation records it too. A record was written only when a translation was made, so
 // translations stored before recording began never got one (665 of the RTX 4070's 10,670 stored
 // programs; a Radeon replaying its manifest then translated 421 of them in game). The frontend runs
 // once under this draw's state for its guest reads; its result is dropped. Command thread, record
@@ -7168,6 +7228,19 @@ void PipelineCache::RecordStoredUse(HwStage hw_stage, SwStage sw_stage,
         sw_stage == Shader::SwStage::Geometry) {
         return;
     }
+    // With recording on by default, play pays for it: at most ~2 ms of these per 16 ms on the
+    // command thread. A shader over the budget is recorded at a later use (this one or the next
+    // session's), so nothing is lost, only spread out.
+    using namespace std::chrono;
+    static steady_clock::time_point window{};
+    static microseconds spent{};
+    const auto now = steady_clock::now();
+    if (now - window > milliseconds{16}) {
+        window = now;
+        spent = microseconds{0};
+    }
+    if (spent >= milliseconds{2}) return;
+    SCOPE_EXIT { spent += duration_cast<microseconds>(steady_clock::now() - now); };
     static std::unordered_set<u64> looked_at;
     if (!looked_at.insert(HashCombine(params.hash, u64{perm_idx})).second) return;
     std::vector<u32> stored_spv;
@@ -7379,7 +7452,7 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
 #ifndef NDEBUG
         const auto preparation_start = std::chrono::steady_clock::now();
 #endif
-        // PERF-GT7-111 (SHADGT_MANIFEST_RECORD=1): the frontend's guest reads, for the manifest.
+        // PERF-GT7-111 (recording, on unless SHADGT_MANIFEST_RECORD=0): the frontend's guest reads, for the manifest.
         // Not a geometry shader: its copy shader comes as a pointer in RuntimeInfo, which a
         // translation made again outside the draw would read wherever it then points.
         const bool record = ManifestRecordOn() && !g_manifest_dir.empty() &&

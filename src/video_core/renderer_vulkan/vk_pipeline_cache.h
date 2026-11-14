@@ -604,6 +604,8 @@ private:
     };
     tsl::robin_map<GraphicsPipelineKey, PrewarmUnclaimed> prewarm_unclaimed;
     u64 prewarm_adopted{};
+    u64 prewarm_installed{}; ///< FEAT-GTS-470: precompile builds queued, in install order
+    bool PrecompileLibrariesOnly() const;
     u64 prewarm_dropped{};
     bool prewarm_settle_dirty{};
     std::vector<GraphicsPipelineKey> prewarm_settle_queue;

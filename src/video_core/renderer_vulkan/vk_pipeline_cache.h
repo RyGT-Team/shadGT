@@ -317,6 +317,15 @@ private:
     void PrewarmRead(std::stop_token stop);
     /// FEAT-GTS-470: other GPU families' stored pipelines made this GPU's (see the .cpp).
     void ImportForeignPipelines(std::stop_token stop);
+    /// FEAT-GTS-471: this GPU's stored pipelines as the manifest's recipe file (see the .cpp).
+    void ExportPipelineRecipes(std::stop_token stop);
+public:
+    /// FEAT-GTS-471: a stored pipeline key file and its shaders' names (program, record SPIR-V hash).
+    struct PipelineRecipe {
+        std::array<std::pair<u64, u64>, MaxShaderStages> names{};
+        std::vector<u8> pipeline;
+    };
+private:
     void ReportPrewarm(std::chrono::steady_clock::time_point now);
     /// PERF-034: waits while a worker builds a pipeline, starting builds for the states the
     /// command thread queues meanwhile. Compilation is owned exclusively by the workers.

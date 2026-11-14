@@ -36,6 +36,7 @@
 #include <thread>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -2536,8 +2537,20 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 #ifndef NDEBUG
                     prewarm_stats.since = std::chrono::steady_clock::now();
 #endif
-                    prewarm_reader =
-                        std::jthread{[this](std::stop_token stop) { PrewarmRead(stop); }};
+                    prewarm_reader = std::jthread{[this](std::stop_token stop) {
+                        PrewarmRead(stop);
+                        // FEAT-GTS-471: the recipes, once the game plays (and a while into it).
+                        if (!ManifestRecordOn()) return;
+                        const auto since = std::chrono::steady_clock::now();
+                        while (!stop.stop_requested() &&
+                               (PrecompileHoldsGame() ||
+                                std::chrono::steady_clock::now() - since < std::chrono::seconds{30})) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds{250});
+                        }
+                        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+                        try { ExportPipelineRecipes(stop); }
+                        catch (const std::exception& e) { LOG_WARNING(Render_Vulkan, "FEAT-GTS-471: recipe export stopped: {}", e.what()); }
+                    }};
                 }
             }
         }
@@ -5841,6 +5854,9 @@ struct PipelineCache::PrewarmRecord {
 // family's store is the sibling with the same switches and another store number (v7 for v8).
 // Pipelines with helper shaders made for the host (tessellation, rect and quad lists) are left out.
 // Once per foreign key count and mapping size (recipe-imports.txt). SHADGT_PIPELINE_RECIPES=0: off.
+static std::optional<std::vector<PipelineCache::PipelineRecipe>> ReadPipelineRecipes(
+    const std::filesystem::path& file, const std::string& switches);
+
 void PipelineCache::ImportForeignPipelines(std::stop_token stop) {
     if (const char* env = std::getenv("SHADGT_PIPELINE_RECIPES"); env && env[0] == '0') return;
     namespace fs = std::filesystem;
@@ -5890,7 +5906,21 @@ void PipelineCache::ImportForeignPipelines(std::stop_token stop) {
         }
         foreign.push_back(entry.path());
     }
-    if (foreign.empty()) return;
+    // FEAT-GTS-471: the manifest's recipe files from other GPUs (pipelines-<vendor>-<device>.rcp,
+    // ExportPipelineRecipes): the shippable source, without the other GPU's store.
+    std::vector<fs::path> recipe_files;
+    const std::string own_recipes =
+        fmt::format("pipelines-{:04x}-{:04x}.rcp", g_manifest_vendor, g_manifest_device);
+    if (!g_manifest_dir.empty()) {
+        for (const auto& entry : fs::directory_iterator(g_manifest_dir, ec)) {
+            const auto name = entry.path().filename().string();
+            if (name.starts_with("pipelines-") && entry.path().extension() == ".rcp" &&
+                name != own_recipes) {
+                recipe_files.push_back(entry.path());
+            }
+        }
+    }
+    if (foreign.empty() && recipe_files.empty()) return;
     std::unordered_map<u64, size_t> local_perm; // HashCombine(program, record SPIR-V hash)
     {
         std::ifstream in{local / "recipe-perms.txt"};
@@ -5905,6 +5935,23 @@ void PipelineCache::ImportForeignPipelines(std::stop_token stop) {
     if (local_perm.empty()) return;
     const fs::path marker = local / "recipe-imports.txt";
     std::string done = read_text(marker);
+    enum class Installed { Imported, Present, Unresolved, Failed };
+    // FEAT-GTS-471: key's shaders, named by program and record SPIR-V hash, renumbered to this
+    // store's permutations (recipe-perms.txt) and stored as this GPU's pipeline.
+    const auto install = [&](GraphicsPipelineKey& key, GraphicsPipeline::SerializationSupport& sdata,
+                             const std::array<std::pair<u64, u64>, MaxShaderStages>& names) {
+        for (u32 i = 0; i < MaxShaderStages; ++i) {
+            if (key.stage_hashes[i] == 0) continue;
+            const auto mapped = local_perm.find(HashCombine(names[i].first, names[i].second));
+            if (names[i].first == 0 || mapped == local_perm.end()) return Installed::Unresolved;
+            key.stage_hashes[i] = HashCombine(names[i].first, u64{mapped->second});
+        }
+        const u64 hash = std::hash<GraphicsPipelineKey>{}(key);
+        const auto target = local / fmt::format("g_{:#018x}.key", hash);
+        if (fs::exists(target, ec)) return Installed::Present;
+        return WriteStoredGraphicsPipeline(target, key, sdata) ? Installed::Imported
+                                                                : Installed::Failed;
+    };
     for (const auto& dir : foreign) {
         std::vector<std::pair<fs::path, fs::file_time_type>> keys;
         for (const auto& entry : fs::directory_iterator(dir, ec)) {
@@ -5934,8 +5981,8 @@ void PipelineCache::ImportForeignPipelines(std::stop_token stop) {
                 ++helpers;
                 continue;
             }
-            bool ok = true;
-            for (u32 i = 0; ok && i < MaxShaderStages; ++i) {
+            std::array<std::pair<u64, u64>, MaxShaderStages> names{};
+            for (u32 i = 0; i < MaxShaderStages; ++i) {
                 const u64 foreign_hash = key.stage_hashes[i];
                 if (foreign_hash == 0) continue;
                 auto it = stages.find(foreign_hash);
@@ -5953,26 +6000,14 @@ void PipelineCache::ImportForeignPipelines(std::stop_token stop) {
                     }
                     it = stages.emplace(foreign_hash, stage).first;
                 }
-                const auto mapped = it->second.ok
-                    ? local_perm.find(HashCombine(it->second.pgm, it->second.spv))
-                    : local_perm.end();
-                if (mapped == local_perm.end()) {
-                    ok = false;
-                } else {
-                    key.stage_hashes[i] = HashCombine(it->second.pgm, u64{mapped->second});
-                }
+                if (it->second.ok) names[i] = {it->second.pgm, it->second.spv};
             }
-            if (!ok) {
-                ++unresolved;
-                continue;
+            switch (install(key, sdata, names)) {
+            case Installed::Imported: ++imported; break;
+            case Installed::Present: ++present; break;
+            case Installed::Unresolved: ++unresolved; break;
+            case Installed::Failed: break;
             }
-            const u64 hash = std::hash<GraphicsPipelineKey>{}(key);
-            const auto target = local / fmt::format("g_{:#018x}.key", hash);
-            if (fs::exists(target, ec)) {
-                ++present;
-                continue;
-            }
-            imported += WriteStoredGraphicsPipeline(target, key, sdata) ? 1 : 0;
         }
         LOG_WARNING(Render_Vulkan, "FEAT-GTS-470: {} pipelines from {} made this GPU's: {} imported, "
                     "{} present already, {} with host helper shaders, {} with a shader no record "
@@ -5984,6 +6019,241 @@ void PipelineCache::ImportForeignPipelines(std::stop_token stop) {
             std::fclose(f);
         }
     }
+    for (const auto& file : recipe_files) {
+        if (stop.stop_requested()) return;
+        auto recipes = ReadPipelineRecipes(file, switches(local_version));
+        if (!recipes) {
+            LOG_WARNING(Render_Vulkan, "FEAT-GTS-471: {} not read (another format or other switches)",
+                        file.filename().string());
+            continue;
+        }
+        const std::string mark = fmt::format("{} {} {}\n", file.filename().string(), recipes->size(),
+                                             local_perm.size());
+        if (done.find(mark) != std::string::npos) continue;
+        u64 imported = 0, present = 0, unresolved = 0, unreadable = 0;
+        for (auto& recipe : *recipes) {
+            GraphicsPipelineKey key{};
+            GraphicsPipeline::SerializationSupport sdata{};
+            if (!LoadStoredGraphicsPipeline(std::move(recipe.pipeline), key, sdata)) {
+                ++unreadable;
+                continue;
+            }
+            switch (install(key, sdata, recipe.names)) {
+            case Installed::Imported: ++imported; break;
+            case Installed::Present: ++present; break;
+            case Installed::Unresolved: ++unresolved; break;
+            case Installed::Failed: break;
+            }
+        }
+        LOG_WARNING(Render_Vulkan, "FEAT-GTS-471: {} recipes from {} made this GPU's: {} imported, "
+                    "{} present already, {} with a shader no record maps here, {} unreadable",
+                    recipes->size(), file.filename().string(), imported, present, unresolved,
+                    unreadable);
+        done += mark;
+        if (std::FILE* f = std::fopen(marker.string().c_str(), "ab")) {
+            std::fwrite(mark.data(), 1, mark.size(), f);
+            std::fclose(f);
+        }
+    }
+}
+
+// FEAT-GTS-471: the manifest's pipeline recipes, this GPU's stored pipelines with their shaders
+// named as the records name them (program hash, record SPIR-V hash) instead of by this store's
+// permutations, in <serial>.manifest/pipelines-<vendor>-<device>.rcp. A recipe is a pipeline key
+// file (draw state, vertex inputs, multisampling: no code) and those names; another GPU imports
+// them (ImportForeignPipelines) once its pre-translation has made the records' translations.
+// Pipelines with helper shaders made for the host are left out. Written after the splash
+// precompile, at low priority, when the store's pipeline count or the records changed.
+//
+// File: "RYGTRCP1", u32 switches length, the store's switches, u32 count, then per recipe
+// MaxShaderStages (u64 program, u64 SPIR-V hash) pairs (0 for none), u32 length, key file bytes.
+static constexpr char RecipeMagic[8] = {'R', 'Y', 'G', 'T', 'R', 'C', 'P', '1'};
+
+static std::optional<std::vector<PipelineCache::PipelineRecipe>> ReadPipelineRecipes(
+    const std::filesystem::path& file, const std::string& switches) {
+    std::ifstream in{file, std::ios::binary};
+    if (!in) return std::nullopt;
+    const auto get = [&](auto& value) {
+        in.read(reinterpret_cast<char*>(&value), sizeof(value));
+        return bool(in);
+    };
+    char magic[8]{};
+    u32 length{};
+    if (!get(magic) || std::memcmp(magic, RecipeMagic, 8) != 0 || !get(length) || length > 4096) {
+        return std::nullopt;
+    }
+    std::string theirs(length, '\0');
+    in.read(theirs.data(), length);
+    u32 count{};
+    if (!in || theirs != switches || !get(count)) return std::nullopt;
+    std::vector<PipelineCache::PipelineRecipe> recipes;
+    recipes.reserve(std::min<u32>(count, 1u << 20));
+    for (u32 r = 0; r < count; ++r) {
+        PipelineCache::PipelineRecipe recipe;
+        for (auto& [pgm, spv] : recipe.names) {
+            if (!get(pgm) || !get(spv)) return std::nullopt;
+        }
+        if (!get(length) || length > (1u << 20)) return std::nullopt;
+        recipe.pipeline.resize(length);
+        in.read(reinterpret_cast<char*>(recipe.pipeline.data()), length);
+        if (!in) return std::nullopt;
+        recipes.push_back(std::move(recipe));
+    }
+    return recipes;
+}
+
+void PipelineCache::ExportPipelineRecipes(std::stop_token stop) {
+    namespace fs = std::filesystem;
+    auto& store = Storage::DataBase::Instance();
+    if (g_manifest_dir.empty() || !store.IsOpened() || EmulatorSettings.IsPipelineCacheArchived()) {
+        return;
+    }
+    const fs::path local = store.StorePath();
+    std::error_code ec;
+    const auto read_bytes = [](const fs::path& path) {
+        std::vector<u8> bytes;
+        std::ifstream in{path, std::ios::binary};
+        if (!in) return bytes;
+        in.seekg(0, std::ios::end);
+        const auto size = std::streamoff(in.tellg());
+        if (size <= 0) return bytes;
+        bytes.resize(size_t(size));
+        in.seekg(0);
+        in.read(reinterpret_cast<char*>(bytes.data()), size);
+        if (!in) bytes.clear();
+        return bytes;
+    };
+    std::string switches;
+    {
+        const auto bytes = read_bytes(local / "store-version.txt");
+        const std::string version{bytes.begin(), bytes.end()};
+        const auto close = version.find(')');
+        if (close == std::string::npos) return;
+        switches = version.substr(close + 1);
+    }
+    // The records this manifest has: <program>-<SPIR-V hash>.rec.
+    std::unordered_set<u64> records;
+    for (const auto& entry : fs::directory_iterator(g_manifest_dir, ec)) {
+        unsigned long long pgm{}, spv{};
+        const auto name = entry.path().filename().string();
+        if (entry.path().extension() == ".rec" &&
+            std::sscanf(name.c_str(), "%16llx-%16llx.rec", &pgm, &spv) == 2) {
+            records.insert(HashCombine(u64(pgm), u64(spv)));
+        }
+    }
+    // Permutations pre-translated from other GPUs' records are named by those records.
+    std::unordered_map<u64, u64> record_of_perm; // HashCombine(program, permutation) -> SPIR-V hash
+    {
+        std::ifstream in{local / "recipe-perms.txt"};
+        std::string line;
+        while (std::getline(in, line)) {
+            unsigned long long pgm{}, spv{}, perm{};
+            if (std::sscanf(line.c_str(), "%llx %llx %llu", &pgm, &spv, &perm) == 3 &&
+                records.contains(HashCombine(u64(pgm), u64(spv)))) {
+                record_of_perm[HashCombine(u64(pgm), u64(perm))] = u64(spv);
+            }
+        }
+    }
+    std::vector<std::pair<fs::path, fs::file_time_type>> keys;
+    for (const auto& entry : fs::directory_iterator(local, ec)) {
+        const auto name = entry.path().filename().string();
+        if (name.starts_with("g_") && entry.path().extension() == ".key") {
+            keys.emplace_back(entry.path(), entry.last_write_time(ec));
+        }
+    }
+    const auto target =
+        g_manifest_dir / fmt::format("pipelines-{:04x}-{:04x}.rcp", g_manifest_vendor, g_manifest_device);
+    const fs::path marker = local / "recipe-export.txt";
+    const std::string mark = fmt::format("{} {} {}", keys.size(), records.size(), record_of_perm.size());
+    if (const auto old = read_bytes(marker);
+        std::string{old.begin(), old.end()} == mark && fs::exists(target, ec)) {
+        return;
+    }
+    const auto start_time = std::chrono::steady_clock::now();
+    // Oldest first, as the store's files: an import keeps the order (ImportForeignPipelines).
+    std::ranges::sort(keys, [](const auto& a, const auto& b) { return a.second < b.second; });
+    struct Name { u64 pgm{}; u64 spv{}; bool ok{}; };
+    std::unordered_map<u64, Name> names; // HashCombine(program, permutation)
+    std::vector<u8> out;
+    const auto put = [&out](const auto& value) {
+        const auto* bytes = reinterpret_cast<const u8*>(&value);
+        out.insert(out.end(), bytes, bytes + sizeof(value));
+    };
+    out.insert(out.end(), RecipeMagic, RecipeMagic + 8);
+    put(u32(switches.size()));
+    out.insert(out.end(), switches.begin(), switches.end());
+    const size_t count_at = out.size();
+    put(u32{0});
+    u32 written = 0, helpers = 0, unnamed = 0;
+    for (const auto& [file, time] : keys) {
+        if (stop.stop_requested()) return;
+        const auto blob = read_bytes(file);
+        GraphicsPipelineKey key{};
+        GraphicsPipeline::SerializationSupport sdata{};
+        if (!LoadStoredGraphicsPipeline(std::vector<u8>{blob}, key, sdata)) continue;
+        if (!sdata.tcs.empty() || !sdata.tes.empty() || !sdata.fragment.empty()) {
+            ++helpers;
+            continue;
+        }
+        std::array<std::pair<u64, u64>, MaxShaderStages> stage_names{};
+        bool ok = true;
+        for (u32 i = 0; ok && i < MaxShaderStages; ++i) {
+            const u64 stage_hash = key.stage_hashes[i];
+            if (stage_hash == 0) continue;
+            auto it = names.find(stage_hash);
+            if (it == names.end()) {
+                Name name{};
+                u64 pgm{};
+                size_t perm{};
+                if (PeekShaderMeta(read_bytes(local / fmt::format("{:#018x}.meta", stage_hash)), pgm,
+                                   perm) &&
+                    HashCombine(pgm, u64{perm}) == stage_hash) {
+                    // Recorded here: the record is named by this store's SPIR-V.
+                    const auto spv = read_bytes(local / fmt::format("{:#018x}_{}.spv", pgm, perm));
+                    const u64 spv_xxh = spv.empty() ? 0 : XXH3_64bits(spv.data(), spv.size());
+                    if (spv_xxh && records.contains(HashCombine(pgm, spv_xxh))) {
+                        name = {pgm, spv_xxh, true};
+                    } else if (const auto r = record_of_perm.find(stage_hash);
+                               r != record_of_perm.end()) {
+                        name = {pgm, r->second, true};
+                    }
+                }
+                it = names.emplace(stage_hash, name).first;
+            }
+            ok = it->second.ok;
+            stage_names[i] = {it->second.pgm, it->second.spv};
+        }
+        if (!ok) {
+            ++unnamed;
+            continue;
+        }
+        for (const auto& [pgm, spv] : stage_names) {
+            put(pgm);
+            put(spv);
+        }
+        put(u32(blob.size()));
+        out.insert(out.end(), blob.begin(), blob.end());
+        ++written;
+    }
+    std::memcpy(out.data() + count_at, &written, sizeof(written));
+    auto temp = target;
+    temp += ".tmp";
+    {
+        std::ofstream file{temp, std::ios::binary | std::ios::trunc};
+        file.write(reinterpret_cast<const char*>(out.data()), std::streamsize(out.size()));
+        if (!file) return;
+    }
+    fs::rename(temp, target, ec);
+    if (ec) return;
+    if (std::FILE* f = std::fopen(marker.string().c_str(), "wb")) {
+        std::fwrite(mark.data(), 1, mark.size(), f);
+        std::fclose(f);
+    }
+    LOG_WARNING(Render_Vulkan, "FEAT-GTS-471: {} pipeline recipes written to {} ({} KB) in {:.1f} s; "
+                "{} with host helper shaders, {} with a shader no record names",
+                written, target.filename().string(), out.size() / 1024,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count(),
+                helpers, unnamed);
 }
 
 void PipelineCache::PrewarmRead(std::stop_token stop) {

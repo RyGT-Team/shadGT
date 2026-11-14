@@ -88,7 +88,7 @@ struct TimingTrace {
     }
 
     void Create(const Instance& instance) {
-        const char* option = std::getenv("RYGT_FG_GPU_TIMING");
+        const char* option = std::getenv("SHADGT_FG_GPU_TIMING");
         if (!option || std::string{option} != "1") return;
         const auto families = instance.GetPhysicalDevice().getQueueFamilyProperties();
         const auto bits = families[instance.GetGraphicsQueueFamilyIndex()].timestampValidBits;
@@ -194,7 +194,7 @@ struct TimingTrace {
 // This constant has one code reference: the interpolation-thread reset threshold.
 // Check the entire DLL on disk and the loaded instructions before touching its data.
 bool ApplyLowFpsPacing(HMODULE module, const std::wstring& path) {
-    const char* option = std::getenv("RYGT_FG_LOW_FPS_PACING");
+    const char* option = std::getenv("SHADGT_FG_LOW_FPS_PACING");
     if (!option || std::string{option} != "1") return false;
     constexpr std::array<u8, 32> expected_hash{
         0xa1,0x62,0x4c,0xc4,0x23,0x8f,0xef,0x04,0x6f,0x30,0xc4,0xd8,0x0c,0xe3,0xf4,0x7b,

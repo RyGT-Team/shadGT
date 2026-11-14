@@ -569,11 +569,11 @@ public:
     };
     /// PERF-GTS-367: takes a kept buffer whose memory is in the reserve, to free it for another.
     bool TakeReservedRecycled(RecycledBuffer& out);
-    /// Most bytes kept at once: RYGT_UPLOAD_COPY_POOL_MB, default 512; 0 keeps none. At 256 MB
+    /// Most bytes kept at once: SHADGT_UPLOAD_COPY_POOL_MB, default 512; 0 keeps none. At 256 MB
     /// the pool filled in the first 40 s of Autopolis and copies of new sizes were freed again.
     static u64 RecycleLimit() {
         static const u64 limit = [] {
-            const char* env = std::getenv("RYGT_UPLOAD_COPY_POOL_MB");
+            const char* env = std::getenv("SHADGT_UPLOAD_COPY_POOL_MB");
             char* end = nullptr;
             const unsigned long long mb = env && *env ? std::strtoull(env, &end, 10) : 512;
             return (end && *end ? 512ULL : std::min<u64>(mb, 4096)) << 20;
@@ -589,7 +589,7 @@ public:
         return (size + step - 1) / step * step;
     }
     /// PERF-GTS-364: a VMA pool for recycled upload buffers whose memory is allocated once, up
-    /// front (RYGT_UPLOAD_COPY_RESERVE_MB, default 256, in 128 MB blocks; 0 = none). A copy the
+    /// front (SHADGT_UPLOAD_COPY_RESERVE_MB, default 256, in 128 MB blocks; 0 = none). A copy the
     /// PERF-GTS-362 pool cannot serve yet (a texture seen for the first time) is then placed in
     /// memory that exists, instead of VMA allocating a new 32 MB block on the recorder (6 to 7 ms
     /// each, several in a row when large buildings come into view). It never grows: when full,
@@ -1017,12 +1017,12 @@ std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
         alloc_ci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
         break;
     case MemoryKind::Upload: {
-        // PERF-GTS-457 (RYGT_NATIVE_UPLOAD_VRAM=1): upload memory in video memory the CPU can
+        // PERF-GTS-457 (SHADGT_NATIVE_UPLOAD_VRAM=1): upload memory in video memory the CPU can
         // write (Resizable BAR), falling back to system memory when there is none left. Shaders
         // read snapshots from upload memory: GT Sport's tessellated car bodies read their hull
         // shader data there every draw, and over PCIe each read waited (~16 us a draw).
         static const bool vram = [] {
-            const char* env = std::getenv("RYGT_NATIVE_UPLOAD_VRAM");
+            const char* env = std::getenv("SHADGT_NATIVE_UPLOAD_VRAM");
             return !env || !*env || env[0] == '1'; // PERF-GTS-407: on unless set to something else
         }();
         alloc_ci.usage = vram ? VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE : VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
@@ -1119,7 +1119,7 @@ VmaPool VulkanDevice::UploadReserve(const VkBufferCreateInfo& buffer_ci,
                                     const VmaAllocationCreateInfo& alloc_ci) {
     std::call_once(upload_reserve_once, [&] {
         constexpr u64 BlockBytes = 128ULL << 20;
-        const char* env = std::getenv("RYGT_UPLOAD_COPY_RESERVE_MB");
+        const char* env = std::getenv("SHADGT_UPLOAD_COPY_RESERVE_MB");
         char* end = nullptr;
         u64 mb = env && *env ? std::strtoull(env, &end, 10) : 256;
         if (end && *end) mb = 256;
@@ -2607,7 +2607,7 @@ std::unique_ptr<Device> CreateVulkanDevice(const Vulkan::Instance& instance) {
     };
     return std::make_unique<VulkanDevice>(std::move(context),
 #ifndef NDEBUG
-        GpuTimingRequested(std::getenv("RYGT_GPU_TIMING"))
+        GpuTimingRequested(std::getenv("SHADGT_GPU_TIMING"))
 #else
         false
 #endif
@@ -2781,7 +2781,7 @@ static std::unique_ptr<Device> CreateStandaloneVulkanDeviceImpl(std::string* err
 std::unique_ptr<Device> CreateStandaloneVulkanDevice(std::string* error) {
     return CreateStandaloneVulkanDeviceImpl(error,
 #ifndef NDEBUG
-        GpuTimingRequested(std::getenv("RYGT_GPU_TIMING"))
+        GpuTimingRequested(std::getenv("SHADGT_GPU_TIMING"))
 #else
         false
 #endif
@@ -2806,7 +2806,7 @@ extern "C" __declspec(dllexport) int RytyNativeGpuTimingSelfTest(char* report, i
     auto configured = CreateStandaloneVulkanDevice(&error);
     if (!configured) return 1;
     auto& configured_device = static_cast<VulkanDevice&>(*configured);
-    const bool configured_enabled = GpuTimingRequested(std::getenv("RYGT_GPU_TIMING"));
+    const bool configured_enabled = GpuTimingRequested(std::getenv("SHADGT_GPU_TIMING"));
     const u32 configured_pools = configured_device.gpu_timing_count;
     const bool configured_reader = configured_device.gpu_timing_reader.joinable();
     if (configured_device.gpu_timing_enabled != configured_enabled ||

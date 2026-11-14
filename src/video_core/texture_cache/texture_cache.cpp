@@ -1835,7 +1835,7 @@ void TextureCache::GarbageCollectUnusedImages() {
 void TextureCache::ReportMemoryBreakdown() {
 #ifndef NDEBUG
     static const bool enabled = [] {
-        const char* value = Common::DiagEnv("RYGT_VRAM_DIAGNOSTICS");
+        const char* value = Common::DiagEnv("SHADGT_VRAM_DIAGNOSTICS");
         return value && value[0] == '1';
     }();
     const auto now = std::chrono::steady_clock::now();

@@ -10,4 +10,4 @@ On Windows, `RytyNativeImageSelfTest` also exercises a deterministic upload race
 
 Gameplay improvement still requires a same-scene comparison. These tests do not establish that every frame meets 16.6 ms.
 
-GPU command-list timing is diagnostic and defaults off. Set `RYGT_GPU_TIMING=1` exactly to enable query pools and the timing reader; unset, `0`, and other values leave it off. `RytyNativeGpuTimingSelfTest` checks the environment-controlled factory and explicitly exercises both disabled and enabled timing, including its bounded query-lease tests.
+GPU command-list timing is diagnostic and defaults off. Set `SHADGT_GPU_TIMING=1` exactly to enable query pools and the timing reader; unset, `0`, and other values leave it off. `RytyNativeGpuTimingSelfTest` checks the environment-controlled factory and explicitly exercises both disabled and enabled timing, including its bounded query-lease tests.

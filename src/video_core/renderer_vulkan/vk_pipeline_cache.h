@@ -474,11 +474,11 @@ private:
     void CreateDriverCache();
     void SaveDriverCache(bool wait);
     void MaybeSaveDriverCache();
-    /// PERF-GT7-108: the compile pack's start-up compile (RYGT_COMPILE_PACK=1), on its own thread.
+    /// PERF-GT7-108: the compile pack's start-up compile (SHADGT_COMPILE_PACK=1), on its own thread.
     void CompilePackShaders(std::stop_token stop);
     std::jthread compile_pack_thread;
-    /// PERF-GT7-111: RYGT_MANIFEST_VERIFY=1 translates every manifest record again at start and
-    /// compares SPIR-V. PERF-GT7-117: RYGT_MANIFEST_PRETRANSLATE=1 stores the records of programs
+    /// PERF-GT7-111: SHADGT_MANIFEST_VERIFY=1 translates every manifest record again at start and
+    /// compares SPIR-V. PERF-GT7-117: SHADGT_MANIFEST_PRETRANSLATE=1 stores the records of programs
     /// the shader store does not have. Both off by default; joined with the cache.
     void VerifyManifest(std::stop_token stop);
     void PretranslateManifest(std::stop_token stop);
@@ -598,7 +598,7 @@ private:
     /// the command thread waiting for the translation.
     bool SkipTranslationWait(Shader::SwStage sw_stage, const Shader::ShaderParams& params);
     /// PERF-GT7-115: the draw's wait for its hull shader translation is bounded by the window's
-    /// budget (RYGT_HS_WAIT_BUDGET_MS), under SHD-005's conditions (async pipelines, not a forced
+    /// budget (SHADGT_HS_WAIT_BUDGET_MS), under SHD-005's conditions (async pipelines, not a forced
     /// or one-off wait).
     bool HullWaitBudgeted(Shader::SwStage sw_stage, const Shader::ShaderParams& params);
     tsl::robin_map<u64, bool> code_writes_memory; ///< by program hash
@@ -705,7 +705,7 @@ private:
     std::unordered_map<u64, std::shared_future<StoredListing>> pending_listings;
     std::unique_ptr<StoreReaders> store_readers;
     /// PERF-GT7-118: a stored permutation's module, made by a store reader from the SPIR-V it
-    /// read ahead (RYGT_PREFETCH_MODULES=0: not made); LoadStoredModule takes it.
+    /// read ahead (SHADGT_PREFETCH_MODULES=0: not made); LoadStoredModule takes it.
     void PrefetchStoredModule(u64 pgm_hash, size_t perm_idx, const std::vector<u32>& words);
     std::mutex prefetched_mutex;
     std::unordered_map<u64, vk::ShaderModule> prefetched_modules; ///< by HashCombine(program, permutation)

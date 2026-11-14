@@ -12,7 +12,7 @@
 static_assert(std::is_empty_v<Common::FrameQueueTrace::Ticket>);
 static_assert(std::is_empty_v<Common::FrameQueueTrace::Row>);
 static_assert(std::is_empty_v<Common::FrameQueueTrace::Scope>);
-static_assert(Common::DebugEnv("RYGT_FRAME_QUEUE_TRACE") == nullptr);
+static_assert(Common::DebugEnv("SHADGT_FRAME_QUEUE_TRACE") == nullptr);
 
 static bool SetEnvironment(const char* name, const char* value) {
 #ifdef _WIN32
@@ -31,10 +31,10 @@ int main(int argc, char** argv) {
     const auto status = base.string() + ".status";
     if (std::filesystem::exists(output) || std::filesystem::exists(status))
         return 2;
-    if (!SetEnvironment("RYGT_FRAME_QUEUE_TRACE", "1") ||
-        !SetEnvironment("RYGT_FRAME_QUEUE_TRACE_OUTPUT", output.c_str()) ||
-        !SetEnvironment("RYGT_FRAME_QUEUE_TRACE_CONTROL", control.c_str()) ||
-        !SetEnvironment("RYGT_FRAME_QUEUE_TRACE_STATUS", status.c_str()))
+    if (!SetEnvironment("SHADGT_FRAME_QUEUE_TRACE", "1") ||
+        !SetEnvironment("SHADGT_FRAME_QUEUE_TRACE_OUTPUT", output.c_str()) ||
+        !SetEnvironment("SHADGT_FRAME_QUEUE_TRACE_CONTROL", control.c_str()) ||
+        !SetEnvironment("SHADGT_FRAME_QUEUE_TRACE_STATUS", status.c_str()))
         return 3;
     namespace Trace = Common::FrameQueueTrace;
     Trace::Initialize();

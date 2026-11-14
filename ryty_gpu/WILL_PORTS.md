@@ -12,10 +12,10 @@
   Unsupported/interrupted cases retain a bounded pin and wait policy until exit.
   Known one-shot, shader memory-write and depth-bake protections remain in place.
 - The skipped-output observer is now explicitly opt-in with
-  `RYGT_ONE_OFF_LEARN=1`: sampling a temporary skipped intermediate does not prove
+  `SHADGT_ONE_OFF_LEARN=1`: sampling a temporary skipped intermediate does not prove
   that it is a persistent one-shot image, and address reuse must not silently
   convert normal Keep Going draws into blocking work.
-- `RYGT_CAPTURE_SCOPED_MENUS=0` restores the previous blanket menu wait for a
+- `SHADGT_CAPTURE_SCOPED_MENUS=0` restores the previous blanket menu wait for a
   control run. This is an isolated candidate; cold thumbnail output, cancellation,
   animated menu performance and race/UI transitions require runtime validation.
 
@@ -41,13 +41,13 @@ completed port of every inventory entry.
 | `f97bc35f` | Batch image downloads, tile in device-local scratch and copy to guest memory. Keep target's authoritative image-to-region copy ordering and reusable standalone scratch. |
 | `ed6d5c06`, `42003b21` | Coalesce proven independent compute runs; same-texel mip/layer keys retain unknown-write, descriptor-alias and prior-read safeguards. A functional recording epoch replaces diagnostic counters for Release dependency checks. |
 
-Will's switches/defaults are retained: `RYGT_D1_VIEW_MB=256`,
-`RYGT_NATIVE_KEEP_TEXTURES_MB=2048`, buffer/texture revalidation enabled,
-`RYGT_NATIVE_WRITEBACK_EACH` unset, writeback batching enabled and same-texel
+Will's switches/defaults are retained: `SHADGT_D1_VIEW_MB=256`,
+`SHADGT_NATIVE_KEEP_TEXTURES_MB=2048`, buffer/texture revalidation enabled,
+`SHADGT_NATIVE_WRITEBACK_EACH` unset, writeback batching enabled and same-texel
 optimization enabled. Program-specific dispatch shortcuts require the exact
 upstream program identity and proofs; other dispatches keep their barriers.
 
-`RYGT_SPLIT_GDS_WRITE_FAULTS` now defaults ON following the requested GTS
+`SHADGT_SPLIT_GDS_WRITE_FAULTS` now defaults ON following the requested GTS
 runtime check. Explicit `0` restores the full-drain control. The user reported
 correct grass placement with the enabled run; no matched OFF recovery comparison
 has established the individual cause. Separate PERF-014 drain/readback safeguards
@@ -101,7 +101,7 @@ and the general write-fault splitting default are unchanged.
   owning thread, and start a list during serialized recorder idle. The ring is
   excluded when recorder workers, Intel direct recording, raw checkpoints or
   unsupported timing paths require direct command handles. Explicit
-  `RYGT_NATIVE_RING=0` remains available in Release; periodic A/B diagnostics
+  `SHADGT_NATIVE_RING=0` remains available in Release; periodic A/B diagnostics
   are Debug-only.
 - `PERF-273`: early submission when the preceding tick is complete, bounded
   read-only storage mirrors. `FIX-290` follows upstream `83502d8b`, removing
@@ -129,7 +129,7 @@ and the general write-fault splitting default are unchanged.
 - `FIX-258`: precise changed-word region writeback, operation-wide preflight,
   imported-part leases, exact image overlap preservation, and a bounded snapshot
   pool. Large or unsupported writebacks invalidate recency instead of dropping
-  the guest operation. Fault-ahead remains opt-in (`RYGT_NATIVE_FAULT_AHEAD=1`),
+  the guest operation. Fault-ahead remains opt-in (`SHADGT_NATIVE_FAULT_AHEAD=1`),
   with image exclusions and guarded snapshots.
 - `FIX-289`, `FIX-302`: mip-crop layout checks, superseded-target retirement,
   fill-hash invalidation, packed-order alias isolation, whole-cube view checks,

@@ -34,10 +34,10 @@ struct State {
     std::jthread writer;
     State() noexcept {
         try {
-            const char* enabled = std::getenv("RYGT_FRAME_QUEUE_TRACE");
-            const char* output = std::getenv("RYGT_FRAME_QUEUE_TRACE_OUTPUT");
-            const char* control = std::getenv("RYGT_FRAME_QUEUE_TRACE_CONTROL");
-            const char* status = std::getenv("RYGT_FRAME_QUEUE_TRACE_STATUS");
+            const char* enabled = std::getenv("SHADGT_FRAME_QUEUE_TRACE");
+            const char* output = std::getenv("SHADGT_FRAME_QUEUE_TRACE_OUTPUT");
+            const char* control = std::getenv("SHADGT_FRAME_QUEUE_TRACE_CONTROL");
+            const char* status = std::getenv("SHADGT_FRAME_QUEUE_TRACE_STATUS");
             if (!enabled || std::strcmp(enabled, "1") || !output || !control || !status)
                 return;
             writer = std::jthread([this, out = std::string(output), ctl = std::string(control),

@@ -7,7 +7,7 @@
 #include <thread>
 
 TEST(GeometryTrace, RetainsLatestEventsAndSealsAfterTrigger) {
-    _putenv_s("RYGT_GEOMETRY_TRACE", "1");
+    _putenv_s("SHADGT_GEOMETRY_TRACE", "1");
     auto& state = GeometryTrace::Get();
     state.armed = true;
     for (std::uint64_t i = 0; i < state.events.size() + 7; ++i)

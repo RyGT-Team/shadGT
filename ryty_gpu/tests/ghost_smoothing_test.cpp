@@ -18,9 +18,9 @@ void Check(bool condition, const char* message) {
 
 int main(int argc, char**) {
 #ifdef _WIN32
-    _putenv_s("RYGT_SMOOTH_GHOST", argc > 1 ? "0" : "1");
+    _putenv_s("SHADGT_SMOOTH_GHOST", argc > 1 ? "0" : "1");
 #else
-    setenv("RYGT_SMOOTH_GHOST", argc > 1 ? "0" : "1", 1);
+    setenv("SHADGT_SMOOTH_GHOST", argc > 1 ? "0" : "1", 1);
 #endif
     auto regs = std::make_unique<AmdGpu::Regs>();
     std::memset(regs.get(), 0, sizeof(*regs));

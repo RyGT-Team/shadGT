@@ -10,7 +10,7 @@
 // scissor scaled. The presenter then shows the proxy instead of scaling the display buffer.
 // A draw the proxy cannot take (more targets, a depth buffer) resolves the proxy back into the
 // display buffer and the frame continues the normal way. GPU.ui_hires in
-// user\custom_configs\CUSA03220.json (the launcher's option) or RYGT_UI_HIRES=1 turns it on.
+// user\custom_configs\CUSA03220.json (the launcher's option) or SHADGT_UI_HIRES=1 turns it on.
 
 #include <algorithm>
 #include <array>
@@ -144,7 +144,7 @@ inline bool KnownAddress(VAddr address) {
 
 inline bool Enabled() {
     static const bool enabled = [] {
-        if (const char* env = std::getenv("RYGT_UI_HIRES")) {
+        if (const char* env = std::getenv("SHADGT_UI_HIRES")) {
             return env[0] == '1';
         }
         return Ryty::ConfigTrue("ui_hires");

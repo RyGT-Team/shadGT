@@ -118,7 +118,7 @@ static u32 ShaderBinaryVersionFor(const Shader::StageSpecialization& spec,
                                   bool scalar_prefix = false) {
     if (spec.runtime_info.sw_stage == Shader::SwStage::TessellationControl) {
         static const bool mip = [] {
-            const char* env = std::getenv("RYGT_UNNORMALIZED_MIP");
+            const char* env = std::getenv("SHADGT_UNNORMALIZED_MIP");
             return !(env && env[0] == '0');
         }();
         if (spec.runtime_info.sw.tcs.lds_emulation) {

@@ -32,7 +32,7 @@ struct SharedShaderObjects {
             if (shader) VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyShaderEXT(device, shader, nullptr);
     }
 };
-/// DIAG-243 (RYGT_DEVICE_FAULT=1): the renderer's recent draws, logged when the device is lost.
+/// DIAG-243 (SHADGT_DEVICE_FAULT=1): the renderer's recent draws, logged when the device is lost.
 void NoteDrawForFault(u64 pipeline_hash, u32 info);
 
 class Instance {
@@ -49,7 +49,7 @@ public:
         return shader_object_properties;
     }
     /// DIAG-243: once, after a lost device: VK_EXT_device_fault's report (with
-    /// RYGT_DEVICE_FAULT=1) and the last draws the renderer recorded.
+    /// SHADGT_DEVICE_FAULT=1) and the last draws the renderer recorded.
     void ReportDeviceLost() const;
 
     /// Returns a formatted string for the driver version
@@ -194,7 +194,7 @@ public:
         return depth_clip_control;
     }
     /// FIX-GTS-443: true when draws use the extension's -1..1 depth; false when the vertex shader
-    /// converts the depth itself (no extension, or RYGT_DEPTH_CLIP_CONTROL unset). A pipeline gets
+    /// converts the depth itself (no extension, or SHADGT_DEPTH_CLIP_CONTROL unset). A pipeline gets
     /// the extension's state baked in, a shader object sets it dynamically, and the two gave
     /// slightly different depth for the same position on NVIDIA (garage floor and grass z-fought).
     bool UsesDepthClipControl() const {
@@ -211,7 +211,7 @@ public:
         return depth_range_unrestricted;
     }
 
-    /// SO-001: exact RYGT_SHADER_OBJECT=1 opts into shader objects on non-AMD GPUs.
+    /// SO-001: exact SHADGT_SHADER_OBJECT=1 opts into shader objects on non-AMD GPUs.
     bool IsShaderObjectEnabled() const {
         return shader_object;
     }

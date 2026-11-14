@@ -256,7 +256,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
           if (instance_.GetVendorID() == 0x1002) {
               return false;
           }
-          const char* env = std::getenv("RYGT_SPLIT_GDS_WRITE_FAULTS");
+          const char* env = std::getenv("SHADGT_SPLIT_GDS_WRITE_FAULTS");
           if (instance_.GetVendorID() == 0x10de) {
               return !(env && env[0] == '0');
           }

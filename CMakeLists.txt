@@ -36,7 +36,7 @@ message(STATUS "Window branding: ${SHADGT_BRANDING}")
 # DIAG-056: path to the nvtx3 headers of an NVIDIA Nsight Systems install, for timeline ranges.
 set(SHADGT_NVTX_INCLUDE "" CACHE PATH "nvtx3 include directory (Nsight Systems timeline ranges)")
 option(ENABLE_SYSTEM_LIBRARIES "Enable building against system libraries" OFF)
-# Diagnostics (common/diagnostics.h): RYGT_DIAG=1's stutter capture, the per-draw step timers and
+# Diagnostics (common/diagnostics.h): SHARED_DIAG=1's stutter capture, the per-draw step timers and
 # work counters, the 2 s reports, the F1 dumps and every other diagnostic environment switch.
 # AUTO builds them into Debug and RelWithDebInfo and compiles them out of Release and MinSizeRel,
 # where they cost frame time even when unused; ON or OFF overrides the build type (an optimized
@@ -134,7 +134,9 @@ endif()
 # generate git revision information
 include("${CMAKE_CURRENT_SOURCE_DIR}/externals/cmake-modules/GetGitRevisionDescription.cmake")
 get_git_head_revision(GIT_REF_SPEC GIT_REV)
-git_describe(GIT_DESC --always --long)
+# FIX-GTS-418: shadgt7's release tags (gt7-*) came in with its history; describing from them
+# named a GT7 release in GT Sport's watermark. Without them the description is the commit.
+git_describe(GIT_DESC --always --long --exclude "gt7-*")
 # --dirty would count the patches externals/CMakeLists.txt applies to VMA, so every build but the
 # first one of a clone would say dirty. A submodule on another commit still counts.
 execute_process(COMMAND "${GIT_EXECUTABLE}" status --porcelain --untracked-files=no --ignore-submodules=dirty

@@ -572,7 +572,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     // otherwise snap to 30 fps). Enqueue wakes the thread between four scheduled ticks per
     // vblank; the game's vblank events and status still come once per vblank.
     // The native renderer defaults to this path without frame generation; an explicit
-    // GPU.fast_flips setting or RYGT_FAST_FLIPS overrides that default. The elapsed-time
+    // GPU.fast_flips setting or SHADGT_FAST_FLIPS overrides that default. The elapsed-time
     // limit still honors the guest flip rate and the configured FPS lock.
     static const u32 ticks_per_vblank = [] {
         std::optional<bool> configured;
@@ -581,7 +581,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         configured = Ryty::ConfigBool("fast_flips");
         native = Vulkan::NativeModeRequested();
 #endif
-        const bool fast = FastFlipsEnabled(std::getenv("RYGT_FAST_FLIPS"), configured, native,
+        const bool fast = FastFlipsEnabled(std::getenv("SHADGT_FAST_FLIPS"), configured, native,
                                            EmulatorSettings.IsFrameGenEnabled() ||
                                                EmulatorSettings.IsDlssgEnabled());
         if (fast) {
@@ -608,7 +608,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         return ticks_per_vblank > 1 && !DebugState.IsGuestThreadsPaused() &&
                !Common::GuestClock::IsPaused();
     };
-    // PERF-GTS-410 (RYGT_FLIP_BUFFER_FRAMES=0, 1 or 2, default 1): the presenter keeps that many
+    // PERF-GTS-410 (SHADGT_FLIP_BUFFER_FRAMES=0, 1 or 2, default 1): the presenter keeps that many
     // frames queued behind the one it shows. Before PERF-GTS-406 it kept three by accident
     // (flips 17.2 ms apart against a game at 60), which hid every game stall shorter than the
     // queue at the cost of 58 fps and 51 ms from submit to flip; with 406 the queue stays at one
@@ -616,7 +616,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     // apart; above it 1 ms sooner (the queue drains); below it 0.5 ms later, so a game running
     // at 60 refills it in about half a second a frame. Implies PERF-GTS-406's timing.
     static const u32 buffer_frames = [] {
-        const char* env = std::getenv("RYGT_FLIP_BUFFER_FRAMES");
+        const char* env = std::getenv("SHADGT_FLIP_BUFFER_FRAMES");
         const unsigned long value = env && *env ? std::strtoul(env, nullptr, 10) : 1;
         return static_cast<u32>(std::min<unsigned long>(value, 2));
     }();
@@ -635,13 +635,13 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     const auto flip_allowed_at = [&] {
         return last_flip_time + flip_interval(request_depth.load(std::memory_order_acquire));
     };
-    // PERF-GTS-406 (RYGT_FLIP_PACE_EXACT=1): a frame that was waiting for its time counts from
+    // PERF-GTS-406 (SHADGT_FLIP_PACE_EXACT=1): a frame that was waiting for its time counts from
     // that time, not from when its flip returned. Counting from the return adds the flip's own
     // duration and the late wake to every interval: with frames queued the flips came 17.2 ms
     // apart at Tokyo, so a game running at 60 filled the queue (3 frames, 51 ms from submit to
     // flip) and was then held at 58.
     static const bool pace_exact = [] {
-        const char* env = std::getenv("RYGT_FLIP_PACE_EXACT");
+        const char* env = std::getenv("SHADGT_FLIP_PACE_EXACT");
         return env && env[0] == '1' && env[1] == '\0';
     }();
     const auto flip_paced = [&](const Request& request) {
@@ -718,10 +718,10 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         // but at most MaxCatchUp vblank periods of it. A longer stall (a present or driver hitch,
         // a flip blocked behind a compile hold) is not made up, so no burst of vblanks tells the
         // game that time passed while the emulator, not the game, was stuck.
-        // RYGT_VBLANK_CATCHUP=0: every missed tick is made up, as before.
+        // SHADGT_VBLANK_CATCHUP=0: every missed tick is made up, as before.
         {
             static const bool catch_up_limit = [] {
-                const char* env = std::getenv("RYGT_VBLANK_CATCHUP");
+                const char* env = std::getenv("SHADGT_VBLANK_CATCHUP");
                 return !(env && env[0] == '0');
             }();
             constexpr int MaxCatchUp = 6; // ~100 ms at 60 Hz: a 3-vblank frame at 20 fps and more

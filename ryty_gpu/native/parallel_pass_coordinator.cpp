@@ -13,10 +13,10 @@
 
 namespace Native::Parallel {
 namespace {
-bool GateDiag() noexcept {static const bool on=[] {auto p=std::getenv("RYGT_PARALLEL_GATE_DIAG");return p && p[0]=='1' && !p[1];}();return on;}
-bool BatchDiag() noexcept {static const bool on=[] {auto p=std::getenv("RYGT_PARALLEL_BATCH_DIAG");return p && p[0]=='1' && !p[1];}();return on;}
-bool BatchTwoPass() noexcept {static const bool on=[] {auto p=std::getenv("RYGT_PARALLEL_BATCH_TWO_PASSES");return p && p[0]=='1' && !p[1];}();return on;}
-bool TransferPasses() noexcept {static const bool on=[] {auto p=std::getenv("RYGT_PARALLEL_TRANSFER_PASSES");return p && p[0]=='1' && !p[1];}();return on;}
+bool GateDiag() noexcept {static const bool on=[] {auto p=std::getenv("SHADGT_PARALLEL_GATE_DIAG");return p && p[0]=='1' && !p[1];}();return on;}
+bool BatchDiag() noexcept {static const bool on=[] {auto p=std::getenv("SHADGT_PARALLEL_BATCH_DIAG");return p && p[0]=='1' && !p[1];}();return on;}
+bool BatchTwoPass() noexcept {static const bool on=[] {auto p=std::getenv("SHADGT_PARALLEL_BATCH_TWO_PASSES");return p && p[0]=='1' && !p[1];}();return on;}
+bool TransferPasses() noexcept {static const bool on=[] {auto p=std::getenv("SHADGT_PARALLEL_TRANSFER_PASSES");return p && p[0]=='1' && !p[1];}();return on;}
 bool ThreadCpu100ns(u64& out) noexcept {
 #ifdef _WIN32
     FILETIME create{},exit{},kernel{},user{};

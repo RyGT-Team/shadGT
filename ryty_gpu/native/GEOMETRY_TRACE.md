@@ -4,7 +4,7 @@ DIAG-334 adds an opt-in Debug-only trace. `NDEBUG` removes its state, environmen
 lookup and call sites from the renderer. It does not activate F8 or bypass normal
 prepared draws, and it does not change GDS settings or add GPU synchronization.
 
-Set `RYGT_GEOMETRY_TRACE=1` before starting a Debug build. Create
+Set `SHADGT_GEOMETRY_TRACE=1` before starting a Debug build. Create
 `geometry-trace.arm` in the game's working directory immediately before entering
 the affected track. A correlated graphics pipeline wait of at least 50 ms seals
 the recent history after 1,024 subsequent events. Alternatively, create

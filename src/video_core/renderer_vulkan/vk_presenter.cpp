@@ -1705,9 +1705,9 @@ void Presenter::WaitFrameDrawn(const Frame* frame) {
     // the GPU drew that frame let GT7 refill the frame's UI vertex data while the GPU had yet
     // to read it: on the title screen, the background picture or its blurred copy drawn back
     // over it went missing on about one frame in four (the World Map scene behind it or black
-    // showing). RYGT_NATIVE_FLIP_WAIT=0 reports flips at once as before (diagnosis).
+    // showing). SHADGT_NATIVE_FLIP_WAIT=0 reports flips at once as before (diagnosis).
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_NATIVE_FLIP_WAIT");
+        const char* env = std::getenv("SHADGT_NATIVE_FLIP_WAIT");
         return !(env && env[0] == '0');
     }();
     if (!enabled || !frame || !frame->ready_scheduler || !rasterizer->Native()) {

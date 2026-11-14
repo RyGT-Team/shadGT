@@ -39,7 +39,7 @@ inline bool IsGhostCoverageDraw(const AmdGpu::Regs& regs) {
 
 inline bool Enabled() {
     static const bool enabled = [] {
-        if (const char* value = std::getenv("RYGT_SMOOTH_GHOST")) {
+        if (const char* value = std::getenv("SHADGT_SMOOTH_GHOST")) {
             return value[0] == '1';
         }
         if (const auto value = Common::RytyGameConfigValue("smooth_ghost")) {

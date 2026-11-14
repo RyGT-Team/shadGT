@@ -7,12 +7,12 @@
 #include <system_error>
 namespace Vulkan {
 std::counting_semaphore<64>& HeavyPipelineGate();
-// PERF-419-GTS (follows shadgt7 PERF-171/PERF-172): RYGT_TESS_BUILDS tessellated pipelines
+// PERF-419-GTS (follows shadgt7 PERF-171/PERF-172): SHADGT_TESS_BUILDS tessellated pipelines
 // (1..16, default 4) build at once, under HeavyBuildGate's memory check. 1 keeps the shared
 // one-at-a-time limit (HeavyPipelineGate and the build queue's heavy slot).
 inline unsigned TessBuildsAsked() {
     static const unsigned asked = [] {
-        if (const char* env = std::getenv("RYGT_TESS_BUILDS"); env && *env) {
+        if (const char* env = std::getenv("SHADGT_TESS_BUILDS"); env && *env) {
             return std::clamp(static_cast<unsigned>(std::strtoul(env, nullptr, 10)), 1u, 16u);
         }
         return 4u;

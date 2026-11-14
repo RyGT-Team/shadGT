@@ -1322,7 +1322,8 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         // has no such rule: AMD keeps the shader as it is. SHADGT_NEO_PIXEL_RATE=0: as before.
         static const bool neo_pixel_rate = [] {
             const char* env = std::getenv("SHADGT_NEO_PIXEL_RATE");
-            return Libraries::Kernel::sceKernelIsNeoMode() != 0 && !(env && env[0] == '0');
+            return Common::IsGt7() && Libraries::Kernel::sceKernelIsNeoMode() != 0 &&
+                   !(env && env[0] == '0');
         }();
         if (neo_pixel_rate && instance.IsMixedDepthSamplesSupported() &&
             !instance.IsMixedAnySamplesSupported()) {
@@ -4897,8 +4898,9 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             // compared with this pipeline's code and written again when different (a recipe the
             // warm-up had not reached yet is the same, and left alone).
             static const bool refresh = [] {
+                // GT7 by default; GT Sport keeps its recipes as written (PERF-260) unless =1.
                 const char* env = std::getenv("SHADGT_WARM_COMPUTE_REFRESH");
-                return !(env && env[0] == '0');
+                return env && *env ? env[0] != '0' : Common::IsGt7();
             }();
             const bool known = std::filesystem::exists(file, ec);
             if (!known || (refresh && ms >= 50.0)) {
@@ -7426,8 +7428,11 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         // were translated (only Pro code has SDWA, so the base mode never looks). Stores are
         // never cleared for another build here (FIX-271), so the check stays on. Bit 4096: 2048
         // is the lane-read marker of this tree (lane_read_policy.h).
-        static const bool neo = Libraries::Kernel::sceKernelIsNeoMode() != 0;
-        if (neo) {
+        // At a program's first use only: this block also runs at every compute lookup, and
+        // the census decodes the whole program. GT7's Pro mode only (GT Sport's is its own).
+        static const bool neo =
+            Common::IsGt7() && Libraries::Kernel::sceKernelIsNeoMode() != 0;
+        if (neo && first_use) {
             const auto use = Shader::NeoCodeCensus(params.code);
             if (use.sdwa_compares_to_sgpr + use.sdwa_selects != 0) {
                 needed_fixes |= 4096u;

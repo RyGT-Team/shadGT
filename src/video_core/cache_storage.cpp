@@ -49,7 +49,8 @@ namespace {
 // NEO-GT7-007: SHADGT_NEO_SDWA_CMP=0 translates SDWA compares the old way (to VCC), which breaks the
 // PS4 Pro checkerboard resolve; those translations get a store of their own, so a session run once
 // with the switch leaves nothing wrong in the usual store. Only with the Pro mode's switch
-// (SHADGT_NEO=1, read as libkernel reads it): the base mode has no SDWA, so its store stays.
+// (SHADGT_NEO=1; ryGT7's libkernel reads the same switch as RYGT_NEO, which SWITCH-001 hands
+// on under this name): the base mode has no SDWA, so its store stays.
 std::string StoreTag() {
     const char* env = std::getenv("SHADGT_SHADER_STORE_TAG");
     std::string tag = env && *env ? std::string{"-"} + env : std::string{};

@@ -15,9 +15,9 @@ GameTitle CurrentGameTitle() {
     static const GameTitle title = [] {
         std::wstring file;
 #ifdef _WIN32
-        wchar_t exe[MAX_PATH] = {};
-        GetModuleFileNameW(nullptr, exe, MAX_PATH);
-        const std::wstring path{exe};
+        // The longest path Windows gives: a name cut at MAX_PATH would be taken for GT Sport.
+        std::wstring path(32768, L'\0');
+        path.resize(GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size())));
         file = path.substr(path.find_last_of(L"\\/") + 1);
 #endif
         const auto& elf = ElfInfo::Instance();

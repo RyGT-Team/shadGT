@@ -10,6 +10,7 @@
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
+#include "common/game_title.h"
 #include "common/path_util.h"
 #include "common/ryty_config.h"
 #include "common/debug.h"
@@ -677,7 +678,7 @@ bool Instance::CreateDevice() {
     // device is made, and the base mode has no mixed-sample draws.
     // SHADGT_NEO_COVERAGE_TRUNCATE=0: MERGE, as before.
     if (nv_framebuffer_mixed_samples && !amd_mixed_attachment_samples &&
-        Libraries::Kernel::sceKernelIsNeoMode() != 0) {
+        Common::IsGt7() && Libraries::Kernel::sceKernelIsNeoMode() != 0) {
         const char* env = std::getenv("SHADGT_NEO_COVERAGE_TRUNCATE");
         const bool wanted = !(env && env[0] == '0');
         const bool available = std::ranges::any_of(available_extensions, [](const auto& name) {

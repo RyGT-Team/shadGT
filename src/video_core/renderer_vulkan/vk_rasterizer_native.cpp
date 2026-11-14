@@ -6449,8 +6449,9 @@ constexpr u32 OneOffPlaceSafeCount = 4;
 // PERF-GT7-023's exemption, so that none is skipped outright on the old rule's word.
 bool OneOffKeptRule() {
     static const bool on = [] {
+        // GT7 only (FIX-GT7-149): GT Sport keeps its rule and its learned file.
         const char* env = std::getenv("SHADGT_ONE_OFF_KEPT_RULE");
-        return !(env && env[0] == '0');
+        return Common::IsGt7() && !(env && env[0] == '0');
     }();
     return on;
 }

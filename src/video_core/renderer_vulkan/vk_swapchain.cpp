@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <limits>
 #include "common/assert.h"
+#include "common/game_title.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #ifdef RYTY_GPU
@@ -35,6 +36,15 @@ Swapchain::Swapchain(const Instance& instance_, const Frontend::WindowSDL& windo
     Create(window.GetWidth(), window.GetHeight());
     ImGui::Core::Initialize(instance, window, image_count,
                             needs_hdr ? SURFACE_FORMAT_HDR.format : surface_format.format);
+#ifdef RYTY_GPU
+    // GT7 (FIX-GT7-142): the overlay's sRGB colours are placed in the HDR10 picture by its HDR
+    // shader. shadgt7 told the overlay when the swapchain switched to HDR; here the swapchain is
+    // HDR10 from the start and never switches, so it is told once. GT Sport keeps its overlay
+    // as it was (its white level is 0, see OnSurfaceFormatChange).
+    if (needs_hdr && Common::IsGt7()) {
+        ImGui::Core::OnSurfaceFormatChange(SURFACE_FORMAT_HDR.format, true);
+    }
+#endif
 }
 
 Swapchain::~Swapchain() {

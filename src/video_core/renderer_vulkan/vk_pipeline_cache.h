@@ -712,6 +712,11 @@ private:
                               const Shader::Backend::Bindings& binding, bool insert);
     /// FIX-078 (lookup lock held): queues a translation; false when one with the same inputs is
     /// already queued.
+    /// FEAT-GTS-470: records a stored translation on a draw's first use (record mode).
+    void RecordStoredUse(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
+                         const Shader::ShaderParams& params,
+                         const Shader::RuntimeInfo& runtime_info,
+                         const Shader::Backend::Bindings& start, size_t perm_idx);
     bool QueueTranslation(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
                           const Shader::ShaderParams& params,
                           const Shader::RuntimeInfo& runtime_info,

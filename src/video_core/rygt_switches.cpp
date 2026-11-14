@@ -84,6 +84,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_COMPILE_PRIORITY|choice|Shader compiling|below the game's priority in races|normal = keep compile threads at normal priority|In races, shader translations and pipeline builds run below the game's priority (PERF-310); 'normal' keeps them level.",
     "RYGTSW1|SHADGT_GPL|flag|Shader compiling|on|0 = off|Uses shared pipeline libraries with fast linking for tessellated pipelines (PERF-GT7-040 port); 0 turns them off.",
     "RYGTSW1|SHADGT_MANIFEST_PRETRANSLATE|flag|Shader compiling|off|1 = on (needs the shader store)|At start, pre-translates shaders listed in the recorded manifest on a background thread (PERF-GT7-117).",
+    "RYGTSW1|SHADGT_MANIFEST_FOREIGN|flag|Shader compiling|on|0 = this GPU's records only|Pre-translation also uses the manifest records other GPUs made, adjusted for this GPU (FEAT-GTS-470).",
     "RYGTSW1|SHADGT_MANIFEST_RECORD|flag|Shader compiling|off|1 = on|Writes a manifest record (and a local capture of the code) for each translated shader, for later pre-translation (PERF-GT7-111).",
     "RYGTSW1|SHADGT_NATIVE_ONE_OFF_FRAMES|int|Shader compiling|64|frames; 4 = old behaviour|A picture drawn within this many frames counts as redrawn regularly, so its draw may skip during compiles (PERF-165).",
     "RYGTSW1|SHADGT_NATIVE_ONE_OFF_LAYOUT|flag|Shader compiling|on|0 = off|One-off check matches the picture layout, and skipped draws into a new layout clear the target (FIX-GT7-131). 0 = as before.",

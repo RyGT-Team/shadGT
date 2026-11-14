@@ -583,6 +583,16 @@ private:
     std::atomic<u64> prewarm_read{};
     std::atomic<u64> prewarm_total{};
     std::atomic<bool> prewarm_reader_done{};
+    /// FIX-GTS-468: stored pipelines the workers finished building. The command thread moves
+    /// them from pending_builds into graphics_pipelines (AdoptPrewarmed), where the retention
+    /// trim can release the ones no draw uses; left in pending_builds they were never released.
+    std::mutex prewarm_finished_mutex;
+    std::vector<std::weak_ptr<PipelineBuild>> prewarm_finished;
+    std::atomic<bool> prewarm_finished_any{};
+    /// FIX-GTS-468: adopted stored pipelines no draw has used yet. The first draw that uses
+    /// one stores its key again, as a draw taking it from pending_builds did (PERF-038).
+    tsl::robin_map<GraphicsPipelineKey, GraphicsPipeline::SerializationSupport> prewarm_unclaimed;
+    void AdoptPrewarmed();
     /// PERF-076: new graphics pipelines build in the background while their draws are skipped.
     static bool AsyncPipelines();
     static bool WritesMemory(const std::array<const Shader::Info*, MaxShaderStages>& infos);

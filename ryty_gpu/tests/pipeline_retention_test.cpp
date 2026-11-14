@@ -18,5 +18,16 @@ int main() {
     assert(!PipelineRetentionUnderPressure(UINT64_MAX, 0));
     assert(PipelineRetentionUnderPressure(UINT64_MAX, UINT64_MAX));
     assert(!PipelineRetentionUnderPressure(UINT64_MAX - 2 * GiB, UINT64_MAX));
-    printf("PASS %llu pipeline budget boundary cases\n", (unsigned long long)(cases + 3));
+    // FIX-GTS-468: the system RAM reserve is total/8, clamped to 1..2 GiB.
+    using Vulkan::SystemRamUnderPressure;
+    assert(!SystemRamUnderPressure(0, 0));
+    assert(SystemRamUnderPressure(2 * GiB - 1, 16 * GiB));
+    assert(!SystemRamUnderPressure(2 * GiB, 16 * GiB));
+    assert(SystemRamUnderPressure(2 * GiB - 1, 64 * GiB));
+    assert(!SystemRamUnderPressure(2 * GiB, 64 * GiB));
+    assert(SystemRamUnderPressure(GiB - 1, 4 * GiB));
+    assert(!SystemRamUnderPressure(GiB, 4 * GiB));
+    assert(SystemRamUnderPressure(GiB + GiB / 2 - 1, 12 * GiB));
+    assert(!SystemRamUnderPressure(GiB + GiB / 2, 12 * GiB));
+    printf("PASS %llu pipeline budget boundary cases\n", (unsigned long long)(cases + 12));
 }

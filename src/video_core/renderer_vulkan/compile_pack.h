@@ -11,8 +11,8 @@
 // with its shader objects ready: after a driver update (the driver's caches start empty), or with a
 // pack made on another PC with the same GPU. SHADGT_PACK_RECORD=0: no recipes are kept.
 // FIX-GT7-136: recording and the start-up compile need shader objects (off by default since
-// FIX-GTS-366, SHADGT_SHADER_OBJECT=1 turns them on): without them no SPIR-V is kept, so there is
-// no recipe to keep or compile.
+// FIX-GTS-366 / FIX-GT7-147, SHADGT_SHADER_OBJECT=1 turns them on): without them no SPIR-V is
+// kept, so there is no recipe to keep or compile.
 
 #include <atomic>
 #include <cstdint>

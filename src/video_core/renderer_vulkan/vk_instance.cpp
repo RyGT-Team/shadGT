@@ -16,6 +16,7 @@
 #include "common/perf_monitor.h"
 #include "common/types.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/kernel/process.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -110,9 +111,8 @@ std::string GetReadableVersion(u32 version) {
 
 // AMD-300 (SHADGT_SIMULATE_GPU=gcn|rdna1|rdna2): the device reports only what an older Radeon's
 // Windows driver offers (gpuinfo.org: RX 580/RX Vega 2.0.283, RX 5700 XT/RX 6800 2.0.353), so a
-// newer card exercises the paths those cards take. It cannot change the hardware's wave size.
-// Nor the vendor ID: on a non-AMD card rdna1|rdna2 keep shader objects on, while a real Radeon
-// draws pipelines by default (FIX-GT7-136); add SHADGT_SHADER_OBJECT=0 to mimic one.
+// newer card exercises the paths those cards take. It cannot change the hardware's wave size
+// nor the vendor ID.
 enum class SimulatedGpu { None, Gcn, Rdna1, Rdna2 };
 
 SimulatedGpu GetSimulatedGpu() {
@@ -512,7 +512,10 @@ bool Instance::CreateDevice() {
     // RTX GPU lost the device while a Nurburgring race loaded (a shader that never finished) and
     // the renderer's video memory grew to 12 to 20 GB of a 6.7 GB budget at the start, with
     // frames of 300 ms to 3.5 s; with pipelines the same start had no long frames and stayed near
-    // 4 GB. SHADGT_SHADER_OBJECT=1 turns them on, on any GPU; =0 and any other value leave them off.
+    // 4 GB. In GT7 (FIX-GT7-147), on an RTX 4070, the small icons of the car interiors (garage)
+    // lost pieces with shader objects and were whole with pipelines, on three renderers
+    // (f26615ed, a283e27e, 422deef9). SHADGT_SHADER_OBJECT=1 turns them on, on any GPU; =0 and
+    // any other value leave them off.
     // SO-012: a start that wants shader objects after a lost device with shader objects on uses
     // pipelines once (the marker is removed, so the next start that wants them tries them again).
     // A start that doesn't want them leaves the marker for that next one.
@@ -662,6 +665,38 @@ bool Instance::CreateDevice() {
     }
     nv_framebuffer_mixed_samples = add_extension(VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME);
     amd_mixed_attachment_samples = add_extension(VK_AMD_MIXED_ATTACHMENT_SAMPLES_EXTENSION_NAME);
+    // NEO-GT7-016: the PS4 Pro mode's checkerboard draws rasterize two samples into one colour
+    // fragment. With VK_AMD_mixed_attachment_samples on the same GCN hardware (TRUNCATE by
+    // default) the fragment's colour follows sample 0 only. NVIDIA's mixed samples default to
+    // MERGE: the colour is written when either sample is covered, so a pixel an edge splits gets
+    // both triangles, and blended glass was blended twice along every shared edge (a light
+    // wireframe on the car windows). VK_NV_coverage_reduction_mode lets those pipelines ask for
+    // TRUNCATE (vk_graphics_pipeline.cpp). NVIDIA lists only mixed combinations; the other
+    // pipelines keep the implicit MERGE (not checked by the validation layers without the
+    // structure). Only in the PS4 Pro mode: sceKernelIsNeoMode is answered (and kept) before the
+    // device is made, and the base mode has no mixed-sample draws.
+    // SHADGT_NEO_COVERAGE_TRUNCATE=0: MERGE, as before.
+    if (nv_framebuffer_mixed_samples && !amd_mixed_attachment_samples &&
+        Libraries::Kernel::sceKernelIsNeoMode() != 0) {
+        const char* env = std::getenv("SHADGT_NEO_COVERAGE_TRUNCATE");
+        const bool wanted = !(env && env[0] == '0');
+        const bool available = std::ranges::any_of(available_extensions, [](const auto& name) {
+            return name == VK_NV_COVERAGE_REDUCTION_MODE_EXTENSION_NAME;
+        });
+        if (wanted && available) {
+            const auto chain =
+                physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
+                                             vk::PhysicalDeviceCoverageReductionModeFeaturesNV>();
+            nv_coverage_reduction =
+                chain.get<vk::PhysicalDeviceCoverageReductionModeFeaturesNV>()
+                    .coverageReductionMode &&
+                add_extension(VK_NV_COVERAGE_REDUCTION_MODE_EXTENSION_NAME);
+        }
+        LOG_WARNING(Render_Vulkan, "NEO-GT7-016: colour coverage of mixed-sample draws: {}",
+                    !wanted                 ? "MERGE (SHADGT_NEO_COVERAGE_TRUNCATE=0)"
+                    : nv_coverage_reduction ? "TRUNCATE where the driver lists it"
+                                            : "MERGE (no VK_NV_coverage_reduction_mode)");
+    }
     shader_atomic_float = add_extension(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
     shader_atomic_float2 = add_extension(VK_EXT_SHADER_ATOMIC_FLOAT_2_EXTENSION_NAME);
     if (shader_atomic_float2) {
@@ -731,8 +766,12 @@ bool Instance::CreateDevice() {
     LOG_INFO(Render_Vulkan, "AMD-VRAM-002: memory overallocation allowed: {}", amd_overallocation);
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     // DIAG-243: SHADGT_DEVICE_FAULT=1 enables VK_EXT_device_fault, so a lost device reports the
-    // faulting address and the driver's description.
-    if (const char* env = std::getenv("SHADGT_DEVICE_FAULT"); env && env[0] == '1') {
+    // faulting address and the driver's description, and the renderer notes its last draws.
+    {
+        const char* env = std::getenv("SHADGT_DEVICE_FAULT");
+        note_fault_draws = env && env[0] == '1';
+    }
+    if (note_fault_draws) {
         const auto fault_chain =
             physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
                                          vk::PhysicalDeviceFaultFeaturesEXT>();
@@ -780,7 +819,9 @@ bool Instance::CreateDevice() {
                                      ? "RDNA1 (RX 5000)"
                                  : has("Vega")                              ? "GCN 5 (Vega)"
                                  : has("Radeon RX 4") || has("Radeon RX 5") ? "GCN 4 (RX 400/500)"
-                                                                            : "other Radeon";
+                                 // "Radeon (TM) RX 480 Graphics" has "(TM)" in the middle.
+                                 : IsAmdGcn() ? "GCN"
+                                              : "other Radeon";
         const bool legacy = IsAmdLegacyShaderCompiler();
         LOG_INFO(Render_Vulkan,
                  "AMD-316: {} on driver {} ({}), shader compiler {}; quad control {}, vertex "
@@ -1143,6 +1184,15 @@ bool Instance::CreateDevice() {
         maintenance11_features.pNext = const_cast<void*>(create_info.pNext);
         create_info.pNext = &maintenance11_features;
     }
+    // NEO-GT7-016: the coverage reduction feature joins the chain when its extension is on.
+    vk::PhysicalDeviceCoverageReductionModeFeaturesNV coverage_reduction_features{
+        .coverageReductionMode = true,
+    };
+    if (nv_coverage_reduction) {
+        auto& create_info = device_chain.get<vk::DeviceCreateInfo>();
+        coverage_reduction_features.pNext = const_cast<void*>(create_info.pNext);
+        create_info.pNext = &coverage_reduction_features;
+    }
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
         // ryGT: on some NVIDIA driver and setup combinations the driver rejects the device once
@@ -1180,6 +1230,33 @@ bool Instance::CreateDevice() {
     }
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
+
+    // NEO-GT7-016: the sample counts the driver takes TRUNCATE for. A pipeline whose counts are
+    // not listed keeps MERGE (vk_graphics_pipeline.cpp logs it).
+    if (nv_coverage_reduction &&
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceSupportedFramebufferMixedSamplesCombinationsNV) {
+        const auto [combinations_result, combinations] =
+            physical_device.getSupportedFramebufferMixedSamplesCombinationsNV();
+        if (combinations_result == vk::Result::eSuccess) {
+            for (const auto& combination : combinations) {
+                if (combination.coverageReductionMode == vk::CoverageReductionModeNV::eTruncate) {
+                    truncate_combinations.push_back({
+                        .raster = static_cast<u32>(combination.rasterizationSamples),
+                        .depth = static_cast<u32>(combination.depthStencilSamples),
+                        .color = static_cast<u32>(combination.colorSamples),
+                    });
+                }
+            }
+        }
+        std::string listed;
+        for (const auto& combination : truncate_combinations) {
+            listed += fmt::format(" {}/{}/{}", combination.raster, combination.depth,
+                                  combination.color);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "NEO-GT7-016: {} TRUNCATE combinations (raster/depth/colour sample masks):{}",
+                 truncate_combinations.size(), listed);
+    }
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);

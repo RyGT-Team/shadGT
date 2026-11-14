@@ -7,9 +7,11 @@
 #include <cstring>
 
 namespace Vulkan {
-inline std::uint64_t NativeChunkBytes(const char* value) {
+// unset_mb: the size without the switch (TITLE-001: 64 MB for GT Sport, PERF-GTS-407; 1 MB for
+// GT7, FIX-GT7-047).
+inline std::uint64_t NativeChunkBytes(const char* value, std::uint64_t unset_mb = 64) {
     constexpr std::uint64_t mb = 1024 * 1024;
-    if (!value || !*value) return 64 * mb; // PERF-GTS-407: 64 MB unless set
+    if (!value || !*value) return unset_mb * mb;
     std::uint64_t count{};
     const auto end = value + std::strlen(value);
     const auto result = std::from_chars(value, end, count);

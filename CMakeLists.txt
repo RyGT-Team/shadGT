@@ -848,6 +848,10 @@ set(COMMON src/common/logging/classes.cpp
            src/common/decoder.h
            src/common/diagnostics.h
            src/common/elf_info.h
+           src/common/game_title.cpp
+           src/common/game_title.h
+           src/common/old_switch_names.cpp
+           src/common/old_switch_names.h
            src/common/endian.h
            src/common/enum.h
            src/common/incremental_id.h

@@ -69,4 +69,5 @@ runtime modules included, and takes a description from whichever file has it. Ad
 - Keep the switch name a plain string literal at the `getenv` call. The launcher finds names that way,
   so a name built at run time (concatenated or formatted) will not be found.
 
-The launcher side is `loader/AdvancedPage.cs` (`SwitchWalker`) and `loader/ADVANCED-PAGE.md` in RyGTS.
+The launcher side is `loader/AdvancedPage.cs` (`SwitchWalker`) and `loader/ADVANCED-PAGE.md` in RyGTS
+and in ryGT7.

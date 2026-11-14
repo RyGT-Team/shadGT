@@ -474,7 +474,8 @@ private:
     void CreateDriverCache();
     void SaveDriverCache(bool wait);
     void MaybeSaveDriverCache();
-    /// PERF-GT7-108: the compile pack's start-up compile (SHADGT_COMPILE_PACK=1), on its own thread.
+    /// PERF-GT7-108: the compile pack's start-up compile (SHADGT_COMPILE_PACK=1, with shader
+    /// objects only, off by default since FIX-GTS-366 / FIX-GT7-147), on its own thread.
     void CompilePackShaders(std::stop_token stop);
     std::jthread compile_pack_thread;
     /// PERF-GT7-111: SHADGT_MANIFEST_VERIFY=1 translates every manifest record again at start and

@@ -6,7 +6,9 @@
 #include <mutex>
 #include <span>
 #include <unordered_map>
+#include <vector>
 
+#include "video_core/renderer_vulkan/coverage_reduction.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/shared_build_map.h"
 
@@ -356,6 +358,16 @@ public:
         return amd_mixed_attachment_samples;
     }
 
+    /// NEO-GT7-016: VK_NV_coverage_reduction_mode is on (PS4 Pro mode, NVIDIA's mixed samples).
+    bool IsCoverageTruncateOn() const {
+        return nv_coverage_reduction;
+    }
+
+    /// NEO-GT7-016: the combinations the driver lists for VK_COVERAGE_REDUCTION_MODE_TRUNCATE_NV.
+    std::span<const CoverageReduction::Combination> GetTruncateCombinations() const {
+        return truncate_combinations;
+    }
+
     /// Returns true when geometry shaders are supported by the device
     bool IsGeometryStageSupported() const {
         return features.geometryShader;
@@ -387,8 +399,8 @@ public:
         return shader_clock && shader_clock_features.shaderSubgroupClock;
     }
 
-    /// FIX-GTS-364: a GCN Radeon (R7/R9, three-digit RX 400/500/600 models, Vega, Radeon VII)
-    /// on AMD's driver. Four-digit RX models (RX 5300 and up) are RDNA.
+    /// FIX-GTS-364 (shadgt7 FIX-GT7-151): a GCN Radeon (R7/R9, three-digit RX 400/500/600 models,
+    /// Vega, Radeon VII) on AMD's driver. Four-digit RX models (RX 5300 and up) are RDNA.
     bool IsAmdGcn() const;
 
     /// AMD-306/307: AMD's driver compiling with its older proprietary shader compiler
@@ -396,6 +408,12 @@ public:
     bool IsAmdLegacyShaderCompiler() const {
         return driver_id == vk::DriverId::eAmdProprietary &&
                driver_info.find("LLPC") == std::string::npos;
+    }
+
+    /// DIAG-243: SHADGT_DEVICE_FAULT=1: the device fault extension is asked for and the renderer
+    /// notes its last draws.
+    bool NotesDrawsForFault() const {
+        return note_fault_draws;
     }
 
     /// AMD-313: a Radeon RX 7000 on AMD's driver.
@@ -711,6 +729,8 @@ private:
     bool amd_shader_trinary_minmax{};
     bool nv_framebuffer_mixed_samples{};
     bool amd_mixed_attachment_samples{};
+    bool nv_coverage_reduction{}; ///< NEO-GT7-016
+    std::vector<CoverageReduction::Combination> truncate_combinations; ///< NEO-GT7-016
     bool shader_atomic_float{};
     bool shader_atomic_float2{};
     bool workgroup_memory_explicit_layout{};
@@ -726,6 +746,7 @@ private:
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
     bool shader_clock{};
+    bool note_fault_draws{}; ///< DIAG-243: SHADGT_DEVICE_FAULT=1
     bool quad_control{};       ///< AMD-306
     bool vertex_order_check{}; ///< AMD-307
     bool supports_memory_budget{};

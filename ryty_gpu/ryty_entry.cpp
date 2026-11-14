@@ -14,8 +14,12 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <nlohmann/json.hpp>
 
 #include "common/diagnostics.h"
+#include "common/game_title.h"
+#include "common/old_switch_names.h"
+#include "ryty_gpu/ryty_upscale.h"
 #include "common/guest_clock.h"
 #include "common/mapping_writeback_gate.h"
 #include "common/logging/log.h"
@@ -62,6 +66,7 @@
 #ifdef RYGT_PGO_TRAIN
 // The game deliberately uses TerminateProcess, which skips LLVM's atexit writer.
 extern "C" int __llvm_profile_write_file();
+extern "C" void __llvm_profile_initialize_file();
 #endif
 
 namespace Libraries::SystemService {
@@ -145,6 +150,9 @@ void RunWindowThread() {
     }
     Common::Log::Flush();
 #ifdef RYGT_PGO_TRAIN
+    // The runtime's own initializer did not run in this module on 2026-11-12 ("Filename not
+    // set"): the file name is set here, from LLVM_PROFILE_FILE or the build's default.
+    __llvm_profile_initialize_file();
     const int profile_result = __llvm_profile_write_file();
     std::fprintf(stderr, "[window] PGO profile write result: %d\n", profile_result);
 #endif
@@ -296,7 +304,27 @@ std::string BuildWatermark() {
     if (Common::g_is_release || (env && env[0] == '0')) {
         return {};
     }
-    return fmt::format("GT Sport | {}", Common::g_scm_desc);
+    if (!Common::IsGt7()) {
+        return fmt::format("GT Sport | {}", Common::g_scm_desc);
+    }
+    // GT7: the revision, after the prerelease's name when this is that prerelease's renderer
+    // (manifest.json beside the exe has its commit; a test renderer copied into a release leaves
+    // the release's manifest there).
+    const std::string revision = Common::g_scm_desc;
+    std::ifstream file{Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path() /
+                       "manifest.json"};
+    const auto manifest = nlohmann::json::parse(file, nullptr, false);
+    // The key the ryGT7 package has used so far, then the one a package built from this
+    // repository would write.
+    for (const char* key : {"/sources/shadGT7/commit", "/sources/shadGT/commit"}) {
+        const nlohmann::json::json_pointer commit{key};
+        if (manifest.contains("name") && manifest["name"].is_string() &&
+            manifest.contains(commit) && manifest.at(commit).is_string() &&
+            revision.contains(manifest.at(commit).get<std::string>().substr(0, 7))) {
+            return fmt::format("{} | {}", manifest["name"].get<std::string>(), revision);
+        }
+    }
+    return fmt::format("GT7 | {}", revision);
 }
 
 std::string g_watermark;
@@ -350,11 +378,29 @@ void DrawFpsCounter() {
         window_shown = shown;
         window_start = now;
     }
-    char text[48];
+    char text[192];
+    int written = 0;
     if (shown_fps > 0.0) {
-        std::snprintf(text, sizeof(text), "%.0f FPS (%.0f shown)", fps, shown_fps);
+        written = std::snprintf(text, sizeof(text), "%.0f FPS (%.0f shown)", fps, shown_fps);
     } else {
-        std::snprintf(text, sizeof(text), "%.0f FPS", fps);
+        written = std::snprintf(text, sizeof(text), "%.0f FPS", fps);
+    }
+    // DLSS-GT7-001: what the DLSS pass runs with, and its test keys, with SHADGT_DLSS_TEMPORAL_KEY=1
+    // only (DLSS-GT7-004): players see the plain counter.
+    if (Vulkan::RytyUpscale::TemporalRequested() && Vulkan::RytyUpscale::TemporalKeys() &&
+        written > 0 &&
+        written < static_cast<int>(sizeof(text))) {
+        const bool wanted = Vulkan::RytyUpscale::TemporalActive();
+        const bool used = Vulkan::RytyUpscale::TemporalStatus().load(std::memory_order_relaxed) == 1;
+        std::snprintf(
+            text + written, sizeof(text) - written,
+            " | DLSS %s (Page Up) | menu interface %s (Home), %s (End)",
+            !wanted ? "single frames" : used ? "TEMPORAL" : "temporal, waiting",
+            Vulkan::RytyUpscale::TemporalUiJitter().load(std::memory_order_relaxed) ? "shifted"
+                                                                                   : "in place",
+            Vulkan::RytyUpscale::TemporalUiMask().load(std::memory_order_relaxed)
+                ? "no motion"
+                : "the scene's motion");
     }
     auto* draw = ImGui::GetForegroundDrawList();
     const ImVec2 origin = ImGui::GetMainViewport()->Pos;
@@ -613,6 +659,12 @@ void Ryty::RytyLibraryInitialize() {
     }
 #endif
     g_watermark = BuildWatermark();
+    LOG_WARNING(Render_Vulkan, "GAME-001: renderer for {}", Common::IsGt7() ? "GT7" : "GT Sport");
+    if (const auto& old_names = Common::OldSwitchNamesTaken(); !old_names.empty()) {
+        LOG_WARNING(Render_Vulkan,
+                    "SWITCH-001: old switch names read as SHADGT_/SHARED_ (rename them): {}",
+                    old_names);
+    }
     Ryty::SetOverlayDraw(&DrawFpsCounter);
 #ifdef ENABLE_DISCORD_RPC
     if (EmulatorSettings.IsDiscordRPCEnabled()) {
@@ -847,6 +899,13 @@ extern "C" __declspec(dllexport) int RytyGpuRegisterCpuStack(u64 address, u64 si
 extern "C" __declspec(dllexport) void RytyGpuUnregisterCpuStack(u64 address, u64 size) noexcept {
     try { Native::CpuStacks().Unregister(address, size); } catch (...) {}
 }
+// NEO-GT7-015: this renderer draws the PS4 Pro mode (NEO-GT7-001 to 014). Ryty's libkernel asks
+// for it before SHADGT_NEO=1 answers sceKernelIsNeoMode with 1: a renderer without the Pro mode
+// (an older package) keeps the base PS4 mode instead of a black screen and a lost GPU.
+extern "C" __declspec(dllexport) int RytyGpuNeoSupported() {
+    return 1;
+}
+
 // Ryty calls this before the kernel writes guest memory directly (a file read into a guest
 // buffer), which would fail on a write-protected page instead of faulting.
 extern "C" __declspec(dllexport) void RytyGpuInvalidateMemory(u64 address, u64 size) {

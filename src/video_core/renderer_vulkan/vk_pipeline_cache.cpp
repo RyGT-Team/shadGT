@@ -56,10 +56,12 @@
 #endif
 #include "common/read_capture.h"
 #include "common/scope_exit.h"
+#include "video_core/title_defaults.h"
 #include "common/singleton.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/kernel/process.h"
 #include "core/memory.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/info.h"
@@ -1313,6 +1315,36 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
                                (stencil_ref_export_enable << 1) |
                                (regs.depth_shader_control.mask_export_enable << 2) |
                                (regs.depth_shader_control.coverage_to_mask_enable << 3);
+        // NEO-GT7-005: in the PS4 Pro mode, a draw rasterizing more samples (its depth's) than
+        // one of its colour targets has fragments runs its pixel shader once per pixel, where
+        // Vulkan requires it: VK_NV_framebuffer_mixed_samples (per-sample shading with fewer
+        // colour samples lost the GPU, writing to address 0). VK_AMD_mixed_attachment_samples
+        // has no such rule: AMD keeps the shader as it is. SHADGT_NEO_PIXEL_RATE=0: as before.
+        static const bool neo_pixel_rate = [] {
+            const char* env = std::getenv("SHADGT_NEO_PIXEL_RATE");
+            return Libraries::Kernel::sceKernelIsNeoMode() != 0 && !(env && env[0] == '0');
+        }();
+        if (neo_pixel_rate && instance.IsMixedDepthSamplesSupported() &&
+            !instance.IsMixedAnySamplesSupported()) {
+            const u32 raster = S().graphics_key.num_samples; // the depth's, at this point
+            bool fewer = false;
+            for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+                const auto& col_buf = regs.color_buffers[cb];
+                if (col_buf && regs.color_target_mask.GetMask(cb) != 0) {
+                    fewer |= col_buf.NumSamples() < raster;
+                }
+            }
+            if (fewer) {
+                info.hw.fs.mrtz_mask |= Shader::HwFragmentRuntimeInfo::MrtzPixelRate;
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 3) {
+                    LOG_WARNING(Render_Vulkan,
+                                "NEO-GT7-005: pixel shader at {:#x} runs once per pixel: {} "
+                                "raster samples, fewer colour fragments (mixed samples)",
+                                regs.ps_program.Address<VAddr>(), raster);
+                }
+            }
+        }
         const auto& cb0_blend = regs.blend_control[0];
         if (cb0_blend.enable) {
             info.hw.fs.dual_source_blending =
@@ -2174,16 +2206,16 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         VideoCore::DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported();
     profile.lds_read_counters = DiagLdsReadCountersAddress(instance); // DIAG-GTS-459
 #ifdef RYTY_GPU
-    // FIX-GTS-364: an RX 480 drew GT7 right only with the legacy 2D-array cube sampling path, so
-    // GCN Radeons take it by default. SHADGT_NATIVE_CUBE=0 picks the legacy path on any GPU, =1
-    // the native one.
+    // FIX-GTS-364 (FIX-GT7-151): an RX 480 drew GT7 right only with the legacy 2D-array cube
+    // sampling path, so GCN Radeons take it by default. SHADGT_NATIVE_CUBE=0 picks the legacy
+    // path on any GPU, =1 the native one.
     {
         const char* native_cube_env = std::getenv("SHADGT_NATIVE_CUBE");
         const bool native_cube = native_cube_env && *native_cube_env ? native_cube_env[0] != '0'
                                                                      : !instance.IsAmdGcn();
         profile.native_cube_sampling =
             NativeModeRequested() && instance.IsImageCubeArraySupported() && native_cube;
-        LOG_INFO(Render_Vulkan, "FIX-GTS-364: native cube sampling {}{}",
+        LOG_INFO(Render_Vulkan, "FIX-GTS-364 (FIX-GT7-151): native cube sampling {}{}",
                  profile.native_cube_sampling ? "on" : "off",
                  native_cube_env && *native_cube_env ? " (SHADGT_NATIVE_CUBE)"
                  : instance.IsAmdGcn()              ? " (GCN Radeon)"
@@ -2423,7 +2455,8 @@ static u64 DriverCacheMaxBytes() {
     static const u64 limit = [] {
         const char* env = std::getenv("SHADGT_DRIVER_CACHE_MAX_MB");
         if (!env || !*env) {
-            return u64{4096} << 20;
+            // TITLE-001: 4096 for GT Sport, 2048 for GT7 (FIX-GT7-049).
+            return u64{VideoCore::CurrentTitleDefaults().driver_cache_max_mb} << 20;
         }
         const long long mb = std::strtoll(env, nullptr, 10);
         return mb < 0 ? ~u64{0} : u64(mb) << 20;
@@ -2439,6 +2472,10 @@ static bool DriverCacheFileEnabled() {
 #endif
 #ifdef RYTY_GPU
     const char* env = std::getenv("SHADGT_DRIVER_CACHE");
+    if (VideoCore::CurrentTitleDefaults().driver_cache_follows_pipeline_cache &&
+        !EmulatorSettings.IsPipelineCacheEnabled()) {
+        return false; // TITLE-001: GT7, as shadgt7
+    }
     return (!env || env[0] != '0') && DriverCacheMaxBytes() != 0; // PERF-167: 0 turns it off
 #else
     return EmulatorSettings.IsPipelineCacheEnabled();
@@ -4822,6 +4859,8 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             std::vector<u32> user_data;
             ComputePipeline::SerializationSupport sdata{};
         };
+        // FIX-GT7-150: how long the game waited for this build (the recipe check below).
+        const auto build_start = std::chrono::steady_clock::now();
         auto inputs = std::make_shared<ComputeBuild>();
         inputs->info = *S().infos[0];
         inputs->user_data.assign(inputs->info.user_data.begin(), inputs->info.user_data.end());
@@ -4840,12 +4879,29 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         build_workers->Push([job] { (*job)(); }, BuildQueue::Kind::Urgent);
         it.value() = completion.get();
         it.value()->SetStageInfo(*S().infos[0]);
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - build_start)
+                              .count();
         if (const Shader::Info* info = S().infos[0]; WarmComputeOn() && info) {
             const auto dir = WarmComputeDir();
             const auto file = dir / fmt::format("{:#018x}-{:#018x}.bin", pipeline_hash,
                                                   ComputePipeline::RecipePolicy(instance, profile));
             std::error_code ec;
-            if (!std::filesystem::exists(file, ec)) {
+            // FIX-GT7-150 (SHADGT_WARM_COMPUTE_REFRESH=0: as before): a recipe was written once and
+            // never again, so once a renderer update changed a program's translation the warm-up
+            // went on building the old code at every start while the pipeline of the new code was
+            // built here, the game waiting: on a PC whose recipes were five days old, the same 16
+            // of 335 were built here in every session the driver lacked them (60 ms to 1.6 s
+            // each, 8-10 s in all; the SPIR-V of all 16 differed from their recipe's). A build
+            // that took long although its recipe was there has a recipe that did not serve: it is
+            // compared with this pipeline's code and written again when different (a recipe the
+            // warm-up had not reached yet is the same, and left alone).
+            static const bool refresh = [] {
+                const char* env = std::getenv("SHADGT_WARM_COMPUTE_REFRESH");
+                return !(env && env[0] == '0');
+            }();
+            const bool known = std::filesystem::exists(file, ec);
+            if (!known || (refresh && ms >= 50.0)) {
                 std::optional<size_t> perm;
                 if (const auto prog = program_cache.find(info->pgm_hash); prog != program_cache.end()) {
                     const auto& modules = prog->second->modules;
@@ -4856,7 +4912,12 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
                 if (perm) Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
                     fmt::format("{:#018x}_{}", info->pgm_hash, *perm), spirv);
                 std::filesystem::create_directories(dir, ec);
-                if (IsCompleteSpirv(spirv)) it.value()->SaveRecipe(file, spirv);
+                if (IsCompleteSpirv(spirv) && it.value()->SaveRecipe(file, spirv) && known) {
+                    LOG_INFO(Render_Vulkan,
+                             "FIX-GT7-150: compute pipeline {:#x} took {:.0f} ms although its "
+                             "recipe was there; the recipe held other code and is written again",
+                             pipeline_hash, ms);
+                }
             }
         }
         sdata = inputs->sdata;
@@ -7361,6 +7422,35 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
                                                       Shader::LaneReadUnbranchEnabled());
         }
       }
+        // NEO-GT7-007: PS4 Pro programs with SDWA compares or selections, stored before they
+        // were translated (only Pro code has SDWA, so the base mode never looks). Stores are
+        // never cleared for another build here (FIX-271), so the check stays on. Bit 4096: 2048
+        // is the lane-read marker of this tree (lane_read_policy.h).
+        static const bool neo = Libraries::Kernel::sceKernelIsNeoMode() != 0;
+        if (neo) {
+            const auto use = Shader::NeoCodeCensus(params.code);
+            if (use.sdwa_compares_to_sgpr + use.sdwa_selects != 0) {
+                needed_fixes |= 4096u;
+            }
+        }
+    }
+    // NEO-GT7-008 (diagnosis, SHADGT_NEO_CENSUS=1): the PS4 Pro encodings each program uses, at
+    // its first use; DPP and the MIMG G16/A16/D16 bits are not translated yet.
+    static const bool neo_census = [] {
+        const char* env = std::getenv("SHADGT_NEO_CENSUS");
+        return Libraries::Kernel::sceKernelIsNeoMode() != 0 && env && env[0] == '1';
+    }();
+    if (neo_census && first_use) {
+        const auto use = Shader::NeoCodeCensus(params.code);
+        if (use.sdwa_compares_to_sgpr + use.sdwa_selects + use.dpp + use.mimg_g16 + use.mimg_a16 +
+                use.mimg_d16 !=
+            0) {
+            LOG_WARNING(Render_Vulkan,
+                        "NEO-GT7-008: {}_{:#x} uses SDWA compares to SGPRs {}, SDWA selections {}, "
+                        "DPP {}, MIMG G16 {} A16 {} D16 {}",
+                        hw_stage, params.hash, use.sdwa_compares_to_sgpr, use.sdwa_selects,
+                        use.dpp, use.mimg_g16, use.mimg_a16, use.mimg_d16);
+        }
     }
     const auto known = else_scope_fixed.find(params.hash);
     const auto session = session_fix_marks.find(params.hash);

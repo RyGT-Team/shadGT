@@ -133,8 +133,8 @@ void Swapchain::SetHDR(bool hdr) {
 
     needs_hdr = hdr;
     Recreate(width, height);
-    ImGui::Core::OnSurfaceFormatChange(needs_hdr ? SURFACE_FORMAT_HDR.format
-                                                 : surface_format.format);
+    ImGui::Core::OnSurfaceFormatChange(
+        needs_hdr ? SURFACE_FORMAT_HDR.format : surface_format.format, needs_hdr);
 }
 
 void Swapchain::RecreateSurface() {
@@ -165,7 +165,7 @@ void Swapchain::RecreateSurface() {
     const vk::Format new_format = needs_hdr ? SURFACE_FORMAT_HDR.format : surface_format.format;
     LOG_WARNING(Render_Vulkan, "FIX-218: surface lost; created a new surface (HDR={})", needs_hdr);
     if (new_format != previous_format) {
-        ImGui::Core::OnSurfaceFormatChange(new_format);
+        ImGui::Core::OnSurfaceFormatChange(new_format, needs_hdr);
     }
 }
 

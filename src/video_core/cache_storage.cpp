@@ -46,9 +46,19 @@ namespace {
 // incompatible store is preserved while a compatible numbered sibling is opened instead.
 
 // Tests: a store of its own for this tag. A test keeps one store per renderer and switches.
+// NEO-GT7-007: SHADGT_NEO_SDWA_CMP=0 translates SDWA compares the old way (to VCC), which breaks the
+// PS4 Pro checkerboard resolve; those translations get a store of their own, so a session run once
+// with the switch leaves nothing wrong in the usual store. Only with the Pro mode's switch
+// (SHADGT_NEO=1, read as libkernel reads it): the base mode has no SDWA, so its store stays.
 std::string StoreTag() {
     const char* env = std::getenv("SHADGT_SHADER_STORE_TAG");
-    return env && *env ? std::string{"-"} + env : std::string{};
+    std::string tag = env && *env ? std::string{"-"} + env : std::string{};
+    const char* sdwa = std::getenv("SHADGT_NEO_SDWA_CMP");
+    const char* neo = std::getenv("SHADGT_NEO");
+    if (sdwa && sdwa[0] == '0' && neo && neo[0] == '1' && neo[1] == '\0') {
+        tag += "-sdwa-vcc";
+    }
+    return tag;
 }
 
 } // namespace

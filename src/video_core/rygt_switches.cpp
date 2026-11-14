@@ -116,6 +116,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     // Native recorder & sync
     "RYGTSW1|RYGT_LONG_LIVED_SETS|flag|Native recorder & sync|on|unset or 1 = on, any other value = off (needs RYGT_DYNAMIC_BUFFER_OFFSETS on)|Keeps descriptor sets across command lists and drops one when an object it uses is destroyed (PERF-GTS-375). Experimental.",
     "RYGTSW1|RYGT_DYNAMIC_BUFFER_OFFSETS|flag|Native recorder & sync|on in native mode|unset or 1 = on, any other value = off (native mode; not with parallel recording)|Descriptor sets take buffer offsets at the bind, so draws reuse sets instead of making new ones (PERF-GTS-374). Experimental: every pipeline is rebuilt once and the driver cache grows.",
+    "RYGTSW1|RYGT_NATIVE_LAYER_HASH_ASYNC|flag|Native recorder & sync|on|0 = off (the recorder checks them itself)|Checks large many-layer textures for CPU changes on a background thread instead of on the recorder (PERF-GTS-452).",
     "RYGTSW1|RYGT_PREPARED_MIRROR_EXACT|flag|Native recorder & sync|on|unset or exactly 1 = on, any other value = off|A draw prepared ahead is redone after a GPU copy of vertex memory is made or dropped only when it used that copy, not any memory under it (PERF-GTS-405). Experimental.",
     "RYGTSW1|RYGT_PREPARED_EVICT_EXACT|flag|Native recorder & sync|on|unset or exactly 1 = on, any other value = off|A draw prepared ahead is redone after a texture eviction only when it used the evicted texture, not any texture over the same memory (PERF-GTS-404). Experimental.",
     "RYGTSW1|RYGT_PREPARE_MISSING_PICTURES|flag|Native recorder & sync|on|unset or exactly 1 = on, any other value = off|A draw prepared ahead keeps its work when one texture does not exist yet; the recorder makes that texture and fills it in (PERF-GTS-403). Experimental.",
@@ -209,9 +210,11 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_STAGE_WORKERS|int|Native recorder & sync|1|1-4 (clamped); only with the buffer stage|Number of buffer stage worker threads (1-4); above 1 the recorder also obtains buffers under a shared lock.",
     "RYGTSW1|SHADGT_WRITE_THROUGH|flag|Native recorder & sync|off|exactly 1 = on; -DisablePerf 103 keeps it off|CPU stores to pages with GPU-written bytes go through without waiting for the GPU (FIX-079). Opt-in: froze some sessions at scene changes.",
     // Memory & VRAM
+    "RYGTSW1|RYGT_BATCH_MAP_MERGE|flag|Memory & VRAM|off|1 = on|Maps a run of the renderer's fixed batch maps as one direct-memory map (PERF-GTS-268); off because it caused 30-80 ms recorder stalls in races. Runtime (libkernel).",
     "RYGTSW1|RYGT_COMPUTE_PREFIX_COPY|flag|Memory & VRAM|off|1 = on|Menus: copies each compute shader's 4 KB constant snapshot to video memory before the dispatch, as before PERF-GTS-461. Slower; for comparison.",
     "RYGTSW1|RYGT_D1_VIEW_MB|int|Memory & VRAM|256|MB per imported piece; 0 = whole allocation at once|Imports large GPU memory allocations in pieces of this many MB when first used (PERF-GT7-022); 0 pins the whole allocation.",
     "RYGTSW1|RYGT_GATHER_REUSE|flag|Memory & VRAM|on|0 = off|Draws in one command list that read the same guest buffer spanning several imported pieces share one GPU copy of it, instead of a new copy each (PERF-GTS-365; VRAM filled at the Nurburgring without it).",
+    "RYGTSW1|RYGT_NATIVE_KEEP_NEW_IDLE|flag|Memory & VRAM|on|0 = off|Keeps a loaded texture that went idle after the last full sweep, within the texture budget, instead of dropping it.",
     "RYGTSW1|RYGT_REGION_GROW_MB|int|Memory & VRAM|64|MB, 0-1024; 0 = exact size|A GPU copy of guest memory that has to grow gets this much room past what was asked (up to its own size), so the next bind just past it does not rebuild it again (PERF-GTS-369; one region grew 16 to 181 MB in about 20 rebuilds at the Autopolis start).",
     "RYGTSW1|RYGT_UNMAP_HANDOFF|flag|Memory & VRAM|off|1 = on|The renderer lets the game in when it is waiting to unmap or map memory, instead of making it wait out a stretch of draws (PERF-GTS-368; up to 390 ms frames at the Autopolis start without it).",
     "RYGTSW1|RYGT_UPLOAD_COPY_RESERVE_MB|int|Memory & VRAM|256|MB, 0-4096, in 128 MB blocks; 0 = off|Reserves this much upload memory up front for texture upload copies, so textures seen for the first time do not wait for an allocation (PERF-GTS-364). Uses that much more VRAM.",
@@ -371,6 +374,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     // Runtime
     "RYGTSW1|RYGT_ADAPTIVE_TRIGGERS|flag|Runtime|on|0 = off (ignored when the dlssg_enabled config is on)|Telemetry-driven adaptive trigger effects for player 1 (braking slip, wheelspin, TCS); 0 turns them off.",
     "RYGTSW1|RYGT_ADAPTIVE_TRIGGERS_REPLAY|flag|Runtime|off|1 = on|Adaptive trigger effects also run in replays and demos, to check them without driving. For testing.",
+    "RYGTSW1|RYGT_APP0_LAYERS|string|Runtime|the update= and game= folders from RyGT.ini|folders separated by ; (the first holding a file wins)|The folders the game's /app0 is read from, in order, instead of the launcher's update and game folders. Read by the runtime (libc).",
     "RYGTSW1|RYGT_ARCADE_MEMORY|flag|Runtime|on|0 = off; GT7 only|GT7 Arcade remembers the last course, weather and car across launches (FIX-GT7-060). 0 turns it off.",
     "RYGTSW1|RYGT_CLIP_MINUTES|int|Runtime|15|minutes, 0 or more|Length in minutes of the clip kept by video capture (GTS-015). Only matters with RYGT_REPLAY_VIDEO=1.",
     "RYGTSW1|RYGT_DEBUG_BUILD|flag|Runtime|off|1 (first char) = on|Keeps the game's 'debug' VersionBuild, which shows developer layers in Scapes and Photo mode (GTS-012 off).",
@@ -382,6 +386,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|RYGT_LEWIS|flag|Runtime|on|0 = off|Unlocks the Lewis Hamilton challenge DLC by answering its unlock keys. 0 turns it off.",
     "RYGTSW1|RYGT_LIVERY|flag|Runtime|on|0 = off|Patches the menu script so the Livery Editor works offline (GTS-003). 0 turns it off.",
     "RYGTSW1|RYGT_MOVIES|flag|Runtime|on|0 = off|Decodes the game's movies; 0 turns movie decoding off.",
+    "RYGTSW1|RYGT_MUTEX_SPIN|int|Runtime|40|tries; 0 = off, at most 20000|A held game mutex is tried this many more times, a pause apart, before the thread blocks: fewer kernel waits in heavy frames (PERF-GTS-269). Runtime (libkernel).",
     "RYGTSW1|RYGT_NATIVE_SNAPSHOT_LEASE|flag|Runtime|off|exactly 1 = on|Runtime file/socket writes into game memory are marked unsafe for snapshot reuse and invalidated in the renderer. Experimental.",
     "RYGTSW1|RYGT_ONLINE_SERVER|string|Runtime|online_server in RyGT.ini, else this PC|server address|Address of the RyGTServer for online play; overrides online_server in RyGT.ini.",
     "RYGTSW1|RYGT_P2P_PORT|int|Runtime|3658|1..65535|UDP port used for peer-to-peer online play.",

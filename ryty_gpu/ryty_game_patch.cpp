@@ -40,6 +40,7 @@
 #include "ryty_gpu/native/menu_snapshot_session.h"
 #include "ryty_gpu/native/menu_capture_compile_guard.h"
 #include "ryty_gpu/native/scene_history_origin.h"
+#include "input/telemetry_haptics_output.h"
 #include "input/trigger_feedback.h"
 #include "ryty_gpu/ryty_dlssg.h"
 
@@ -2151,6 +2152,7 @@ void PS4_SYSV_ABI TelemetryUpdateHook(void* service, void* context) {
     const auto* packet = static_cast<const u8*>(service) + 0x1dc;
     Vulkan::RytyDlssG::PublishTelemetry(packet);
     Input::TriggerFeedback::Publish(packet);
+    Input::TelemetryHaptics::Publish(packet);
 }
 void InstallTriggerTelemetry(u8* base) {
     // CUSA03220 v1.69: SimulatorInterface::update virtual slot, converter RVA.
@@ -2159,8 +2161,8 @@ void InstallTriggerTelemetry(u8* base) {
     auto original = reinterpret_cast<TelemetryUpdateFn>(base + 0x68cf20);
     const u8 magic[] = {0xc7, 0x87, 0xdc, 0x01, 0, 0, 0x30, 0x53, 0x37, 0x47};
     if (*slot != original || std::memcmp(base + 0x68cf53, magic, sizeof(magic)) != 0) return;
-    const char* enabled = std::getenv("SHADGT_ADAPTIVE_TRIGGERS");
-    if (enabled && enabled[0] == '0' && !ConfigFlag("dlssg_enabled", false)) return;
+    // FEAT-GTS-436: always installed: telemetry haptics need it too (their launcher sliders turn
+    // them off), and SHADGT_ADAPTIVE_TRIGGERS=0 still releases the triggers in the input bridge.
     DWORD protection;
     if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &protection)) return;
     g_telemetry_update = original;
@@ -2177,6 +2179,7 @@ void PS4_SYSV_ABI TelemetryUpdateHookGt7(void* service, void* context) {
     g_telemetry_update_gt7(service, context);
     const auto* packet = static_cast<const u8*>(service) + 0x1dc;
     Input::TriggerFeedback::Publish(packet);
+    Input::TelemetryHaptics::Publish(packet);
     static const bool log = [] {
         const char* env = std::getenv("SHADGT_ADAPTIVE_TRIGGERS_LOG");
         return env && env[0] == '1';
@@ -2228,11 +2231,9 @@ void InstallTriggerTelemetryGt7(u8* base) {
         std::memcmp(base + 0x1d10f53, magic, sizeof(magic)) != 0) {
         return;
     }
-    // On whenever the launcher's trigger strength slider is above 0% (the bridge scales the effects
-    // by it and releases the triggers at 0%, also while the game runs); SHADGT_ADAPTIVE_TRIGGERS=0
-    // forces it off, =1 on even at 0%.
-    const char* enabled = std::getenv("SHADGT_ADAPTIVE_TRIGGERS");
-    if (enabled && enabled[0] == '0') return;
+    // FEAT-GTS-436: always installed, for the telemetry haptics and the adaptive triggers; the
+    // launcher's sliders scale or silence each effect while the game runs, and
+    // SHADGT_ADAPTIVE_TRIGGERS=0 still releases the triggers in the input bridge.
     DWORD protection;
     if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &protection)) return;
     g_telemetry_update_gt7 = original;

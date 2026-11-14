@@ -3,6 +3,7 @@
 
 #include <windows.h>
 #include <tlhelp32.h>
+#include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <algorithm>
@@ -73,6 +74,8 @@ void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label)
 
 Frontend::WindowSDL* g_window = nullptr;
 
+[[noreturn]] void RytyEndGame(int code, const char* reason);
+
 namespace {
 
 std::mutex g_window_mutex;
@@ -129,28 +132,7 @@ void RunWindowThread() {
             SDL_SetWindowTitle(window.GetSDLWindow(), title.c_str());
         }
     }
-    // The window was closed: end the game without DLL teardown (see Emulator::Shutdown).
-    // Stop trigger effects before the deliberate TerminateProcess skips SDL cleanup.
-    Input::TriggerFeedback::stopping = true;
-    const auto released = Input::TriggerFeedback::Vibration(0);
-    for (int slot = 0; slot < 4; ++slot) {
-        (*controllers)[slot]->SetTriggerFeedback(released, released, 0, 0);
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50)); // Flush queued HID releases.
-    try {
-        if (Vulkan::SaveDriverCacheAtExit())
-            LOG_INFO(Render_Vulkan, "CACHE-EXIT: driver pipeline save attempted before process termination");
-    } catch (const std::exception& error) {
-        LOG_WARNING(Render_Vulkan, "CACHE-EXIT: save failed: {}", error.what());
-    }
-    Common::Log::Flush();
-#ifdef RYGT_PGO_TRAIN
-    const int profile_result = __llvm_profile_write_file();
-    std::fprintf(stderr, "[window] PGO profile write result: %d\n", profile_result);
-#endif
-    std::fprintf(stderr, "[window] closed: the game ends\n");
-    std::fflush(stderr);
-    TerminateProcess(GetCurrentProcess(), 0);
+    RytyEndGame(0, "[window] closed");
 }
 
 // Signals the named event Ryty's save data library waits on before GT Sport's first save access
@@ -469,6 +451,44 @@ void StartHeapReport() {
 
 #endif
 } // namespace
+
+// Ends the game's process without DLL teardown (see Emulator::Shutdown), after saving what the
+// renderer would otherwise lose. Called when the window is closed and when the game's main
+// returns (EXIT-001, ryty_game_patch.cpp). `code` is the process's exit code.
+[[noreturn]] void RytyEndGame(int code, const char* reason) {
+    static std::atomic_flag ending;
+    if (ending.test_and_set()) {
+        // The other way out is already ending the process.
+        for (;;) {
+            Sleep(INFINITE);
+        }
+    }
+    // Stop trigger effects before the deliberate TerminateProcess skips SDL cleanup.
+    Input::TriggerFeedback::stopping = true;
+    const auto released = Input::TriggerFeedback::Vibration(0);
+    auto* controllers = Common::Singleton<Input::GameControllers>::Instance();
+    for (int slot = 0; slot < 4; ++slot) {
+        (*controllers)[slot]->SetTriggerFeedback(released, released, 0, 0);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50)); // Flush queued HID releases.
+    try {
+        if (Vulkan::SaveDriverCacheAtExit())
+            LOG_INFO(Render_Vulkan, "CACHE-EXIT: driver pipeline save attempted before process termination");
+    } catch (const std::exception& error) {
+        LOG_WARNING(Render_Vulkan, "CACHE-EXIT: save failed: {}", error.what());
+    }
+    Common::Log::Flush();
+#ifdef RYGT_PGO_TRAIN
+    const int profile_result = __llvm_profile_write_file();
+    std::fprintf(stderr, "[window] PGO profile write result: %d\n", profile_result);
+#endif
+    std::fprintf(stderr, "%s: the game ends (exit code %d)\n", reason, code);
+    std::fflush(stderr);
+    TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
+    for (;;) {
+        Sleep(INFINITE);
+    }
+}
 
 static bool SerializedMapProtocolAvailable();
 

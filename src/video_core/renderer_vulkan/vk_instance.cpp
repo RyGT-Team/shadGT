@@ -624,7 +624,8 @@ bool Instance::CreateDevice() {
         // default): an RX 6600 XT failed to build shaders with them on. FIX-419-GTS: replaces
         // AMD-314's on-by-default for RX 7000 and newer.
         const std::string model{GetModelName()};
-        AmdBarycentricDefault() = false;
+        // FEAT-GTS-483: on by default on the RX 90XX (RDNA4).
+        AmdBarycentricDefault() = IsAmdRx90();
         LOG_INFO(Render_Vulkan, "FIX-GT7-061: AMD barycentric fix default {} ({}), in use {}",
                  AmdBarycentricDefault() ? "on" : "off", model,
                  properties.vendorID == 0x1002 && SingleSampleBarycentricRequested());
@@ -641,9 +642,11 @@ bool Instance::CreateDevice() {
         // AMD-307: with AMD's barycentric extension and its older shader compiler (RX 6000 and
         // older), per-vertex reads find the driver's vertex order per triangle.
         // SHADGT_VERTEX_ORDER=0 turns it off, =1 turns it on with AMD's extension on any driver.
+        // FEAT-GTS-483: off by default on the RX 90XX (RDNA4), whatever its shader compiler.
         const char* order_env = std::getenv("SHADGT_VERTEX_ORDER");
-        vertex_order_check = amd_shader_explicit_vertex_parameter &&
-                             (order_env ? order_env[0] == '1' : IsAmdLegacyShaderCompiler());
+        vertex_order_check =
+            amd_shader_explicit_vertex_parameter &&
+            (order_env ? order_env[0] == '1' : IsAmdLegacyShaderCompiler() && !IsAmdRx90());
         LOG_INFO(Render_Vulkan, "AMD-307: barycentrics from {}, vertex order check {}",
                  amd_shader_explicit_vertex_parameter ? "VK_AMD_shader_explicit_vertex_parameter"
                  : fragment_shader_barycentric        ? "VK_KHR_fragment_shader_barycentric"

@@ -443,8 +443,16 @@ bool Instance::CreateDevice() {
     // binaries with ErrorOutOfHostMemory.
     // PERF-376-GTS: opt in only; AMD remains disabled after the observed driver failures.
     const char* pipeline_binary_env = std::getenv("SHADGT_PIPELINE_BINARIES");
-    const bool request_pipeline_binaries = properties.vendorID != 0x1002 &&
-        pipeline_binary_env && pipeline_binary_env[0] == '1' && pipeline_binary_env[1] == '\0';
+    // PERF-GTS-482 (prototype, opt-in): AMD's driver keeps no whole pipeline with dynamic vertex
+    // input in a VkPipelineCache (every whole pipeline here), so each launch compiled them all
+    // again. With SHADGT_AMD_WHOLE_BINARIES=1 whole pipelines are stored as pipeline binaries;
+    // libraries stay off them (BIN-003).
+    const char* amd_whole_binaries_env = std::getenv("SHADGT_AMD_WHOLE_BINARIES");
+    whole_pipeline_binaries_only = properties.vendorID == 0x1002 && amd_whole_binaries_env &&
+                                   amd_whole_binaries_env[0] == '1';
+    const bool request_pipeline_binaries = (properties.vendorID != 0x1002 &&
+        pipeline_binary_env && pipeline_binary_env[0] == '1' && pipeline_binary_env[1] == '\0') ||
+        whole_pipeline_binaries_only;
     if (request_pipeline_binaries && maintenance_5) {
         const auto chain = physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
                                                         vk::PhysicalDevicePipelineBinaryFeaturesKHR>();
@@ -464,6 +472,11 @@ bool Instance::CreateDevice() {
         } else {
             LOG_WARNING(Render_Vulkan, "BIN-001: pipeline binaries not supported by this driver");
         }
+    }
+    whole_pipeline_binaries_only = whole_pipeline_binaries_only && pipeline_binary;
+    if (whole_pipeline_binaries_only) {
+        LOG_WARNING(Render_Vulkan, "PERF-GTS-482: whole pipelines are stored as pipeline binaries "
+                                   "(libraries are not)");
     }
     attachment_feedback_loop =
         feature_chain.get<vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT>().attachmentFeedbackLoopLayout &&

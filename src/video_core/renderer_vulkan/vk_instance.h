@@ -169,6 +169,11 @@ public:
         return pipeline_binary;
     }
 
+    /// PERF-GTS-482: only whole pipelines go through the binary store (AMD, SHADGT_AMD_WHOLE_BINARIES).
+    bool IsPipelineBinaryWholeOnly() const {
+        return whole_pipeline_binaries_only;
+    }
+
     /// Returns true if VK_KHR_maintenance8 is supported
     bool IsMaintenance8Supported() const {
         return maintenance_8;
@@ -718,6 +723,7 @@ private:
     bool maintenance_8{};
     bool anti_lag{};
     bool pipeline_binary{}; // BIN-001
+    bool whole_pipeline_binaries_only{}; // PERF-GTS-482
     bool amd_overallocation{}; // AMD-VRAM-002
     bool memory_priority{};    // AMD-VRAM-003
     mutable u64 anti_lag_frame{};

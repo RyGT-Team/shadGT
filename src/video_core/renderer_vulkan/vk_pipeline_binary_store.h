@@ -181,8 +181,11 @@ inline vk::ResultValue<vk::Pipeline> CreateGraphics(const Instance& instance, vk
                                                     const vk::GraphicsPipelineCreateInfo& info) {
     using namespace detail;
     const auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
+    // PERF-GTS-482: with whole pipelines only, libraries are built as before (BIN-003).
+    const bool library = static_cast<bool>(info.flags & vk::PipelineCreateFlagBits::eLibraryKHR);
     if (!instance.IsPipelineBinarySupported() || !d.vkGetPipelineKeyKHR ||
-        !d.vkCreatePipelineBinariesKHR || !d.vkGetPipelineBinaryDataKHR) {
+        !d.vkCreatePipelineBinariesKHR || !d.vkGetPipelineBinaryDataKHR ||
+        (library && instance.IsPipelineBinaryWholeOnly())) {
         return device.createGraphicsPipeline(cache, info);
     }
     const auto& folder = Folder(device);

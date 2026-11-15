@@ -2261,9 +2261,17 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
             trace.Next(1);
             RefreshRegion(*region, address, size);
             // RefreshRegion may record transfer writes after FlushUploads' initial barrier.
-            // The upload or untiling dispatch must read those refreshed bytes.
-            list.Barrier(Native::Rhi::ScopeTransfer,
-                         Native::Rhi::ScopeTransfer | Native::Rhi::ScopeCompute);
+            // The upload or untiling dispatch must read those refreshed bytes (FIX-196).
+            // SHADGT_NATIVE_UPLOAD_BARRIER=0: no barrier, as before FIX-196 (diagnosis only:
+            // textures the CPU writes in a region can upload stale).
+            static const bool upload_barrier = [] {
+                const char* env = std::getenv("SHADGT_NATIVE_UPLOAD_BARRIER");
+                return !(env && env[0] == '0');
+            }();
+            if (upload_barrier) {
+                list.Barrier(Native::Rhi::ScopeTransfer,
+                             Native::Rhi::ScopeTransfer | Native::Rhi::ScopeCompute);
+            }
             trace.Next(2);
             auto wrapped = device->WrapBuffer(region->buffer->NativeHandle(), region->buffer->Size());
             source.buffer = wrapped.get();

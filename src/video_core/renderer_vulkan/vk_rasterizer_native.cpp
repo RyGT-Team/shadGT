@@ -5806,6 +5806,13 @@ static const std::vector<std::pair<VAddr, VAddr>>& NativeInplaceRanges() {
         std::vector<std::pair<VAddr, VAddr>> result;
         const char* configured = std::getenv("SHADGT_NATIVE_INPLACE_RANGES");
         const char* extra = std::getenv("SHADGT_NATIVE_INPLACE_EXTRA");
+        // FIX-GT7-034 (port): the listed ranges whose GPU writes go back under a region include
+        // FIX-GT7-029's per-frame tail, as InplaceRanges() does (shadgt7 used one list for both).
+        // Without it a neighbour's region grown over the tail kept the GPU's writes there from
+        // the CPU. Only with a list (GT7's launcher sets one; GT Sport has none).
+        if (!extra && configured) {
+            extra = "208000000+800000";
+        }
         for (const char* source : {configured, extra}) {
             for (const char* at = source; at && *at;) {
                 char* end = nullptr;

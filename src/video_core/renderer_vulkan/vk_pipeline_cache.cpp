@@ -6757,6 +6757,20 @@ bool PipelineCache::InstallPrewarmRecord(PrewarmRecord& record) {
 }
 
 bool PipelineCache::PreservesDepthOutput() const {
+#ifdef RYTY_GPU
+    // FIX-GTS-484: keep going (compile mode 2) in a race skips depth-only draws like any other
+    // draw while their pipeline builds. A race redraws its shadow maps every frame, so a skipped
+    // draw only leaves a shadow out for a moment; waiting for it stopped the race for seconds.
+    // The loading-time bakes this wait is for happen outside races. SHADGT_RACE_DEPTH_WAIT=1
+    // waits in races too.
+    static const bool race_depth_wait = [] {
+        const char* env = std::getenv("SHADGT_RACE_DEPTH_WAIT");
+        return env && env[0] == '1';
+    }();
+    if (!race_depth_wait && CompileMode() == 2 && RytyGtsInRace()) {
+        return false;
+    }
+#endif
     const auto& regs = Regs();
     if (!regs.depth_control.depth_enable || !regs.depth_control.depth_write_enable ||
         !regs.depth_buffer.DepthValid()) {

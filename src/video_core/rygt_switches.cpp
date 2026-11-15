@@ -428,6 +428,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_NEO_EXTRAS|string|Runtime|unset (the game's presets as they are)|see gt7_preset_options.h|GT7: which options of the PS4 Pro 1080p preset the other presets take too (NEO-GT7-014).",
     "RYGTSW1|SHADGT_PHOTO_EXPORT|flag|Runtime|on (unless photo_export is false in the config)|0 = off|Converts new Scapes and photo mode pictures to PNG in Pictures\\Gran Turismo Sport (GTS-010). 0 turns it off.",
     "RYGTSW1|SHADGT_PS4_PRO|choice|Runtime|GPU.ps4_pro config (Pro 1080 when on, else base)|0 = base PS4; 1080 = Pro 1080; 2160 = Pro 4K|Overrides the PS4 Pro mode the game sees: 1080, 4K (1 or 2160) or base (0).",
+    "RYGTSW1|SHADGT_RACE_CONTEXT_GUARD|flag|Runtime|on|0 (first char) = off; GT7 only, applied when the code bytes match|GT7: skips one frame's race sound settings when the race context is empty, instead of crashing (FIX-GT7-162). Leave on.",
     "RYGTSW1|SHADGT_REPLAY_VIDEO|flag|Runtime|off|exactly 1 = on|Enables in-game video capture of replays and clips to files (GTS-015).",
     "RYGTSW1|SHADGT_SCRIPTS|flag|Runtime|on|0 = off|Loads replacement game scripts from patches\\scripts\\*.ADC next to the exe. 0 turns them off.",
     "RYGTSW1|RYGT_USER_NAME|string|Runtime|Player|player 1's name (UTF-16 on Windows)|Player 1's name when the launcher's player name is empty; otherwise 'Player'.",

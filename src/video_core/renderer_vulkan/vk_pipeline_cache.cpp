@@ -1592,6 +1592,18 @@ static bool WarmComputeOn() {
     return on;
 }
 
+// PERF-GT7-032 (port): a build the GPU's commands wait for runs above normal priority off the
+// compile cores while the other compiles stay there below normal (Common::BeginForegroundCompile).
+// In a GT7 race on a new track two compute pipelines took 1.3-1.6 s each beside a catch-up's
+// compiles on every core. SHADGT_FOREGROUND_COMPILE=0: built as the other compiles are.
+static bool ForegroundCompileOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_FOREGROUND_COMPILE");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
 std::filesystem::path PipelineCache::WarmComputeDir() {
     const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
     return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
@@ -3176,8 +3188,9 @@ void PipelineCache::FinishBuild(PipelineBuild& build) {
           }
       };
       const bool foreground = build.urgent.load(std::memory_order_acquire);
-      if (foreground) Common::BeginForegroundCompile();
-      SCOPE_EXIT { if (foreground) Common::EndForegroundCompile(); };
+      const bool foreground_compile = foreground && ForegroundCompileOn(); // PERF-GT7-032 (port)
+      if (foreground_compile) Common::BeginForegroundCompile();
+      SCOPE_EXIT { if (foreground_compile) Common::EndForegroundCompile(); };
       // FIX-419-GTS (follows FIX-GT7-030): a build a draw waits for does not wait for another
       // build's shared libraries.
       g_pipeline_build_urgent = foreground;
@@ -5264,8 +5277,9 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         const auto module = S().modules[0];
         auto job = std::make_shared<std::packaged_task<std::unique_ptr<ComputePipeline>()>>(
             [this, inputs, key, module] {
-                Common::BeginForegroundCompile();
-                SCOPE_EXIT { Common::EndForegroundCompile(); };
+                const bool foreground = ForegroundCompileOn(); // PERF-GT7-032 (port)
+                if (foreground) Common::BeginForegroundCompile();
+                SCOPE_EXIT { if (foreground) Common::EndForegroundCompile(); };
                 return std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
                     *pipeline_cache, key, inputs->info, module, inputs->sdata);
             });

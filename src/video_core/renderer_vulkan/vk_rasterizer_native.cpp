@@ -4870,6 +4870,17 @@ void NativeRenderer::TrimIdleChunks() {
     // Release completed buffers outside the pool mutex.
 }
 
+// DIAG-171 (port of shadgt7's switch; diagnosis, SHADGT_NATIVE_NO_REUSE): 1 = descriptor pools
+// are never used again, 2 = upload chunks neither, 3 = chunks reused 16 GPU ticks later than
+// they could be. They pile up: to see whether reuse races the GPU. 0 or unset: off.
+static char NativeNoReuse() {
+    static const char mode = [] {
+        const char* env = std::getenv("SHADGT_NATIVE_NO_REUSE");
+        return env && env[0] >= '1' && env[0] <= '3' ? env[0] : '0';
+    }();
+    return mode;
+}
+
 NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     Native::SlowCallTrace<6> trace{t_timed, "take-upload-chunk",
         {"mutex", "timeline-query", "trim-free", "reclaim-retired", "take-free", "create-buffer"}};
@@ -4890,7 +4901,12 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     // reserve once their GPU work finishes instead of retaining that peak forever.
     trace.Next(2);
     trace.Next(3);
-    CacheCompletedUploadChunks(free_chunks, retiring_chunks, known);
+    // DIAG-171 (port): =2 keeps retired chunks out of reuse, =3 reuses them 16 ticks late.
+    if (const char no_reuse = NativeNoReuse(); no_reuse != '2') {
+        const u64 margin = no_reuse == '3' ? u64{16} : u64{0};
+        CacheCompletedUploadChunks(free_chunks, retiring_chunks,
+                                   known > margin ? known - margin : u64{0});
+    }
     free_chunks_low = std::min(free_chunks_low, free_chunks.size());
     trace.Next(4);
     auto fit = free_chunks.end();
@@ -5013,7 +5029,8 @@ vk::DescriptorPool NativeRenderer::TakeDescriptorPool() {
     const vk::Device vk_device = r.instance.GetDevice();
     vk::DescriptorPool ready;
     bool reset = false;
-    {
+    // DIAG-171 (port): SHADGT_NATIVE_NO_REUSE=1 or 2: a new pool each time (diagnosis).
+    if (const char no_reuse = NativeNoReuse(); no_reuse != '1' && no_reuse != '2') {
         std::scoped_lock lock{chunk_mutex};
         std::tie(ready, reset) = Native::TakeReadyDescriptorPool(free_pools, retiring_pools,
             r.scheduler.GetWorkSemaphore()->KnownGpuTick());

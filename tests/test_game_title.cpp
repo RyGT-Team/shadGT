@@ -35,6 +35,8 @@ static_assert(VideoCore::TitleDefaultsOf(GameTitle::GtSport).driver_cache_max_mb
 static_assert(!VideoCore::TitleDefaultsOf(GameTitle::GtSport).driver_cache_follows_pipeline_cache);
 static_assert(!VideoCore::TitleDefaultsOf(GameTitle::GtSport).kept_textures_from_vram_setting);
 static_assert(VideoCore::TitleDefaultsOf(GameTitle::GtSport).so_blend_on_nvidia);
+static_assert(VideoCore::TitleDefaultsOf(GameTitle::GtSport).stored_pipelines_prebuilt);
+static_assert(!VideoCore::TitleDefaultsOf(GameTitle::Gt7).stored_pipelines_prebuilt);
 static_assert(!VideoCore::TitleDefaultsOf(GameTitle::Gt7).prepared_draws);
 static_assert(VideoCore::TitleDefaultsOf(GameTitle::Gt7).prepared_draws_refused_with_lds);
 static_assert(VideoCore::TitleDefaultsOf(GameTitle::Gt7).native_chunk_mb == 1);

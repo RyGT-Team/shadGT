@@ -35,6 +35,12 @@ struct TitleDefaults {
     // SHADGT_SO_SKIP unset, on NVIDIA: blended draws on shader objects (GT Sport, FIX-GTS-449)
     // or kept off them (GT7, SO-017). Other vendors keep them off for both games.
     bool so_blend_on_nvidia;
+    // SHADGT_PREWARM unset: the pipelines stored by earlier sessions are built in the background
+    // (PERF-038), where GPU.precompile_shaders allows it. GT Sport: yes. GT7: no. shadgt7 never
+    // had it, and on GT7 it loses the GPU device at the title screen on every start with a
+    // filled store (five of five, RTX 4070 only; the stored key of fs 0x3be222a4 with
+    // vs 0x482206fa alone is enough), while the same starts pass with it off.
+    bool stored_pipelines_prebuilt;
 };
 
 constexpr TitleDefaults TitleDefaultsOf(Common::GameTitle title) {
@@ -48,6 +54,7 @@ constexpr TitleDefaults TitleDefaultsOf(Common::GameTitle title) {
             .driver_cache_follows_pipeline_cache = true,
             .kept_textures_from_vram_setting = true,
             .so_blend_on_nvidia = false,
+            .stored_pipelines_prebuilt = false,
         };
     case Common::GameTitle::GtSport:
     default:
@@ -59,6 +66,7 @@ constexpr TitleDefaults TitleDefaultsOf(Common::GameTitle title) {
             .driver_cache_follows_pipeline_cache = false,
             .kept_textures_from_vram_setting = false,
             .so_blend_on_nvidia = true,
+            .stored_pipelines_prebuilt = true,
         };
     }
 }

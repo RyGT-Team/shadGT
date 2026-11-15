@@ -2354,8 +2354,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             const char* prewarm = std::getenv("SHADGT_PREWARM");
 #ifdef RYTY_GPU
             // PERF-098: GPU.precompile_shaders (on by default) unless the variable says otherwise.
+            // TITLE-001: not on GT7 unless the variable asks for it.
             const bool prewarm_on =
-                prewarm ? prewarm[0] != '0' : EmulatorSettings.IsPrecompileShaders();
+                prewarm ? prewarm[0] != '0'
+                        : VideoCore::CurrentTitleDefaults().stored_pipelines_prebuilt &&
+                              EmulatorSettings.IsPrecompileShaders();
 #else
             const bool prewarm_on = prewarm && prewarm[0] == '1';
 #endif

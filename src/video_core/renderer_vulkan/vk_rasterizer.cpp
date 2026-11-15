@@ -41,6 +41,7 @@
 #include "video_core/renderer_vulkan/stencil_reference.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "shader_recompiler/direct_learning.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/pipeline_owner.h"
 #include "video_core/renderer_vulkan/draw_selection_identity.h"
@@ -5067,6 +5068,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     for (size_t i = 0; i < stage.buffers.size(); ++i) {
                         std::memcpy(&table[4 + i * 4], direct_entries[i].data(), 16);
                     }
+                    // PERF-GTS-479: which direct candidates this draw read in place.
+                    Shader::DirectLearning::NoteBind(stage.pgm_hash, direct_entries, [&](u32 slot) {
+                        return stage.buffers[slot].IsDirectEligible();
+                    });
                 }
                 auto& vk_buffer = buffer_cache.GetStreamBuffer();
                 const u32 table_size = static_cast<u32>(table.size() * sizeof(u32));

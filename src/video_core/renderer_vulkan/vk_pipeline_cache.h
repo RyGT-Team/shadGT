@@ -755,6 +755,10 @@ private:
         u64 waited{};
         double wait_ms{};
         double translate_ms{};
+        // DIAG-GT7-123 (port): the waits by stage (Shader::SwStage), and by why they waited.
+        u64 waited_stage[8]{};
+        double wait_ms_stage[8]{};
+        u64 waited_writer{}, waited_forced{}, waited_shaders{}, waited_dropped{};
         std::chrono::steady_clock::time_point since{};
     } translate_stats;
     std::unique_ptr<TranslateWorkers> translate_workers;

@@ -8175,6 +8175,8 @@ bool PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
         bool hs_waited = false; // PERF-GT7-115
 #ifndef NDEBUG
         bool waited = false;
+        u32 stage = 7;        // DIAG-GT7-123 (port)
+        bool dropped = false; // DIAG-GT7-123 (port): taken off the queue as too old
 #endif
         for (const auto& job : jobs) {
             if (MatchesTranslationRequest(*job, hw_stage, sw_stage, runtime_info, binding) &&
@@ -8200,6 +8202,10 @@ bool PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
                 } else {
                     job->cv.wait(lk, [&] { return job->done.load(); });
                 }
+#ifndef NDEBUG
+                stage = std::min<u32>(u32(job->sw_stage), 7);
+                dropped |= job->cancelled;
+#endif
             }
         }
         if (hs_waited) {
@@ -8207,12 +8213,19 @@ bool PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
         }
 #ifndef NDEBUG
         if (waited) {
-#ifndef NDEBUG
             ++translate_stats.waited;
-#endif
-            translate_stats.wait_ms += std::chrono::duration<double, std::milli>(
-                                           std::chrono::steady_clock::now() - wait_start)
-                                           .count();
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - wait_start)
+                                  .count();
+            translate_stats.wait_ms += ms;
+            // DIAG-GT7-123 (port): the waits by stage, and why they waited.
+            ++translate_stats.waited_stage[stage];
+            translate_stats.wait_ms_stage[stage] += ms;
+            const auto writer = code_writes_memory.find(hash);
+            translate_stats.waited_writer += writer != code_writes_memory.end() && writer->second;
+            translate_stats.waited_forced += force_wait;
+            translate_stats.waited_shaders += wait_for_shaders;
+            translate_stats.waited_dropped += dropped;
         }
 #endif
     }
@@ -8272,6 +8285,23 @@ bool PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
                         std::chrono::duration<double>(now - stats.since).count(), stats.queued,
                         stats.used, stats.translate_ms, stats.expired, stats.duplicate,
                         stats.failed, stats.waited, stats.wait_ms);
+            if (stats.waited != 0) {
+                // DIAG-GT7-123 (port)
+                std::string by_stage;
+                static constexpr const char* names[8] = {"fs", "hs", "ds", "vs", "gs", "cs",
+                                                         "?", "?"};
+                for (u32 i = 0; i < 8; ++i) {
+                    if (stats.waited_stage[i] != 0) {
+                        by_stage += fmt::format(" {} {}/{:.0f} ms", names[i], stats.waited_stage[i],
+                                                stats.wait_ms_stage[i]);
+                    }
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "DIAG-GT7-123: waits by stage:{}; memory writers {}, forced {}, "
+                            "wait-for-shaders {}, dropped as too old {}",
+                            by_stage, stats.waited_writer, stats.waited_forced,
+                            stats.waited_shaders, stats.waited_dropped);
+            }
             if (const u64 skipped = std::exchange(HsWindow().skipped, 0); skipped != 0) {
                 LOG_WARNING(Render_Vulkan,
                             "PERF-GT7-115: {} tessellated draws skipped past the hull shader "

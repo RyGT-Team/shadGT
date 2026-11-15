@@ -169,7 +169,8 @@ public:
         return pipeline_binary;
     }
 
-    /// PERF-GTS-482: only whole pipelines go through the binary store (AMD, SHADGT_AMD_WHOLE_BINARIES).
+    /// PERF-GTS-482: only whole pipelines go through the binary store (AMD,
+    /// SHADGT_AMD_WHOLE_BINARIES; PERF-GTS-486: by default on RDNA2).
     bool IsPipelineBinaryWholeOnly() const {
         return whole_pipeline_binaries_only;
     }
@@ -407,6 +408,17 @@ public:
     bool IsAmdRx7000() const {
         return driver_id == vk::DriverId::eAmdProprietary &&
                GetModelName().find("Radeon RX 7") != std::string_view::npos;
+    }
+
+    /// PERF-GTS-486: an RDNA2 Radeon on AMD's driver (RX 6000, Radeon 610M/660M/680M, Steam
+    /// Deck), by PCI device ID: integrated ones are named only "AMD Radeon(TM) Graphics".
+    bool IsAmdRdna2() const;
+
+    /// PERF-GTS-486: preloading builds whole pipelines instead of libraries
+    /// (SHADGT_PREWARM_WHOLE_PIPELINES; by default on RDNA2 when whole pipelines are stored as
+    /// pipeline binaries).
+    bool IsWholePrewarm() const {
+        return whole_prewarm;
     }
 
     /// FEAT-GTS-483: a Radeon RX 90XX (RX 9060, RX 9070; RDNA4), on any driver.
@@ -730,6 +742,7 @@ private:
     bool anti_lag{};
     bool pipeline_binary{}; // BIN-001
     bool whole_pipeline_binaries_only{}; // PERF-GTS-482
+    bool whole_prewarm{};                // PERF-GTS-486
     bool amd_overallocation{}; // AMD-VRAM-002
     bool memory_priority{};    // AMD-VRAM-003
     mutable u64 anti_lag_frame{};

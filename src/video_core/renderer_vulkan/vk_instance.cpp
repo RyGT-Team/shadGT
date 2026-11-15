@@ -447,9 +447,13 @@ bool Instance::CreateDevice() {
     // input in a VkPipelineCache (every whole pipeline here), so each launch compiled them all
     // again. With SHADGT_AMD_WHOLE_BINARIES=1 whole pipelines are stored as pipeline binaries;
     // libraries stay off them (BIN-003).
+    // PERF-GTS-486: on by default on RDNA2 (measured on a Radeon 610M), together with whole
+    // prewarm below; SHADGT_AMD_WHOLE_BINARIES=0 turns both defaults off.
     const char* amd_whole_binaries_env = std::getenv("SHADGT_AMD_WHOLE_BINARIES");
-    whole_pipeline_binaries_only = properties.vendorID == 0x1002 && amd_whole_binaries_env &&
-                                   amd_whole_binaries_env[0] == '1';
+    const bool amd_whole_binaries_set = amd_whole_binaries_env && *amd_whole_binaries_env;
+    whole_pipeline_binaries_only =
+        properties.vendorID == 0x1002 &&
+        (amd_whole_binaries_set ? amd_whole_binaries_env[0] == '1' : IsAmdRdna2());
     const bool request_pipeline_binaries = (properties.vendorID != 0x1002 &&
         pipeline_binary_env && pipeline_binary_env[0] == '1' && pipeline_binary_env[1] == '\0') ||
         whole_pipeline_binaries_only;
@@ -477,6 +481,17 @@ bool Instance::CreateDevice() {
     if (whole_pipeline_binaries_only) {
         LOG_WARNING(Render_Vulkan, "PERF-GTS-482: whole pipelines are stored as pipeline binaries "
                                    "(libraries are not)");
+    }
+    // PERF-GTS-486: whole prewarm is the RDNA2 default only when those binaries are in use;
+    // without them the driver would compile every whole pipeline again on each launch.
+    {
+        const char* whole_prewarm_env = std::getenv("SHADGT_PREWARM_WHOLE_PIPELINES");
+        whole_prewarm = whole_prewarm_env && *whole_prewarm_env
+                            ? whole_prewarm_env[0] == '1'
+                            : whole_pipeline_binaries_only &&
+                                  IsAmdRdna2();
+        LOG_INFO(Render_Vulkan, "PERF-GTS-486: RDNA2 {}, whole prewarm {}, whole binaries {}",
+                 IsAmdRdna2(), whole_prewarm, whole_pipeline_binaries_only);
     }
     attachment_feedback_loop =
         feature_chain.get<vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT>().attachmentFeedbackLoopLayout &&
@@ -1502,6 +1517,19 @@ vk::Format Instance::GetSupportedFormat(const vk::Format format,
         }
     }
     return format;
+}
+
+bool Instance::IsAmdRdna2() const {
+    if (driver_id != vk::DriverId::eAmdProprietary) {
+        return false;
+    }
+    const u32 id = properties.deviceID;
+    return (id >= 0x73A0 && id <= 0x73FF) || // Navi 21/22/23: RX 6950 XT ... RX 6600
+           (id >= 0x7420 && id <= 0x743F) || // Navi 24: RX 6500 XT, RX 6400
+           id == 0x164E ||                   // Raphael / Dragon Range: Radeon 610M (Ryzen 7000)
+           id == 0x1506 ||                   // Mendocino: Radeon 610M (Ryzen 7020)
+           id == 0x1681 ||                   // Rembrandt: Radeon 660M/680M
+           id == 0x163F || id == 0x1435;     // Van Gogh, Sephiroth: Steam Deck
 }
 
 bool Instance::IsAmdGcn() const {

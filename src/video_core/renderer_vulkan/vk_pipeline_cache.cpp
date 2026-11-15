@@ -3259,7 +3259,7 @@ void PipelineCache::QueueBuild(const std::shared_ptr<PipelineBuild>& build, Buil
         Common::PerfFeatureEnabled(79) && TessBuildsAsked() <= 1 &&
         QueueWholeTessellation(build->infos[u32(Shader::SwStage::TessellationControl)] != nullptr,
             build->preloading, PrecompileHoldsGame(),
-            SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(), build->preloading)));
+            SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(), instance.IsWholePrewarm(), build->preloading)));
 }
 
 bool PipelineCache::FinishBuildUnlocked(const std::shared_ptr<PipelineBuild>& build,
@@ -4031,7 +4031,7 @@ void PipelineCache::QueueBackgroundBuild(const std::shared_ptr<PipelineBuild>& b
     }, Common::PerfFeatureEnabled(79) &&
        QueueWholeTessellation(build->infos[u32(Shader::SwStage::TessellationControl)] != nullptr,
             build->preloading, PrecompileHoldsGame(),
-            SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(), build->preloading)));
+            SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(), instance.IsWholePrewarm(), build->preloading)));
 }
 
 void PipelineCache::ReadAheadAtBufferStart() {
@@ -6543,7 +6543,7 @@ bool PipelineCache::PrecompileLibrariesOnly() const {
         return env && *env ? (env[0] == '0' ? 0 : 1) : -1;
     }();
     const bool libraries =
-        SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(), true);
+        SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(), instance.IsWholePrewarm(), true);
     return libraries && forced == 1;
 }
 

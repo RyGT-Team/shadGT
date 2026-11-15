@@ -37,7 +37,7 @@ u64 ReadAheadStates::PipelineStateHash(std::span<const u32> regs) {
 
 static bool DropReachedDefault() {
     static const bool enabled = [] {
-        const char* value = std::getenv("RYGT_READ_AHEAD_DROP_REACHED");
+        const char* value = std::getenv("SHADGT_READ_AHEAD_DROP_REACHED");
         if (value) return value[0] != '0';
 #ifdef RYTY_GPU
         return true;

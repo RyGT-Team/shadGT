@@ -1,7 +1,7 @@
 # NVIDIA tessellation LDS fixture
 
 Build `shadps4_gcn_test` and `shadgt_tess_lds_gpu` in a Debug configuration. Run
-`shadps4_gcn_test --gtest_filter=TessLdsShader.*` with `RYGT_TEST_SPV_DIR` set to a
+`shadps4_gcn_test --gtest_filter=TessLdsShader.*` with `SHADGT_TEST_SPV_DIR` set to a
 writable directory. This emits the TCS cases using the actual shader backend. Validate
 each module with `spirv-val --target-env vulkan1.3`.
 

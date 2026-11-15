@@ -6,7 +6,7 @@
 namespace Vulkan {
 inline constexpr std::size_t DriverCacheDiskBudget = 2ull << 30;
 inline constexpr std::uint64_t DriverCacheCommitReserve = 1ull << 30;
-// PERF-167: disk_budget is RYGT_DRIVER_CACHE_MAX_MB's limit (DriverCacheDiskBudget unset).
+// PERF-167: disk_budget is SHADGT_DRIVER_CACHE_MAX_MB's limit (DriverCacheDiskBudget unset).
 inline std::size_t DriverCacheSnapshotBudget(std::size_t reported, std::uint64_t available,
                                              std::uint64_t disk_budget = DriverCacheDiskBudget) {
     if (available <= DriverCacheCommitReserve) return 0;

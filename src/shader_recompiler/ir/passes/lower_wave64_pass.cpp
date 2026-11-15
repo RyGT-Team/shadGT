@@ -315,7 +315,7 @@ static IR::Inst* FindBallotForMaskedBitCount(const IR::Inst& mbcnt) {
 // lane at all. And only in a group of 64 invocations, the one wave the lowering can exchange: a guard
 // on a 64-lane boundary stays what it is (crowd fix, f35c61f8), and any if around the read that is not
 // an EXEC scope leaves the read as it was.
-// RYGT_LANE_READ_UNBRANCH=0: as before.
+// SHADGT_LANE_READ_UNBRANCH=0: as before.
 static bool ReadsActiveLanes(const IR::Inst& inst) {
     switch (inst.GetOpcode()) {
     case IR::Opcode::ReadFirstLane:

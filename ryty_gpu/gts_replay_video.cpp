@@ -6,7 +6,7 @@
 // every new game frame (without RyGT's overlays) to this file, and Media Foundation encodes them
 // to H.264 MP4 in "<Videos>\Gran Turismo Sport" (the Capture Gallery):
 //
-//  - Clip buffer: the last RYGT_CLIP_MINUTES minutes (15 by default, as the PS4; 0 turns it off)
+//  - Clip buffer: the last SHADGT_CLIP_MINUTES minutes (15 by default, as the PS4; 0 turns it off)
 //    are kept in one-minute pieces in %TEMP%\RyGT GTS clips. Holding Share/Create (or F10) saves
 //    them as one "Clip <date time>.mp4", like the PS4's "Save video clip".
 //  - Recordings: a short press of Share/Create (or F9) starts and stops a "Video <date time>.mp4".
@@ -14,7 +14,7 @@
 //    into "Replay <date time>.mp4", until the replay ends.
 //
 // The videos have the game's sound (AAC), captured with Windows' process loopback, so other
-// programs on the PC are not in them. Set RYGT_REPLAY_VIDEO=1 to enable recording and clips;
+// programs on the PC are not in them. Set SHADGT_REPLAY_VIDEO=1 to enable recording and clips;
 // they are disabled by default.
 
 #include <windows.h>
@@ -88,9 +88,9 @@ u64 g_dropped = 0;
 
 bool Enabled() {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_REPLAY_VIDEO");
+        const char* env = std::getenv("SHADGT_REPLAY_VIDEO");
         const bool enabled = env && std::strcmp(env, "1") == 0;
-        std::fprintf(stderr, "[patch] GTS-015 video capture %s (RYGT_REPLAY_VIDEO=1 enables it)\n",
+        std::fprintf(stderr, "[patch] GTS-015 video capture %s (SHADGT_REPLAY_VIDEO=1 enables it)\n",
                      enabled ? "enabled" : "disabled");
         return enabled;
     }();
@@ -99,7 +99,7 @@ bool Enabled() {
 
 int ClipMinutes() {
     static const int minutes = [] {
-        const char* env = std::getenv("RYGT_CLIP_MINUTES");
+        const char* env = std::getenv("SHADGT_CLIP_MINUTES");
         return env && env[0] ? std::max(0, std::atoi(env)) : 15;
     }();
     return minutes;

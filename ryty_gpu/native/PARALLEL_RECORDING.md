@@ -1,7 +1,7 @@
 # Experimental parallel recording
 
 The native renderer can record eligible race passes on worker threads. The
-experiment is off by default; set `RYGT_PARALLEL_RECORDING=1` before launch to
+experiment is off by default; set `SHADGT_PARALLEL_RECORDING=1` before launch to
 request it. Draws that cannot be safely captured continue on the ordered
 recorder. Resource freshness, feedback, descriptor ownership, and GPU-tick
 retirement are checked before work is handed off. The producer descriptor

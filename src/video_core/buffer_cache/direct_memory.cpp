@@ -47,7 +47,7 @@ namespace {
 std::atomic<u64> imported_view_epoch{1};
 Native::Parallel::DirectCoherenceRegistry<> direct_coherence;
 bool TrackParallelDirect() noexcept {
-    static const bool active=[] { const char* p=std::getenv("RYGT_PARALLEL_D2"); return p && p[0]=='1' && p[1]=='\0'; }();
+    static const bool active=[] { const char* p=std::getenv("SHADGT_PARALLEL_D2"); return p && p[0]=='1' && p[1]=='\0'; }();
     return active;
 }
 
@@ -230,13 +230,13 @@ bool DirectMemory::Covered(VAddr address, u64 size) const {
 
 std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr address,
                                                                      u64 size) const {
-    // PERF-GT7-127 (RYGT_DIRECT_FIND_RECENT=0 off): in a 20-car race the recorder asked for a
+    // PERF-GT7-127 (SHADGT_DIRECT_FIND_RECENT=0 off): in a 20-car race the recorder asked for a
     // view ~10,000 times a frame, each time under the lock and down the map (2.5% of its busy
     // time in the map walk alone), almost always for one of a few dozen views. The thread's
     // own memo of the views it found is checked before the lock: it is this thread's alone,
     // and a view only goes when imported_view_epoch moves on.
     static const bool recent_on = [] {
-        const char* env = std::getenv("RYGT_DIRECT_FIND_RECENT");
+        const char* env = std::getenv("SHADGT_DIRECT_FIND_RECENT");
         return !(env && env[0] == '0');
     }();
     static thread_local Native::EpochRangeMemo<const Buffer*> memo;
@@ -267,7 +267,7 @@ namespace {
 // the original whole-allocation policy. Invalid/overflowing input uses 256 MiB.
 u64 ViewPiece() {
     static const u64 piece = [] {
-        const char* env = std::getenv("RYGT_D1_VIEW_MB");
+        const char* env = std::getenv("SHADGT_D1_VIEW_MB");
         u64 mb = 256;
         if (env && *env) {
             char* end = nullptr;

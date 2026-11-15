@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <map>
 #include <mutex>
 
@@ -118,7 +119,7 @@ static u32 ShaderBinaryVersionFor(const Shader::StageSpecialization& spec,
                                   bool scalar_prefix = false) {
     if (spec.runtime_info.sw_stage == Shader::SwStage::TessellationControl) {
         static const bool mip = [] {
-            const char* env = std::getenv("RYGT_UNNORMALIZED_MIP");
+            const char* env = std::getenv("SHADGT_UNNORMALIZED_MIP");
             return !(env && env[0] == '0');
         }();
         if (spec.runtime_info.sw.tcs.lds_emulation) {
@@ -229,6 +230,29 @@ void RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
 
     Storage::DataBase::Instance().Save(Storage::BlobType::PipelineKey,
                                        fmt::format("g_{:#018x}", hash), ar.TakeOff());
+}
+
+// FEAT-GTS-470: what RegisterPipelineData stores, written at once (not through the store's
+// queue), so a listing right after it sees the file.
+bool WriteStoredGraphicsPipeline(const std::filesystem::path& file, const GraphicsPipelineKey& key,
+                                 GraphicsPipeline::SerializationSupport& sdata) {
+    Serialization::Archive ar{};
+    Serialization::Writer pldata{ar};
+    pldata.Write(Serialization::PipelineKeyVersion);
+    pldata.Write(u32{0}); // graphics
+    key.Serialize(ar);
+    sdata.Serialize(ar);
+    const auto bytes = ar.TakeOff();
+    auto temp = file;
+    temp += ".tmp";
+    {
+        std::ofstream out{temp, std::ios::binary | std::ios::trunc};
+        out.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+        if (!out) return false;
+    }
+    std::error_code ec;
+    std::filesystem::rename(temp, file, ec);
+    return !ec;
 }
 
 bool PeekShaderMeta(std::vector<u8>&& blob, u64& pgm_hash, size_t& perm_idx) {

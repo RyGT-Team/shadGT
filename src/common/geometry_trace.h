@@ -29,7 +29,7 @@ struct State {
     std::atomic<bool> sealed{};
 };
 inline State& Get() { static State state; return state; }
-inline bool Enabled() { static const bool enabled = [] { const char* p = std::getenv("RYGT_GEOMETRY_TRACE"); return p && p[0] == '1' && !p[1]; }(); return enabled; }
+inline bool Enabled() { static const bool enabled = [] { const char* p = std::getenv("SHADGT_GEOMETRY_TRACE"); return p && p[0] == '1' && !p[1]; }(); return enabled; }
 inline thread_local u64 current{};
 template <typename T>
 inline u64 HandleIdentity(T value) {

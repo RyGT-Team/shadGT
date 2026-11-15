@@ -115,7 +115,7 @@ ryty_add_library(ryty_gpu libSceVideoOut
         ryty_gpu/ryty_camera_settings.cpp
         ryty_gpu/ryty_camera_runtime.cpp
         ryty_gpu/ryty_write_watch.cpp
-        # Stutter diagnostics (RYGT_DIAG=1), ryty_diag.h.
+        # Stutter diagnostics (SHARED_DIAG=1), ryty_diag.h.
         ryty_gpu/ryty_diag.cpp
         # NVIDIA DLSS through the optional plugin dlss\ryGT_dlss.dll (ryty_dlss.h).
         ryty_gpu/ryty_dlss.cpp
@@ -149,7 +149,7 @@ ryty_add_library(ryty_gpu libSceVideoOut
         # NAT-020/021: the native image registry and its self test.
         ryty_gpu/native/image_registry.cpp
         ryty_gpu/native/native_selftest.cpp
-        # NAT-100: native mode (RYGT_NATIVE=1): draws recorded with native images.
+        # NAT-100: native mode (SHADGT_NATIVE=1): draws recorded with native images.
         src/video_core/renderer_vulkan/vk_rasterizer_native.cpp
         src/core/cpu_patches.cpp
         src/core/loader/dwarf.cpp
@@ -266,3 +266,13 @@ foreach(target IN ITEMS ryty_ngs2 ryty_ajm ryty_audio3d ryty_zlib ryty_discmap r
 endforeach()
 
 target_link_libraries(ryty_gpu PRIVATE bcrypt windowscodecs ole32 shell32 mfplat mfreadwrite mfuuid mmdevapi) # GTS-010, GTS-015
+
+# FEAT-GTS-436: ryty-feel-test, the launcher's Test buttons for HD rumble and the adaptive triggers
+# (shipped in tools\). It plays one effect through the same headers the renderer uses.
+add_executable(ryty_feel_test ryty_gpu/tools/feel_test.cpp)
+set_target_properties(ryty_feel_test PROPERTIES OUTPUT_NAME ryty-feel-test)
+target_include_directories(ryty_feel_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(ryty_feel_test PRIVATE SDL3::SDL3)
+if (MSVC)
+    target_link_libraries(ryty_feel_test PRIVATE clang_rt.builtins-x86_64.lib)
+endif()

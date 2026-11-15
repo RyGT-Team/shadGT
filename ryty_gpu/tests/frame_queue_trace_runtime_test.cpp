@@ -26,7 +26,7 @@ static std::string Read(const std::string &path) {
 }
 int main(int argc, char **argv) {
   if (argc > 1 && std::string(argv[1]) == "disabled") {
-    Env("RYGT_FRAME_QUEUE_TRACE", "0");
+    Env("SHADGT_FRAME_QUEUE_TRACE", "0");
     Initialize();
     assert(!Start().generation && current == nullptr);
     return 0;
@@ -35,10 +35,10 @@ int main(int argc, char **argv) {
   std::filesystem::remove(base + ".csv");
   std::filesystem::remove(base + ".control");
   std::filesystem::remove(base + ".status");
-  Env("RYGT_FRAME_QUEUE_TRACE", "1");
-  Env("RYGT_FRAME_QUEUE_TRACE_OUTPUT", base + ".csv");
-  Env("RYGT_FRAME_QUEUE_TRACE_CONTROL", base + ".control");
-  Env("RYGT_FRAME_QUEUE_TRACE_STATUS", base + ".status");
+  Env("SHADGT_FRAME_QUEUE_TRACE", "1");
+  Env("SHADGT_FRAME_QUEUE_TRACE_OUTPUT", base + ".csv");
+  Env("SHADGT_FRAME_QUEUE_TRACE_CONTROL", base + ".control");
+  Env("SHADGT_FRAME_QUEUE_TRACE_STATUS", base + ".status");
   {
     std::ofstream f(base + ".control");
     f << 0;

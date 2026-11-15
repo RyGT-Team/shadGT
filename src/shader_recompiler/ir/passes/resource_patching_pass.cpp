@@ -263,7 +263,7 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
                         u32(image.GetNumberFmt()), image.width + 1, image.height + 1,
                         image.NumSamples(), u32(image.base_array), u32(image.last_array),
                         image.depth + 1, image.Pitch(),
-                        MsaaArrayEnabled() ? "" : "; RYGT_MSAA_ARRAY_SAMPLE=0: not translated", n);
+                        MsaaArrayEnabled() ? "" : "; SHADGT_MSAA_ARRAY_SAMPLE=0: not translated", n);
         }
     }
     // Port of xacidr4inx's reflection fix (RyGT 0066): keep integer accesses,
@@ -325,7 +325,7 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
         // lamp halos (vs 0x59b5b0b6) leave float data in their cube's slot on draws that don't read
         // it; the rare time it looked like an FMask, the cube's read became these constants, and
         // the draws with a real cube took that code for the rest of the session: light of 1e33,
-        // the long pink rays. RYGT_FMASK_KEY=0: as before.
+        // the long pink rays. SHADGT_FMASK_KEY=0: as before.
         const bool size_read = inst.GetOpcode() == IR::Opcode::ImageQueryDimensions;
         if (FMaskKeyEnabled() || size_read) {
             const u32 index = descriptors.Add(fmask_res);
@@ -825,11 +825,11 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
     // were divided by the base mip's dimensions, so a sample at LOD n read 2^n times nearer the
     // origin. GT7's car hull shaders cull patches against an occlusion depth pyramid that way (the
     // cell at (x >> n) + 0.5 of mip n, n from the patch's size on screen); with FIX-227 they no
-    // longer culled patches in view in the race start's close-ups. RYGT_UNNORMALIZED_MIP=0: as
+    // longer culled patches in view in the race start's close-ups. SHADGT_UNNORMALIZED_MIP=0: as
     // before. Hull shaders only (where it was verified; their stored translations have their own
     // version).
     static const bool mip_unnormalized_on = [] {
-        const char* env = std::getenv("RYGT_UNNORMALIZED_MIP");
+        const char* env = std::getenv("SHADGT_UNNORMALIZED_MIP");
         return !(env && env[0] == '0');
     }();
     const bool mip_unnormalized =

@@ -1195,7 +1195,7 @@ void Init(State& s) {
         std::fputs(header.c_str(), s.frames_csv);
     }
     s.samples = std::make_unique<Sample[]>(SampleRingSize);
-    const char* counters_only = std::getenv("RYGT_DIAG_COUNTERS_ONLY");
+    const char* counters_only = std::getenv("SHADGT_DIAG_COUNTERS_ONLY");
     if (!(counters_only && counters_only[0] == '1')) {
         std::thread{SamplerThread}.detach();
     }
@@ -1226,7 +1226,7 @@ double Seconds(std::chrono::steady_clock::time_point tp) {
 
 bool Enabled() {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_DIAG");
+        const char* env = std::getenv("SHARED_DIAG");
         if (!env || env[0] != '1') {
             return false;
         }
@@ -1343,10 +1343,10 @@ void FrameShown() {
         }
         s.spike_cv.notify_one();
         const auto t = std::chrono::steady_clock::now();
-        // Opt-in (RYGT_DIAG_SHOTS=1): the PNG is encoded on the GPU's completion thread, which
+        // Opt-in (SHADGT_DIAG_SHOTS=1): the PNG is encoded on the GPU's completion thread, which
         // delayed the fault downloads waiting there by up to 100 ms (spikes of their own).
         static const bool shots_on = [] {
-            const char* env = std::getenv("RYGT_DIAG_SHOTS");
+            const char* env = std::getenv("SHADGT_DIAG_SHOTS");
             return env && env[0] == '1';
         }();
         static u32 shots = 0;
@@ -1359,10 +1359,10 @@ void FrameShown() {
     s.prev_frame_tsc = s.last_frame_tsc;
     s.last_frame_tsc = now;
 
-    // RYGT_DIAG_TEST_HITCH=ms: busy work on this thread every 600 frames, to check that a spike
+    // SHADGT_DIAG_TEST_HITCH=ms: busy work on this thread every 600 frames, to check that a spike
     // is caught and blamed on it.
     static const u32 test_hitch = [] {
-        const char* env = std::getenv("RYGT_DIAG_TEST_HITCH");
+        const char* env = std::getenv("SHADGT_DIAG_TEST_HITCH");
         return env ? u32(std::atoi(env)) : 0u;
     }();
     if (test_hitch && frame % 600 == 0) {

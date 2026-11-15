@@ -328,17 +328,17 @@ std::array<u8, 48_KB> Liverpool::ConstantEngine::constants_heap;
 
 bool Liverpool::DirectNestedResume() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_DIRECT_NESTED_RESUME");
+        const char* env = std::getenv("SHADGT_DIRECT_NESTED_RESUME");
         // PERF-GTS-407: on in native mode unless set to something else.
         return env && *env ? env[0] == '1' : Vulkan::NativeModeRequested();
     }();
     return on;
 }
 
-// DIAG-206 (RYGT_WATCH_WRITES=<hex address>,<hex size>): GPU-command writes into that range.
+// DIAG-206 (SHADGT_WATCH_WRITES=<hex address>,<hex size>): GPU-command writes into that range.
 static void WatchWrite(VAddr dst, u64 size, VAddr src, const char* what) {
     static const std::pair<u64, u64> watch = [] {
-        const char* env = Common::DebugEnv("RYGT_WATCH_WRITES");
+        const char* env = Common::DebugEnv("SHADGT_WATCH_WRITES");
         if (!env || !*env) {
             return std::pair<u64, u64>{0, 0};
         }
@@ -893,9 +893,9 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     // arguments, in GPU memory, don't change it). In GT7's pause menu a fifth of the draws are
     // indirect, and the recorder selected each one itself under the lookup lock. Only the
     // pipeline: the draw's reads are neither hashed, captured nor staged ahead, as before.
-    // RYGT_INDIRECT_AHEAD=0: as before.
+    // SHADGT_INDIRECT_AHEAD=0: as before.
     static const bool indirect_ahead = [] {
-        const char* env = std::getenv("RYGT_INDIRECT_AHEAD");
+        const char* env = std::getenv("SHADGT_INDIRECT_AHEAD");
         return !(env && env[0] == '0');
     }();
     bool indirect_selected = false;
@@ -1148,10 +1148,10 @@ void Liverpool::PipeReadAhead() {
 // PERF-GT7-046: a queue's wait for a label no queued work writes stopped the command thread until
 // the recorder had finished all it was given, ~4 ms a frame on GT7's pre-race screens, and nothing
 // else decoded meanwhile. The queue now yields until the recorder has run dry, and only then asks
-// for it. RYGT_NATIVE_WAIT_NO_DRAIN=0: the wait drains the recorder at once.
+// for it. SHADGT_NATIVE_WAIT_NO_DRAIN=0: the wait drains the recorder at once.
 bool Liverpool::WaitsYieldToRecorder() const {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_NATIVE_WAIT_NO_DRAIN");
+        const char* env = std::getenv("SHADGT_NATIVE_WAIT_NO_DRAIN");
         return !(env && env[0] == '0');
     }();
     return enabled && draw_pipe;
@@ -1945,7 +1945,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
         // PERF-GT7-052: let runnable compute submissions decode between graphics packets.
         static const u32 yield_packets = [] {
-            const char* env = std::getenv("RYGT_GFX_YIELD_PACKETS");
+            const char* env = std::getenv("SHADGT_GFX_YIELD_PACKETS");
             return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 32u;
         }();
         if (yield_packets && ++gfx_packets_since_yield >= yield_packets) {
@@ -3053,7 +3053,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 SetCurrentDecodeIb(indirect_buffer->Address<const u32>(), indirect_buffer->ib_size);
                 auto task = ProcessGraphics(
                     {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
-                // PERF-GTS-383 (RYGT_DIRECT_NESTED_RESUME=1): GT Sport calls each command
+                // PERF-GTS-383 (SHADGT_DIRECT_NESTED_RESUME=1): GT Sport calls each command
                 // buffer from the one before it, over 250 deep in a race. A yield left every
                 // one of them in turn and the next resume entered them all again: 47% of this
                 // thread's CPU time in a 20-car race (it ran at 88% of a core). The thread's

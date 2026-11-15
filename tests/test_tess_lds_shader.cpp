@@ -84,7 +84,7 @@ static void EmitFixture(unsigned stride, unsigned mode, bool invalid, bool inval
     }
     EXPECT_TRUE(physical && write && branch);
     EXPECT_TRUE(scratch_at_112);
-    if (const char* dir = std::getenv("RYGT_TEST_SPV_DIR")) {
+    if (const char* dir = std::getenv("SHADGT_TEST_SPV_DIR")) {
         std::ofstream file{std::filesystem::path(dir) / name, std::ios::binary};
         ASSERT_TRUE(file);
         file.write(reinterpret_cast<const char*>(code.data()), std::streamsize(code.size() * sizeof(u32)));

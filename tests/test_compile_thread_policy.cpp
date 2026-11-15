@@ -23,9 +23,9 @@ int main() {
     if (!GetSystemCpuSetInformation(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(data.data()),bytes,&bytes,GetCurrentProcess(),0)) return 2;
     const auto* first=reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(data.data());
     const ULONG selected=first->CpuSet.Id;
-    if (std::getenv("RYGT_POLICY_TEST_LATE")) {
-        _putenv_s("RYGT_COMPILE_CORES","0");
-        _putenv_s("RYGT_CORE_OWNERS","2");
+    if (std::getenv("SHADGT_POLICY_TEST_LATE")) {
+        _putenv_s("SHADGT_COMPILE_CORES","0");
+        _putenv_s("SHADGT_CORE_OWNERS","2");
         Common::UpdateCoreOwner(1,true);
         ULONG needed=0;
         GetProcessDefaultCpuSets(GetCurrentProcess(),nullptr,0,&needed);

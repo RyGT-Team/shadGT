@@ -129,7 +129,7 @@ const std::vector<VAddr>& WatchedTextures() {
 #ifndef NDEBUG
     static const std::vector<VAddr> watched = [] {
         std::vector<VAddr> list;
-        const char* env = Common::DiagEnv("RYGT_NATIVE_WATCH_TEXTURE");
+        const char* env = Common::DiagEnv("SHADGT_NATIVE_WATCH_TEXTURE");
         for (const char* at = env; at && *at;) {
             char* end = nullptr;
             const VAddr address = std::strtoull(at, &end, 16);
@@ -157,10 +157,10 @@ bool WatchedTexture(VAddr begin, VAddr end) {
             return true;
         }
     }
-    // DIAG-167 (RYGT_NATIVE_WATCH_RANGE=<hex lo>-<hex hi>): images starting in that range too
+    // DIAG-167 (SHADGT_NATIVE_WATCH_RANGE=<hex lo>-<hex hi>): images starting in that range too
     // (pictures whose address changes from run to run).
     static const std::pair<VAddr, VAddr> range = [] {
-        const char* env = Common::DiagEnv("RYGT_NATIVE_WATCH_RANGE");
+        const char* env = Common::DiagEnv("SHADGT_NATIVE_WATCH_RANGE");
         if (!env || !*env) {
             return std::pair<VAddr, VAddr>{};
         }
@@ -315,9 +315,9 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
             // layer inside a larger one of the same format (scratch-pool reuse with other
             // formats or samples broke the race minimaps).
             ImageEntry* largest = nullptr;
-            // RYGT_NATIVE_SHARED_TARGETS=0 turns it off (diagnosis).
+            // SHADGT_NATIVE_SHARED_TARGETS=0 turns it off (diagnosis).
             static const bool shared_targets = [] {
-                const char* env = std::getenv("RYGT_NATIVE_SHARED_TARGETS");
+                const char* env = std::getenv("SHADGT_NATIVE_SHARED_TARGETS");
                 return !(env && env[0] == '0');
             }();
             const bool plain = shared_targets && info.num_samples == 1 && !info.props.is_depth &&
@@ -379,7 +379,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
             // what the GPU drew, and nothing had a shadow. Of the depth targets there (GT7 also
             // draws a 5-layer one at that address), the one drawn last.
             static const bool depth_textures = [] {
-                const char* env = std::getenv("RYGT_NATIVE_DEPTH_TEXTURES"); // FIX-206 off: =0
+                const char* env = std::getenv("SHADGT_NATIVE_DEPTH_TEXTURES"); // FIX-206 off: =0
                 return !(env && env[0] == '0');
             }();
             ImageEntry* depth = nullptr;
@@ -414,9 +414,9 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
             // 64x64 B10G11R11 target of 7 mips and 2048 layers, and the car shaders read it as
             // 1464 layers: no target had that layout, the texture was uploaded from memory, which
             // never holds what the GPU drew, and parts of the cars reflected black (blocks on
-            // the car in the race start's close-ups). RYGT_NATIVE_LAYER_VIEWS=1: on.
+            // the car in the race start's close-ups). SHADGT_NATIVE_LAYER_VIEWS=1: on.
             static const bool layer_views = [] {
-                const char* env = std::getenv("RYGT_NATIVE_LAYER_VIEWS");
+                const char* env = std::getenv("SHADGT_NATIVE_LAYER_VIEWS");
                 return env && env[0] == '1'; // off unless asked: it did not fix what it was made for
             }();
             ImageEntry* layered = nullptr;
@@ -447,7 +447,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
 #ifndef NDEBUG
         if (!render_target && WatchedTexture(info.guest_address, info.guest_address + 1) &&
             WatchSample()) {
-            // DIAG-221 (diagnosis, with RYGT_NATIVE_WATCH_TEXTURE): a texture lookup that found no
+            // DIAG-221 (diagnosis, with SHADGT_NATIVE_WATCH_TEXTURE): a texture lookup that found no
             // target of its layout: the pictures at its address and how their layouts differ.
             std::string others;
             for (auto it = first; it != last; ++it) {
@@ -570,7 +570,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         }
         result = entry.get();
         static const bool remember_fills = [] {
-            const char* env = std::getenv("RYGT_NATIVE_FILL_NEW_TARGETS");
+            const char* env = std::getenv("SHADGT_NATIVE_FILL_NEW_TARGETS");
             return !(env && env[0] == '0');
         }();
         if (render_target && info.num_samples == 1 && remember_fills) {
@@ -638,10 +638,10 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         // that draws part of it leaves the rest as it was). GT Sport draws its 16x16 brightness
         // grid into a 64x16 target the CPU reads back for the exposure: the undrawn part went
         // back to memory as uninitialized video memory, and the picture came out too dark.
-        // (diagnosis) RYGT_NATIVE_ZERO_NEW_TARGETS=1: a new target starts as zeros instead.
+        // (diagnosis) SHADGT_NATIVE_ZERO_NEW_TARGETS=1: a new target starts as zeros instead.
         // =<hex lo>-<hex hi>: only targets starting in that range.
         static const std::pair<VAddr, VAddr> zero_range = [] {
-            const char* env = std::getenv("RYGT_NATIVE_ZERO_NEW_TARGETS");
+            const char* env = std::getenv("SHADGT_NATIVE_ZERO_NEW_TARGETS");
             if (!env || !*env) {
                 return std::pair<VAddr, VAddr>{};
             }
@@ -790,10 +790,10 @@ SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageIn
     // and the scene samples the BC6H texture. Without a place the texture read guest memory,
     // which only the GPU had written: zeros, a black background in the editor and in every photo.
     // The copy then counts in source texels, one per block (Vulkan's rule between compressed and
-    // uncompressed formats). RYGT_NATIVE_BLOCK_TARGETS=0: as before.
+    // uncompressed formats). SHADGT_NATIVE_BLOCK_TARGETS=0: as before.
     if (texture.props.is_block && !target.props.is_block) {
         static const bool block_targets = [] {
-            const char* env = std::getenv("RYGT_NATIVE_BLOCK_TARGETS");
+            const char* env = std::getenv("SHADGT_NATIVE_BLOCK_TARGETS");
             return !(env && env[0] == '0');
         }();
         const s32 mip = block_targets ? texture.BlockLevelOf(target) : -1;
@@ -833,9 +833,9 @@ SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageIn
     // championship course maps resolve into the scratch pool's target at 0x100a0b0000, and when
     // that was a 256x256 pyramid left by another pass, their 200x180 texture found no place and
     // read guest memory: whatever colours it held, then a black square, with the map in the target.
-    // RYGT_NATIVE_CROP_OF_MIPS=0: as before.
+    // SHADGT_NATIVE_CROP_OF_MIPS=0: as before.
     static const bool crop_of_mips = [] {
-        const char* env = std::getenv("RYGT_NATIVE_CROP_OF_MIPS");
+        const char* env = std::getenv("SHADGT_NATIVE_CROP_OF_MIPS");
         return !(env && env[0] == '0');
     }();
     if (target.guest_address == texture.guest_address &&
@@ -873,9 +873,9 @@ SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageIn
     // drawing each level as its own target sized to its extent (345x248, 172x124, ...) while the
     // texture that samples the pyramid is 690x493, 690x479 or 690x496 (levels 345x246, 172x123,
     // ...): no level was found, the blurred levels read guest memory (zeros) and the blurred
-    // background came out black. The copy is the mip's size. RYGT_NATIVE_PADDED_MIPS=0: as before.
+    // background came out black. The copy is the mip's size. SHADGT_NATIVE_PADDED_MIPS=0: as before.
     static const bool padded_mips = [] {
-        const char* env = std::getenv("RYGT_NATIVE_PADDED_MIPS");
+        const char* env = std::getenv("SHADGT_NATIVE_PADDED_MIPS");
         return !(env && env[0] == '0');
     }();
     if (const s32 mip = target.MipOf(texture, padded_mips); mip >= 0) {
@@ -921,7 +921,7 @@ SourcePlace PartOf(const VideoCore::ImageInfo& part, const VideoCore::ImageInfo&
 
 bool ImageRegistry::SmallRewritesOn() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_NATIVE_SMALL_REWRITES");
+        const char* env = std::getenv("SHADGT_NATIVE_SMALL_REWRITES");
         return !(env && env[0] == '0');
     }();
     return on;
@@ -934,7 +934,7 @@ bool ImageRegistry::RewrittenSmall(ImageEntry& entry) {
     // region the write went to: GT7 computes the driver's lighting into 4x4 RGBA16F textures
     // with one dispatch over a larger buffer, and when the texture was first used before that
     // dispatch it kept the garbage memory held then (Inf and NaN): the driver glowed in a random
-    // colour for the whole session, half the launches. RYGT_NATIVE_SMALL_REWRITES=0: ignored.
+    // colour for the whole session, half the launches. SHADGT_NATIVE_SMALL_REWRITES=0: ignored.
     const u64 rewritten = entry.gpu_rewritten.load(std::memory_order_relaxed);
     if (rewritten <= entry.rewrite_seen) {
         return false;
@@ -962,7 +962,7 @@ int ImageRegistry::LayersDifferingFromUpload(const ImageEntry& entry) const {
 
 bool TargetPartsOn() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_NATIVE_TARGET_PARTS");
+        const char* env = std::getenv("SHADGT_NATIVE_TARGET_PARTS");
         return !(env && env[0] == '0');
     }();
     return on;
@@ -1037,14 +1037,14 @@ void ImageRegistry::LinkTarget(ImageEntry& target) {
             if (place.mip < 0) {
                 return;
             }
-            // (diagnosis) RYGT_NATIVE_TARGET_PARTS=2: only layered wholes; =3: only 2D ones.
+            // (diagnosis) SHADGT_NATIVE_TARGET_PARTS=2: only layered wholes; =3: only 2D ones.
             static const char parts_mode = [] {
-                const char* env = std::getenv("RYGT_NATIVE_TARGET_PARTS");
+                const char* env = std::getenv("SHADGT_NATIVE_TARGET_PARTS");
                 return env && *env ? env[0] : '1';
             }();
-            // (diagnosis) RYGT_NATIVE_TARGET_PARTS_ONLY=<hex address>: only that whole.
+            // (diagnosis) SHADGT_NATIVE_TARGET_PARTS_ONLY=<hex address>: only that whole.
             static const VAddr parts_only = [] {
-                const char* env = std::getenv("RYGT_NATIVE_TARGET_PARTS_ONLY");
+                const char* env = std::getenv("SHADGT_NATIVE_TARGET_PARTS_ONLY");
                 return env && *env ? VAddr(std::strtoull(env, nullptr, 16)) : VAddr{0};
             }();
             if ((parts_mode == '2' && whole->info.resources.layers <= 1) ||
@@ -1073,7 +1073,7 @@ void ImageRegistry::LinkTarget(ImageEntry& target) {
         }
         const auto place = PlaceOf(target.info, entry.info);
 #ifndef NDEBUG
-        static const bool small_links = Common::DiagEnv("RYGT_DIAG_SMALL_LINKS") != nullptr;
+        static const bool small_links = Common::DiagEnv("SHADGT_DIAG_SMALL_LINKS") != nullptr;
         static std::atomic<u32> small_logged{};
         if (small_links && place.mip >= 0 && entry.info.size.width <= 8 &&
             entry.info.size.height <= 8 && small_logged++ < 200) {
@@ -1131,8 +1131,8 @@ void ImageRegistry::LinkTexture(ImageEntry& texture) {
 #endif
             if (place.mip >= 0) {
 #ifndef NDEBUG
-                // DIAG-181 (diagnosis, RYGT_DIAG_SMALL_LINKS=1): links of tiny textures.
-                static const bool small_links = Common::DiagEnv("RYGT_DIAG_SMALL_LINKS") != nullptr;
+                // DIAG-181 (diagnosis, SHADGT_DIAG_SMALL_LINKS=1): links of tiny textures.
+                static const bool small_links = Common::DiagEnv("SHADGT_DIAG_SMALL_LINKS") != nullptr;
                 static std::atomic<u32> small_logged{};
                 if (small_links && texture.info.size.width <= 8 && texture.info.size.height <= 8 &&
                     small_logged++ < 200) {
@@ -1264,14 +1264,14 @@ u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_
     // Scan metadata in every shard: a heavily populated single shard must still
     // be able to retire a full budget every frame, rather than once per rotation.
     // Rotate the selection order so a busy shard cannot starve the others.
-    // PERF-GTS-385 (RYGT_EVICT_SCAN_SHARDS=<1..64>, default 64 = as before): the bounded
+    // PERF-GTS-385 (SHADGT_EVICT_SCAN_SHARDS=<1..64>, default 64 = as before): the bounded
     // per-frame scan read every picture's last use, a cache miss each: 7.5% of the recorder's
     // CPU time in a 20-car race at Tokyo (about 1.2 ms a frame), and a second walk of every
     // shard whenever something went (1.8%). With fewer shards a frame the scan goes round
     // the table over several frames; a frame's budget is still filled whenever the shards
     // it visits hold that many idle pictures.
     static const u32 scan_shards = [] {
-        const char* env = std::getenv("RYGT_EVICT_SCAN_SHARDS");
+        const char* env = std::getenv("SHADGT_EVICT_SCAN_SHARDS");
         // PERF-GTS-407: 8 shards a frame unless set.
         const u32 value = env && *env ? u32(std::strtoul(env, nullptr, 10)) : 8;
         return std::clamp<u32>(value, 1, NumShards);
@@ -1549,7 +1549,7 @@ bool ImageRegistry::MemoryUnchanged(const ImageEntry& entry) {
 
 static bool LayerSamplesEnabled() {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_NATIVE_LAYER_SAMPLES");
+        const char* env = std::getenv("SHADGT_NATIVE_LAYER_SAMPLES");
         return !(env && env[0] == '0');
     }();
     return enabled;
@@ -1557,7 +1557,7 @@ static bool LayerSamplesEnabled() {
 
 static bool LayerWholeHashEnabled() {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_NATIVE_LAYER_HASH");
+        const char* env = std::getenv("SHADGT_NATIVE_LAYER_HASH");
         return !(env && env[0] == '0');
     }();
     return enabled;
@@ -1604,7 +1604,7 @@ private:
 
 bool LayerHashAsyncEnabled() {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_NATIVE_LAYER_HASH_ASYNC");
+        const char* env = std::getenv("SHADGT_NATIVE_LAYER_HASH_ASYNC");
         return !(env && env[0] == '0');
     }();
     return enabled;
@@ -1672,7 +1672,7 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
     }
 #ifndef NDEBUG
     if (WatchedTexture(address, address + std::max<u64>(size, 1)) && WatchSample()) {
-        static const bool dump_on_fill = Common::DiagEnv("RYGT_FRAME_DUMP_ON_FILL") != nullptr;
+        static const bool dump_on_fill = Common::DiagEnv("SHADGT_FRAME_DUMP_ON_FILL") != nullptr;
         if (pattern && dump_on_fill) {
             g_dump_request = true; // FIX-156 (diagnosis): dump the next frame
         }
@@ -1696,11 +1696,11 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
                     }
                 }
 #ifndef NDEBUG
-                // DIAG-183 (diagnosis, RYGT_DIAG_IGNORED_WRITES=1): such writes over tiny textures;
+                // DIAG-183 (diagnosis, SHADGT_DIAG_IGNORED_WRITES=1): such writes over tiny textures;
                 // =<w>x<h>: over textures that size (GT7's 30x17 light grid, 136 KB).
                 static const std::array<u32, 3> diag = [] {
                     std::array<u32, 3> d{};
-                    if (const char* env = Common::DiagEnv("RYGT_DIAG_IGNORED_WRITES")) {
+                    if (const char* env = Common::DiagEnv("SHADGT_DIAG_IGNORED_WRITES")) {
                         d[0] = 1;
                         if (std::sscanf(env, "%ux%u", &d[1], &d[2]) != 2) {
                             d[1] = d[2] = 0;
@@ -1750,9 +1750,9 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
                 // for "unchanged" and never uploaded, and the texture kept the fill. GT7's main
                 // menu reads its sky tables from memory a race's fill covers: they stayed zero,
                 // and after a race the menu's ground and buildings were black until the game
-                // closed, whatever the time of day. RYGT_NATIVE_FILL_FORGETS_HASH=0: as before.
+                // closed, whatever the time of day. SHADGT_NATIVE_FILL_FORGETS_HASH=0: as before.
                 static const bool forget_hash = [] {
-                    const char* env = std::getenv("RYGT_NATIVE_FILL_FORGETS_HASH");
+                    const char* env = std::getenv("SHADGT_NATIVE_FILL_FORGETS_HASH");
                     return !(env && env[0] == '0');
                 }();
                 if (forget_hash) {
@@ -1781,9 +1781,9 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
             // are). GT7's compute shaders write pictures as buffers into the scratch pool other
             // passes drew into before (0x100a0b0000), and the texture read there kept showing an
             // older target's picture: the far scenery of the replay's depth-of-field shots was
-            // black. RYGT_NATIVE_REWRITE_MADE_OF_TARGETS=0: such writes are ignored, as before.
+            // black. SHADGT_NATIVE_REWRITE_MADE_OF_TARGETS=0: such writes are ignored, as before.
             static const bool rewrite_made_of_targets = [] {
-                const char* env = std::getenv("RYGT_NATIVE_REWRITE_MADE_OF_TARGETS");
+                const char* env = std::getenv("SHADGT_NATIVE_REWRITE_MADE_OF_TARGETS");
                 return !(env && env[0] == '0');
             }();
             const bool whole = address <= entry.info.guest_address &&
@@ -2044,10 +2044,10 @@ Rhi::Buffer* ImageRegistry::AcquireUploadGatherScratch(Rhi::CommandList& list, u
 // memory they hold zeros and the driver looks right, but the allocator often places them over
 // memory that held other data (compressed texture blocks, descriptor tables), and the driver
 // then lit up in a random colour with a glare over the whole picture, in most launches. Such
-// textures upload as zeros. RYGT_NATIVE_SANITIZE_TINY=0: as memory holds them.
+// textures upload as zeros. SHADGT_NATIVE_SANITIZE_TINY=0: as memory holds them.
 static bool ImplausibleTinyFloatTexture(const ImageEntry& entry) {
     static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_NATIVE_SANITIZE_TINY");
+        const char* env = std::getenv("SHADGT_NATIVE_SANITIZE_TINY");
         return !(env && env[0] == '0');
     }();
     const auto& info = entry.info;
@@ -2217,7 +2217,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
         // all read ~3 GB a second of guest memory on the recorder in GT7's races (compute
         // output sampled as textures, written several times a frame).
         static const bool hash_forced = [] {
-            const char* env = std::getenv("RYGT_NATIVE_HASH_FORCED"); // PERF-108 off: =1
+            const char* env = std::getenv("SHADGT_NATIVE_HASH_FORCED"); // PERF-108 off: =1
             return env && env[0] == '1';
         }();
         const bool skip_hash = forced && entry->from_cpu && !hash_forced;
@@ -2244,10 +2244,10 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
             // for "unchanged" and never uploaded, and the texture kept the forced picture.
             entry->content_hash = 0;
         }
-        // (diagnosis) RYGT_DIAG_ZERO_TEXTURES=<w>x<h>x<bits>: textures of that size upload zeros.
+        // (diagnosis) SHADGT_DIAG_ZERO_TEXTURES=<w>x<h>x<bits>: textures of that size upload zeros.
         static const std::array<u32, 3> zero_size = [] {
             std::array<u32, 3> parts{};
-            if (const char* env = Common::DiagEnv("RYGT_DIAG_ZERO_TEXTURES")) {
+            if (const char* env = Common::DiagEnv("SHADGT_DIAG_ZERO_TEXTURES")) {
                 std::sscanf(env, "%ux%ux%u", &parts[0], &parts[1], &parts[2]);
             }
             return parts;
@@ -2267,11 +2267,11 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
         }
         // NAT-107: the bytes as the GPU sees guest memory, in GPU order (textures the game's
         // GPU work filled, in memory the CPU may not even read), else a copy the CPU makes now.
-        // (diagnosis) RYGT_DIAG_UPLOAD_CPU_SIZE=<w>x<h>: textures that size are copied from guest
+        // (diagnosis) SHADGT_DIAG_UPLOAD_CPU_SIZE=<w>x<h>: textures that size are copied from guest
         // memory by the CPU, never from a region or an imported view.
         static const std::array<u32, 2> cpu_size = [] {
             std::array<u32, 2> parts{};
-            if (const char* env = Common::DiagEnv("RYGT_DIAG_UPLOAD_CPU_SIZE")) {
+            if (const char* env = Common::DiagEnv("SHADGT_DIAG_UPLOAD_CPU_SIZE")) {
                 std::sscanf(env, "%ux%u", &parts[0], &parts[1]);
             }
             return parts;
@@ -2284,12 +2284,12 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
             gpu_source = upload_source(*entry, list);
         }
 #ifndef NDEBUG
-        // DIAG-200 (diagnosis, RYGT_DIAG_UPLOAD_SIZE=<w>x<h>): each upload of textures that size,
+        // DIAG-200 (diagnosis, SHADGT_DIAG_UPLOAD_SIZE=<w>x<h>): each upload of textures that size,
         // where its bytes come from (1 region, 2 imported view, 3 gathered, 0 CPU copy) and a
         // hash of guest memory at the time.
         static const std::array<u32, 2> diag_size = [] {
             std::array<u32, 2> parts{};
-            if (const char* env = Common::DiagEnv("RYGT_DIAG_UPLOAD_SIZE")) {
+            if (const char* env = Common::DiagEnv("SHADGT_DIAG_UPLOAD_SIZE")) {
                 std::sscanf(env, "%ux%u", &parts[0], &parts[1]);
             }
             return parts;
@@ -2501,9 +2501,9 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
         // rewrites its scratch pool before each pass, and the textures over its post-processing
         // pyramid and the car close-ups were uploaded from that (zero) memory and kept it: black
         // blocks on the car during the race start. They take their targets' pictures again at
-        // their next use. RYGT_NATIVE_SOURCES_AFTER_UPLOAD=1: on.
+        // their next use. SHADGT_NATIVE_SOURCES_AFTER_UPLOAD=1: on.
         static const bool sources_after_upload = [] {
-            const char* env = std::getenv("RYGT_NATIVE_SOURCES_AFTER_UPLOAD");
+            const char* env = std::getenv("SHADGT_NATIVE_SOURCES_AFTER_UPLOAD");
             return env && env[0] == '1'; // off unless asked: it did not fix what it was made for
         }();
         if (sources_after_upload) {

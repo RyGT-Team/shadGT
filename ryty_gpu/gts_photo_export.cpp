@@ -4,7 +4,7 @@
 // folder and writes each new photo as a PNG to the user's Pictures folder
 // (Pictures\Gran Turismo Sport), decoded with Windows' own JPEG XR codec (WIC). Photos already
 // there when the game starts are left alone, as are the "_t" previews.
-// On unless RYGT_PHOTO_EXPORT=0 or "photo_export": false in the game's config.
+// On unless SHADGT_PHOTO_EXPORT=0 or "photo_export": false in the game's config.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -288,7 +288,7 @@ void Watch(fs::path source) {
 } // namespace
 
 void InstallPhotoExport() {
-    if (const char* env = std::getenv("RYGT_PHOTO_EXPORT"); env && env[0] == '0') {
+    if (const char* env = std::getenv("SHADGT_PHOTO_EXPORT"); env && env[0] == '0') {
         return;
     }
     if (!ConfigFlag("photo_export", true)) {

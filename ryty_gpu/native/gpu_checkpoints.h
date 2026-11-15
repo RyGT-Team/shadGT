@@ -11,7 +11,7 @@ namespace Native::GpuCheckpoints {
 #ifndef NDEBUG
 inline bool Requested() {
     static const bool requested = [] {
-        const char* value = std::getenv("RYGT_GPU_CHECKPOINTS");
+        const char* value = std::getenv("SHADGT_GPU_CHECKPOINTS");
         return value && value[0] == '1' && value[1] == '\0';
     }();
     return requested;

@@ -127,9 +127,9 @@ struct Owner {
 static void Words(std::vector<unsigned char>& out,size_t word,std::array<u32,4> value){std::memcpy(out.data()+word*4,value.data(),16);}
 int main() {
 #ifdef _WIN32
-    _putenv_s("RYGT_PARALLEL_ABSENT_GUEST","1");
+    _putenv_s("SHADGT_PARALLEL_ABSENT_GUEST","1");
 #else
-    setenv("RYGT_PARALLEL_ABSENT_GUEST","1",1);
+    setenv("SHADGT_PARALLEL_ABSENT_GUEST","1",1);
 #endif
     Owner owner;VideoCore::DirectMemory direct;owner.r.buffer_cache.direct=&direct;
     VideoCore::registry.Register(&direct,true);VideoCore::registry.Add(&direct,100,200,true);

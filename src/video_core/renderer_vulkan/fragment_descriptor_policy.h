@@ -6,8 +6,8 @@ namespace Vulkan {
 // draw. Made for NVIDIA, where repeated material pushes dominated command recording.
 // AMD-PERF-002: AMD too. Its driver writes every pushed descriptor into the command buffer, so a
 // race frame of 2,000-3,800 draws repeated that work thousands of times; the cache is plain Vulkan
-// and was only gated to the GPU it was tested on. RYGT_NVIDIA_CACHED_FRAGMENT_SETS=0 turns it off
-// on NVIDIA, RYGT_AMD_CACHED_FRAGMENT_SETS=0 on AMD.
+// and was only gated to the GPU it was tested on. SHADGT_NVIDIA_CACHED_FRAGMENT_SETS=0 turns it off
+// on NVIDIA, SHADGT_AMD_CACHED_FRAGMENT_SETS=0 on AMD.
 constexpr bool CacheFragmentDescriptors(std::uint32_t vendor, bool native,
                                          const char* override_value,
                                          const char* amd_override = nullptr) {

@@ -103,6 +103,9 @@ struct PrecompileProgress {
     bool active; ///< still going
 };
 PrecompileProgress GetPrecompileProgress();
+/// FEAT-GTS-469: progress of the manifest pre-translation (PERF-GT7-117), which runs in the
+/// background while the game does (records looked at of the manifest's records).
+PrecompileProgress GetPretranslateProgress();
 /// PERF-102: the game waits on the splash screen for the precompile.
 bool PrecompileHoldsGame();
 /// PERF-103: the game runs in slow motion while pipelines it needs are compiled.
@@ -312,6 +315,17 @@ private:
     struct PrewarmRecord;
     bool InstallPrewarmRecord(PrewarmRecord& record);
     void PrewarmRead(std::stop_token stop);
+    /// FEAT-GTS-470: other GPU families' stored pipelines made this GPU's (see the .cpp).
+    void ImportForeignPipelines(std::stop_token stop);
+    /// FEAT-GTS-471: this GPU's stored pipelines as the manifest's recipe file (see the .cpp).
+    void ExportPipelineRecipes(std::stop_token stop);
+public:
+    /// FEAT-GTS-471: a stored pipeline key file and its shaders' names (program, record SPIR-V hash).
+    struct PipelineRecipe {
+        std::array<std::pair<u64, u64>, MaxShaderStages> names{};
+        std::vector<u8> pipeline;
+    };
+private:
     void ReportPrewarm(std::chrono::steady_clock::time_point now);
     /// PERF-034: waits while a worker builds a pipeline, starting builds for the states the
     /// command thread queues meanwhile. Compilation is owned exclusively by the workers.
@@ -474,11 +488,11 @@ private:
     void CreateDriverCache();
     void SaveDriverCache(bool wait);
     void MaybeSaveDriverCache();
-    /// PERF-GT7-108: the compile pack's start-up compile (RYGT_COMPILE_PACK=1), on its own thread.
+    /// PERF-GT7-108: the compile pack's start-up compile (SHADGT_COMPILE_PACK=1), on its own thread.
     void CompilePackShaders(std::stop_token stop);
     std::jthread compile_pack_thread;
-    /// PERF-GT7-111: RYGT_MANIFEST_VERIFY=1 translates every manifest record again at start and
-    /// compares SPIR-V. PERF-GT7-117: RYGT_MANIFEST_PRETRANSLATE=1 stores the records of programs
+    /// PERF-GT7-111: SHADGT_MANIFEST_VERIFY=1 translates every manifest record again at start and
+    /// compares SPIR-V. PERF-GT7-117: SHADGT_MANIFEST_PRETRANSLATE=1 stores the records of programs
     /// the shader store does not have. Both off by default; joined with the cache.
     void VerifyManifest(std::stop_token stop);
     void PretranslateManifest(std::stop_token stop);
@@ -583,6 +597,39 @@ private:
     std::atomic<u64> prewarm_read{};
     std::atomic<u64> prewarm_total{};
     std::atomic<bool> prewarm_reader_done{};
+    /// FIX-GTS-468: stored pipelines the workers finished building. The command thread moves
+    /// them from pending_builds into graphics_pipelines (AdoptPrewarmed), where the retention
+    /// trim can release the ones no draw uses; left in pending_builds they were never released.
+    std::mutex prewarm_finished_mutex;
+    std::vector<std::weak_ptr<PipelineBuild>> prewarm_finished;
+    std::atomic<bool> prewarm_finished_any{};
+    /// FIX-GTS-468: adopted stored pipelines no draw has used yet. The first draw that uses
+    /// one stores its key again, as a draw taking it from pending_builds did (PERF-038).
+    /// `order` is the adoption order (about most recently used first): once the precompile is
+    /// done, those past SHADGT_PRECOMPILE_KEEP are released (RetireUnclaimedPrewarm).
+    struct PrewarmUnclaimed {
+        GraphicsPipeline::SerializationSupport sdata;
+        u64 order{};
+    };
+    tsl::robin_map<GraphicsPipelineKey, PrewarmUnclaimed> prewarm_unclaimed;
+    u64 prewarm_adopted{};
+    u64 prewarm_installed{}; ///< FEAT-GTS-470: precompile builds queued, in install order
+    bool PrecompileLibrariesOnly() const;
+    u64 prewarm_dropped{};
+    bool prewarm_settle_dirty{};
+    std::vector<GraphicsPipelineKey> prewarm_settle_queue;
+    u64 prewarm_settled{};
+    void AdoptPrewarmed();
+    void RetireUnclaimedPrewarm(std::vector<std::shared_ptr<const void>>& retired);
+    /// FIX-GTS-468: the shader modules the precompile made (program hash, permutation). Once its
+    /// unused pipelines are retired, the modules no live pipeline uses go back to being stored
+    /// (loaded again on first use), as before the precompile.
+    std::vector<std::pair<u64, size_t>> prewarm_loaded;
+    /// FIX-GTS-468: programs the precompile listed (decoded shader metadata for every stored
+    /// program; a normal start lists only the ones its draws use). Dropped with the modules when
+    /// nothing uses them; a draw lists them from the store again (GetProgram).
+    std::vector<u64> prewarm_programs;
+    void ReleasePrewarmModules();
     /// PERF-076: new graphics pipelines build in the background while their draws are skipped.
     static bool AsyncPipelines();
     static bool WritesMemory(const std::array<const Shader::Info*, MaxShaderStages>& infos);
@@ -598,7 +645,7 @@ private:
     /// the command thread waiting for the translation.
     bool SkipTranslationWait(Shader::SwStage sw_stage, const Shader::ShaderParams& params);
     /// PERF-GT7-115: the draw's wait for its hull shader translation is bounded by the window's
-    /// budget (RYGT_HS_WAIT_BUDGET_MS), under SHD-005's conditions (async pipelines, not a forced
+    /// budget (SHADGT_HS_WAIT_BUDGET_MS), under SHD-005's conditions (async pipelines, not a forced
     /// or one-off wait).
     bool HullWaitBudgeted(Shader::SwStage sw_stage, const Shader::ShaderParams& params);
     tsl::robin_map<u64, bool> code_writes_memory; ///< by program hash
@@ -678,6 +725,11 @@ private:
                               const Shader::Backend::Bindings& binding, bool insert);
     /// FIX-078 (lookup lock held): queues a translation; false when one with the same inputs is
     /// already queued.
+    /// FEAT-GTS-470: records a stored translation on a draw's first use (record mode).
+    void RecordStoredUse(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
+                         const Shader::ShaderParams& params,
+                         const Shader::RuntimeInfo& runtime_info,
+                         const Shader::Backend::Bindings& start, size_t perm_idx);
     bool QueueTranslation(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
                           const Shader::ShaderParams& params,
                           const Shader::RuntimeInfo& runtime_info,
@@ -705,7 +757,7 @@ private:
     std::unordered_map<u64, std::shared_future<StoredListing>> pending_listings;
     std::unique_ptr<StoreReaders> store_readers;
     /// PERF-GT7-118: a stored permutation's module, made by a store reader from the SPIR-V it
-    /// read ahead (RYGT_PREFETCH_MODULES=0: not made); LoadStoredModule takes it.
+    /// read ahead (SHADGT_PREFETCH_MODULES=0: not made); LoadStoredModule takes it.
     void PrefetchStoredModule(u64 pgm_hash, size_t perm_idx, const std::vector<u32>& words);
     std::mutex prefetched_mutex;
     std::unordered_map<u64, vk::ShaderModule> prefetched_modules; ///< by HashCombine(program, permutation)

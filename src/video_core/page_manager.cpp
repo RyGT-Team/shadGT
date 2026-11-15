@@ -62,7 +62,7 @@ namespace VideoCore {
 namespace {
 u64 TracePage() {
     static const u64 page = [] {
-        const char* value = std::getenv("RYGT_TRACE_PAGE");
+        const char* value = std::getenv("SHADGT_TRACE_PAGE");
         if (!value || !*value || *value == '-' || *value == '+' || *value == ' ') return ~u64{0};
         errno = 0;
         char* end = nullptr;
@@ -137,8 +137,8 @@ struct ProtectCost {
 };
 static ProtectCost g_protect_cost;
 
-/// DIAG-190/196 (diagnosis, RYGT_DIAG_FAULT_COST=1): fault and protection costs are timed.
-/// PERF-GT7-051 (diagnosis, RYGT_PROTECT_MAP=1): protections, unprotections and CPU write
+/// DIAG-190/196 (diagnosis, SHADGT_DIAG_FAULT_COST=1): fault and protection costs are timed.
+/// PERF-GT7-051 (diagnosis, SHADGT_PROTECT_MAP=1): protections, unprotections and CPU write
 /// faults counted by 1 MB of guest memory; the 15 busiest areas are logged every 10 s.
 static bool ProtectMapOn() {
     if constexpr (!Common::DiagnosticsBuilt) {
@@ -147,7 +147,7 @@ static bool ProtectMapOn() {
     static const bool on = [] {
         // Or a file protect_map.on in the game's folder (the working directory), whatever
         // started the game.
-        const char* env = std::getenv("RYGT_PROTECT_MAP");
+        const char* env = std::getenv("SHADGT_PROTECT_MAP");
         std::error_code ec;
         return (env && env[0] == '1') || std::filesystem::exists("protect_map.on", ec);
     }();
@@ -206,7 +206,7 @@ static void NoteProtectMap(u64 address, u64 size, int kind) {
 
 static bool FaultCostDiag() {
     static const bool on = [] {
-        const char* env = Common::DiagEnv("RYGT_DIAG_FAULT_COST");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_FAULT_COST");
         return env && env[0] == '1';
     }();
     return on;

@@ -5,7 +5,7 @@ namespace Vulkan {
 // with retained LTO data for the heavy tessellation path.
 inline bool Mr14SharedTessellationEnabled(bool lto) {
     static const bool enabled = [] {
-        const char* env=std::getenv("RYGT_GPL");
+        const char* env=std::getenv("SHADGT_GPL");
         return !(env && env[0]=='0');
     }();
     return enabled && !lto;
@@ -14,17 +14,17 @@ inline bool Mr14SharedTessellationEnabled(bool lto) {
 // AMD's compiler keeps its optimizer for tessellated libraries. AMD-322: no link-time data and
 // no second, optimized link: on an RX 7600 they made each menu pipeline take 0.4-0.7 s and
 // filled pipeline memory (4.4 GB, then trimming and rebuilding pipelines in a loop).
-// RYGT_AMD_PIPELINE_POLICY=0 uses the shared policy.
+// SHADGT_AMD_PIPELINE_POLICY=0 uses the shared policy.
 inline bool AmdPipelinePolicyEnabled(unsigned vendor_id) {
     static const bool allowed = [] {
-        const char* env=std::getenv("RYGT_AMD_PIPELINE_POLICY");
+        const char* env=std::getenv("SHADGT_AMD_PIPELINE_POLICY");
         return !(env && env[0]=='0');
     }();
     return allowed && vendor_id == 0x1002;
 }
 inline bool SharedPipelineLibrariesEnabled(bool supported, bool preloading) {
     static const bool no_libraries = [] {const char* p=std::getenv("SHADGT_NO_LIBRARIES");return p&&p[0]=='1';}();
-    static const bool whole_prewarm = [] {const char* p=std::getenv("RYGT_PREWARM_WHOLE_PIPELINES");return p&&p[0]=='1';}();
+    static const bool whole_prewarm = [] {const char* p=std::getenv("SHADGT_PREWARM_WHOLE_PIPELINES");return p&&p[0]=='1';}();
     return supported && !no_libraries && !(preloading && whole_prewarm);
 }
 // Relax only splash-screen dispatch admission. The driver-call semaphore remains

@@ -176,8 +176,8 @@ u64 RecipeSignature(const Instance& instance, const Shader::Profile& p) {
         u64(p.intel_arc_workarounds),u64(p.needs_buffer_offsets),u64(p.needs_unorm_fixup),
         u64(p.needs_clip_distance_emulation),u64(p.supports_shader_stencil_export)}) add(v);
     const std::array<const char*, 4> policies{std::getenv("SHADGT_DISABLE_PERF"),
-        std::getenv("RYGT_FMASK_KEY"), std::getenv("RYGT_UNNORMALIZED_MIP"),
-        std::getenv("RYGT_FLOAT_ATOMIC_EXACT")};
+        std::getenv("SHADGT_FMASK_KEY"), std::getenv("SHADGT_UNNORMALIZED_MIP"),
+        std::getenv("SHADGT_FLOAT_ATOMIC_EXACT")};
     for (const char* str : policies) {
         if (str) for (; *str; ++str) add(static_cast<unsigned char>(*str));
         add(0xff);

@@ -107,10 +107,10 @@ inline bool ProConfigEnabled() {
     return ConfigTrue("ps4_pro");
 }
 
-// RYGT_PS4_PRO overrides the config (0 forces base mode); the config option means Neo 1080.
+// SHADGT_PS4_PRO overrides the config (0 forces base mode); the config option means Neo 1080.
 inline ProMode GetProMode() {
     static const ProMode mode = [] {
-        const char* value = std::getenv("RYGT_PS4_PRO");
+        const char* value = std::getenv("SHADGT_PS4_PRO");
         if (value) {
             return ParseProMode(std::string_view{value});
         }

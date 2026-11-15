@@ -15,7 +15,7 @@ namespace Common {
 #ifdef SHADGT_DIAGNOSTICS
 inline constexpr bool DiagnosticsBuilt = true;
 
-/// std::getenv for a diagnostic switch (RYGT_DIAG_*, RYGT_AB, the F1 dumps, ...).
+/// std::getenv for a diagnostic switch (SHADGT_DIAG_*, RYGT_AB, the F1 dumps, ...).
 inline const char* DiagEnv(const char* name) {
     return std::getenv(name);
 }

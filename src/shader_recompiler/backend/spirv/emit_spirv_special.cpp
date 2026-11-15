@@ -86,12 +86,12 @@ static void EmitLdsEmulationPrologue(EmitContext& ctx) {
     ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
     ctx.OpBranchConditional(writer, write_label, merge_label);
     ctx.AddLabel(write_label);
-    // PERF-GTS-458 (RYGT_TESS_LDS_SPREAD=0: as before): the patch's invocations share the stores,
+    // PERF-GTS-458 (SHADGT_TESS_LDS_SPREAD=0: as before): the patch's invocations share the stores,
     // control point cp by invocation cp % invocations, one vec4 store per attribute. Before, the
     // first invocation stored every float alone (GT Sport's car bodies: 26 control points of 2
     // attributes, 208 single-float stores a patch while 3 of 4 invocations waited).
     static const bool spread = [] {
-        const char* env = std::getenv("RYGT_TESS_LDS_SPREAD");
+        const char* env = std::getenv("SHADGT_TESS_LDS_SPREAD");
         return !(env && env[0] == '0');
     }();
     const Id invocation = ctx.OpLoad(ctx.U32[1], ctx.invocation_id);
@@ -277,13 +277,13 @@ void ConvertPositionToClipSpace(EmitContext& ctx) {
     ctx.OpStore(ptr(2), b2);
 }
 
-// DIAG-GTS-447 (diagnosis): RYGT_DIAG_FS_CONST=<hex program hash>[,...] makes those pixel shaders
+// DIAG-GTS-447 (diagnosis): SHADGT_DIAG_FS_CONST=<hex program hash>[,...] makes those pixel shaders
 // write magenta (1, 0, 1, 1) to every float colour output at the end: whether a draw's output
 // reaches its targets at all (a shader-object draw on NVIDIA left GT Sport's floor black).
 static bool DiagConstantOutput(u64 hash) {
     static const std::vector<u64> hashes = [] {
         std::vector<u64> list;
-        const char* env = std::getenv("RYGT_DIAG_FS_CONST");
+        const char* env = std::getenv("SHADGT_DIAG_FS_CONST");
         for (const char* at = env ? env : ""; *at;) {
             char* end = nullptr;
             const u64 value = std::strtoull(at, &end, 16);

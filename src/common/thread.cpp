@@ -199,10 +199,10 @@ struct CoreClasses {
     std::vector<ULONG> compile_ids; // PERF-GT7-024: one kind of core: the compile cores
     std::vector<ULONG> game_ids;    // PERF-GT7-032: and the other cores
     std::vector<std::vector<ULONG>> game_cores; // PERF-GT7-048: the same, by physical core
-    std::vector<std::vector<ULONG>> all_cores;  // PERF-GT7-048: every core: RYGT_COMPILE_CORES=0
+    std::vector<std::vector<ULONG>> all_cores;  // PERF-GT7-048: every core: SHADGT_COMPILE_CORES=0
 };
 
-// PERF-GT7-055 (test, RYGT_COMPILE_LOW=1): the driver's compile threads and the translators stay
+// PERF-GT7-055 (test, SHADGT_COMPILE_LOW=1): the driver's compile threads and the translators stay
 // below normal priority whenever no draw waits for its pipeline, not only during a catch-up
 // (PERF-GT7-032). In the pre-race the random grid brings ~47 driver compiles over 100 ms a race
 // at normal priority beside the game's job threads: a fifth of the 66 ms frames of two runs had
@@ -210,7 +210,7 @@ struct CoreClasses {
 // priority when they are found, every 10 s.
 static bool CompileAlwaysLow() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_COMPILE_LOW");
+        const char* env = std::getenv("SHADGT_COMPILE_LOW");
         return env && env[0] == '1';
     }();
     return on;
@@ -218,7 +218,7 @@ static bool CompileAlwaysLow() {
 
 bool CompileCoresOn() {
     static const bool on = [] {
-        const char* env = std::getenv("RYGT_COMPILE_CORES");
+        const char* env = std::getenv("SHADGT_COMPILE_CORES");
         return !(env && env[0] == '0');
     }();
     return on;
@@ -304,7 +304,7 @@ const CoreClasses& GetCoreClasses() {
                 }
                 LOG_INFO(Common, "PERF-GT7-024: compiles on {} of {} cores ({} logical processors){}",
                          count, cores.size(), result.compile_ids.size(),
-                         CompileCoresOn() ? "" : ", off (RYGT_COMPILE_CORES=0)");
+                         CompileCoresOn() ? "" : ", off (SHADGT_COMPILE_CORES=0)");
             }
         }
         return result;
@@ -380,7 +380,7 @@ void ReleaseCompileCores() {
 // default CPU set is the game's cores but the owners' (compile cores excluded): a thread without
 // a set of its own runs there only, so compiles "widened" for a waiting draw, a catch-up or a
 // backlog left the 3 compile cores for the game's 4 (a first race filled in at ~3.9 pipelines a
-// second either way, ~7 with RYGT_COMPILE_CORES=0). Every core but the owners' then, explicitly.
+// second either way, ~7 with SHADGT_COMPILE_CORES=0). Every core but the owners' then, explicitly.
 std::mutex g_wide_mutex;
 std::vector<ULONG> g_wide_ids; ///< empty: no owner, the process default is every core
 
@@ -405,7 +405,7 @@ void AllowAllCores() {
     SetWideCores(GetCurrentThread());
 }
 
-// PERF-GT7-048 (RYGT_CORE_OWNERS=<mask>: 1 command processor, 2 recorder, 4 Vulkan commands; 0 none,
+// PERF-GT7-048 (SHADGT_CORE_OWNERS=<mask>: 1 command processor, 2 recorder, 4 Vulkan commands; 0 none,
 // the default): a renderer thread gets a physical core of its own, both hardware threads, from the
 // last of the cores that aren't the compile cores; the process's threads without a CPU set of their
 // own, the game's included, run on the rest (the first core takes the interrupts). Threads ask from
@@ -419,7 +419,7 @@ void AllowAllCores() {
 // ~50 without an owner (rygt7 issue 41, Ryzen 5 7500F and 5500X3D).
 void UpdateCoreOwner(u32 slot, bool wanted) {
     static const u32 mask = [] {
-        const char* env = std::getenv("RYGT_CORE_OWNERS");
+        const char* env = std::getenv("SHADGT_CORE_OWNERS");
         return env && *env ? u32(std::strtoul(env, nullptr, 0)) : u32{0};
     }();
     if (((mask >> slot) & 1) == 0) {
@@ -462,7 +462,7 @@ void UpdateCoreOwner(u32 slot, bool wanted) {
     if (classes.hybrid || usable.size() < owners + 2) {
         static bool told_ignored = false; // under owner_policy_mutex; the loops ask every pass
         if (wanted && !std::exchange(told_ignored, true)) {
-            LOG_INFO(Common, "PERF-GT7-048: core owners {:#x} (RYGT_CORE_OWNERS) ignored: {}", mask,
+            LOG_INFO(Common, "PERF-GT7-048: core owners {:#x} (SHADGT_CORE_OWNERS) ignored: {}", mask,
                      classes.hybrid ? "hybrid CPU" : "too few cores");
         }
         return;
@@ -470,7 +470,7 @@ void UpdateCoreOwner(u32 slot, bool wanted) {
     static bool told_applied = false;
     if (wanted && !std::exchange(told_applied, true)) {
         LOG_INFO(Common,
-                 "PERF-GT7-048: core owners {:#x} (RYGT_CORE_OWNERS), {} of {} usable cores left "
+                 "PERF-GT7-048: core owners {:#x} (SHADGT_CORE_OWNERS), {} of {} usable cores left "
                  "to the other threads",
                  mask, usable.size() - owners, usable.size());
     }
@@ -556,7 +556,7 @@ struct DriverCompileThreads {
     bool applied_wide = false;
     bool applied_low = false;
     std::atomic<bool> wide_now{false};
-    // FIX-GT7-072: low from the start with RYGT_COMPILE_LOW=1 (no draw waits yet), so that
+    // FIX-GT7-072: low from the start with SHADGT_COMPILE_LOW=1 (no draw waits yet), so that
     // CompileThreadsLow reads only this, never the counts it would race with.
     std::atomic<bool> low_now{CompileAlwaysLow()};
     u32 calls = 0;
@@ -593,11 +593,11 @@ void ApplyCompilePriority(DriverCompileThreads::Thread& thread, bool low) {
 void ApplyCompileState(DriverCompileThreads& d) {
     // FIX-GT7-106: a backlog of draws on screen: every core (FIX-GT7-107), foreground or not,
     // below normal priority: Monza's first race filled in at 7.7 pipelines a second, the same as at
-    // normal priority. RYGT_COMPILE_BACKLOG_LOW=0: the driver threads' own priority.
+    // normal priority. SHADGT_COMPILE_BACKLOG_LOW=0: the driver threads' own priority.
     const bool wide = !d.in_play && // FIX-GT7-109
                       (d.waits > 0 || d.backlog > 0 || (d.catch_up > 0 && d.foreground == 0));
     static const bool backlog_low = [] {
-        const char* env = std::getenv("RYGT_COMPILE_BACKLOG_LOW");
+        const char* env = std::getenv("SHADGT_COMPILE_BACKLOG_LOW");
         return !(env && env[0] == '0');
     }();
     const bool low = d.waits == 0 && (d.backlog == 0 || backlog_low) &&
@@ -889,7 +889,7 @@ void SetCompileInPlay(bool on) {
 }
 
 bool CompileThreadsLow() {
-    // PERF-GT7-055 (RYGT_COMPILE_LOW=1): ApplyCompileState counts it in low_now under the mutex.
+    // PERF-GT7-055 (SHADGT_COMPILE_LOW=1): ApplyCompileState counts it in low_now under the mutex.
     return DriverThreads().low_now.load(std::memory_order_relaxed);
 }
 

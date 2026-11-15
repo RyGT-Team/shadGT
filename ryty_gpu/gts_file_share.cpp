@@ -10,7 +10,7 @@
 // FILE_SHARE_DELETE as well, then hands the handle to the C runtime, so the descriptor works exactly
 // as before. If CreateFileW fails, the original _wopen runs, so errors (errno) stay the same.
 // The renames of libstdc++ (std::filesystem::rename, used by sceKernelRename) are logged when they
-// fail. RYGT_FILE_SHARE_DELETE=0 turns this off.
+// fail. SHADGT_FILE_SHARE_DELETE=0 turns this off.
 
 #include <windows.h>
 
@@ -135,7 +135,7 @@ void* PatchImport(HMODULE module, const char* name, void* replacement) {
 } // namespace
 
 void InstallFileShareDelete() {
-    if (const char* env = std::getenv("RYGT_FILE_SHARE_DELETE"); env && env[0] == '0') {
+    if (const char* env = std::getenv("SHADGT_FILE_SHARE_DELETE"); env && env[0] == '0') {
         return;
     }
     HMODULE kernel = GetModuleHandleA("libkernel.prx");

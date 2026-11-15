@@ -155,7 +155,7 @@ public:
     /// before that one it was written in (0: none).
     std::atomic<u64> written_frame{0};
     std::atomic<u64> written_frame_before{0};
-    /// DIAG-GT7-008 (diagnosis): the last frame a shader sampled it (kept with RYGT_DIAG=1).
+    /// DIAG-GT7-008 (diagnosis): the last frame a shader sampled it (kept with SHARED_DIAG=1).
     std::atomic<u64> sampled_frame{0};
     std::atomic<bool> kept{false};
     std::atomic<bool> reused{false};
@@ -191,7 +191,7 @@ private:
     std::vector<std::pair<ImageViewKey, std::unique_ptr<Rhi::ImageView>>> views;
 };
 
-/// FIX-153 (diagnosis): RYGT_NATIVE_WATCH_TEXTURE=<hex address>[,<hex address>...]: whether
+/// FIX-153 (diagnosis): SHADGT_NATIVE_WATCH_TEXTURE=<hex address>[,<hex address>...]: whether
 /// [begin, end) holds one of them; what happens there (writes, unmaps, invalidations, uploads)
 /// is logged.
 bool WatchedTexture(VAddr begin, VAddr end);
@@ -355,7 +355,7 @@ public:
     /// NAT-120: uploads the image from guest memory before its next use.
     // Admission happens on actual image use, not on each intermediate streaming write.
     // Duplicate requests are harmless: RecordUploads atomically consumes needs_upload.
-    /// PERF-GTS-384 (RYGT_UPLOAD_ONCE_A_FRAME=1): whether a stale texture is uploaded at this
+    /// PERF-GTS-384 (SHADGT_UPLOAD_ONCE_A_FRAME=1): whether a stale texture is uploaded at this
     /// use. GT Sport streams a track's 4096x4096 textures (21 MB with their mips) in while draws
     /// already sample them: each write made the texture stale and the next draw uploaded all of
     /// it again, up to four times a frame (85 MB), in frames of 45 to 57 ms. A large texture
@@ -367,7 +367,7 @@ public:
             return false;
         }
         static const bool once_a_frame = [] {
-            const char* env = std::getenv("RYGT_UPLOAD_ONCE_A_FRAME");
+            const char* env = std::getenv("SHADGT_UPLOAD_ONCE_A_FRAME");
             return !env || !*env || env[0] == '1'; // PERF-GTS-407: on unless set to something else
         }();
         if (!once_a_frame || !entry.from_cpu || entry.info.guest_size < (4ull << 20) ||
@@ -554,7 +554,7 @@ SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageIn
 /// mips or layers); mip -1: it isn't.
 SourcePlace PartOf(const VideoCore::ImageInfo& part, const VideoCore::ImageInfo& whole);
 
-/// FIX-197: RYGT_NATIVE_TARGET_PARTS=0 turns target-of-targets links off (diagnosis).
+/// FIX-197: SHADGT_NATIVE_TARGET_PARTS=0 turns target-of-targets links off (diagnosis).
 bool TargetPartsOn();
 
 } // namespace Native

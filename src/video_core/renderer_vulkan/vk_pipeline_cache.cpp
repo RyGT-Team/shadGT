@@ -1076,6 +1076,9 @@ public:
     bool ForegroundIdle() {
         return queue.ForegroundIdle();
     }
+    size_t Pending() {
+        return queue.Pending(); // DIAG-GT7-012 (port)
+    }
 
 private:
     static void SetCatchUpPolicy(bool on) {
@@ -4650,6 +4653,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineUnlocked(
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     UpdateCatchUp(std::chrono::steady_clock::now());
+#ifndef NDEBUG
+    ReportSkippedBuilds(std::chrono::steady_clock::now()); // DIAG-GT7-012 (port)
+#endif
     // PERF-034: builds for the upcoming draws the command thread read ahead start first.
     BuildQueuedStates(params, false);
     // PERF-038: then, while no draw waits for pipelines, stored ones go to the background.
@@ -7041,6 +7047,59 @@ bool PipelineCache::AsyncPipelines() {
         return on && Common::PerfFeatureEnabled(76);
     }();
     return enabled;
+}
+
+void PipelineCache::ReportSkippedBuilds(std::chrono::steady_clock::time_point now) {
+#ifndef NDEBUG
+    // DIAG-GT7-012 (port): the builds draws are skipped for, every 2 s while there are any. In a
+    // GT7 race on a new track ~4,000 draws a second were skipped for three minutes (the catch-up
+    // never ended) while a few builds finished in 2 s, often none. Here, not in ReportPrewarm,
+    // which runs only with the background prewarm (off for GT7, TITLE-001).
+    if (now - skipped_builds_reported < std::chrono::seconds{2}) {
+        return;
+    }
+    skipped_builds_reported = now;
+    u32 count = 0;
+    u32 started = 0;
+    const PipelineBuild* oldest = nullptr;
+    const PipelineBuild* most = nullptr;
+    for (const auto& [key, build] : pending_builds) {
+        if (!build->async || build->skips.load(std::memory_order_relaxed) == 0 ||
+            build->done.wait_for(std::chrono::microseconds{0}) == std::future_status::ready) {
+            continue;
+        }
+        ++count;
+        started += build->started.load(std::memory_order_relaxed) ? 1 : 0;
+        if (!oldest || build->queued < oldest->queued) {
+            oldest = build.get();
+        }
+        if (!most || build->skips.load(std::memory_order_relaxed) >
+                         most->skips.load(std::memory_order_relaxed)) {
+            most = build.get();
+        }
+    }
+    if (count == 0) {
+        return;
+    }
+    const auto describe = [&](const PipelineBuild& build) {
+        return fmt::format("{:#x}, queued {:.1f} s ago, {}, {} draws skipped",
+                           std::hash<GraphicsPipelineKey>{}(build.key),
+                           std::chrono::duration<double>(now - build.queued).count(),
+                           build.started.load(std::memory_order_relaxed) ? "building"
+                                                                         : "not started",
+                           build.skips.load(std::memory_order_relaxed));
+    };
+    size_t screen = 0;
+    {
+        std::scoped_lock lk{on_screen_mutex};
+        screen = on_screen.size();
+    }
+    LOG_WARNING(Render_Vulkan,
+                "DIAG-GT7-012: {} pipelines still building for skipped draws ({} started, {} "
+                "jobs queued, {} on screen waiting); the oldest {}; the most skipped {}",
+                count, started, build_workers ? build_workers->Pending() : 0, screen,
+                describe(*oldest), describe(*most));
+#endif
 }
 
 void PipelineCache::ReportPrewarm(std::chrono::steady_clock::time_point now) {

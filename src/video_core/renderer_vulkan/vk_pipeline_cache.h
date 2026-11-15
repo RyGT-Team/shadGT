@@ -327,6 +327,9 @@ public:
     };
 private:
     void ReportPrewarm(std::chrono::steady_clock::time_point now);
+    /// DIAG-GT7-012 (port, Debug builds): the builds skipped draws wait for, every 2 s.
+    void ReportSkippedBuilds(std::chrono::steady_clock::time_point now);
+    std::chrono::steady_clock::time_point skipped_builds_reported{};
     /// PERF-034: waits while a worker builds a pipeline, starting builds for the states the
     /// command thread queues meanwhile. Compilation is owned exclusively by the workers.
     void WaitForBuild(PipelineBuild& build, const DrawIndirectParams params);

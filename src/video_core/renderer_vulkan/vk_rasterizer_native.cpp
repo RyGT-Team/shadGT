@@ -6257,9 +6257,15 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         }
     }
     dirty.erase(first, last);
+    // PERF-104 (port of shadgt7's switch): consecutive pages are watched again in one call.
+    // SHADGT_NATIVE_REFRESH_BATCH=0: each page on its own (diagnosis).
+    static const bool watch_batch = [] {
+        const char* env = std::getenv("SHADGT_NATIVE_REFRESH_BATCH");
+        return !(env && env[0] == '0');
+    }();
     for (size_t first = 0; first < pages.size();) {
         size_t last = first + 1;
-        while (last < pages.size() && pages[last] == pages[last - 1] + 4096) ++last;
+        while (watch_batch && last < pages.size() && pages[last] == pages[last - 1] + 4096) ++last;
         const VAddr watched_end = std::min(region.end, pages[last - 1] + 4096);
         WatchPages(pages[first], watched_end - pages[first]);
         first = last;

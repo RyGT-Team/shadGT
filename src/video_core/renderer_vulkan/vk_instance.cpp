@@ -444,8 +444,20 @@ bool Instance::CreateDevice() {
     // binaries with ErrorOutOfHostMemory.
     // PERF-376-GTS: opt in only; AMD remains disabled after the observed driver failures.
     const char* pipeline_binary_env = std::getenv("SHADGT_PIPELINE_BINARIES");
-    const bool request_pipeline_binaries = properties.vendorID != 0x1002 &&
-        pipeline_binary_env && pipeline_binary_env[0] == '1' && pipeline_binary_env[1] == '\0';
+    // PERF-GTS-482 (prototype, opt-in): AMD's driver keeps no whole pipeline with dynamic vertex
+    // input in a VkPipelineCache (every whole pipeline here), so each launch compiled them all
+    // again. With SHADGT_AMD_WHOLE_BINARIES=1 whole pipelines are stored as pipeline binaries;
+    // libraries stay off them (BIN-003).
+    // PERF-GTS-486: on by default on RDNA2 (measured on a Radeon 610M), together with whole
+    // prewarm below; SHADGT_AMD_WHOLE_BINARIES=0 turns both defaults off.
+    const char* amd_whole_binaries_env = std::getenv("SHADGT_AMD_WHOLE_BINARIES");
+    const bool amd_whole_binaries_set = amd_whole_binaries_env && *amd_whole_binaries_env;
+    whole_pipeline_binaries_only =
+        properties.vendorID == 0x1002 &&
+        (amd_whole_binaries_set ? amd_whole_binaries_env[0] == '1' : IsAmdRdna2());
+    const bool request_pipeline_binaries = (properties.vendorID != 0x1002 &&
+        pipeline_binary_env && pipeline_binary_env[0] == '1' && pipeline_binary_env[1] == '\0') ||
+        whole_pipeline_binaries_only;
     if (request_pipeline_binaries && maintenance_5) {
         const auto chain = physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
                                                         vk::PhysicalDevicePipelineBinaryFeaturesKHR>();
@@ -465,6 +477,22 @@ bool Instance::CreateDevice() {
         } else {
             LOG_WARNING(Render_Vulkan, "BIN-001: pipeline binaries not supported by this driver");
         }
+    }
+    whole_pipeline_binaries_only = whole_pipeline_binaries_only && pipeline_binary;
+    if (whole_pipeline_binaries_only) {
+        LOG_WARNING(Render_Vulkan, "PERF-GTS-482: whole pipelines are stored as pipeline binaries "
+                                   "(libraries are not)");
+    }
+    // PERF-GTS-486: whole prewarm is the RDNA2 default only when those binaries are in use;
+    // without them the driver would compile every whole pipeline again on each launch.
+    {
+        const char* whole_prewarm_env = std::getenv("SHADGT_PREWARM_WHOLE_PIPELINES");
+        whole_prewarm = whole_prewarm_env && *whole_prewarm_env
+                            ? whole_prewarm_env[0] == '1'
+                            : whole_pipeline_binaries_only &&
+                                  IsAmdRdna2();
+        LOG_INFO(Render_Vulkan, "PERF-GTS-486: RDNA2 {}, whole prewarm {}, whole binaries {}",
+                 IsAmdRdna2(), whole_prewarm, whole_pipeline_binaries_only);
     }
     attachment_feedback_loop =
         feature_chain.get<vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT>().attachmentFeedbackLoopLayout &&
@@ -628,7 +656,8 @@ bool Instance::CreateDevice() {
         // default): an RX 6600 XT failed to build shaders with them on. FIX-419-GTS: replaces
         // AMD-314's on-by-default for RX 7000 and newer.
         const std::string model{GetModelName()};
-        AmdBarycentricDefault() = false;
+        // FEAT-GTS-483: on by default on the RX 90XX (RDNA4).
+        AmdBarycentricDefault() = IsAmdRx90();
         LOG_INFO(Render_Vulkan, "FIX-GT7-061: AMD barycentric fix default {} ({}), in use {}",
                  AmdBarycentricDefault() ? "on" : "off", model,
                  properties.vendorID == 0x1002 && SingleSampleBarycentricRequested());
@@ -645,9 +674,11 @@ bool Instance::CreateDevice() {
         // AMD-307: with AMD's barycentric extension and its older shader compiler (RX 6000 and
         // older), per-vertex reads find the driver's vertex order per triangle.
         // SHADGT_VERTEX_ORDER=0 turns it off, =1 turns it on with AMD's extension on any driver.
+        // FEAT-GTS-483: off by default on the RX 90XX (RDNA4), whatever its shader compiler.
         const char* order_env = std::getenv("SHADGT_VERTEX_ORDER");
-        vertex_order_check = amd_shader_explicit_vertex_parameter &&
-                             (order_env ? order_env[0] == '1' : IsAmdLegacyShaderCompiler());
+        vertex_order_check =
+            amd_shader_explicit_vertex_parameter &&
+            (order_env ? order_env[0] == '1' : IsAmdLegacyShaderCompiler() && !IsAmdRx90());
         LOG_INFO(Render_Vulkan, "AMD-307: barycentrics from {}, vertex order check {}",
                  amd_shader_explicit_vertex_parameter ? "VK_AMD_shader_explicit_vertex_parameter"
                  : fragment_shader_barycentric        ? "VK_KHR_fragment_shader_barycentric"
@@ -1564,6 +1595,19 @@ vk::Format Instance::GetSupportedFormat(const vk::Format format,
         }
     }
     return format;
+}
+
+bool Instance::IsAmdRdna2() const {
+    if (driver_id != vk::DriverId::eAmdProprietary) {
+        return false;
+    }
+    const u32 id = properties.deviceID;
+    return (id >= 0x73A0 && id <= 0x73FF) || // Navi 21/22/23: RX 6950 XT ... RX 6600
+           (id >= 0x7420 && id <= 0x743F) || // Navi 24: RX 6500 XT, RX 6400
+           id == 0x164E ||                   // Raphael / Dragon Range: Radeon 610M (Ryzen 7000)
+           id == 0x1506 ||                   // Mendocino: Radeon 610M (Ryzen 7020)
+           id == 0x1681 ||                   // Rembrandt: Radeon 660M/680M
+           id == 0x163F || id == 0x1435;     // Van Gogh, Sephiroth: Steam Deck
 }
 
 bool Instance::IsAmdGcn() const {

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "core/emulator_settings.h"
+#include "shader_recompiler/direct_learning.h"
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/profile.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -183,6 +184,18 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
     if (!EmulatorSettings.IsDirectMemoryAccessEnabled()) {
         info.uses_dma = false;
         info.readconst_types = Info::ReadConstType::None;
+    }
+
+    // PERF-GTS-479: buffers earlier runs never read in place get no direct-memory path; a shader
+    // left with none gets no direct table either.
+    if (profile.direct_buffers) {
+        for (u32 i = 0; i < info.buffers.size(); ++i) {
+            auto& buffer = info.buffers[i];
+            if (buffer.IsDirectCandidate() && DirectLearning::NoDirect(info.pgm_hash, i)) {
+                buffer.used_types |= BufferResource::NoDirectFlag;
+                DirectLearning::GetState().no_direct_slots.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
     }
 
     // D2: the per-draw table of direct buffers (their guest addresses and the page table).

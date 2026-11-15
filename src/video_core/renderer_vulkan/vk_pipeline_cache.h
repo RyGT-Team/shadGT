@@ -103,6 +103,9 @@ struct PrecompileProgress {
     bool active; ///< still going
 };
 PrecompileProgress GetPrecompileProgress();
+/// FEAT-GTS-469: progress of the manifest pre-translation (PERF-GT7-117), which runs in the
+/// background while the game does (records looked at of the manifest's records).
+PrecompileProgress GetPretranslateProgress();
 /// PERF-102: the game waits on the splash screen for the precompile.
 bool PrecompileHoldsGame();
 /// PERF-103: the game runs in slow motion while pipelines it needs are compiled.
@@ -312,6 +315,17 @@ private:
     struct PrewarmRecord;
     bool InstallPrewarmRecord(PrewarmRecord& record);
     void PrewarmRead(std::stop_token stop);
+    /// FEAT-GTS-470: other GPU families' stored pipelines made this GPU's (see the .cpp).
+    void ImportForeignPipelines(std::stop_token stop);
+    /// FEAT-GTS-471: this GPU's stored pipelines as the manifest's recipe file (see the .cpp).
+    void ExportPipelineRecipes(std::stop_token stop);
+public:
+    /// FEAT-GTS-471: a stored pipeline key file and its shaders' names (program, record SPIR-V hash).
+    struct PipelineRecipe {
+        std::array<std::pair<u64, u64>, MaxShaderStages> names{};
+        std::vector<u8> pipeline;
+    };
+private:
     void ReportPrewarm(std::chrono::steady_clock::time_point now);
     /// PERF-034: waits while a worker builds a pipeline, starting builds for the states the
     /// command thread queues meanwhile. Compilation is owned exclusively by the workers.
@@ -584,6 +598,39 @@ private:
     std::atomic<u64> prewarm_read{};
     std::atomic<u64> prewarm_total{};
     std::atomic<bool> prewarm_reader_done{};
+    /// FIX-GTS-468: stored pipelines the workers finished building. The command thread moves
+    /// them from pending_builds into graphics_pipelines (AdoptPrewarmed), where the retention
+    /// trim can release the ones no draw uses; left in pending_builds they were never released.
+    std::mutex prewarm_finished_mutex;
+    std::vector<std::weak_ptr<PipelineBuild>> prewarm_finished;
+    std::atomic<bool> prewarm_finished_any{};
+    /// FIX-GTS-468: adopted stored pipelines no draw has used yet. The first draw that uses
+    /// one stores its key again, as a draw taking it from pending_builds did (PERF-038).
+    /// `order` is the adoption order (about most recently used first): once the precompile is
+    /// done, those past SHADGT_PRECOMPILE_KEEP are released (RetireUnclaimedPrewarm).
+    struct PrewarmUnclaimed {
+        GraphicsPipeline::SerializationSupport sdata;
+        u64 order{};
+    };
+    tsl::robin_map<GraphicsPipelineKey, PrewarmUnclaimed> prewarm_unclaimed;
+    u64 prewarm_adopted{};
+    u64 prewarm_installed{}; ///< FEAT-GTS-470: precompile builds queued, in install order
+    bool PrecompileLibrariesOnly() const;
+    u64 prewarm_dropped{};
+    bool prewarm_settle_dirty{};
+    std::vector<GraphicsPipelineKey> prewarm_settle_queue;
+    u64 prewarm_settled{};
+    void AdoptPrewarmed();
+    void RetireUnclaimedPrewarm(std::vector<std::shared_ptr<const void>>& retired);
+    /// FIX-GTS-468: the shader modules the precompile made (program hash, permutation). Once its
+    /// unused pipelines are retired, the modules no live pipeline uses go back to being stored
+    /// (loaded again on first use), as before the precompile.
+    std::vector<std::pair<u64, size_t>> prewarm_loaded;
+    /// FIX-GTS-468: programs the precompile listed (decoded shader metadata for every stored
+    /// program; a normal start lists only the ones its draws use). Dropped with the modules when
+    /// nothing uses them; a draw lists them from the store again (GetProgram).
+    std::vector<u64> prewarm_programs;
+    void ReleasePrewarmModules();
     /// PERF-076: new graphics pipelines build in the background while their draws are skipped.
     static bool AsyncPipelines();
     static bool WritesMemory(const std::array<const Shader::Info*, MaxShaderStages>& infos);
@@ -679,6 +726,11 @@ private:
                               const Shader::Backend::Bindings& binding, bool insert);
     /// FIX-078 (lookup lock held): queues a translation; false when one with the same inputs is
     /// already queued.
+    /// FEAT-GTS-470: records a stored translation on a draw's first use (record mode).
+    void RecordStoredUse(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
+                         const Shader::ShaderParams& params,
+                         const Shader::RuntimeInfo& runtime_info,
+                         const Shader::Backend::Bindings& start, size_t perm_idx);
     bool QueueTranslation(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
                           const Shader::ShaderParams& params,
                           const Shader::RuntimeInfo& runtime_info,

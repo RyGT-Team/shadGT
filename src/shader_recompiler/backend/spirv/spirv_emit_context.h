@@ -6,7 +6,9 @@
 #include <array>
 #include <functional>
 #include <optional>
+#include <span>
 #include <unordered_map>
+#include <vector>
 #include <sirit/sirit.h>
 
 #include "shader_recompiler/backend/bindings.h"
@@ -390,6 +392,20 @@ public:
     bool IsDirectBuffer(u32 handle) const;
     Id EmitDirectLoad(u32 handle, Id byte_offset, u32 bytes, Id result_type,
                       Id physical_pointer_type, const std::function<Id()>& fallback);
+    /// PERF-GTS-473: one read of a direct-eligible buffer (a byte, short, dword or qword).
+    struct DirectPart {
+        Id byte_offset;
+        u32 bytes;
+        Id result_type;
+        Id physical_pointer_type;
+        std::function<Id()> fallback; ///< the SSBO read; captures by value
+    };
+    /// PERF-GTS-473: reads of one buffer behind a single direct/SSBO branch (one per read
+    /// before). Each read keeps its own bounds check and translation.
+    std::vector<Id> EmitDirectLoads(u32 handle, const std::vector<DirectPart>& parts);
+    /// PERF-GTS-473: whether reads of this buffer may share one branch. Compute reads of a
+    /// scalar-pointer buffer pick the path per read (SSBO prefix), so they keep their own.
+    bool CanGroupDirectLoads(u32 handle) const;
     Id DirectTableWord(u32 index);
     Id DirectTableAddress(u32 index);
     Id DefineDirectTranslate();
@@ -452,5 +468,19 @@ private:
 
     Id GetBufferSize(u32 sharp_idx);
 };
+
+/// PERF-GTS-473: a buffer read of a direct-eligible buffer, split into the reads EmitDirectLoads
+/// makes and the step that builds the instruction's value from their results.
+struct DirectLoadDesc {
+    u32 handle{};
+    std::vector<EmitContext::DirectPart> parts;
+    std::function<Id(std::span<const Id>)> combine;
+};
+
+/// PERF-GTS-473: the handle of a buffer read that EmitDirectLoads can share with the reads around
+/// it, or nullopt (not a read, not direct, or a compute scalar-pointer buffer).
+std::optional<u32> GroupableDirectLoad(const EmitContext& ctx, const IR::Inst& inst);
+/// PERF-GTS-473: emits the address math of a read GroupableDirectLoad accepted, before the branch.
+DirectLoadDesc DescribeDirectLoad(EmitContext& ctx, IR::Inst* inst);
 
 } // namespace Shader::Backend::SPIRV

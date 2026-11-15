@@ -8,7 +8,7 @@ namespace Vulkan {
 // flat grey with dark triangles on an RX 7600 (driver 26.10.1, LLPC). The launcher's "AMD Graphics
 // Fix" option (off by default; an RX 6600 XT failed to build shaders with it on) passes
 // SHADGT_AMD_SINGLE_SAMPLE_BARYCENTRIC: 1, true, on or yes turns it on, any other value off. Unset,
-// it is off (the Vulkan instance sets the default). SHADGT_AMD_EXPLICIT_VERTEX=1 turns it off whatever else is set.
+// the Vulkan instance sets the default: on with an RX 90XX (FEAT-GTS-483), off otherwise. SHADGT_AMD_EXPLICIT_VERTEX=1 turns it off whatever else is set.
 inline bool& AmdBarycentricDefault() {
     static bool on = false;
     return on;

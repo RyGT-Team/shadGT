@@ -152,6 +152,7 @@
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_native_ui.h"
+#include "shader_recompiler/direct_learning.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/image_descriptor.h"
 #include "video_core/texture_cache/sampler.h"
@@ -10407,6 +10408,10 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                     for (size_t i = 0; i < stage.buffers.size(); ++i) {
                         std::memcpy(&table[4 + i * 4], direct_entries[i].data(), 16);
                     }
+                    // PERF-GTS-479: which direct candidates this draw read in place.
+                    Shader::DirectLearning::NoteBind(stage.pgm_hash, direct_entries, [&](u32 slot) {
+                        return stage.buffers[slot].IsDirectEligible();
+                    });
                 }
                 const auto [buffer, offset] = UploadBytes(upload_slot + 2, table,
                                                           words * sizeof(u32), alignment); // OPT-015
@@ -18737,6 +18742,10 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                     for (size_t i = 0; i < stage.buffers.size(); ++i) {
                         std::memcpy(&table[4 + i * 4], direct_entries[i].data(), 16);
                     }
+                    // PERF-GTS-479: which direct candidates this draw read in place.
+                    Shader::DirectLearning::NoteBind(stage.pgm_hash, direct_entries, [&](u32 slot) {
+                        return stage.buffers[slot].IsDirectEligible();
+                    });
                 }
                 info = upload(table.data(), words * sizeof(u32));
                 break;

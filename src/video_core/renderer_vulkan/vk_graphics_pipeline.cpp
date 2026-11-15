@@ -1159,10 +1159,10 @@ GraphicsPipeline::GraphicsPipeline(
     // does not populate the stage-library cache used when new runtime permutations appear.
     const auto compile_policy = amd_policy
         ? SharedPipelinePolicy::SelectAmd(
-              SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(),preloading),
+              SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(), instance.IsWholePrewarm(), preloading),
               tessellated && (Common::PerfFeatureEnabled(80) || !Mr14SharedTessellationEnabled(false)))
         : SharedPipelinePolicy::Select(
-              SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(),preloading),
+              SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(), instance.IsWholePrewarm(), preloading),
               tessellated && (Common::PerfFeatureEnabled(80) || !Mr14SharedTessellationEnabled(LinkTimeOptimization())),
               tessellated, LinkTimeOptimization(), is_rect_list || is_quad_list);
     // AMD-322 / SHD-001: whether libraries keep link-time data for a second, optimized link.
@@ -1449,6 +1449,12 @@ GraphicsPipeline::GraphicsPipeline(
         library_link->owned_libraries[0] = vk::UniquePipeline{library_handles[0], device};
         library_link->owned_libraries[1] = vk::UniquePipeline{library_handles[3], device};
         const auto libraries_done = std::chrono::steady_clock::now();
+        if (g_pipeline_libraries_only) {
+            // FEAT-GTS-470: the stage libraries are in the driver cache now; the link, AMD's
+            // costly part, is left to the draw that needs this pipeline, if one ever does.
+            link_skipped = true;
+            return;
+        }
 
         const vk::PipelineLibraryCreateInfoKHR link_libraries = {
             .libraryCount = static_cast<u32>(library_handles.size()),
@@ -1550,6 +1556,14 @@ GraphicsPipeline::GraphicsPipeline(
         whole_watch.emplace(debug_str, "whole pipeline compile");
     }
     auto [pipeline_result, pipe] = CreateWithRetries("pipeline", debug_str, [&] {
+        // PERF-GTS-482: AMD keeps no whole pipeline with dynamic vertex input in the driver
+        // cache; the binary store keeps them across launches instead.
+        if (instance.IsPipelineBinaryWholeOnly()) {
+            auto made = PipelineBinaryStore::CreateGraphics(instance, device, pipeline_cache,
+                                                            pipeline_info);
+            return vk::ResultValue<vk::UniquePipeline>{
+                made.result, vk::UniquePipeline{made.value, device}};
+        }
         return device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
     }); // FIX-GT7-101
     whole_watch.reset();

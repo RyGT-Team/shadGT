@@ -115,10 +115,18 @@ void RunWindowThread() {
         g_window_ready = true;
     }
     g_window_cv.notify_all();
-    // Events reach ImGui, which the presenter initializes, so pump only once it exists.
+    // Events reach ImGui, which the presenter initializes, so they are handled only once it
+    // exists. FIX-GTS-474: meanwhile the window's messages are still taken from Windows (SDL
+    // queues them for the loop below), or after 5 s Windows calls it "Not Responding" while the
+    // renderer starts (the manifest merge, a large driver cache).
     {
         std::unique_lock lock{g_window_mutex};
-        g_window_cv.wait(lock, [] { return g_renderer_ready; });
+        while (!g_window_cv.wait_for(lock, std::chrono::milliseconds{50},
+                                     [] { return g_renderer_ready; })) {
+            lock.unlock();
+            SDL_PumpEvents();
+            lock.lock();
+        }
     }
     window.InitTimers();
     while (window.IsOpen()) {
@@ -193,28 +201,32 @@ void StartFirstDrawWatcher() {
 
 // PERF-098: the precompile of stored shaders and pipelines, as a translucent blue bar with
 // shadowed white text near the bottom of the splash screen (and of the game, if it is still
-// going when the game starts drawing).
-void DrawPrecompileProgress() {
+// going when the game starts drawing).// FEAT-GTS-469: it also counts the manifest pre-translation (PERF-GT7-117), which runs in the
+// background; before, nothing showed that it ran.
+struct ProgressBarState {
+    std::chrono::steady_clock::time_point finished{};
+    bool shown = false;
+};
+
+static void DrawProgressBar(const Vulkan::PrecompileProgress& progress, ProgressBarState& state,
+                            const char* doing, const char* done_text, float height_fraction) {
     using Clock = std::chrono::steady_clock;
-    const auto progress = Vulkan::GetPrecompileProgress();
-    static Clock::time_point finished{};
-    static bool shown = false;
     if (progress.total == 0) {
         return;
     }
     float alpha = 1.0f;
     if (progress.active) {
-        shown = true;
-        finished = {};
+        state.shown = true;
+        state.finished = {};
     } else {
-        if (!shown) {
-            return; // nothing was left to build: no bar at all
+        if (!state.shown) {
+            return; // nothing was left to do: no bar at all
         }
-        if (finished == Clock::time_point{}) {
-            finished = Clock::now();
+        if (state.finished == Clock::time_point{}) {
+            state.finished = Clock::now();
         }
         // "Done" stays a moment, then fades out.
-        const float since = std::chrono::duration<float>(Clock::now() - finished).count();
+        const float since = std::chrono::duration<float>(Clock::now() - state.finished).count();
         alpha = std::clamp(1.0f - (since - 1.5f) / 0.5f, 0.0f, 1.0f);
         if (alpha <= 0.0f) {
             return;
@@ -223,20 +235,22 @@ void DrawPrecompileProgress() {
     const auto a = [alpha](float value) { return static_cast<int>(value * alpha); };
     const float fraction =
         progress.total ? float(progress.done) / float(progress.total) : 0.0f;
-    char text[96];
-    if (progress.active) {
-        std::snprintf(text, sizeof(text), "Precompiling shaders   %llu / %llu   %.0f%%",
+    char text[128];
+    if (progress.active && progress.total <= 1) {
+        std::snprintf(text, sizeof(text), "%s", doing); // a step without a count (FEAT-GTS-470)
+    } else if (progress.active) {
+        std::snprintf(text, sizeof(text), "%s   %llu / %llu   %.0f%%", doing,
                       static_cast<unsigned long long>(progress.done),
                       static_cast<unsigned long long>(progress.total), fraction * 100.0f);
     } else {
-        std::snprintf(text, sizeof(text), "Shaders ready");
+        std::snprintf(text, sizeof(text), "%s", done_text);
     }
     auto* draw = ImGui::GetForegroundDrawList();
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     const float width = std::clamp(viewport->Size.x * 0.36f, 240.0f, 720.0f);
     const float bar_height = 6.0f;
     const ImVec2 bar_min{viewport->Pos.x + (viewport->Size.x - width) * 0.5f,
-                         viewport->Pos.y + viewport->Size.y * 0.90f};
+                         viewport->Pos.y + viewport->Size.y * height_fraction};
     const ImVec2 bar_max{bar_min.x + width, bar_min.y + bar_height};
     draw->AddRectFilled(bar_min, bar_max, IM_COL32(25, 80, 190, a(70)), bar_height * 0.5f);
     if (fraction > 0.0f) {
@@ -250,6 +264,37 @@ void DrawPrecompileProgress() {
         draw->AddText({at.x + offset.x, at.y + offset.y}, IM_COL32(0, 0, 0, a(150)), text);
     }
     draw->AddText(at, IM_COL32(255, 255, 255, a(235)), text);
+}
+
+void DrawPrecompileProgress() {
+    // FEAT-GTS-469: one bar for the manifest translations and then the stored pipelines the
+    // precompile compiles (it waits for the translations).
+    // FEAT-GTS-470: the second step's count is known only after the translations and the pipeline
+    // import, so the steps are counted one after the other, named, and the bar stays up for as
+    // long as the game is held on the splash screen: before, it reached 100% and said "Shaders
+    // ready" after the translations, while thousands of pipelines were still to be compiled.
+    const auto compile = Vulkan::GetPrecompileProgress();
+    const auto translate = Vulkan::GetPretranslateProgress();
+    const bool held = Vulkan::PrecompileHoldsGame();
+    static bool translated = false; // a translation step ran: the compile step is step 2 of 2
+    static ProgressBarState state;
+    const char* doing = "Compiling shaders";
+    Vulkan::PrecompileProgress shown{1, 1, false};
+    if (translate.active) {
+        translated = translated || held;
+        shown = translate;
+        doing = held ? "Compiling shaders  -  step 1 of 2: translating"
+                     : "Compiling shaders  -  translating";
+    } else if (compile.active) {
+        shown = compile;
+        doing = translated ? "Compiling shaders  -  step 2 of 2: building pipelines"
+                           : "Compiling shaders";
+    } else if (held) {
+        shown = {1, 0, true}; // between the steps: the pipeline import, the listing
+        doing = translated ? "Compiling shaders  -  step 2 of 2: preparing pipelines"
+                           : "Compiling shaders  -  preparing";
+    }
+    DrawProgressBar(shown, state, doing, "Shaders ready", 0.90f);
 }
 
 // PERF-100: while a new shader compiles and the game is held, a translucent notice with a

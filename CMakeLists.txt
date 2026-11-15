@@ -144,6 +144,13 @@ execute_process(COMMAND "${GIT_EXECUTABLE}" status --porcelain --untracked-files
 if(GIT_CHANGES)
     string(APPEND GIT_DESC "-dirty")
 endif()
+# FIX-GTS-419: a GT Sport package build is described by its release tag. Those tags are RyGTS's
+# (gt-sport-<date>, RyGTS AGENTS.md) and shadGT's history has none, so RyGTS's CI passes its own
+# describe (gt-sport-2026-11-15-3-g1a2b3c4d) in SHADGT_BUILD_DESCRIBE. The watermark and the
+# launcher's renderer line show it; a build without it keeps shadGT's commit, as above.
+if(DEFINED ENV{SHADGT_BUILD_DESCRIBE} AND "$ENV{SHADGT_BUILD_DESCRIBE}" MATCHES "^gt-sport-[0-9A-Za-z._-]+$")
+    set(GIT_DESC "$ENV{SHADGT_BUILD_DESCRIBE}")
+endif()
 # Each commit runs CMake again, so the description stays true: the module above doesn't see the HEAD
 # of a git worktree, and "ninja: no work to do" left the last commit's description in the build.
 execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse --path-format=absolute --git-path logs/HEAD

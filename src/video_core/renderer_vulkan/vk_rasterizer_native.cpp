@@ -19758,7 +19758,16 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
     const u32 depth = desc.dim == Native::Rhi::ImageDim::D3 ? std::max(desc.depth, 1u) : 1u;
     const u32 mips = rows ? 1u : std::max(desc.mips, 1u);
     const u32 height0 = rows ? std::min(rows, desc.height) : desc.height;
-    const u32 row_layers = std::clamp(first_layers, 1u, layers);
+    // FIX-GT7-187: a partial fill (`rows`) of a 3D picture counted one layer in `bytes` and
+    // copied the picture's whole depth: GT7's 120x67x128 volume read 4,116,480 bytes from a
+    // pattern buffer of 1 MB (32,160 bytes counted, times 128 slices). Reading past the buffer
+    // is harmless while what follows it in video memory is alive, and loses the device (device
+    // fault, write invalid, on GT7's title screen and in races while pipelines build) once it
+    // was freed; the slices past the buffer got whatever memory held. Found with the Vulkan
+    // validation layers (VUID-vkCmdCopyBufferToImage-pRegions-00171). A 3D picture's partial
+    // fill now covers `first_layers` slices, as a layered picture's covers its first layers.
+    const bool volume = desc.dim == Native::Rhi::ImageDim::D3;
+    const u32 row_layers = std::clamp(first_layers, 1u, volume ? depth : layers);
     const u64 bytes = u64(desc.width) * height0 * texel * (rows ? row_layers : layers * depth);
     if (info.props.is_bgr_packed_float) {
         lo = VideoCore::PackedFloatToVulkan(lo);
@@ -19775,7 +19784,8 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
     for (u32 m = 0; m < mips; ++m) {
         const u32 w = std::max(desc.width >> m, 1u);
         const u32 h = rows ? height0 : std::max(desc.height >> m, 1u);
-        const u32 d = std::max(depth >> m, 1u);
+        // FIX-GT7-187: the slices counted in `bytes`, not the whole depth.
+        const u32 d = rows && volume ? row_layers : std::max(depth >> m, 1u);
         copies.push_back(vk::BufferImageCopy{
             .bufferOffset = 0,
             .bufferRowLength = w,
@@ -19784,7 +19794,7 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
                                                                 : vk::ImageAspectFlagBits::eColor,
                               .mipLevel = m,
                               .baseArrayLayer = 0,
-                              .layerCount = rows ? row_layers : layers},
+                              .layerCount = rows && !volume ? row_layers : layers},
             .imageOffset = {0, 0, 0},
             .imageExtent = {w, h, d},
         });
@@ -19882,7 +19892,14 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
             info.props.is_volume, Native::WholeLayerPatternSafe(lo, hi, image_texel, layer_stride)) : 0;
         const bool filled_layers = whole_layers && FillImage(entry, lo, hi, image->Desc().height,
                                                               whole_layers);
-        if (filled_layers || (rows != 0 && FillImage(entry, lo, hi, rows))) {
+        // FIX-GT7-187: a 3D picture: the whole slices the fill covers (at least one).
+        u32 slices = 1;
+        if (image && image->Desc().dim == Native::Rhi::ImageDim::D3 && rows == info.size.height) {
+            const u64 slice_bytes = row_bytes * info.size.height;
+            slices = u32(std::clamp<u64>(slice_bytes ? entry.rewrite_bytes / slice_bytes : 1, 1,
+                                         std::max(image->Desc().depth, 1u)));
+        }
+        if (filled_layers || (rows != 0 && FillImage(entry, lo, hi, rows, slices))) {
             NATIVE_DIAGNOSTIC(++stats.rewrite_partial);
         }
     } else if (rewrite == Rewrite::Clear && !depth_value && !color_zero) {

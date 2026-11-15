@@ -22,9 +22,10 @@ inline bool AmdPipelinePolicyEnabled(unsigned vendor_id) {
     }();
     return allowed && vendor_id == 0x1002;
 }
-inline bool SharedPipelineLibrariesEnabled(bool supported, bool preloading) {
+// PERF-GTS-486: whole_prewarm is Instance::IsWholePrewarm() (SHADGT_PREWARM_WHOLE_PIPELINES,
+// by default on RDNA2 with whole-pipeline binaries).
+inline bool SharedPipelineLibrariesEnabled(bool supported, bool whole_prewarm, bool preloading) {
     static const bool no_libraries = [] {const char* p=std::getenv("SHADGT_NO_LIBRARIES");return p&&p[0]=='1';}();
-    static const bool whole_prewarm = [] {const char* p=std::getenv("SHADGT_PREWARM_WHOLE_PIPELINES");return p&&p[0]=='1';}();
     return supported && !no_libraries && !(preloading && whole_prewarm);
 }
 // Relax only splash-screen dispatch admission. The driver-call semaphore remains

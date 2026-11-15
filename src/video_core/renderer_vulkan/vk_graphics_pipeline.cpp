@@ -1101,10 +1101,10 @@ GraphicsPipeline::GraphicsPipeline(
     // does not populate the stage-library cache used when new runtime permutations appear.
     const auto compile_policy = amd_policy
         ? SharedPipelinePolicy::SelectAmd(
-              SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(),preloading),
+              SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(), instance.IsWholePrewarm(), preloading),
               tessellated && (Common::PerfFeatureEnabled(80) || !Mr14SharedTessellationEnabled(false)))
         : SharedPipelinePolicy::Select(
-              SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(),preloading),
+              SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(), instance.IsWholePrewarm(), preloading),
               tessellated && (Common::PerfFeatureEnabled(80) || !Mr14SharedTessellationEnabled(LinkTimeOptimization())),
               tessellated, LinkTimeOptimization(), is_rect_list || is_quad_list);
     // AMD-322 / SHD-001: whether libraries keep link-time data for a second, optimized link.

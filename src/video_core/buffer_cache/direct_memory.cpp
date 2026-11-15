@@ -612,6 +612,9 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
     trace.Next(0, address, size);
     // Imported-view destruction is queued at OnUnmap to the scheduler's
     // GPU-gated background runner. Never drain old imports on a draw's bind path.
+    // PERF-GT7-129 (port): this already keeps view releases off the recorder, always, so
+    // shadgt7's switch for it (SHADGT_D1_ASYNC_RELEASE) is gone. PERF-GT7-002 (port): its
+    // per-thread memo of imported ranges is imported_coverage below, which needs no lock.
     if (address > ImportedPageCoverage<>::Limit ||
         size > ImportedPageCoverage<>::Limit - address) return false;
     const VAddr end = address + size;

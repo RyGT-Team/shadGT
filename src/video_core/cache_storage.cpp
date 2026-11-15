@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <stdexcept>
+#include "common/diagnostics.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/polyfill_thread.h"
@@ -169,6 +170,12 @@ void DataBase::Open() {
                     if (const char* env = std::getenv(name); env && *env) {
                         parts += fmt::format(", {}={}", name, env[0]);
                     }
+                }
+                // DIAG-230 (port): without SHADGT_MANUAL_INTERP, the diagnosis switch changes
+                // NVIDIA's translations (vk_pipeline_cache.cpp); they are kept apart.
+                if (const char* manual = std::getenv("SHADGT_MANUAL_INTERP");
+                    !(manual && *manual) && Common::DiagEnv("SHADGT_DIAG_NO_MANUAL_INTERP")) {
+                    parts += ", no manual interp";
                 }
                 // FIX-GTS-441: translations with the invariant position (the default) are kept
                 // apart from those made without it.

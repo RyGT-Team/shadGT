@@ -701,6 +701,8 @@ private:
         std::chrono::steady_clock::time_point ready_since{};
         std::chrono::steady_clock::time_point retry_after{};
         std::chrono::steady_clock::time_point queued_at{};
+        u32 diag_id{};     ///< DIAG-GT7-073 (port)
+        bool diag_ahead{}; ///< DIAG-GT7-073 (port): queued by a read-ahead state
         bool required{}; // protected by the translation queue mutex until claimed
         bool retry_direct_only{}; // fixed before the job is published to workers
         bool cancelled{}; // published before done

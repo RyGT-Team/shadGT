@@ -680,6 +680,16 @@ extern "C" __declspec(dllexport) int RytyTestOwnedTranslationInputs() {
     return cases;
 }
 
+// DIAG-GT7-073 (port, diagnosis, SHADGT_DIAG_TRANSLATE_JOBS=1): each background translation,
+// and why a finished one did not match the lookup that tried it.
+static bool TranslateJobsDiag() {
+    static const bool enabled = [] {
+        const char* env = Common::DiagEnv("SHADGT_DIAG_TRANSLATE_JOBS");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+
 class PipelineCache::TranslateWorkers {
 public:
     TranslateWorkers(const Shader::Profile& profile_, vk::Device device_, u32 count, bool keep_code_)
@@ -819,6 +829,20 @@ private:
             info->resource_usage_known = false;
         }
         job.module = CompileSPV(job.spv, device, keep_code);
+        if (TranslateJobsDiag()) { // DIAG-GT7-073 (port)
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-GT7-073: translated #{} age {:.0f} ms ahead {} {:#x} stage {} start "
+                        "{}/{}, {} code words, spv {} words {:#x}, runtime {:#x}, user data {:#x}",
+                        job.diag_id,
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                                  job.queued_at)
+                            .count(),
+                        job.diag_ahead, job.hash, u32(job.hw_stage), job.start.unified,
+                        job.start.buffer, job.code.size(), job.spv.size(),
+                        XXH3_64bits(job.spv.data(), job.spv.size() * sizeof(u32)),
+                        XXH3_64bits(&job.runtime_info, sizeof(job.runtime_info)),
+                        XXH3_64bits(job.user_data.data(), sizeof(job.user_data)));
+        }
 #ifndef NDEBUG
         job.translate_ms +=
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
@@ -1344,7 +1368,19 @@ bool PipelineCache::ReadsVertexValues(const AmdGpu::ShaderProgram& program) {
         }
     }
     std::scoped_lock lk{vertex_value_mutex};
-    vertex_value_programs.emplace(address, found);
+    if (vertex_value_programs.emplace(address, found).second) {
+        // DIAG-222 (port, diagnosis, SHADGT_DIAG_BARY_COUNT): how many pixel shaders read
+        // per-vertex values; counted under the mutex, on any GPU (see BuildRuntimeInfo).
+        static u32 programs = 0, matching = 0;
+        ++programs;
+        matching += found;
+        static const bool diag = Common::DiagEnv("SHADGT_DIAG_BARY_COUNT") != nullptr;
+        if (diag && (found || programs % 100 == 0)) {
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-222: {} of {} pixel shaders read vertex values ({:#x}{})",
+                        matching, programs, params.hash, found ? " does" : "");
+        }
+    }
     return found;
 }
 
@@ -1447,6 +1483,10 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
             S().graphics_key.num_samples, direct_barycentric_requested);
         info.hw.fs.single_sample_barycentric =
             candidate && (all_shaders || ReadsVertexValues(regs.ps_program));
+        static const bool diag_count = Common::DiagEnv("SHADGT_DIAG_BARY_COUNT") != nullptr;
+        if (diag_count) {
+            ReadsVertexValues(regs.ps_program); // DIAG-222 (port): counted on any GPU
+        }
         info.hw.fs.front_face_all_bits = regs.barycentric_control.front_face_all_bits;
         info.hw.fs.quad_sample_mask =
             regs.reg_array[0xa30e] != ~0u || regs.reg_array[0xa30f] != ~0u;
@@ -1575,6 +1615,25 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.sw.tcs.offchip_lds_enable = regs.hs_program.settings.oc_lds_en;
         info.sw.tcs.lds_emulation = u8(TessLdsEmulation(regs));
         info.sw.tcs.num_patches = u8(info.sw.tcs.lds_emulation ? regs.ls_hs_config.num_patches : 0);
+        // DIAG-239 (port, diagnosis, SHADGT_DIAG_TCS_CONFIG): each new LS/HS configuration, 60
+        // lines at most.
+        if (static const bool diag = Common::DiagEnv("SHADGT_DIAG_TCS_CONFIG") != nullptr; diag) {
+            static std::mutex seen_mutex;
+            static std::vector<u32> seen;
+            const u32 combo = u32(regs.ls_hs_config.num_patches) |
+                              (u32(regs.ls_hs_config.hs_input_control_points) << 8) |
+                              (u32(regs.ls_hs_config.hs_output_control_points) << 16);
+            std::scoped_lock lock{seen_mutex};
+            if (seen.size() < 60 && std::ranges::find(seen, combo) == seen.end()) {
+                seen.push_back(combo);
+                LOG_WARNING(Render_Vulkan, "DIAG-239: hs patches {} input cp {} output threads {} "
+                            "offchip {} tess type {}",
+                            u32(regs.ls_hs_config.num_patches),
+                            u32(regs.ls_hs_config.hs_input_control_points),
+                            u32(regs.ls_hs_config.hs_output_control_points),
+                            u32(regs.hs_program.settings.oc_lds_en), u32(regs.tess_config.type));
+            }
+        }
         break;
     }
     case SwStage::TessellationEval: {
@@ -2445,13 +2504,16 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         // single-colour triangles (hills at Fuji on an RX 6600 XT). AMD's older compiler keeps
         // that path (AMD-314), so it does GCN's P1/P2 arithmetic by hand, as 217d4011 does for
         // the KHR path. SHADGT_MANUAL_INTERP=0/1 overrides.
+        // DIAG-230 (port, diagnosis): SHADGT_DIAG_NO_MANUAL_INTERP turns off NVIDIA's default
+        // hand-made interpolation (its translations get a store of their own, cache_storage.cpp).
         .needs_manual_interpolation =
             [&] {
                 if (const char* env = std::getenv("SHADGT_MANUAL_INTERP"); env && *env) {
                     return env[0] != '0';
                 }
                 return (instance.IsFragmentShaderBarycentricSupported() &&
-                        instance.GetDriverID() == vk::DriverId::eNvidiaProprietary) ||
+                        instance.GetDriverID() == vk::DriverId::eNvidiaProprietary &&
+                        !Common::DiagEnv("SHADGT_DIAG_NO_MANUAL_INTERP")) ||
                        (instance.IsAmdShaderExplicitVertexParameterSupported() &&
                         instance.IsAmdLegacyShaderCompiler());
             }(),
@@ -4733,6 +4795,25 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     }
     if (!key_valid) {
         return nullptr;
+    }
+    {
+        // DIAG-225 (port, diagnosis, SHADGT_DIAG_AA_MASK): draws with no pixel shader while
+        // PA_SC_AA_MASK hides pixels (the quad sample mask is applied in the pixel shader only).
+        static const bool diag = Common::DiagEnv("SHADGT_DIAG_AA_MASK") != nullptr;
+        const auto& r = Regs();
+        if (diag && !S().infos[u32(Shader::SwStage::Fragment)] &&
+            (r.reg_array[0xa30e] != ~0u || r.reg_array[0xa30f] != ~0u)) {
+            static std::atomic<u32> counter{};
+            const u32 count = ++counter;
+            if (count <= 30 || count % 500 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "DIAG-225: draw {} with no pixel shader under AA mask {:08x} {:08x}, "
+                            "depth write {}, depth test {}",
+                            count, r.reg_array[0xa30e], r.reg_array[0xa30f],
+                            u32(r.depth_control.depth_write_enable),
+                            u32(r.depth_control.depth_enable));
+            }
+        }
     }
 #ifndef NDEBUG
     // A normal key may be replaced by a legacy fallback before PipelineForCurrentKey.
@@ -8077,6 +8158,9 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
     } catch (const std::bad_alloc&) {
         return false;
     }
+    static std::atomic<u32> diag_next_id{}; // DIAG-GT7-073 (port)
+    job->diag_id = ++diag_next_id;
+    job->diag_ahead = regs_override != nullptr;
     jobs.push_back(job);
     try {
         translate_workers->Queue(job);
@@ -8161,10 +8245,27 @@ bool PipelineCache::TakeReadyTranslation(HwStage hw_stage, SwStage sw_stage, u64
         // FIX-GT7-024: the lookup's on the right, as GetProgram compares (its bitsets decide).
         if (job->hw_stage != hw_stage || job->sw_stage != sw_stage ||
             job->spec != Shader::StageSpecialization(info, runtime_info, profile, binding)) {
+            if (TranslateJobsDiag() && job->hw_stage == hw_stage && job->sw_stage == sw_stage) {
+                // DIAG-GT7-073 (port): why it is not this lookup's.
+                static std::atomic<u32> logged{};
+                if (++logged <= 3000) {
+                    u32 index{};
+                    const auto spec =
+                        Shader::StageSpecialization(info, runtime_info, profile, binding);
+                    const char* reason = job->spec.FirstDifference(spec, index);
+                    LOG_WARNING(Render_Vulkan, "DIAG-GT7-073: #{} not for this {}: {}[{}]",
+                                job->diag_id, regs_override != nullptr ? "read-ahead" : "draw",
+                                reason ? reason : "none", index);
+                }
+            }
             continue;
         }
         if (!insert) {
             return true;
+        }
+        if (TranslateJobsDiag()) {
+            LOG_WARNING(Render_Vulkan, "DIAG-GT7-073: #{} taken by a {}", job->diag_id,
+                        regs_override != nullptr ? "read-ahead" : "draw");
         }
 #ifndef NDEBUG
         LogNewPermutation(program, hw_stage, params, runtime_info, binding); // DIAG-GT7-013 (port)
@@ -8289,7 +8390,12 @@ bool PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
         if (!job->done) {
             return false;
         }
-        if (job->cancelled) return true;
+        if (job->cancelled) {
+            if (TranslateJobsDiag()) {
+                LOG_WARNING(Render_Vulkan, "DIAG-GT7-073: #{} too old", job->diag_id);
+            }
+            return true;
+        }
         if (!job->info || !job->module) {
             if (!job->failure_reported) {
 #ifndef NDEBUG
@@ -8320,6 +8426,9 @@ bool PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
     std::erase_if(ready, [&](const std::shared_ptr<TranslateJob>& job) {
         if (now - job->ready_since < std::chrono::seconds{30} && ready.size() <= 32) {
             return false;
+        }
+        if (TranslateJobsDiag()) {
+            LOG_WARNING(Render_Vulkan, "DIAG-GT7-073: #{} expired", job->diag_id); // (port)
         }
         ForgetModuleCode(instance.GetDevice(), job->module);
         instance.GetDevice().destroyShaderModule(job->module);

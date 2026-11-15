@@ -404,6 +404,12 @@ public:
                GetModelName().find("Radeon RX 7") != std::string_view::npos;
     }
 
+    /// FEAT-GTS-483: a Radeon RX 90XX (RX 9060, RX 9070; RDNA4), on any driver.
+    bool IsAmdRx90() const {
+        return properties.vendorID == 0x1002 &&
+               GetModelName().find("Radeon RX 90") != std::string_view::npos;
+    }
+
     /// AMD-306: pixel shaders can ask for whole quads and maximal reconvergence
     /// (VK_KHR_shader_quad_control with VK_KHR_shader_maximal_reconvergence).
     bool IsQuadDerivativesSupported() const {

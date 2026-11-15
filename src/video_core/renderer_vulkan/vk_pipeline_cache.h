@@ -729,6 +729,13 @@ private:
                               Program& program, const Shader::ShaderParams& params,
                               const Shader::RuntimeInfo& runtime_info,
                               const Shader::Backend::Bindings& binding, bool insert);
+#ifndef NDEBUG
+    /// DIAG-GT7-013 (port, Debug builds): why a worker's translation becomes a new permutation.
+    void LogNewPermutation(const Program& program, Shader::HwStage hw_stage,
+                           const Shader::ShaderParams& params,
+                           const Shader::RuntimeInfo& runtime_info,
+                           const Shader::Backend::Bindings& binding);
+#endif
     /// FIX-078 (lookup lock held): queues a translation; false when one with the same inputs is
     /// already queued.
     /// FEAT-GTS-470: records a stored translation on a draw's first use (record mode).

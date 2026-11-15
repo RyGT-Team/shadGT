@@ -8090,6 +8090,57 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
     return true;
 }
 
+#ifndef NDEBUG
+void PipelineCache::LogNewPermutation(const Program& program, Shader::HwStage hw_stage,
+                                      const Shader::ShaderParams& params,
+                                      const Shader::RuntimeInfo& runtime_info,
+                                      const Shader::Backend::Bindings& binding) {
+    // DIAG-GT7-013 (port): why a known program gets a new permutation from a worker's translation
+    // (each one is a pipeline compile, up to a second, its draws skipped meanwhile), for a draw
+    // or a read-ahead state: how the lookup differs from each existing permutation, with the V#
+    // of a differing buffer. GetProgram's own "New permutation" line covers the translations
+    // made on this thread. Each permutation's info is set to this lookup's user data, as
+    // GetProgram's match does.
+    if (std::ranges::none_of(program.modules, [](const auto& m) { return bool(m.info); })) {
+        return;
+    }
+    static u64 events = 0;
+    const u64 event = ++events;
+    if (event > 80 && event % 100 != 0) {
+        return;
+    }
+    std::string reasons;
+    u32 listed = 0;
+    for (size_t perm_idx = 0; perm_idx < program.modules.size() && listed < 8; ++perm_idx) {
+        const auto& permutation = program.modules[perm_idx];
+        if (!permutation.info) {
+            continue;
+        }
+        ++listed;
+        auto& info = *permutation.info;
+        info.pgm_base = params.Base();
+        info.user_data = params.user_data;
+        info.RefreshFlatBuf();
+        const auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+        u32 index{};
+        const char* reason = permutation.spec.FirstDifference(spec, index);
+        reasons += fmt::format(" {}:{}[{}]", perm_idx, reason ? reason : "none", index);
+        if (reason && std::string_view{reason}.starts_with("buffer") &&
+            index < info.buffers.size()) {
+            const auto sharp = info.buffers[index].GetSharp(info);
+            std::array<u32, 4> words{};
+            std::memcpy(words.data(), &sharp, sizeof(words));
+            reasons += fmt::format("(V# {:08x} {:08x} {:08x} {:08x})", words[0], words[1],
+                                   words[2], words[3]);
+        }
+    }
+    LOG_WARNING(Render_Vulkan,
+                "DIAG-GT7-013: new permutation {} of {}_{:#x} for {}; existing ones differ in:{}",
+                event, hw_stage, params.hash, regs_override ? "a read-ahead state" : "a draw",
+                reasons);
+}
+#endif
+
 bool PipelineCache::TakeReadyTranslation(HwStage hw_stage, SwStage sw_stage, u64 hash,
                                          Program& program,
                                          const Shader::ShaderParams& params,
@@ -8115,6 +8166,9 @@ bool PipelineCache::TakeReadyTranslation(HwStage hw_stage, SwStage sw_stage, u64
         if (!insert) {
             return true;
         }
+#ifndef NDEBUG
+        LogNewPermutation(program, hw_stage, params, runtime_info, binding); // DIAG-GT7-013 (port)
+#endif
         size_t perm_idx = program.modules.size();
         if (const auto end = stored_perm_end.find(hash); end != stored_perm_end.end()) {
             perm_idx = std::max(perm_idx, end->second);

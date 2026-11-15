@@ -1772,6 +1772,58 @@ void InstallGt7RaceSignal(u8* base) {
     std::fprintf(stderr, "[patch] GAME-002 GT7 race signal applied (org_race's gate)\n");
 }
 
+// GAME-003: GT7 culls its scenery with the code GT Sport uses. GT7 has two implementations of
+// PDIEXT::OcclusionCulling: OcclusionCullingCS, compute shaders whose answers (each object's
+// visibility state) the game's CPU reads back to choose what it draws, and OcclusionCullingPS4,
+// on the CPU, the only one GTSport.exe has. eboot 0x363f2b0, called twice by the factory that
+// makes the object, is the only reader of the command-line option occlusionculling_mode: absent or
+// "cs" returns 1 (compute), "cpu" returns 0 (CPU). With the compute one, the game's scenery list
+// changed for one frame now and then on the merged renderer (groups of scenery gone or other ones
+// drawn, up to 2-3 times a second), and the states it reads lie in a range the renderer holds in a
+// region and writes back (Nsight capture of 2026-11-15 17:31: every write-back recorded, the bad
+// frame's included); the renderer's fault was not found. With occlusionculling_mode=cpu, ten
+// sessions in a row without it. The "mov eax, 1" becomes "mov eax, 0": the same choice in the
+// game's code, whatever its command line says, so GT7 culls like GT Sport and its CPU no longer
+// reads visibility answers from the GPU. Other versions (other bytes) keep the game's own choice,
+// with one line. SHADGT_GT7_OCCLUSION=gpu: the game's own choice. Played on an RTX 4070 and a
+// Ryzen 7 8700G (16 threads) only; the cost on CPUs with fewer threads is not measured.
+constexpr u64 kGt7OcclusionMode = 0x363f2b0;
+constexpr u8 kGt7OcclusionModeCode[] = {
+    0x55, 0x48, 0x89, 0xe5, 0x53, 0x48, 0x83, 0xec, 0x28, 0x48, 0x8b, 0x1d,
+    0x20, 0xfa, 0xf2, 0x01, 0x48, 0x8d, 0x3d, 0xff, 0xd9, 0xbe, 0x00, 0x48,
+    0x8d, 0x75, 0xd0, 0xba, 0x20, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x03, 0x48,
+    0x89, 0x45, 0xf0, 0xe8, 0x64, 0xb6, 0xd3, 0xff, 0x85, 0xc0, 0x75, 0x1c,
+    0xb8, 0x01, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x0b, 0x48, 0x3b, 0x4d, 0xf0,
+    0x75, 0x07, 0x48, 0x83, 0xc4, 0x28, 0x5b, 0x5d, 0xc3, 0xe8, 0xa6, 0x96,
+    0x71, 0x00, 0x0f, 0x0b, 0xb8, 0x63, 0x73, 0x00, 0x00, 0x33, 0x45, 0xd0,
+    0x0f, 0xb6, 0x4d, 0xd2, 0x66, 0x09, 0xc1, 0x74, 0xd3, 0x31, 0xc0, 0x81,
+    0x7d, 0xd0, 0x63, 0x70, 0x75, 0x00, 0x75, 0xc8, 0xeb, 0xcb};
+constexpr u64 kGt7OcclusionModeOne = 0x31; // the 1 of "mov eax, 1"
+
+void InstallGt7CpuOcclusion(u8* base) {
+    const u64 rva = kGt7OcclusionMode + kTextRvaShift;
+    const u8* const code = base + rva;
+    if (!ReadableRange(code, sizeof(kGt7OcclusionModeCode)) ||
+        std::memcmp(code, kGt7OcclusionModeCode, sizeof(kGt7OcclusionModeCode)) != 0) {
+        // GT Sport, or a GT7 version this address is not for.
+        char name[MAX_PATH]{};
+        GetModuleFileNameA(nullptr, name, sizeof(name));
+        if (std::string_view{name}.ends_with("GT7.exe")) {
+            std::fprintf(stderr, "[patch] GAME-003: the occlusion choice is not where version 1.71 "
+                                 "has it, GT7 picks its occlusion culling itself\n");
+        }
+        return;
+    }
+    const char* env = std::getenv("SHADGT_GT7_OCCLUSION");
+    if (env && std::string_view{env} == "gpu") {
+        std::fprintf(stderr, "[patch] GAME-003: off (SHADGT_GT7_OCCLUSION=gpu), GT7 picks its "
+                             "occlusion culling itself\n");
+        return;
+    }
+    Apply(base, Patch{rva + kGt7OcclusionModeOne, {0x01}, {0x00},
+                      "GAME-003 GT7 culls its scenery on the CPU, as GT Sport does"});
+}
+
 void InstallMiscHooks(u8* base) {
 #ifndef NDEBUG
     const char* diag = Common::DiagEnv("SHADGT_ENV_DIAG");
@@ -3703,6 +3755,7 @@ void RytyApplyGamePatches() {
     InstallScriptPatches(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallGt7ScriptDump(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // DIAG-GT7-043
     InstallGt7RaceSignal(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // GAME-002
+    InstallGt7CpuOcclusion(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // GAME-003
     Gt7Cipher::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));     // PERF-GT7-113
     Gt7RaceContextGuard::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // FIX-GT7-162
 #ifndef NDEBUG

@@ -1668,6 +1668,110 @@ void InstallGt7ScriptDump(u8* base) {
     std::fprintf(stderr, "[patch] DIAG-GT7-043 script reads applied\n");
 }
 
+// GAME-002: GT7 can raise the race flag (RytyGtsInRace, FIX-110) as GT Sport does, so that both
+// games run the same race code instead of GT7 staying in the menus' code for ever. GT Sport raises
+// it when the game loads a race_* project script (GTS-003). GT7's races are script applications too
+// (gt7/menu/app/race_single, race_grand_prix, race_replay...), but it loads its whole script package
+// at boot, so a load hook cannot tell which one runs. The flag comes from the game's own state
+// instead: the Organizer's per-frame "org_race" module (GTFramework::Organizer::Impl::initialize's
+// $_7, eboot 0x1e9a5d0 in version 1.71; GT Sport has the same module) does its work only when its
+// gate is open: G = [[Impl+0x2558]+0x18], G+0x74 set and G+0x77 clear. Read on a PS4 Pro at 80 Hz
+// (2026-11-14), the gate opens at the entry of an event and stays open for the whole session
+// (pre-race screen, race, replay), and is closed at the menus. The module's entry is hooked: the
+// gate is read on the game's own thread, each frame it runs. Whether the module runs at the menus
+// was not observed, so the flag also falls when the module has not run for five seconds (one
+// second fell during the stalls of a race's loading and countdown). Another version of the game
+// (other bytes at the entry) keeps today's behaviour, with one line.
+//
+// Only g_in_race is raised: g_race_session and g_project_hooks stay GT Sport's (the first drives
+// writes at GT Sport addresses, the second would make GT7's menus wait for their pipelines, see
+// FIX-GT7-140). In GT7's usual configuration (keep going, native renderer) the one thing the flag
+// changes is Rasterizer::SelectsPipelinesAhead(), which shadgt7 always had on: about 31 ms a
+// frame becomes 22 on a hand-played Dragon Trail race (RTX 4070 only; shadgt7 itself: 17.5).
+//
+// OFF by default, SHADGT_GT7_RACE_SIGNAL=1 turns it on: with it, while a race's pipelines
+// build, groups of scenery draws are left out for single frames (the scenery flickers two or
+// three times a second; cause not found yet), and it was only run with retired objects kept
+// longer than this branch keeps them (the device loss of GT7's title screen, not fixed).
+constexpr u64 kGt7OrgRace = 0x1e9a5d0;
+constexpr u8 kGt7OrgRaceStart[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
+                                   0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x18};
+using OrgRaceFn = void(PS4_SYSV_ABI*)(void*);
+OrgRaceFn g_gt7_org_race = nullptr;
+std::atomic<u64> g_gt7_org_race_ms{0};
+
+void NoteGt7Race(bool race, const char* why) {
+    if (g_in_race.exchange(race) == race) {
+        return;
+    }
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    std::fprintf(stderr, "[patch] GAME-002 %02d:%02d:%02d.%03d GT7 %s (%s)\n", now.wHour,
+                 now.wMinute, now.wSecond, now.wMilliseconds,
+                 race ? "in a race: the race code runs" : "at the menus", why);
+}
+
+void PS4_SYSV_ABI Gt7OrgRaceHook(void* self) {
+    // As the module reads it: Impl = [self+8], G = [[Impl+0x2558]+0x18].
+    const u8* const impl = *reinterpret_cast<u8* const*>(static_cast<u8*>(self) + 8);
+    const u8* const holder = *reinterpret_cast<u8* const*>(impl + 0x2558);
+    const u8* const gate = *reinterpret_cast<u8* const*>(holder + 0x18);
+    const bool open = gate[0x74] != 0 && gate[0x77] == 0;
+    g_gt7_org_race_ms.store(GetTickCount64(), std::memory_order_relaxed);
+    NoteGt7Race(open, open ? "org_race's gate is open" : "org_race's gate is closed");
+    g_gt7_org_race(self);
+}
+
+void InstallGt7RaceSignal(u8* base) {
+    const char* env = std::getenv("SHADGT_GT7_RACE_SIGNAL");
+    if (!(env && env[0] == '1')) {
+        return;
+    }
+    u8* const entry = base + kGt7OrgRace + kTextRvaShift;
+    constexpr size_t kMoved = sizeof(kGt7OrgRaceStart);
+    if (std::memcmp(entry, kGt7OrgRaceStart, kMoved) != 0) {
+        // GT Sport, or a GT7 version this address is not for.
+        std::fprintf(stderr, "[patch] GAME-002: org_race is not where GT7 1.71 has it, the race "
+                             "flag is not raised\n");
+        return;
+    }
+    u8* const stubs = AllocNear(base);
+    if (!stubs) {
+        std::fprintf(stderr, "[patch] GAME-002: no memory near the game's code for the hook\n");
+        return;
+    }
+    // The entry's first instructions move to a trampoline; they don't depend on where they run.
+    const u8 jump[6] = {0xff, 0x25, 0, 0, 0, 0}; // jmp qword ptr [rip]
+    std::memcpy(stubs, entry, kMoved);
+    std::memcpy(stubs + kMoved, jump, 6);
+    const u8* const resume = entry + kMoved;
+    std::memcpy(stubs + kMoved + 6, &resume, 8);
+    FlushInstructionCache(GetCurrentProcess(), stubs, kMoved + 14);
+    g_gt7_org_race = reinterpret_cast<OrgRaceFn>(stubs);
+    DWORD old_protect = 0;
+    if (!VirtualProtect(entry, kMoved, PAGE_EXECUTE_READWRITE, &old_protect)) {
+        return;
+    }
+    const void* const hook = reinterpret_cast<void*>(&Gt7OrgRaceHook);
+    std::memcpy(entry, jump, 6);
+    std::memcpy(entry + 6, &hook, 8);
+    std::memset(entry + 14, 0x90, kMoved - 14);
+    DWORD ignored = 0;
+    VirtualProtect(entry, kMoved, old_protect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), entry, kMoved);
+    // The flag falls when the module stops running.
+    std::thread([] {
+        for (;;) {
+            Sleep(250);
+            const u64 last = g_gt7_org_race_ms.load(std::memory_order_relaxed);
+            if (last != 0 && GetTickCount64() - last > 5000) {
+                NoteGt7Race(false, "org_race has not run for five seconds");
+            }
+        }
+    }).detach();
+    std::fprintf(stderr, "[patch] GAME-002 GT7 race signal applied (org_race's gate)\n");
+}
+
 void InstallMiscHooks(u8* base) {
 #ifndef NDEBUG
     const char* diag = Common::DiagEnv("SHADGT_ENV_DIAG");
@@ -3464,6 +3568,7 @@ void RytyApplyGamePatches() {
     InstallLewisChallenge(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallScriptPatches(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallGt7ScriptDump(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // DIAG-GT7-043
+    InstallGt7RaceSignal(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // GAME-002
     Gt7Cipher::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));     // PERF-GT7-113
 #ifndef NDEBUG
     InstallTextEntryDiag(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));

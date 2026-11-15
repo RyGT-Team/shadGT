@@ -989,6 +989,8 @@ public:
     }
     ~PipelineBuildWorkers() {
         if (catch_up) SetCatchUpPolicy(false);
+        if (backlog) Common::SetCompileBacklog(false); // FIX-GT7-106 (port)
+        if (in_play) Common::SetCompileInPlay(false);  // FIX-GT7-109 (port)
         if (boost_wide) Common::SetCompileCoresWide(false); // FEAT-GTS-470
         for (auto& thread : threads) {
             thread.request_stop();
@@ -1029,24 +1031,42 @@ public:
     }
     static u32 UsualWidth() { return NumWorkers(); }
     void SetPace(u32 limit) { queue.SetReadAheadLimit(limit); }
+    // SetCatchUp, SetBacklog and SetInPlay are called from UpdateCatchUp only (catch_up_mutex).
     bool SetCatchUp(bool on) {
         if (on == catch_up) return true;
         if (on) {
-            const u32 width = std::max(NumWorkers(), std::min(8u, StartupWorkers()));
-            if (!TryGrowCompileWorkers(threads, width, [this] {
-                    threads.emplace_back([this](std::stop_token stop) { Work(stop); });
-                })) {
+            if (!GrowExtraWorkers()) {
                 LOG_WARNING(Render_Vulkan, "Catch-up workers unavailable; retaining normal admission");
                 return false;
             }
             SetCatchUpPolicy(true);
-            queue.SetForegroundLimit(width);
+            catch_up = true;
+            ApplyLimit();
         } else {
-            queue.SetForegroundLimit(NumWorkers());
+            catch_up = false;
+            ApplyLimit();
             SetCatchUpPolicy(false);
         }
-        catch_up = on;
         return true;
+    }
+    /// FIX-GT7-106 (port): many draws on screen wait for their pipelines (outside play): as wide
+    /// as a catch-up, on every core below normal priority (Common::SetCompileBacklog).
+    bool SetBacklog(bool on) {
+        if (on == backlog) return true;
+        if (on && !GrowExtraWorkers()) return false;
+        backlog = on;
+        ApplyLimit();
+        Common::SetCompileBacklog(on);
+        return true;
+    }
+    /// FIX-GT7-109 (port): in play (a race), no more than PlayWidth builds at once, whatever
+    /// waits, and the driver's compiler threads stay on the compile cores.
+    void SetInPlay(bool on) {
+        if (!NarrowInPlay()) on = false;
+        if (on == in_play) return;
+        in_play = on;
+        ApplyLimit();
+        Common::SetCompileInPlay(on);
     }
     bool Busy() { return queue.Busy(); }
 
@@ -1065,6 +1085,44 @@ private:
         }();
         if (low) Common::SetCompileCatchUp(on);
         else Common::SetCompileCoresWide(on);
+    }
+
+    /// PERF-GT7-029: a catch-up's width; FIX-GT7-106 (port): a backlog's too.
+    static u32 ExtraWidth() {
+        return std::max(NumWorkers(), std::min(8u, StartupWorkers()));
+    }
+    bool GrowExtraWorkers() {
+        return TryGrowCompileWorkers(threads, ExtraWidth(), [this] {
+            threads.emplace_back([this](std::stop_token stop) { Work(stop); });
+        });
+    }
+    // FIX-GT7-109 (port): measured on GT7 only. With 4 builds at once in a race the recorder's
+    // submits waited in the driver behind the compiles (frames of 60-115 ms on a new track);
+    // 2 at once did not. GT Sport's races keep going on skipped draws with their own pacing
+    // (PERF-GT7-034's step back) and were never measured narrowed, so the narrowing is GT7's
+    // default only. SHADGT_COMPILE_PLAY_WIDTH=<n> narrows to n on either game; 0: never.
+    static bool NarrowInPlay() {
+        static const bool on = [] {
+            const char* env = std::getenv("SHADGT_COMPILE_PLAY_WIDTH");
+            if (env && *env) return std::strtoul(env, nullptr, 10) != 0;
+            return Common::IsGt7();
+        }();
+        return on;
+    }
+    static u32 PlayWidth() {
+        static const u32 width = [] {
+            u32 n = 2;
+            if (const char* env = std::getenv("SHADGT_COMPILE_PLAY_WIDTH"); env && *env) {
+                n = u32(std::strtoul(env, nullptr, 10));
+            }
+            return std::clamp(n, 1u, NumWorkers());
+        }();
+        return width;
+    }
+    void ApplyLimit() {
+        queue.SetForegroundLimit(in_play                ? PlayWidth()
+                                 : catch_up || backlog ? ExtraWidth()
+                                                       : NumWorkers());
     }
 
     static u32 NumWorkers() {
@@ -1119,6 +1177,8 @@ private:
     BuildQueue queue;
     std::vector<std::jthread> threads;
     bool catch_up{};
+    bool backlog{}; ///< FIX-GT7-106 (port)
+    bool in_play{}; ///< FIX-GT7-109 (port)
     bool boost_wide{}; // FEAT-GTS-470: SetBoost widened the compile cores
 };
 
@@ -3219,10 +3279,41 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
             g_game_in_play.store(play, std::memory_order_relaxed);
             if (play != state.in_play) {
                 state.in_play = play;
+                build_workers->SetInPlay(play); // FIX-GT7-109 (port)
                 LOG_INFO(Render_Vulkan,
                          "FIX-GT7-109: the game at {:.1f} ms a frame, {:.0f} draws a frame: {}",
                          ms, draws_a_frame, play ? "in play" : "not in play");
             }
+        }
+    }
+    // FIX-GT7-106 (port): while many draws on screen wait for their pipelines (a first GT7 race:
+    // ~1,600, the road side, trees and sky missing for minutes), compiles use every core, as wide
+    // as a catch-up, below normal priority, until few are left. On 3 cores the world filled in
+    // at ~3.5 pipelines a second, on every core at ~7. The catch-up alone ended after a second
+    // there: it counts skips, not the builds still owed. Never in play (FIX-GT7-109): with
+    // compiles on every core the game's and the renderer's threads shared their cores. The
+    // condition is what the game shows (draws owed a pipeline), so it applies to both games.
+    // SHADGT_COMPILE_BACKLOG=<n>: from n draws (256 by default, off below n / 4), 0 never.
+    static const size_t backlog_enter = [] {
+        const char* env = std::getenv("SHADGT_COMPILE_BACKLOG");
+        return env && *env ? size_t(std::strtoull(env, nullptr, 10)) : size_t{256};
+    }();
+    if (backlog_enter != 0 && now - state.backlog_checked >= std::chrono::milliseconds{250}) {
+        state.backlog_checked = now;
+        size_t waiting = 0;
+        {
+            std::scoped_lock lk2{on_screen_mutex};
+            waiting = on_screen.size();
+        }
+        const bool want = (waiting >= backlog_enter ||
+                           (state.backlog && waiting > backlog_enter / 4)) &&
+                          !state.in_play;
+        if (want != state.backlog && build_workers->SetBacklog(want)) {
+            state.backlog = want;
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-GT7-106: {} draws on screen wait for their pipelines: compiles {}",
+                        waiting,
+                        want ? "on every core, below normal priority" : "back to their cores");
         }
     }
     if (!enabled) return;

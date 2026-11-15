@@ -585,6 +585,8 @@ private:
         std::chrono::steady_clock::time_point play_window{};
         u64 play_frames{}, play_us{}, play_draws{};
         bool in_play{};
+        bool backlog{}; ///< FIX-GT7-106 (port)
+        std::chrono::steady_clock::time_point backlog_checked{};
     } catch_up;
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<PipelineBuild>> pending_builds;
     std::chrono::steady_clock::time_point stale_ahead_checked{};

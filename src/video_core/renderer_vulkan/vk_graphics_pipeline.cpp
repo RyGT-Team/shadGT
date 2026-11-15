@@ -1494,6 +1494,14 @@ GraphicsPipeline::GraphicsPipeline(
         whole_watch.emplace(debug_str, "whole pipeline compile");
     }
     auto [pipeline_result, pipe] = CreateWithRetries("pipeline", debug_str, [&] {
+        // PERF-GTS-482: AMD keeps no whole pipeline with dynamic vertex input in the driver
+        // cache; the binary store keeps them across launches instead.
+        if (instance.IsPipelineBinaryWholeOnly()) {
+            auto made = PipelineBinaryStore::CreateGraphics(instance, device, pipeline_cache,
+                                                            pipeline_info);
+            return vk::ResultValue<vk::UniquePipeline>{
+                made.result, vk::UniquePipeline{made.value, device}};
+        }
         return device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
     }); // FIX-GT7-101
     whole_watch.reset();

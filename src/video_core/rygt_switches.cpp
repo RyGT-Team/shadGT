@@ -353,6 +353,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_PASS_SKIP|string|Rendering workarounds|unset (off)|<w>x<h>:<n>,... (n > 1); old (non-native) renderer draw path|Experimental: draws into color targets of that size (e.g. mirrors) are recorded only every n-th frame (EXP-128).",
     // AMD
     "RYGTSW1|SHADGT_AMD_BARYCENTRIC_ALL|flag|AMD|off|1 = all fragment shaders|Applies the AMD barycentric fix to all pixel shaders, not just affected ones; makes AMD retranslate and recompile everything.",
+    "RYGTSW1|SHADGT_AMD_WHOLE_BINARIES|flag|AMD|off|1 = on|Prototype: stores AMD whole pipelines as pipeline binaries so later starts skip compiling them; best with SHADGT_PREWARM_WHOLE_PIPELINES=1 (PERF-GTS-482).",
     "RYGTSW1|SHADGT_AMD_CACHED_FRAGMENT_SETS|flag|AMD|on (AMD, native mode)|exactly 0 = off|AMD native mode: pixel shader descriptor sets use the immutable descriptor cache instead of pushes (AMD-PERF-002); 0 turns it off.",
     "RYGTSW1|SHADGT_AMD_EXPLICIT_VERTEX|flag|AMD|off|1 = force single-sample barycentric off|Forces the AMD single-sample barycentric fix off whatever else is set.",
     "RYGTSW1|SHADGT_AMD_MEMORY_PRIORITY|flag|AMD|on (AMD with memory priority)|0 = off|AMD: passes each allocation's priority so render targets stay in VRAM before old textures (AMD-VRAM-003); 0 turns it off.",

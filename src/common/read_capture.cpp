@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <bit>
+#include <cstdio>
 #include <mutex>
 #include <xxhash.h>
 #include "common/read_capture.h"
@@ -10,6 +11,18 @@ namespace Common {
 
 thread_local const ReadCapture* t_read_capture = nullptr;
 thread_local GuestReadLog* t_guest_read_log = nullptr; // PERF-GT7-111
+
+#ifdef SHADGT_DIAGNOSTICS
+thread_local const char* t_guest_reads_forbidden = nullptr; // PERF-GTS-502
+
+void NoteForbiddenGuestRead(const void* source, size_t size) {
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 20) {
+        std::fprintf(stderr, "PERF-GTS-502: game memory read at %p+%#zx during %s\n", source, size,
+                     t_guest_reads_forbidden);
+    }
+}
+#endif
 
 namespace {
 std::atomic<u64> g_next_capture_id{1};

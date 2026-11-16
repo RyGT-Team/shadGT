@@ -154,10 +154,36 @@ struct GuestReadLog {
 extern thread_local GuestReadLog* t_guest_read_log;
 inline constexpr VAddr FlatBufReadTag = ~VAddr{0}; ///< the SRT walker's output
 
+#ifdef SHADGT_DIAGNOSTICS
+/// PERF-GTS-502 (diagnostics): set while this thread must not read the game's memory (the second
+/// half of a shader translation, on a worker); such a read is written to stderr (20 at most).
+extern thread_local const char* t_guest_reads_forbidden;
+void NoteForbiddenGuestRead(const void* source, size_t size);
+class ForbidGuestReads {
+public:
+    explicit ForbidGuestReads(const char* what) : previous{t_guest_reads_forbidden} {
+        t_guest_reads_forbidden = what;
+    }
+    ~ForbidGuestReads() {
+        t_guest_reads_forbidden = previous;
+    }
+    ForbidGuestReads(const ForbidGuestReads&) = delete;
+    ForbidGuestReads& operator=(const ForbidGuestReads&) = delete;
+
+private:
+    const char* previous;
+};
+#endif
+
 inline void CopyGuestRaw(void* dest, const void* source, size_t size);
 
 /// Copies guest memory, taking the bytes from the current thread's capture where it has them.
 inline void CopyGuest(void* dest, const void* source, size_t size) {
+#ifdef SHADGT_DIAGNOSTICS
+    if (t_guest_reads_forbidden) [[unlikely]] {
+        NoteForbiddenGuestRead(source, size);
+    }
+#endif
     if (GuestReadLog* log = t_guest_read_log) [[unlikely]] {
         if (log->replay) {
             log->Take(reinterpret_cast<VAddr>(source), dest, size);

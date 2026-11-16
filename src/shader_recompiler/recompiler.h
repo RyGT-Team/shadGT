@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -83,5 +84,21 @@ struct NeoCodeUse {
 [[nodiscard]] IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools,
                                            Info& info, RuntimeInfo& runtime_info,
                                            const Profile& profile);
+
+/// PERF-GTS-502: TranslateProgram in two halves. The first (decoding, translation and the passes
+/// that read the game's memory, through resource patching) runs where the game's memory is as
+/// the draw has it; the second (the remaining passes) reads none of it, so it can run later on
+/// another thread. TranslateProgram is TranslateProgramBack(TranslateProgramFront(...)). The
+/// state keeps references to pools, info and runtime_info, which must outlive it.
+struct FrontendState;
+struct FrontendStateDeleter {
+    void operator()(FrontendState* state) const noexcept;
+};
+using FrontendHandle = std::unique_ptr<FrontendState, FrontendStateDeleter>;
+
+[[nodiscard]] FrontendHandle TranslateProgramFront(const std::span<const u32>& code, Pools& pools,
+                                                   Info& info, RuntimeInfo& runtime_info,
+                                                   const Profile& profile);
+[[nodiscard]] IR::Program TranslateProgramBack(FrontendHandle state);
 
 } // namespace Shader

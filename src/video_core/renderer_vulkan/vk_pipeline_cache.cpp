@@ -400,6 +400,16 @@ static std::filesystem::path g_programs_dir;
 // FEAT-GTS-470: on by default (SHADGT_MANIFEST_RECORD=0 turns it off): every translation and every
 // stored one a draw first uses gets a record, so the manifest covers what was played and a
 // pre-translation after a renderer or driver update, here or on another GPU, misses less.
+// PERF-GTS-502 (SHADGT_FRONTEND_SPLIT, on unless 0): the command thread translates a shader only
+// as far as the passes that read the game's memory; the worker does the rest before its SPIR-V.
+static bool FrontendSplitOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_FRONTEND_SPLIT");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
 static bool ManifestRecordOn() {
     static const bool on = [] {
         const char* env = std::getenv("SHADGT_MANIFEST_RECORD");
@@ -639,6 +649,8 @@ struct OwnedTranslation {
     Shader::Pools pools;
     Shader::RuntimeInfo compiled_runtime;
     std::optional<Shader::IR::Program> program;
+    /// PERF-GTS-502: the first half of the translation, when the worker does the second.
+    Shader::FrontendHandle front;
     /// PERF-GT7-111: the manifest record of this translation (its SPIR-V hash comes on the worker).
     std::unique_ptr<ManifestRecord> record;
     explicit OwnedTranslation(const Shader::RuntimeInfo& runtime) : compiled_runtime{runtime} {}
@@ -799,7 +811,7 @@ private:
     void Translate(TranslateJob& job, Shader::Pools& pools) {
         TranslationActivity activity;
         auto prepared = std::static_pointer_cast<OwnedTranslation>(job.prepared_translation);
-        ASSERT(prepared && prepared->program && job.info);
+        ASSERT(prepared && (prepared->program || prepared->front) && job.info);
         auto& info = job.info;
         auto binding = job.start;
 #ifndef NDEBUG
@@ -807,6 +819,11 @@ private:
 #endif
         try {
             Common::RecoverableScope recoverable;
+            if (prepared->front) {
+                // PERF-GTS-502: the passes after the guest reads, here rather than on the command
+                // thread.
+                prepared->program.emplace(Shader::TranslateProgramBack(std::move(prepared->front)));
+            }
             job.spv = Shader::Backend::SPIRV::EmitSPIRV(
                 profile, prepared->compiled_runtime, *prepared->program, binding);
             job.spec = Shader::StageSpecialization(*info, job.runtime_info, profile, job.start,
@@ -8356,9 +8373,12 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
         }
         {
             SCOPE_EXIT { Common::t_guest_read_log = previous_log; };
-            prepared->program.emplace(Shader::TranslateProgram(job->code, prepared->pools,
-                                                               *job->info,
-                                                               prepared->compiled_runtime, profile));
+            // PERF-GTS-502: the part that reads the game's memory here, the rest on the worker.
+            prepared->front = Shader::TranslateProgramFront(job->code, prepared->pools, *job->info,
+                                                            prepared->compiled_runtime, profile);
+            if (!FrontendSplitOn()) {
+                prepared->program.emplace(Shader::TranslateProgramBack(std::move(prepared->front)));
+            }
         }
         if (record) {
             auto rec = std::make_unique<ManifestRecord>();

@@ -797,6 +797,8 @@ private:
                 LOG_WARNING(Render_Vulkan, "SHADER-WORKER-FAIL: shader {:#x}: {}", job->hash,
                             error.what());
             }
+            // PERF-GTS-502: a failed job's IR (its second half may have failed here) goes now.
+            job->prepared_translation.reset();
             {
                 std::scoped_lock lk{job->mutex};
                 if (!job->module) {

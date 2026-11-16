@@ -217,7 +217,13 @@ public:
         return scratch_.infos;
     }
 
-    const ComputePipeline* GetComputePipeline();
+    /// PERF-GTS-501: `select_ahead` (the command thread's selection) starts a new pipeline's build
+    /// and returns without waiting for it; TakeComputeDeferred then says the recorder must look
+    /// it up again at the dispatch.
+    const ComputePipeline* GetComputePipeline(bool select_ahead = false);
+    bool TakeComputeDeferred() {
+        return std::exchange(compute_deferred, false);
+    }
 
     /// NAT-030: the pipeline already built for the draw a game job thread is reading (its
     /// registers installed with Liverpool::SetThreadDrawState), or nullptr. Nothing is
@@ -459,6 +465,7 @@ private:
         u64 skipped = 0;
     };
     tsl::robin_map<ComputePipelineKey, PendingCompute> pending_computes;
+    bool compute_deferred{}; ///< PERF-GTS-501, see GetComputePipeline
     /// PERF-GTS-493: the end-of-race report's state (under the lookup lock).
     struct RaceReport {
         bool in_race = false;

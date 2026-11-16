@@ -5437,8 +5437,9 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
     return it->second.get();
 }
 
-const ComputePipeline* PipelineCache::GetComputePipeline() {
+const ComputePipeline* PipelineCache::GetComputePipeline(bool select_ahead) {
     fallback_miss = false;
+    compute_deferred = false;
     bool key_valid = RefreshComputeKey();
     if (!key_valid && fallback_miss) {
         // D10: as for graphics, the old translation while the new one is made.
@@ -5461,9 +5462,21 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     // race it waits for it below, as before.
     auto pending = pending_computes.find(compute_key);
     const bool race_skips = RaceNeverWaits() && !MenusWait(); // not while a capture runs
-    if (pending != pending_computes.end() && race_skips &&
+    // PERF-GTS-501: out of a race the command thread's selection does not wait for a compute
+    // pipeline either: it starts the build and goes on (selecting the next draws and starting
+    // their builds meanwhile); the recorder looks the pipeline up again at the dispatch and waits
+    // for it there. A cold GT7 menu waited 58 times for compute pipelines on the command thread,
+    // 11.5 s, each a different pipeline built one after the other (RTX 4070 only).
+    // SHADGT_COMPUTE_SELECT_WAITS=1: the selection waits as before.
+    static const bool select_defers = [] {
+        const char* env = std::getenv("SHADGT_COMPUTE_SELECT_WAITS");
+        return !(env && env[0] == '1');
+    }();
+    const bool defers = select_ahead && select_defers && !race_skips && !MenusWait();
+    if (pending != pending_computes.end() && (race_skips || defers) &&
         pending->second.done.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
-        ++pending.value().skipped;
+        if (race_skips) ++pending.value().skipped;
+        compute_deferred = defers;
         return nullptr;
     }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
@@ -5540,14 +5553,17 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             take_built = [inputs] { return inputs->built; };
             if (!build_workers) build_workers = std::make_unique<PipelineBuildWorkers>();
             build_workers->Push([job] { (*job)(); }, BuildQueue::Kind::Urgent);
-            if (race_skips &&
+            if ((race_skips || defers) &&
                 completion.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
-                // PERF-GTS-493: this dispatch and the next ones with this pipeline are skipped
-                // until a worker has built it.
+                // PERF-GTS-493: in a race this dispatch and the next ones with this pipeline are
+                // skipped until a worker has built it. PERF-GTS-501: out of one, the selection
+                // goes on and the recorder waits for it at the dispatch.
                 pending_computes.emplace(compute_key,
                                          PendingCompute{std::move(completion), std::move(take_sdata),
-                                                        std::move(take_built), build_start, 1});
+                                                        std::move(take_built), build_start,
+                                                        race_skips ? 1u : 0u});
                 compute_pipelines.erase(it);
+                compute_deferred = defers;
                 return nullptr;
             }
         }

@@ -87,6 +87,9 @@ public:
         /// PERF-055: a direct dispatch's compute pipeline (then `pipeline` is unused).
         bool is_compute{};
         const ComputePipeline* compute{};
+        /// PERF-GTS-501: no compute pipeline yet, its build started; the recorder looks it up
+        /// again at the dispatch (and waits for it out of a race).
+        bool compute_deferred{};
         std::array<SelectedStage, Shader::MaxStageTypes> stages{};
         /// PERF-068: a quad list's pipeline when the recorder tessellates its quads (the
         /// triangle one is `pipeline`); the recorder decides which it draws with.

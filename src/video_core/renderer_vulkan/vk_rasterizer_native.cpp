@@ -12825,8 +12825,19 @@ void NativeRenderer::RecordVertexIndex(const VertexIndexState& v) {
 // the barriers it takes 3.8 times less GPU time. A listed program must store into its images
 // without loading from them, and must not store the same texels twice in a run: their order is no
 // longer defined. SHADGT_NATIVE_OVERLAP_PROGRAMS=<hex>[,...] sets the list (empty: none).
-bool NativeRenderer::RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64 program,
+// PERF-GT7-136 (SHADGT_NATIVE_INDEPENDENT_RUNS=0: listed programs only, as before): any other
+// program's run goes on the same way when its shader writes no buffer and reads no memory raw
+// (uses_dma), the dispatch stores pictures, and none of them meets a picture an earlier dispatch of
+// the run stored or read, nor does a picture it reads meet one the run stored. GT Sport's two
+// reflection-probe filters, cs 0x5e8f5cf7 (54 dispatches a frame) and cs 0xd0af5a54 (48), are runs
+// like that: each dispatch reads one shared source and stores a picture of its own, and with a
+// barrier between every two of them they took 40% of the GPU's time at Northern Isle; without
+// them the GPU worked ~35% less a frame and the race held 60 fps (Nsight GPU trace and one race of
+// 2026-11-16, RTX 4070 only). Listed programs keep the rule above: GT7's 0x490b6362 may store
+// other parts of the same picture in a run, which the check of stored pictures would stop.
+bool NativeRenderer::RunNeedsBarrier(const Stream& s, const DrawBindings& b, const Shader::Info& cs,
                                      bool recorded, std::optional<u64> texel) const {
+    const u64 program = cs.pgm_hash;
     static const std::vector<u64> listed = [] {
         std::vector<u64> list;
         const char* env = std::getenv("SHADGT_NATIVE_OVERLAP_PROGRAMS");
@@ -12858,7 +12869,14 @@ bool NativeRenderer::RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64
         ++g_run_barrier_reasons[7]; // listed dispatches seen
     }
 #endif
-    if ((std::ranges::find(listed, program) == listed.end() && !texel) ||
+    static const bool independent_runs = [] {
+        const char* env = std::getenv("SHADGT_NATIVE_INDEPENDENT_RUNS");
+        return !(env && env[0] == '0');
+    }();
+    const bool is_listed = std::ranges::find(listed, program) != listed.end();
+    const bool independent = independent_runs && !is_listed && !texel && !cs.uses_dma &&
+                             !b.stored.empty(); // PERF-GT7-136
+    if ((!is_listed && !texel && !independent) ||
         s.run_program != program || s.run_commands != s.commands || s.buffers_written.foreign ||
         recorded || !writebacks.empty() || b.writes_buffers || !s.attach_dirty.empty()) {
         return true;
@@ -12871,6 +12889,15 @@ bool NativeRenderer::RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64
                    picture->info.guest_address < entry->info.guest_address + entry->info.guest_size;
         });
     };
+    if (independent) {
+        // PERF-GT7-136: an unlisted program's dispatches may not store over each other: their
+        // order would no longer be defined.
+        for (const auto* entry : b.stored) {
+            if (entry && meets(s.written, entry)) {
+                return true; // writes what the run wrote
+            }
+        }
+    }
     // PERF-GT7-057: a same-texel program (SameTexelKey) may read the picture it stores where the
     // run wrote it, if the run hasn't stored that mip and layer since its last barrier: each of
     // its dispatches reads only the texels it then stores. FIX-GT7-080: the key says no other of
@@ -20255,7 +20282,7 @@ void NativeRenderer::DispatchDirect() {
     const std::optional<u64> texel = b.stored.size() == 1
         ? SameTexelKey(pipeline->GetStage(Shader::SwStage::Compute), b.image_entries)
         : std::nullopt;
-    if (RunNeedsBarrier(s, b, program, recorded, texel)) {
+    if (RunNeedsBarrier(s, b, pipeline->GetStage(Shader::SwStage::Compute), recorded, texel)) {
         GlobalBarrier();
     } else {
         EndRendering();

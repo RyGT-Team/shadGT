@@ -1178,8 +1178,9 @@ private:
     void RecordIndirect(const IndirectDraw& indirect, const IndirectBuffers& buffers,
                         bool is_indexed);
     bool NeedsBarrierFor(const DrawBindings& b) const;
-    // PERF-GT7-043
-    bool RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64 program, bool recorded,
+    // PERF-GT7-043; PERF-136: `cs` decides whether an unlisted program's run may go on too.
+    bool RunNeedsBarrier(const Stream& s, const DrawBindings& b, const Shader::Info& cs,
+                         bool recorded,
                          std::optional<u64> texel = std::nullopt) const; // PERF-GT7-057: texel
     void NoteWrites(const Targets* targets, const DrawBindings& b);
     /// NAT-105: CPU writes to the pages of a range fault (once) from now on.

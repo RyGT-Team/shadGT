@@ -4466,8 +4466,19 @@ void NativeRenderer::FlushWritebacks() {
                 return;
             }
             if (!chunked && (!direct || !direct->EnsureImported(address, size))) {
-                UNREACHABLE_MSG("native image download import failed");
-                return;
+                // FIX-GTS-499: the game may unmap a picture's memory while its write-back is
+                // pending (GT7 11-16, cold start: DIAG-132 dropped the views of 0x103f000000+
+                // 0x6400000 on the unmap, then the import of a picture inside it failed and this
+                // stopped the renderer). Nothing is left to write back to: the picture's write-back
+                // is skipped, with a line, instead of a crash.
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-GTS-499: write-back of the picture at {:#x}+{:#x} skipped: its "
+                                "memory could not be imported (unmapped by the game?)",
+                                address, size);
+                }
+                continue;
             }
             if (!chunked) parts = direct->PlanLeasedParts(address, size, alignment, 1);
             const bool direct_output = !chunked && parts && parts->size() == 1;

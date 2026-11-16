@@ -1689,10 +1689,11 @@ void InstallGt7ScriptDump(u8* base) {
 // changes is Rasterizer::SelectsPipelinesAhead(), which shadgt7 always had on: about 31 ms a
 // frame becomes 22 on a hand-played Dragon Trail race (RTX 4070 only; shadgt7 itself: 17.5).
 //
-// OFF by default, SHADGT_GT7_RACE_SIGNAL=1 turns it on: with it, while a race's pipelines
-// build, groups of scenery draws are left out for single frames (the scenery flickers two or
-// three times a second; cause not found yet), and it was only run with retired objects kept
-// longer than this branch keeps them (the device loss of GT7's title screen, not fixed).
+// On by default, SHADGT_GT7_RACE_SIGNAL=0 turns it off. At 2,500-3,000 draws a frame (no compile
+// frames, same race, RTX 4070 only): 29.6 ms a frame without, 23.0 with, 22.5 with GAME-003 too.
+// The two defects that kept it off were not its own: the title screen's device loss was
+// FIX-GT7-187 (FillImage), and the scenery flicker showed without the signal too and went with
+// GT7's GPU occlusion culling (GAME-003).
 constexpr u64 kGt7OrgRace = 0x1e9a5d0;
 constexpr u8 kGt7OrgRaceStart[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
                                    0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x18};
@@ -1723,16 +1724,26 @@ void PS4_SYSV_ABI Gt7OrgRaceHook(void* self) {
 }
 
 void InstallGt7RaceSignal(u8* base) {
-    const char* env = std::getenv("SHADGT_GT7_RACE_SIGNAL");
-    if (!(env && env[0] == '1')) {
-        return;
-    }
     u8* const entry = base + kGt7OrgRace + kTextRvaShift;
     constexpr size_t kMoved = sizeof(kGt7OrgRaceStart);
-    if (std::memcmp(entry, kGt7OrgRaceStart, kMoved) != 0) {
-        // GT Sport, or a GT7 version this address is not for.
-        std::fprintf(stderr, "[patch] GAME-002: org_race is not where GT7 1.71 has it, the race "
-                             "flag is not raised\n");
+    const bool gt7_entry = ReadableRange(entry, kMoved) &&
+                           std::memcmp(entry, kGt7OrgRaceStart, kMoved) == 0;
+    const char* env = std::getenv("SHADGT_GT7_RACE_SIGNAL");
+    if (env && env[0] == '0') {
+        if (gt7_entry) {
+            std::fprintf(stderr, "[patch] GAME-002: off (SHADGT_GT7_RACE_SIGNAL=0), GT7 never "
+                                 "raises the race flag\n");
+        }
+        return;
+    }
+    if (!gt7_entry) {
+        // GT Sport (silent), or a GT7 version this address is not for.
+        char name[MAX_PATH]{};
+        GetModuleFileNameA(nullptr, name, sizeof(name));
+        if (std::string_view{name}.ends_with("GT7.exe")) {
+            std::fprintf(stderr, "[patch] GAME-002: org_race is not where version 1.71 has it, GT7 "
+                                 "never raises the race flag\n");
+        }
         return;
     }
     u8* const stubs = AllocNear(base);

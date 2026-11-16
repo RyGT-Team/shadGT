@@ -67,6 +67,7 @@
 namespace Vulkan {
 #ifdef RYTY_GPU
 bool RytyGtsInRace();
+bool RytyGtsMenuCaptureAvailable(); // ryty_game_patch.cpp
 #endif
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
@@ -242,7 +243,10 @@ bool Rasterizer::SelectsPipelinesAhead() const {
 #ifdef RYTY_GPU
     // Thumbnail dependencies must stop the recorder at the actual draw, with
     // its guest-clock hold, rather than compile ahead of its queued resources.
-    if (!RytyGtsInRace()) return false;
+    // PERF-GTS-488: only where the game's menu captures are hooked (GT Sport's icon captures).
+    // A game without them (GT7: the hooks match GT Sport's code only) has no such dependency
+    // and selects ahead at its menus too, as shadgt7 always did.
+    if (!RytyGtsInRace() && RytyGtsMenuCaptureAvailable()) return false;
 #endif
     // PERF-047: -DisablePerf 59 selects every pipeline on the recorder thread as before.
     static const bool enabled = Common::PerfFeatureEnabled(59);

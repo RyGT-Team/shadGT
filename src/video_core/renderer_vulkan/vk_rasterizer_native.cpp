@@ -14375,7 +14375,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
         return r.AcquireGraphicsPipeline(params, !indirect && !quad_list, &pipeline_owner);
     }();
-    const bool must_wait = !pipeline && DrawMustNotSkip(regs);
+    // PERF-GTS-493: in a race no one-off draw waits (FIX-198, FIX-GT7-121/135/153): skipped as
+    // other draws are, and still watched.
+    const bool one_off = !pipeline && DrawMustNotSkip(regs);
+    const bool must_wait = one_off && !PipelineCache::RaceNeverWaits();
     // FIX-GT7-121: a picture known to be sampled before any redraw waits whatever the budget.
     // FIX-GT7-135: so does a never-drawn level of a texture, out of play.
     // FIX-GT7-153: and a draw into a circuit's shadow map at its first drawing, or out of play.
@@ -14429,6 +14432,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         // other draws are, and watched as a skip (it never makes its kind safe).
         ++stats.one_off_budget_skips;
         stats.kept_shadow_skips += one_off_kept_shadow ? 1 : 0; // FIX-GT7-153: a redraw in play
+        WatchOneOffs(regs, true);
+    } else if (one_off) {
+        ++stats.one_off_race_skips; // PERF-GTS-493
+        stats.kept_shadow_skips += one_off_kept_shadow ? 1 : 0;
         WatchOneOffs(regs, true);
     } else if (!pipeline && !one_off_hits.empty()) {
         // PERF-GT7-023: one-off pictures of kinds that no longer wait only: skipped as other
@@ -24206,6 +24213,10 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
     if (stats.one_off_exempt != 0) {
         LOG_INFO(Render_Vulkan, "PERF-GT7-023: {} draws into one-off pictures of kinds always "
                  "redrawn skipped instead of waiting", std::exchange(stats.one_off_exempt, 0));
+    }
+    if (stats.one_off_race_skips != 0) {
+        LOG_INFO(Render_Vulkan, "PERF-GTS-493: {} one-off draws skipped in a race instead of "
+                 "waiting for their pipeline", std::exchange(stats.one_off_race_skips, 0));
     }
     if (stats.one_off_budget_skips != 0) {
         LOG_INFO(Render_Vulkan, "FIX-GT7-102: {} draws into pictures not drawn lately skipped "

@@ -4226,6 +4226,28 @@ bool PipelineCache::MenusWait() {
 #endif
 }
 
+bool PipelineCache::RaceNeverWaits() {
+#ifdef RYTY_GPU
+    // PERF-GTS-493: a cold race (no shader translated, nothing in the driver's cache) stopped
+    // for the draws and dispatches that still waited for their pipeline: one-off pictures
+    // (FIX-198, FIX-GT7-121/135/153), GT7's one-shot list, learned one-off kinds, and every
+    // compute dispatch (built one by one, the game waiting: 472 waits, 160 s over eight cold GT7
+    // sessions, RTX 4070 only), up to frames of 80 s at a race load. In a race, from its loading
+    // to its end, they are now skipped like every other draw until their build is done: the
+    // track and cars show black for a while, the game never stops. Draws that write memory
+    // (PERF-076) still wait (none measured in those sessions). Both games: the race flag is
+    // GT Sport's race projects and GT7's org_race gate (GAME-002). SHADGT_RACE_NEVER_WAITS=0:
+    // as before.
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_RACE_NEVER_WAITS");
+        return !(env && env[0] == '0');
+    }();
+    return enabled && AsyncPipelines() && RytyGtsInRace();
+#else
+    return false;
+#endif
+}
+
 bool PipelineCache::CancelBuild(PipelineBuild& build) {
     // A worker may already have taken the job and wait in FinishBuild for whoever claimed the
     // build; release it, the build stays empty.
@@ -5352,11 +5374,21 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (!key_valid) {
         return nullptr;
     }
+    // PERF-GTS-493: in a race a dispatch whose pipeline is still building is skipped; out of a
+    // race it waits for it below, as before.
+    auto pending = pending_computes.find(compute_key);
+    if (pending != pending_computes.end() && RaceNeverWaits() &&
+        pending->second.done.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
+        ++pending.value().skipped;
+        return nullptr;
+    }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     if (is_new) {
-        Common::GuestClock::CompilePause hold; // FIX-044
+        std::optional<Common::GuestClock::CompilePause> hold; // FIX-044, while it is waited for
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
-        LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
+        if (pending == pending_computes.end()) {
+            LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
+        }
 
         ComputePipeline::SerializationSupport sdata{};
         ++Common::GetWorkCounters().pipelines_compiled;
@@ -5370,25 +5402,63 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             ComputePipeline::SerializationSupport sdata{};
         };
         // FIX-GT7-150: how long the game waited for this build (the recipe check below).
-        const auto build_start = std::chrono::steady_clock::now();
-        auto inputs = std::make_shared<ComputeBuild>();
-        inputs->info = *S().infos[0];
-        inputs->user_data.assign(inputs->info.user_data.begin(), inputs->info.user_data.end());
-        inputs->info.user_data = inputs->user_data;
-        const auto key = compute_key;
-        const auto module = S().modules[0];
-        auto job = std::make_shared<std::packaged_task<std::unique_ptr<ComputePipeline>()>>(
-            [this, inputs, key, module] {
-                const bool foreground = ForegroundCompileOn(); // PERF-GT7-032 (port)
-                if (foreground) Common::BeginForegroundCompile();
-                SCOPE_EXIT { if (foreground) Common::EndForegroundCompile(); };
-                return std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
-                    *pipeline_cache, key, inputs->info, module, inputs->sdata);
-            });
-        auto completion = job->get_future();
-        if (!build_workers) build_workers = std::make_unique<PipelineBuildWorkers>();
-        build_workers->Push([job] { (*job)(); }, BuildQueue::Kind::Urgent);
+        std::chrono::steady_clock::time_point build_start;
+        std::future<std::unique_ptr<ComputePipeline>> completion;
+        std::function<ComputePipeline::SerializationSupport()> take_sdata;
+        if (pending != pending_computes.end()) {
+            // PERF-GTS-493: built in the background while its dispatches were skipped.
+            build_start = pending->second.start;
+            completion = std::move(pending.value().done);
+            take_sdata = std::move(pending.value().sdata);
+            const u64 skipped = pending->second.skipped;
+            pending_computes.erase(pending);
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 200) {
+                LOG_WARNING(Render_Vulkan,
+                            "PERF-GTS-493: compute pipeline {:#x} built in the background in "
+                            "{:.0f} ms, {} dispatches skipped meanwhile",
+                            pipeline_hash,
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - build_start)
+                                .count(),
+                            skipped);
+            }
+        } else {
+            build_start = std::chrono::steady_clock::now();
+            auto inputs = std::make_shared<ComputeBuild>();
+            inputs->info = *S().infos[0];
+            inputs->user_data.assign(inputs->info.user_data.begin(), inputs->info.user_data.end());
+            inputs->info.user_data = inputs->user_data;
+            const auto key = compute_key;
+            const auto module = S().modules[0];
+            auto job = std::make_shared<std::packaged_task<std::unique_ptr<ComputePipeline>()>>(
+                [this, inputs, key, module] {
+                    const bool foreground = ForegroundCompileOn(); // PERF-GT7-032 (port)
+                    if (foreground) Common::BeginForegroundCompile();
+                    SCOPE_EXIT { if (foreground) Common::EndForegroundCompile(); };
+                    return std::make_unique<ComputePipeline>(instance, scheduler, desc_heap,
+                        profile, *pipeline_cache, key, inputs->info, module, inputs->sdata);
+                });
+            completion = job->get_future();
+            take_sdata = [inputs] { return inputs->sdata; };
+            if (!build_workers) build_workers = std::make_unique<PipelineBuildWorkers>();
+            build_workers->Push([job] { (*job)(); }, BuildQueue::Kind::Urgent);
+            if (RaceNeverWaits() &&
+                completion.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
+                // PERF-GTS-493: this dispatch and the next ones with this pipeline are skipped
+                // until a worker has built it.
+                pending_computes.emplace(compute_key,
+                                         PendingCompute{std::move(completion), std::move(take_sdata),
+                                                        build_start, 1});
+                compute_pipelines.erase(it);
+                return nullptr;
+            }
+        }
+        if (completion.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
+            hold.emplace();
+        }
         it.value() = completion.get();
+        hold.reset();
         it.value()->SetStageInfo(*S().infos[0]);
         const double ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - build_start)
@@ -5432,7 +5502,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
                 }
             }
         }
-        sdata = inputs->sdata;
+        sdata = take_sdata();
         if (!S().key_uses_legacy) { // D10
             RegisterPipelineData(compute_key, sdata);
         }
@@ -7110,6 +7180,7 @@ void PipelineCache::NoteReleased(const GraphicsPipelineKey& key) {
 }
 
 bool PipelineCache::NeverSkipped(const std::array<const Shader::Info*, MaxShaderStages>& infos) {
+    if (RaceNeverWaits()) return false; // PERF-GTS-493
     // shadgt7 FIX-198 / PERF-GT7-020: a one-off target's draw (SetForceWait, SetWaitForShaders)
     // waits for its pipeline and shaders.
     if (force_wait || wait_for_shaders) return true;
@@ -9410,6 +9481,7 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
             } else if (std::holds_alternative<ComputePipelineKey>(key)) {
                 auto& compute_key = std::get<ComputePipelineKey>(key);
                 compute_pipelines.erase(compute_key);
+                pending_computes.erase(compute_key); // PERF-GTS-493
             }
         }
     }

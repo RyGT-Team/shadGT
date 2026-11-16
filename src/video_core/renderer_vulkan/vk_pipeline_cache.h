@@ -320,6 +320,9 @@ private:
     /// FEAT-GTS-471: this GPU's stored pipelines as the manifest's recipe file (see the .cpp).
     void ExportPipelineRecipes(std::stop_token stop);
 public:
+    /// PERF-GTS-493: in a race (its loading and pre-race screen included) no draw and no compute
+    /// dispatch waits for a shader or a pipeline; it is skipped until its build is done.
+    static bool RaceNeverWaits();
     /// FEAT-GTS-471: a stored pipeline key file and its shaders' names (program, record SPIR-V hash).
     struct PipelineRecipe {
         std::array<std::pair<u64, u64>, MaxShaderStages> names{};
@@ -444,6 +447,14 @@ private:
     } legacy_stats;
     void ReportLegacy();
     tsl::robin_map<ComputePipelineKey, std::shared_ptr<ComputePipeline>> compute_pipelines;
+    /// PERF-GTS-493: compute pipelines building on a worker while their dispatches are skipped.
+    struct PendingCompute {
+        std::future<std::unique_ptr<ComputePipeline>> done;
+        std::function<ComputePipeline::SerializationSupport()> sdata;
+        std::chrono::steady_clock::time_point start;
+        u64 skipped = 0;
+    };
+    tsl::robin_map<ComputePipelineKey, PendingCompute> pending_computes;
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<GraphicsPipeline>> graphics_pipelines;
     std::unordered_map<const Pipeline*, std::chrono::steady_clock::time_point> pipeline_last_use;
     std::chrono::steady_clock::time_point retention_now{std::chrono::steady_clock::now()};

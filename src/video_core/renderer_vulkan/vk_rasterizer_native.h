@@ -1937,6 +1937,7 @@ private:
         u64 one_off_waits = 0; ///< FIX-198: draws that waited for their new pipeline
         u64 one_off_exempt = 0; ///< PERF-GT7-023: draws into exempt pictures, skipped
         u64 one_off_budget_skips = 0; ///< FIX-GT7-102: skipped once the frame's budget was spent
+        u64 one_off_race_skips = 0; ///< PERF-GTS-493: skipped in a race, never waited for
         u64 one_off_harmful_waits = 0; ///< FIX-GT7-121: waited whatever the budget
         u64 kept_shadow_waits = 0, kept_shadow_wait_ns = 0, kept_shadow_wait_max_ns = 0,
             kept_shadow_skips = 0; ///< FIX-GT7-153

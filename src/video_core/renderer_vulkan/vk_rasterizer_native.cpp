@@ -2559,8 +2559,10 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
 }
 
 static bool ParallelRingOn(); // PERF-GTS-399, below
-/// PERF-GT7-133: moves on when a renderer goes, so no thread keeps its set of owned handles.
+/// PERF-GT7-133: moves on when a region or mirror goes in or out of its map, and when a renderer
+/// goes, so that no thread keeps a stale set of the handles the renderer owns.
 static std::atomic<u64> g_lds_owned_epoch{1};
+static void NoteOwnedMapChange() { g_lds_owned_epoch.fetch_add(1, std::memory_order_acq_rel); }
 
 NativeRenderer::~NativeRenderer() {
     g_lds_owned_epoch.fetch_add(1, std::memory_order_acq_rel); // PERF-GT7-133
@@ -5162,6 +5164,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
                 merged.push_back(std::move(old));
                 ++regions_taken_in;
         }, RegionGrowSlack());
+        NoteOwnedMapChange(); // PERF-GT7-133: regions may have been taken out
         if (action == Native::RegionMergeDisposition::Preserve) return nullptr;
     }
     ++buffer_generation; // OPT-003: regions are taken in or made
@@ -5247,6 +5250,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
 #endif
     NoteHistory(begin, end - begin, 10, merged.size()); // DIAG-187 (diagnosis)
     std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
+    NoteOwnedMapChange(); // PERF-GT7-133
     auto [it, inserted] = regions.emplace(begin, std::move(region));
     return &it->second;
 }
@@ -5342,6 +5346,7 @@ void NativeRenderer::SortRegionWrites() {
                 buffer_log.Note(mirror.begin, mirror.end, true); // OPT-010
                 retired_watch_ranges.emplace_back(mirror.begin, mirror.end);
                 std::unique_lock map_lock{buffer_map_mutex};
+                NoteOwnedMapChange(); // PERF-GT7-133
                 it = mirrors.erase(it); // freed once the GPU is done with it
                 continue;
             }
@@ -5728,6 +5733,7 @@ void NativeRenderer::MakePendingMirrors() {
                     ++buffer_generation;
                     buffer_log.Note(it->second.begin, it->second.end, true);
                     retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
+                    NoteOwnedMapChange(); // PERF-GT7-133
                     it = mirrors.erase(it);
                 } else {
                     ++it;
@@ -5801,6 +5807,7 @@ void NativeRenderer::MakePendingMirrors() {
             for (auto it = FirstMirror(begin); it != mirrors.end() && it->second.begin < end;) {
                 mirror_bytes -= it->second.end - it->second.begin;
                 retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
+                NoteOwnedMapChange(); // PERF-GT7-133
                 it = mirrors.erase(it); // freed once the GPU is done with it
             }
         }
@@ -5819,6 +5826,7 @@ void NativeRenderer::MakePendingMirrors() {
         NATIVE_DIAGNOSTIC(stats.mirror_retaken_bytes += taken);
         NATIVE_DIAGNOSTIC(stats.mirror_largest = std::max<u64>(stats.mirror_largest, end - begin));
         promotion_trace.Next(6);
+        NoteOwnedMapChange(); // PERF-GT7-133
         mirrors.emplace(begin, Mirror{.begin = begin,
                                       .end = end,
                                       .buffer = std::move(buffer),
@@ -5840,6 +5848,7 @@ void NativeRenderer::DropMirrors(VAddr address, u64 size, u32 diagnostic_reason)
         buffer_log.Note(it->second.begin, it->second.end, true); // OPT-010
         retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
         std::unique_lock map_lock{buffer_map_mutex};
+        NoteOwnedMapChange(); // PERF-GT7-133
         it = mirrors.erase(it); // freed once the GPU is done with it
     }
 }
@@ -16386,9 +16395,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     // sorted, kept while neither map changes. Each tessellated draw walked both maps for each of
     // its buffers, with a NativeHandle() call per entry, and a buffer that is in neither (a
     // wrapper over imported guest memory, the usual case) walked them whole: ~0.6 ms a frame of the
-    // recorder in a GT7 race (~145 such draws a frame, a few hundred regions). The maps change
-    // under buffer_generation (OPT-003, which the buffer memos already rely on); their sizes are
-    // checked too. The chunks are the list's own and few: still walked.
+    // recorder in a GT7 race (~145 such draws a frame, a few hundred regions). Every place that
+    // puts a region or mirror in or takes one out moves g_lds_owned_epoch (NoteOwnedMapChange), as
+    // does a renderer going; both maps' sizes are checked too. buffer_generation is not used: it
+    // also moves for dirty pages, and the set would then be made again for nearly every draw. The
+    // chunks are the list's own and few: still walked.
     static const bool owned_memo_on = [] {
         const char* env = std::getenv("SHADGT_LDS_OWNED_MEMO");
         return !(env && env[0] == '0');
@@ -16396,7 +16407,6 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     struct OwnedHandles {
         const NativeRenderer* owner = nullptr;
         u64 epoch = 0;
-        u64 generation = 0;
         size_t regions = 0;
         size_t mirrors = 0;
         std::vector<VkBuffer> handles;
@@ -16408,11 +16418,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     const u64 owned_epoch = g_lds_owned_epoch.load(std::memory_order_acquire);
     if (owned_memo_on && pipeline->LdsEmulation() &&
         (owned_handles.owner != this || owned_handles.epoch != owned_epoch ||
-         owned_handles.generation != buffer_generation ||
          owned_handles.regions != regions.size() || owned_handles.mirrors != mirrors.size())) {
         owned_handles.owner = this;
         owned_handles.epoch = owned_epoch;
-        owned_handles.generation = buffer_generation;
         owned_handles.regions = regions.size();
         owned_handles.mirrors = mirrors.size();
         owned_handles.handles.clear();
@@ -18076,6 +18084,7 @@ void NativeRenderer::PreparedDraw::Reset() {
     pipeline_keepalive.reset();
     stage_hashes = {};
     bindings.Clear();
+    NoteOwnedMapChange(); // PERF-GT7-133
     regions.clear();
     image_ranges.clear();
     picture_ranges.clear(); // PERF-GTS-404
@@ -18091,6 +18100,7 @@ void NativeRenderer::PreparedDraw::Reset() {
     indexed = false;
     index_offset = 0;
     index_address = 0;
+    NoteOwnedMapChange(); // PERF-GT7-133
     mirrors.clear();
     in_place.clear();
     missing_pictures.clear(); // PERF-GTS-403
@@ -21195,6 +21205,7 @@ u32 NativeRenderer::DropRegionsOver(VAddr address, u64 size, u32 mirror_reason) 
                 retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
                 NoteHistory(it->second.begin, it->second.end - it->second.begin, 11,
                             0); // DIAG-187 (diagnosis)
+                NoteOwnedMapChange(); // PERF-GT7-133
                 it = regions.erase(it);
                 ++dropped;
             } else {

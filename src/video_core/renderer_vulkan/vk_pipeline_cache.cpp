@@ -1126,13 +1126,14 @@ private:
     // FIX-GT7-109 (port): measured on GT7 only. With 4 builds at once in a race the recorder's
     // submits waited in the driver behind the compiles (frames of 60-115 ms on a new track);
     // 2 at once did not. GT Sport's races keep going on skipped draws with their own pacing
-    // (PERF-GT7-034's step back) and were never measured narrowed, so the narrowing is GT7's
-    // default only. SHADGT_COMPILE_PLAY_WIDTH=<n> narrows to n on either game; 0: never.
+    // (PERF-GT7-034's step back) and were never measured narrowed.
+    // PERF-GTS-489: 2 at once is the default for both games; it is what took the compile stutter
+    // out of play. SHADGT_COMPILE_PLAY_WIDTH=<n> narrows to n; 0: never.
     static bool NarrowInPlay() {
         static const bool on = [] {
             const char* env = std::getenv("SHADGT_COMPILE_PLAY_WIDTH");
             if (env && *env) return std::strtoul(env, nullptr, 10) != 0;
-            return Common::IsGt7();
+            return true;
         }();
         return on;
     }

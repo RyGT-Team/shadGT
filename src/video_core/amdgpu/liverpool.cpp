@@ -1885,6 +1885,32 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
                                            std::span<const u32> original_dcb) {
     FIBER_ENTER(dcb_task_name);
+#ifdef RYTY_GPU
+    // FIX-GTS-492: GT Sport takes a frame's command memory back at its end-of-pipe interrupt;
+    // the prepared draws kept under packets of this memory end then (see EventWriteEop).
+    if (Vulkan::NativeRenderer::PreparedLifetimeOn()) {
+        // No interrupt for a very long time: the list stays bounded. Retiring early only costs
+        // the prepared draws of what is not recorded yet.
+        if (decoded_command_ranges.size() >= 16384) {
+            if (auto* native = rasterizer ? rasterizer->Native() : nullptr) {
+                std::vector<Native::CommandRange> ranges;
+                ranges.reserve(decoded_command_ranges.size());
+                for (const auto& [begin, end] : decoded_command_ranges) {
+                    ranges.push_back({begin, end});
+                }
+                native->RetirePreparedDraws(ranges);
+            }
+            decoded_command_ranges.clear();
+        }
+        for (const auto buffer : {dcb, original_dcb}) {
+            if (!buffer.empty()) {
+                decoded_command_ranges.emplace_back(
+                    reinterpret_cast<u64>(buffer.data()),
+                    reinterpret_cast<u64>(buffer.data() + buffer.size()));
+            }
+        }
+    }
+#endif
     if (!original_dcb.empty()) {
         RecordCmdBuffer(original_dcb.data(), original_dcb.size_bytes(), false);
         decoding_submit.fetch_add(1, std::memory_order_relaxed); // DIAG-061
@@ -2659,13 +2685,31 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::EventWriteEop: {
                 const auto event = *reinterpret_cast<const PM4CmdEventWriteEop*>(header);
                 const u64 eop_submit = decoding_submit.load(std::memory_order_relaxed);
+                // FIX-GTS-492: when this event raises the interrupt, the game takes back the
+                // command memory decoded up to here: the prepared draws in it are dropped where
+                // the interrupt is sent, right before it.
+                std::function<void()> retire_prepared = [] {};
+#ifdef RYTY_GPU
+                if (auto* native = rasterizer ? rasterizer->Native() : nullptr;
+                    native && !decoded_command_ranges.empty() &&
+                    event.int_sel.Value() != InterruptSelect::None) {
+                    auto ranges = std::make_shared<std::vector<Native::CommandRange>>();
+                    ranges->reserve(decoded_command_ranges.size());
+                    for (const auto& [begin, end] : decoded_command_ranges) {
+                        ranges->push_back({begin, end});
+                    }
+                    decoded_command_ranges.clear();
+                    retire_prepared = [native, ranges] { native->RetirePreparedDraws(*ranges); };
+                }
+#endif
                 if (draw_pipe && rasterizer && (EarlyFencesActive() || EarlyFenceAllowed())) {
                     // EXP-063: signaled now; the recorder only submits at this point.
                     event.SignalFence(
                         [](void* address, u64 data, u32 num_bytes) {
                             Core::Memory::Instance()->TryWriteBacking(address, &data, num_bytes);
                         },
-                        [eop_submit] {
+                        [eop_submit, retire_prepared] {
+                            retire_prepared();
                             NoteEop(eop_submit);
                             Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
                         });
@@ -2681,18 +2725,19 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 RecordLabelWrite(
                     reinterpret_cast<VAddr>(event.Address<u32>()),
                     FenceValueBytes(event.data_sel.Value(), event.DataDWord(), event.DataQWord()),
-                    [this, event, eop_submit] {
+                    [this, event, eop_submit, retire_prepared] {
                         const auto* event_eop = &event;
                         const bool deferred =
                             rasterizer &&
                             rasterizer->DeferFenceSignal(
                                 reinterpret_cast<VAddr>(event_eop->Address<u32>()),
-                                [event, eop_submit] {
+                                [event, eop_submit, retire_prepared] {
                                     event.SignalFence(
                                         [](void* address, u64 data, u32 num_bytes) {
                                             WriteDeferredFence(address, &data, num_bytes);
                                         },
-                                        [eop_submit] {
+                                        [eop_submit, retire_prepared] {
+                                            retire_prepared();
                                             NoteEop(eop_submit);
                                             #ifndef NDEBUG
 ++g_eops_deferred;
@@ -2714,7 +2759,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                     auto* memory = Core::Memory::Instance();
                                     ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
                                 },
-                                [eop_submit] {
+                                [eop_submit, retire_prepared] {
+                                    retire_prepared();
                                     NoteEop(eop_submit);
                                     #ifndef NDEBUG
 ++g_eops_immediate;

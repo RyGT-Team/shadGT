@@ -664,7 +664,23 @@ private:
 
 // Walks a job's commands up to `until` like the command processor does (NAT-004), recording a
 // snapshot of the state at each draw.
-void WalkJobTo(Job& job, const u32* until, std::optional<u32> epoch = std::nullopt) {
+// FIX-GTS-492: what a job reads as it ends, while its command memory is certainly its own.
+u64 PreparedSerialNow() {
+    if (liverpool) {
+        if (auto* rasterizer = liverpool->GetRasterizer()) {
+            if (auto* native = rasterizer->Native()) {
+                return native->PreparedSerial();
+            }
+        }
+    }
+    return 0;
+}
+
+// FIX-GTS-492: `serial` is the job's when the walk runs later than the job (a prepare worker);
+// a walk on the job's own thread reads it now.
+void WalkJobTo(Job& job, const u32* until, std::optional<u32> epoch = std::nullopt,
+               std::optional<u64> serial = std::nullopt) {
+    Vulkan::NativeRenderer::SetWalkSerial(serial ? *serial : PreparedSerialNow());
 #ifndef NDEBUG
     const auto start = std::chrono::steady_clock::now();
 #endif
@@ -1102,6 +1118,7 @@ u32 PrepareWorkers() {
 struct QueuedJob {
     Job job;
     u32 epoch;
+    u64 serial; // FIX-GTS-492: PreparedSerialNow() as the job ended
 };
 std::mutex g_queue_mutex;
 std::condition_variable g_queue_cv;
@@ -1132,7 +1149,20 @@ void PrepareWorker(u32 index) {
             GiveBack(std::move(item.job.state));
             continue;
         }
-        WalkJobTo(item.job, item.job.end, item.epoch); // the submission it was recorded for
+        // FIX-GTS-492: the game has had the job's command memory back (its frame's end-of-pipe
+        // interrupt came while it waited here): other jobs write there now, it is not walked.
+        if (Vulkan::NativeRenderer::PreparedLifetimeOn() && item.job.end != nullptr && liverpool) {
+            auto* rasterizer = liverpool->GetRasterizer();
+            auto* native = rasterizer ? rasterizer->Native() : nullptr;
+            if (native && native->CommandMemoryRetiredSince(
+                              item.serial, reinterpret_cast<u64>(item.job.end) - sizeof(u32))) {
+                ++g_dropped_late;
+                GiveBack(std::move(item.job.state));
+                continue;
+            }
+        }
+        // The submission it was recorded for.
+        WalkJobTo(item.job, item.job.end, item.epoch, item.serial);
         FinishJob(item.job);
         // FinishJob kept the state on this thread: hand it back to the job threads.
         while (!t_free_states.empty()) {
@@ -1168,7 +1198,8 @@ void ShadowJobDecode() {
         size_t queued;
         {
             std::scoped_lock lock{g_queue_mutex};
-            g_queue.push_back({std::move(t_ended), g_epoch.load(std::memory_order_relaxed)});
+            g_queue.push_back({std::move(t_ended), g_epoch.load(std::memory_order_relaxed),
+                               PreparedSerialNow()});
             queued = g_queue.size();
         }
         g_queue_cv.notify_one();
@@ -1181,6 +1212,10 @@ void ShadowJobDecode() {
     }
     WalkJobTo(t_ended, t_ended.end);
     FinishJob(t_ended);
+}
+
+u32 ShadowSubmissions() {
+    return g_epoch.load(std::memory_order_relaxed);
 }
 
 void ShadowSubmitBase(const Regs& regs) {

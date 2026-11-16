@@ -213,7 +213,7 @@ constexpr int MaxPlayers = 2;
 // controls meanwhile.
 std::atomic<bool> g_overlay_open{false};
 
-// The GT Sport config next to GTSport.exe (user/custom_configs/CUSA03220.json) as text.
+// The game's config next to the exe (user/custom_configs/<serial>.json, GAME-005) as text.
 std::string ReadGameConfig() {
     // FIX-230: Unicode and long-path safe.
     std::string text = Common::RytyReadGameConfig();

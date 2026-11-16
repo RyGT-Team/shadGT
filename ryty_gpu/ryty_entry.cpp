@@ -85,21 +85,27 @@ std::condition_variable g_window_cv;
 bool g_window_ready = false;
 bool g_renderer_ready = false;
 
-// The window's title. shadGT branding: "GTSport". RyGT7 branding (-DSHADGT_BRANDING=RyGT7): the
-// game's TITLE from app0\sce_sys\param.sfo next to the exe, as ryGT7's DisplayWindow titles it,
-// or "GTSport" when there is none.
+// The window's title, by the game the renderer runs (GAME-001): GT Sport's is "GTSport". GT7's is
+// the TITLE from app0\sce_sys\param.sfo next to the exe, as ryGT7's DisplayWindow titles it, or
+// "Gran Turismo 7": since /app0 is read from the game folders (FEAT-GTS-259) that file is usually
+// not next to the exe. -DSHADGT_BRANDING=RyGT7 still gives every game GT7's.
 std::string WindowTitle() {
-#ifdef SHADGT_BRANDING_RYGT7
-    const auto sfo = Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path() /
-                     "app0" / "sce_sys" / "param.sfo";
+#ifndef SHADGT_BRANDING_RYGT7
+    if (!Common::IsGt7()) {
+        return "GTSport";
+    }
+#endif
+    {
+    const auto sfo = Common::App0Folder(Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path()) /
+                     "sce_sys" / "param.sfo";
     std::error_code error;
     if (PSF psf; std::filesystem::exists(sfo, error) && psf.Open(sfo)) {
         if (const auto name = psf.GetString("TITLE"); name && !name->empty()) {
             return std::string(name->begin(), name->end());
         }
     }
-#endif
-    return "GTSport";
+    }
+    return "Gran Turismo 7";
 }
 
 void RunWindowThread() {
@@ -108,7 +114,7 @@ void RunWindowThread() {
     static Frontend::WindowSDL window(EmulatorSettings.GetWindowWidth(),
                                       EmulatorSettings.GetWindowHeight(), controllers,
                                       window_title);
-    window.SetIcon({}); // the branding's icon: shadGT's Gran Turismo Sport one or ryGT7's
+    window.SetIcon({}); // the game's icon (GAME-001): shadGT's Gran Turismo Sport one or ryGT7's
     {
         std::scoped_lock lock{g_window_mutex};
         g_window = &window;
@@ -715,10 +721,11 @@ void Ryty::RytyLibraryInitialize() {
     if (EmulatorSettings.IsDiscordRPCEnabled()) {
         // The game's title and id from app0\sce_sys\param.sfo next to the exe (GT7's runtime
         // has one; GT Sport's when there is none), so GT7 shows as GT7.
-        std::string title = "Gran Turismo Sport";
-        std::string serial = "CUSA03220";
-        const auto sfo = Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path() /
-                         "app0" / "sce_sys" / "param.sfo";
+        // GAME-001 decides which game; param.sfo, when there, gives its exact title and region.
+        std::string title = Common::IsGt7() ? "Gran Turismo 7" : "Gran Turismo Sport";
+        std::string serial{Common::CurrentGameSerial()}; // GAME-005
+        const auto sfo = Common::App0Folder(Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path()) /
+                         "sce_sys" / "param.sfo";
         std::error_code error;
         if (PSF psf; std::filesystem::exists(sfo, error) && psf.Open(sfo)) {
             if (const auto name = psf.GetString("TITLE")) {

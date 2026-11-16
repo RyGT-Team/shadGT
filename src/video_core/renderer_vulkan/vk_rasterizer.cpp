@@ -1,4 +1,5 @@
 #include "common/debug_environment.h"
+#include "common/game_title.h"
 #include "common/geometry_trace.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
@@ -3238,15 +3239,11 @@ std::optional<std::pair<const VideoCore::Buffer*, u64>> Rasterizer::DirectReadBu
 
 #ifdef RYTY_GPU
 // FIX-419-GTS (follows shadgt7's fence batching): GT7's two labels its job threads spin on are
-// never batched. GT7 only (CUSA24767/CUSA24769 or its title): the addresses are GT7's.
+// never batched. GT7 only: the addresses are GT7's. GAME-001 decides (its own serial and name test
+// never matched under Ryty, whose serial was GT Sport's for both games, so the exemption shadgt7
+// always had was off in the unified renderer).
 static bool Gt7SpunLabel(VAddr address) {
-    static const bool gt7 = [] {
-        const auto& elf = Common::ElfInfo::Instance();
-        const std::string_view id = elf.GameSerial();
-        const std::string_view name = elf.Title();
-        return id == "CUSA24767" || id == "CUSA24769" ||
-               (name.starts_with("Gran Turismo") && name.ends_with(" 7"));
-    }();
+    static const bool gt7 = Common::IsGt7();
     return gt7 && ((address >= 0x102046a3f0 && address < 0x102046a400) ||
                    (address >= 0x10200004e0 && address < 0x1020000500));
 }

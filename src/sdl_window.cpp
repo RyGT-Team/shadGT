@@ -17,6 +17,7 @@
 #include <windows.h>
 #endif
 
+#include "common/game_title.h"
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
@@ -580,11 +581,14 @@ void SetWindowIcon(SDL_Window* window, const std::vector<u8>& png) {
 
 void SetDefaultWindowIcon(SDL_Window* window) {
     const auto resource = cmrc::res::get_filesystem();
+    // The game's icon (GAME-001): ryGT7's for GT7, shadGT's for GT Sport. -DSHADGT_BRANDING=RyGT7
+    // still gives every game ryGT7's.
 #ifdef SHADGT_BRANDING_RYGT7
-    const auto file = resource.open("src/resources/rygt7.png");
+    const bool gt7 = true;
 #else
-    const auto file = resource.open("src/resources/shadps4.png");
+    const bool gt7 = Common::IsGt7();
 #endif
+    const auto file = resource.open(gt7 ? "src/resources/rygt7.png" : "src/resources/shadps4.png");
     const std::vector<u8> texData = std::vector<u8>(file.begin(), file.end());
     SetWindowIcon(window, texData);
 }

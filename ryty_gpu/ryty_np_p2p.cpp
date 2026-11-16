@@ -11,6 +11,7 @@
 // shadNet's own resolver and STUN echo are replaced: for a game on the same PC as shadNet they
 // would advertise 127.0.0.1, which other players cannot reach.
 
+#include "common/game_title.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -88,7 +89,7 @@ std::string Trim(std::string text) {
 // RyGTServer's address: SHADGT_ONLINE_SERVER, else online_server in RyGT.ini, else this PC.
 std::string ServerAddress() {
     if (const char* text = std::getenv("SHADGT_ONLINE_SERVER"); text && *text) return text;
-    std::ifstream ini("RyGT.ini");
+    std::ifstream ini(Common::RygtIniPath(std::filesystem::current_path())); // <serial>.RyGT.ini
     std::string line;
     while (std::getline(ini, line)) {
         const auto eq = line.find('=');

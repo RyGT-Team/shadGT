@@ -8,6 +8,7 @@
 // SHADGT_PATCH=<rva>:<original hex>:<new hex>[,...] applies arbitrary patches the same way, for
 // experiments (RVA in GTSport.exe: eboot.bin address + 0x10000).
 
+#include "common/game_title.h"
 #include <cstdio>
 #include <array>
 #include <algorithm>
@@ -1952,9 +1953,13 @@ void SyncDecals() {
     std::wstring dir{exe};
     dir = dir.substr(0, dir.find_last_of(L"\\/") + 1);
     const std::wstring src = dir + L"decals\\";
-    const std::wstring dst = dir + L"temp0\\decals\\";
+    // The game's /temp0 is temp0\<serial> (one folder for both games).
+    const std::string serial{Common::CurrentGameSerial()};
+    const std::wstring temp0 = dir + L"temp0\\" + std::wstring(serial.begin(), serial.end());
+    const std::wstring dst = temp0 + L"\\decals\\";
     CreateDirectoryW(src.c_str(), nullptr);
     CreateDirectoryW((dir + L"temp0").c_str(), nullptr);
+    CreateDirectoryW(temp0.c_str(), nullptr);
     CreateDirectoryW(dst.c_str(), nullptr);
     WIN32_FIND_DATAW found{};
     HANDLE find = FindFirstFileW((dst + L"*.svg").c_str(), &found);
@@ -1997,7 +2002,7 @@ void SyncDecals() {
 // 1024x512 reflection of the wet track (ReflectSetting.enableIfWet of the course settings, checked
 // at eboot 0xab27d2): ~24% of a Tokyo rain frame's draws. Ignoring "wet" leaves the pass out
 // (Tokyo rain, 3 races each: 40.6 fps vs 31.1). Off when GPU.wet_reflections is false in
-// user\custom_configs\CUSA03220.json (the launcher's option) or SHADGT_WET_REFLECTIONS=0.
+// user\custom_configs\<serial>.json (the launcher's option) or SHADGT_WET_REFLECTIONS=0.
 bool WetReflectionsWanted() {
     if (const char* env = std::getenv("SHADGT_WET_REFLECTIONS")) {
         return env[0] != '0';

@@ -7,6 +7,8 @@
 #include <string_view>
 #include <utility>
 
+#include "common/ryty_config.h"
+
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -39,52 +41,29 @@ inline std::optional<bool> ParseConfigBool(std::string_view text, std::string_vi
 // The launcher's explicit boolean, if present.
 inline std::optional<bool> ConfigBool(std::string_view key) {
 #ifdef _WIN32
-    char path[MAX_PATH];
-    const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
-    if (length == 0 || length >= MAX_PATH) {
+    // GAME-005: the game's own settings file (Common::RytyGameConfigPathW); FIX-230: Unicode
+    // and long-path safe.
+    const std::string text = Common::RytyReadGameConfig();
+    if (text.empty()) {
         return std::nullopt;
     }
-    std::string config{path, length};
-    config = config.substr(0, config.find_last_of("\\/") + 1) + "user\\custom_configs\\CUSA03220.json";
-    std::FILE* file = std::fopen(config.c_str(), "rb");
-    if (!file) {
-        return std::nullopt;
-    }
-    std::string text;
-    char chunk[4096];
-    while (const size_t n = std::fread(chunk, 1, sizeof(chunk), file)) {
-        text.append(chunk, n);
-    }
-    std::fclose(file);
     return ParseConfigBool(text, key);
 #else
     return std::nullopt;
 #endif
 }
 
-// Whether `key` is true in user\custom_configs\CUSA03220.json (the launcher's options).
+// Whether `key` is true in user\custom_configs\<serial>.json (the launcher's options).
 inline bool ConfigTrue(std::string_view key) { return ConfigBool(key).value_or(false); }
 
 // The number after `key` in the config (the launcher's options), or `fallback`.
 inline double ConfigNumber(std::string_view key, double fallback) {
 #ifdef _WIN32
-    char path[MAX_PATH];
-    const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
-    if (length == 0 || length >= MAX_PATH) {
+    // GAME-005: the game's own settings file (Common::RytyGameConfigPathW).
+    const std::string text = Common::RytyReadGameConfig();
+    if (text.empty()) {
         return fallback;
     }
-    std::string config{path, length};
-    config = config.substr(0, config.find_last_of("\\/") + 1) + "user\\custom_configs\\CUSA03220.json";
-    std::FILE* file = std::fopen(config.c_str(), "rb");
-    if (!file) {
-        return fallback;
-    }
-    std::string text;
-    char chunk[4096];
-    while (const size_t n = std::fread(chunk, 1, sizeof(chunk), file)) {
-        text.append(chunk, n);
-    }
-    std::fclose(file);
     const std::string quoted = "\"" + std::string{key} + "\"";
     const size_t found = text.find(quoted);
     if (found == std::string::npos) {

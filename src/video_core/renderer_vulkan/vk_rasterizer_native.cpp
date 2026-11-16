@@ -1739,11 +1739,13 @@ bool NativeModeRequested() {
         }
 #endif
         const bool on = value && *value == "true";
-        LOG_WARNING(Render_Vulkan, "FIX-230: native renderer {} ({})", on ? "on" : "off",
-                    value ? "native_renderer in user\\custom_configs\\CUSA03220.json"
+        // GAME-005: the settings file is the game's own (Common::GameSettingsSerial).
+        LOG_WARNING(Render_Vulkan, "FIX-230: native renderer {} ({}{})", on ? "on" : "off",
+                    value ? "native_renderer in user\\custom_configs\\"
                     : Common::RytyGameConfigText().empty()
                         ? "the launcher's settings file could not be read: default off"
-                        : "no native_renderer setting: default off");
+                        : "no native_renderer setting: default off",
+                    value ? std::string{Common::GameSettingsSerial()} + ".json" : std::string{});
         return on;
     }();
     return requested;

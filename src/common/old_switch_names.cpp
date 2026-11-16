@@ -52,7 +52,10 @@ std::string& Note() {
 
 #ifdef _WIN32
 bool RunningGt7() {
-    // The executable's name alone (GAME-001): nothing else is known this early.
+    if (const auto launcher = LauncherGameTitle()) { // GAME-004: the launcher says
+        return *launcher == GameTitle::Gt7;
+    }
+    // The executable's name (GAME-001): nothing else is known this early.
     std::wstring path(32768, L'\0');
     path.resize(GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size())));
     const std::wstring_view file =

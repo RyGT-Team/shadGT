@@ -3,6 +3,7 @@
 // by NID. HTTP forwards to Ryty's libSceHttp and the P2P transport is in ryty_np_p2p.cpp; overlay
 // calls do nothing.
 
+#include "common/game_title.h"
 #include <mutex>
 #include <unordered_map>
 #include <winsock2.h>
@@ -354,7 +355,7 @@ s32 PS4_SYSV_ABI sceHttp2CreateTemplate(s32 ctx, const char* agent, s32, s32 pro
 std::string RouteUrl(const char* url) {
     static const std::string server = [] {
         std::string value;
-        if (std::FILE* ini = std::fopen("RyGT.ini", "r")) {
+        if (std::FILE* ini = _wfopen(Common::RygtIniPath(std::filesystem::current_path()).c_str(), L"r")) { // <serial>.RyGT.ini
             char line[256];
             while (std::fgets(line, sizeof(line), ini)) {
                 if (std::strncmp(line, "online_server=", 14) == 0) {

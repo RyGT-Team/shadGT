@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "common/game_title.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/libs.h"
@@ -57,7 +58,15 @@ namespace Ryty {
 
 void InitializeCommon(const char* log_name) {
     Common::Log::Setup(log_name);
-    EmulatorSettings.Load("CUSA03220");
+    // GAME-005: GT7's shader caches take GT7's name before anything opens them.
+    Common::MigrateGt7ShaderNames();
+    // GAME-005: the game's own settings (CUSA24769.json under GT7; its old CUSA03220.json when
+    // that is all there is).
+    EmulatorSettings.Load(std::string{Common::GameSettingsSerial()});
+    if (Common::GameSettingsFromOldName()) {
+        LOG_WARNING(Config, "GAME-005: GT7 settings read from the old {}.json (no {}.json)",
+                    Common::GtSportSerial, Common::Gt7Serial);
+    }
     // Setup logs every class at trace level until a filter is applied; Ngs2 alone then writes
     // hundreds of megabytes a minute. RYTY_LOG_FILTER overrides the configured filter.
     const char* filter = std::getenv("RYTY_LOG_FILTER");

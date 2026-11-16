@@ -575,6 +575,7 @@ static std::unique_ptr<Native::Rhi::Buffer> scene_indirect_buffer;
 static std::vector<SceneIndirectArgs> scene_indirect_args;
 
 bool RytyGtsInRace();
+bool RytyRaceRunning(); // GAME-006, ryty_game_patch.cpp
 static bool PrepareScope(); // PERF-GTS-450: races, or menus with SHADGT_NATIVE_PREPARE_MENUS=1
 bool RytyGtsRaceSession(); // WIDE-015
 int RytyGtsMenuScreen();   // WIDE-020
@@ -6804,6 +6805,72 @@ void NativeRenderer::WatchOneOffs(const AmdGpu::Regs& regs, bool skipped) {
         }
     }
     one_off_hits.clear();
+}
+
+// PERF-GTS-493: a one-off picture skipped in a race (its pipeline was not built yet), kept until a
+// draw writes it. What is left when the race stops running (or every 60 s in a race) is written to
+// the log: pictures the game drew only while their pipeline was missing, so missing for the race.
+void NativeRenderer::NoteRaceMissing(const AmdGpu::Regs& regs) {
+    u64 ps_hash = 0;
+    if (regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Fragment))) {
+        if (const auto* pgm = regs.ProgramForStage(u32(Shader::HwStage::Fragment));
+            pgm && pgm->Address<u32*>()) {
+            ps_hash = AmdGpu::GetParams(*pgm).hash;
+        }
+    }
+    for (const OneOffHit& hit : one_off_hits) {
+        if (race_missing.size() >= 4096 && !race_missing.contains(hit.address)) {
+            continue;
+        }
+        auto [it, first] = race_missing.try_emplace(hit.address);
+        if (first) {
+            it->second.hit = hit;
+            it->second.frame = frame;
+            it->second.ps_hash = ps_hash;
+        }
+        ++it->second.skips;
+    }
+}
+
+void NativeRenderer::CheckRaceMissing() {
+    std::erase_if(race_missing, [&](const auto& item) {
+        const Native::ImageEntry* entry = registry->FindExisting(
+            item.first, [](const Native::ImageEntry& e) { return !e.from_cpu && e.image != nullptr; });
+        return entry && entry->written_frame.load(std::memory_order_relaxed) > item.second.frame;
+    });
+    const bool in_race = RytyGtsInRace();
+    const bool running = RytyRaceRunning();
+    const auto now = std::chrono::steady_clock::now();
+    const bool ended = (race_missing_state.in_race && !in_race) ||
+                       (race_missing_state.running && !running);
+    const bool periodic = in_race && now - race_missing_state.last >= std::chrono::seconds{60};
+    race_missing_state.in_race = in_race;
+    race_missing_state.running = running;
+    if (!ended && !periodic) {
+        return;
+    }
+    race_missing_state.last = now;
+    std::string list;
+    u32 shown = 0;
+    for (const auto& [address, missing] : race_missing) {
+        if (shown++ == 24) {
+            list += " ...";
+            break;
+        }
+        const auto& h = missing.hit;
+        list += fmt::format(" {:#x} {} {}x{} format {}/{} ps {:#x}, skipped {} times since frame "
+                            "{};",
+                            address, h.depth ? std::string{"depth"} : fmt::format("color{}", h.cb), h.pitch,
+                            h.height, h.format, h.number_format, missing.ps_hash, missing.skips,
+                            missing.frame);
+    }
+    LOG_WARNING(Render_Vulkan,
+                "PERF-GTS-493 {}: {} one-off pictures skipped in the race and not drawn since{}{}",
+                ended ? "end of race" : "race report (60 s)", race_missing.size(),
+                list.empty() ? "" : ":", list);
+    if (ended && !in_race) {
+        race_missing.clear(); // a new session's pictures are its own
+    }
 }
 
 void NativeRenderer::CheckOneOffs() {
@@ -14436,6 +14503,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     } else if (one_off) {
         ++stats.one_off_race_skips; // PERF-GTS-493
         stats.kept_shadow_skips += one_off_kept_shadow ? 1 : 0;
+        NoteRaceMissing(regs); // PERF-GTS-493: for the end-of-race report
         WatchOneOffs(regs, true);
     } else if (!pipeline && !one_off_hits.empty()) {
         // PERF-GT7-023: one-off pictures of kinds that no longer wait only: skipped as other
@@ -22707,6 +22775,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         RyDiag::SetProfileTag(drawn > 3300 ? 2 : 0);
     }
     CheckOneOffs(); // DIAG-GT7-008
+    CheckRaceMissing(); // PERF-GTS-493
     // The game's render target there (its layout from the CB registers may differ in details
     // from the video out description), else an image of the display layout.
     // Merge (shadGT): GT7 looks its display up by its exact size, and shows the corner of a larger

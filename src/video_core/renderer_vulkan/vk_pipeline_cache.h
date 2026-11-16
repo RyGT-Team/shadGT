@@ -321,8 +321,11 @@ private:
     void ExportPipelineRecipes(std::stop_token stop);
 public:
     /// PERF-GTS-493: in a race (its loading and pre-race screen included) no draw and no compute
-    /// dispatch waits for a shader or a pipeline; it is skipped until its build is done.
+    /// dispatch waits for its pipeline; it is skipped until its build is done (draws that write
+    /// memory, and some translations, still wait: see the .cpp).
     static bool RaceNeverWaits();
+    /// PERF-GTS-494: the play state comes from the race's own state (GAME-006), in a race.
+    static bool RaceSignalPlay();
     /// FEAT-GTS-471: a stored pipeline key file and its shaders' names (program, record SPIR-V hash).
     struct PipelineRecipe {
         std::array<std::pair<u64, u64>, MaxShaderStages> names{};
@@ -451,10 +454,18 @@ private:
     struct PendingCompute {
         std::future<std::unique_ptr<ComputePipeline>> done;
         std::function<ComputePipeline::SerializationSupport()> sdata;
+        std::function<std::chrono::steady_clock::time_point()> built; ///< when the worker ended
         std::chrono::steady_clock::time_point start;
         u64 skipped = 0;
     };
     tsl::robin_map<ComputePipelineKey, PendingCompute> pending_computes;
+    /// PERF-GTS-493: the end-of-race report's state (under the lookup lock).
+    struct RaceReport {
+        bool in_race = false;
+        bool running = false;
+        std::chrono::steady_clock::time_point last{};
+    } race_report;
+    void ReportRaceMissing(std::chrono::steady_clock::time_point now);
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<GraphicsPipeline>> graphics_pipelines;
     std::unordered_map<const Pipeline*, std::chrono::steady_clock::time_point> pipeline_last_use;
     std::chrono::steady_clock::time_point retention_now{std::chrono::steady_clock::now()};

@@ -1708,9 +1708,11 @@ std::atomic<u64> g_gt7_org_race_ms{0};
 // the start is requested and the countdown begins (GT Sport P+0xae, GT7 P+0xb8: onStartRequest,
 // GT Sport 0x1409c8510 / GT7 0x141f43620 in Ghidra), a byte set when the start time is reached
 // (GT Sport P+0x69, which its endSession logs as "in Race" against "Immediate"; GT7 P+0x75), both
-// cleared by the race's finish. The pre-race screen (cars on the grid until Start is pressed)
-// sets neither. Replays never request a start. Read from the code (Ghidra, GT7 1.71 and GT Sport
-// 1.68), the retry and the results board not observed yet. The renderer's play state follows it
+// cleared by the race's finish block (read in the code). Replays never request a start (mode 3,
+// a deduction). Read from the code (Ghidra, GT7 1.71 and GT Sport 1.68). Seen in play (11-16):
+// both games raise it once during the loading or pre-race screen, drop it for about a second,
+// then raise it at the real start; which field tells the two apart is not known yet. The retry
+// and the results board were not observed. The renderer's play state follows it
 // (PERF-GTS-494); SHADGT_RACE_START_SIGNAL=0 leaves the play state to the frame-time measure.
 std::atomic<bool> g_race_running{false};
 std::atomic<bool> g_race_signal{false}; ///< GAME-006: a hook reads the start bytes

@@ -3358,13 +3358,12 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
             const double fps = 1000.0 / std::max(ms, 0.001);
             const bool slow = state.in_play ? ms > 17.5 : ms > 19.0;
             const bool held = state.in_play && hold_draws > 0.0 && draws_a_frame >= hold_draws;
-            // PERF-GTS-494: with GAME-006 the play state is the race's own: from its start
-            // countdown to its finish. The loading and the pre-race screen are not play: the
-            // compiles are not held back there (every core once many draws wait, FIX-GT7-106);
-            // from the countdown, two at once below normal priority (the frame rate first). Without the hook (another game version, or
-            // SHADGT_RACE_START_SIGNAL=0): the frame-time measure above.
-            const bool play = RytyRaceStartSignal() ? RytyRaceRunning()
-                                                    : fps >= 5.0 && (slow || held);
+            // PERF-GTS-494: in a race session with GAME-006's hook, the play state is the
+            // race's own (from its start countdown to its finish), see below. Elsewhere
+            // (menus, Scapes, without the hook or with SHADGT_RACE_START_SIGNAL=0): the
+            // frame-time measure above.
+            const bool play = RaceSignalPlay() ? RytyRaceRunning()
+                                               : fps >= 5.0 && (slow || held);
             g_game_in_play.store(play, std::memory_order_relaxed);
             if (play != state.in_play) {
                 state.in_play = play;
@@ -3374,7 +3373,22 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
                          ms, draws_a_frame, play ? "in play" : "not in play");
             }
         }
+        // PERF-GTS-494: the race's own state applies at once, not at the next second: the
+        // loading and the pre-race screen are not play (the compiles are not held back there,
+        // every core once many draws wait, FIX-GT7-106); from the countdown, two builds at once
+        // below normal priority, the frame rate first.
+        if (RaceSignalPlay()) {
+            const bool play = RytyRaceRunning();
+            g_game_in_play.store(play, std::memory_order_relaxed);
+            if (play != state.in_play) {
+                state.in_play = play;
+                build_workers->SetInPlay(play);
+                LOG_INFO(Render_Vulkan, "PERF-GTS-494: the race {}: {}",
+                         play ? "starts" : "is not running", play ? "in play" : "not in play");
+            }
+        }
     }
+    ReportRaceMissing(now); // PERF-GTS-493
     // FIX-GT7-106 (port): while many draws on screen wait for their pipelines (a first GT7 race:
     // ~1,600, the road side, trees and sky missing for minutes), compiles use every core, as wide
     // as a catch-up, below normal priority, until few are left. On 3 cores the world filled in
@@ -4243,9 +4257,13 @@ bool PipelineCache::RaceNeverWaits() {
     // (FIX-198, FIX-GT7-121/135/153), GT7's one-shot list, learned one-off kinds, and every
     // compute dispatch (built one by one, the game waiting: 472 waits, 160 s over eight cold GT7
     // sessions, RTX 4070 only), up to frames of 80 s at a race load. In a race, from its loading
-    // to its end, they are now skipped like every other draw until their build is done: the
-    // track and cars show black for a while, the game never stops. Draws that write memory
-    // (PERF-076) still wait (none measured in those sessions). Both games: the race flag is
+    // to its end, they are now skipped like every other draw until their build is done, and a
+    // compute dispatch until its pipeline is built on a worker: the game never stops for a
+    // pipeline. The price: a picture the game draws only once, or a dispatch it runs only once,
+    // may stay missing for the race (the end-of-race report lists them, see ReportRaceMissing).
+    // Still waited for: draws that write memory (PERF-076, none measured in those sessions),
+    // the translation of a compute shader or of a draw that may not be skipped
+    // (SkipTranslationWait), and a capture in progress (MenusWait). Both games: the race flag is
     // GT Sport's race projects and GT7's org_race gate (GAME-002). SHADGT_RACE_NEVER_WAITS=0:
     // as before.
     static const bool enabled = [] {
@@ -4255,6 +4273,55 @@ bool PipelineCache::RaceNeverWaits() {
     return enabled && AsyncPipelines() && RytyGtsInRace();
 #else
     return false;
+#endif
+}
+
+bool PipelineCache::RaceSignalPlay() {
+#ifdef RYTY_GPU
+    // PERF-GTS-494: GAME-006's hook reads the race's state, and a race session is on.
+    return RytyRaceStartSignal() && RytyGtsInRace();
+#else
+    return false;
+#endif
+}
+
+void PipelineCache::ReportRaceMissing(std::chrono::steady_clock::time_point now) {
+#ifdef RYTY_GPU
+    // PERF-GTS-493: the end-of-race report of the compute side (the lookup lock is held): the
+    // dispatches skipped while their pipeline built, and the pipelines whose dispatch never
+    // came back once built (a dispatch the game runs only once: lost for this race). Written
+    // when the race stops running or the race session ends, and every 60 s in a race.
+    const bool in_race = RytyGtsInRace();
+    const bool running = RytyRaceRunning();
+    const bool ended = (race_report.in_race && !in_race) || (race_report.running && !running);
+    const bool periodic = in_race && now - race_report.last >= std::chrono::seconds{60};
+    race_report.in_race = in_race;
+    race_report.running = running;
+    if (!ended && !periodic) return;
+    race_report.last = now;
+    u32 building = 0, never_installed = 0;
+    u64 skipped = 0;
+    std::string list;
+    for (const auto& [key, entry] : pending_computes) {
+        const bool built = entry.done.wait_for(std::chrono::seconds{0}) ==
+                           std::future_status::ready;
+        (built ? never_installed : building) += 1;
+        skipped += entry.skipped;
+        if (list.size() < 1200) {
+            list += fmt::format(" {:#x} ({}, {} skipped, {:.0f} s ago);",
+                                std::hash<ComputePipelineKey>{}(key),
+                                built ? "built, its dispatch never came back" : "building",
+                                entry.skipped,
+                                std::chrono::duration<double>(now - entry.start).count());
+        }
+    }
+    LOG_WARNING(Render_Vulkan,
+                "PERF-GTS-493 {}: compute pipelines not installed: {} built whose dispatch never "
+                "came back, {} still building; {} dispatches skipped for them{}{}",
+                ended ? "end of race" : "race report (60 s)", never_installed, building, skipped,
+                list.empty() ? "" : ":", list);
+#else
+    (void)now;
 #endif
 }
 
@@ -5387,7 +5454,8 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     // PERF-GTS-493: in a race a dispatch whose pipeline is still building is skipped; out of a
     // race it waits for it below, as before.
     auto pending = pending_computes.find(compute_key);
-    if (pending != pending_computes.end() && RaceNeverWaits() &&
+    const bool race_skips = RaceNeverWaits() && !MenusWait(); // not while a capture runs
+    if (pending != pending_computes.end() && race_skips &&
         pending->second.done.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
         ++pending.value().skipped;
         return nullptr;
@@ -5401,39 +5469,49 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         }
 
         ComputePipeline::SerializationSupport sdata{};
-        ++Common::GetWorkCounters().pipelines_compiled;
         RYDIAG_SCOPE(PipelineBuild, pipeline_hash);
-        // Compute dispatches cannot be dropped: later draws may consume their writes. Own the
-        // shader inputs on a bounded compiler worker and publish the completed pipeline before
-        // recording the dispatch; do not hand the worker mutable command-thread state.
+        // Out of a race a compute dispatch is not dropped: later draws may consume its writes,
+        // so the pipeline is published before the dispatch is recorded (in a race,
+        // PERF-GTS-493 skips it until a worker has built it). The shader inputs are owned by
+        // the worker's job; it is never handed mutable command-thread state.
         struct ComputeBuild {
             Shader::Info info;
             std::vector<u32> user_data;
             ComputePipeline::SerializationSupport sdata{};
+            std::chrono::steady_clock::time_point built{}; ///< PERF-GTS-493: when the worker ended
         };
-        // FIX-GT7-150: how long the game waited for this build (the recipe check below).
+        // FIX-GT7-150: how long this build took, from its queueing to the worker's end (the
+        // recipe check below; for one built in the background, not the frames skipped after).
         std::chrono::steady_clock::time_point build_start;
         std::future<std::unique_ptr<ComputePipeline>> completion;
         std::function<ComputePipeline::SerializationSupport()> take_sdata;
+        std::function<std::chrono::steady_clock::time_point()> take_built;
         if (pending != pending_computes.end()) {
             // PERF-GTS-493: built in the background while its dispatches were skipped.
             build_start = pending->second.start;
             completion = std::move(pending.value().done);
             take_sdata = std::move(pending.value().sdata);
+            take_built = std::move(pending.value().built);
             const u64 skipped = pending->second.skipped;
             pending_computes.erase(pending);
             static std::atomic<u32> logged{};
             if (logged.fetch_add(1, std::memory_order_relaxed) < 200) {
+                const auto now = std::chrono::steady_clock::now();
+                const auto built = completion.wait_for(std::chrono::seconds{0}) ==
+                                           std::future_status::ready
+                                       ? take_built()
+                                       : now;
                 LOG_WARNING(Render_Vulkan,
-                            "PERF-GTS-493: compute pipeline {:#x} built in the background in "
-                            "{:.0f} ms, {} dispatches skipped meanwhile",
+                            "PERF-GTS-493: compute pipeline {:#x} built by a worker {:.0f} ms "
+                            "after it was queued, installed {:.0f} ms after; {} dispatches "
+                            "skipped meanwhile",
                             pipeline_hash,
-                            std::chrono::duration<double, std::milli>(
-                                std::chrono::steady_clock::now() - build_start)
-                                .count(),
+                            std::chrono::duration<double, std::milli>(built - build_start).count(),
+                            std::chrono::duration<double, std::milli>(now - build_start).count(),
                             skipped);
             }
         } else {
+            ++Common::GetWorkCounters().pipelines_compiled;
             build_start = std::chrono::steady_clock::now();
             auto inputs = std::make_shared<ComputeBuild>();
             inputs->info = *S().infos[0];
@@ -5446,20 +5524,23 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
                     const bool foreground = ForegroundCompileOn(); // PERF-GT7-032 (port)
                     if (foreground) Common::BeginForegroundCompile();
                     SCOPE_EXIT { if (foreground) Common::EndForegroundCompile(); };
-                    return std::make_unique<ComputePipeline>(instance, scheduler, desc_heap,
+                    auto made = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap,
                         profile, *pipeline_cache, key, inputs->info, module, inputs->sdata);
+                    inputs->built = std::chrono::steady_clock::now();
+                    return made;
                 });
             completion = job->get_future();
             take_sdata = [inputs] { return inputs->sdata; };
+            take_built = [inputs] { return inputs->built; };
             if (!build_workers) build_workers = std::make_unique<PipelineBuildWorkers>();
             build_workers->Push([job] { (*job)(); }, BuildQueue::Kind::Urgent);
-            if (RaceNeverWaits() &&
+            if (race_skips &&
                 completion.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
                 // PERF-GTS-493: this dispatch and the next ones with this pipeline are skipped
                 // until a worker has built it.
                 pending_computes.emplace(compute_key,
                                          PendingCompute{std::move(completion), std::move(take_sdata),
-                                                        build_start, 1});
+                                                        std::move(take_built), build_start, 1});
                 compute_pipelines.erase(it);
                 return nullptr;
             }
@@ -5470,9 +5551,8 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         it.value() = completion.get();
         hold.reset();
         it.value()->SetStageInfo(*S().infos[0]);
-        const double ms = std::chrono::duration<double, std::milli>(
-                              std::chrono::steady_clock::now() - build_start)
-                              .count();
+        const double ms =
+            std::chrono::duration<double, std::milli>(take_built() - build_start).count();
         if (const Shader::Info* info = S().infos[0]; WarmComputeOn() && info) {
             const auto dir = WarmComputeDir();
             const auto file = dir / fmt::format("{:#018x}-{:#018x}.bin", pipeline_hash,
@@ -8473,6 +8553,10 @@ bool PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
                 !job->done) {
                 // As CompileModule: the game never sees a PS4 wait for a shader.
                 Common::GuestClock::CompilePause hold;
+                // PERF-GTS-494: a thread waits for this translation: the compiles' jobs taken
+                // meanwhile run at normal priority (one already running keeps its own).
+                Common::SetCompileCoresWide(true);
+                SCOPE_EXIT { Common::SetCompileCoresWide(false); };
                 RYDIAG_SCOPE(ShaderCompile, hash);
                 // The draw needs this shader now; don't wait behind speculative work.
                 if (CompileCpuBatchEnabled(1)) translate_workers->Prioritize(job);

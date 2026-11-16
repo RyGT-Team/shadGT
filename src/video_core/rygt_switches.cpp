@@ -131,6 +131,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_PREWARM|flag|Shader compiling|GT Sport: GPU.precompile_shaders setting (on by default); GT7: off|0 = off, any other value = on; -DisablePerf 52; needs dynamic vertex input|Builds the stored pipelines in the background while the game runs, most recently used first (PERF-038).",
     "RYGTSW1|SHADGT_PREWARM_LIMIT|int|Shader compiling|unlimited|number of pipelines|Builds at most this many stored pipelines in the background prewarm (most recently used first).",
     "RYGTSW1|SHADGT_PRECOMPILE_KEEP|int|Shader compiling|1024|number of pipelines; -1 = keep all|The splash-screen precompile keeps this many pipelines built; the rest are only compiled into the driver cache, saving RAM and VRAM (-1 keeps all, using much more memory).",
+    "RYGTSW1|SHADGT_REBUILD_WAIT|flag|Shader compiling|on|0 = off|A draw whose pipeline was built and then released (precompile, memory trim) waits for its quick rebuild instead of being skipped, so it does not pop (FIX-GTS-498).",
     "RYGTSW1|SHADGT_DIAG_SPEC_MISS|flag|Diagnostics & tracing|off|1 = on|Logs why stored shader translations (also another GPU's manifest) did not match when the game has to translate a shader again.",
     // Native recorder & sync
     "RYGTSW1|SHADGT_LONG_LIVED_SETS|flag|Native recorder & sync|on|unset or 1 = on, any other value = off (needs SHADGT_DYNAMIC_BUFFER_OFFSETS on)|Keeps descriptor sets across command lists and drops one when an object it uses is destroyed (PERF-GTS-375). Experimental.",

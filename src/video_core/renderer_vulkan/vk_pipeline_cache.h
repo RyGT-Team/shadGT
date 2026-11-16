@@ -618,6 +618,11 @@ private:
         u64 order{};
     };
     tsl::robin_map<GraphicsPipelineKey, PrewarmUnclaimed> prewarm_unclaimed;
+    /// FIX-GTS-498: keys of graphics pipelines this session built and then released (the
+    /// precompile's, or the retention trim's). A draw that needs one again waits for its rebuild,
+    /// a driver-cache hit, instead of being skipped like a pipeline never built.
+    tsl::robin_map<GraphicsPipelineKey, u8> released_graphics;
+    void NoteReleased(const GraphicsPipelineKey& key);
     u64 prewarm_adopted{};
     u64 prewarm_installed{}; ///< FEAT-GTS-470: precompile builds queued, in install order
     bool PrecompileLibrariesOnly() const;

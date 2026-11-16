@@ -6874,6 +6874,7 @@ void PipelineCache::AdoptPrewarmed() {
         if (build->libraries_only ||
             (prewarm_adopted >= PrecompileKeep() && !graphics_pipelines.contains(build->key))) {
             prewarm_adopted += build->libraries_only ? 0 : 1;
+            NoteReleased(build->key); // FIX-GTS-498
             dropped.emplace_back(std::shared_ptr<GraphicsPipeline>(std::move(build->pipeline)));
             pending_builds.erase(pending);
             ++adopted;
@@ -7088,10 +7089,32 @@ static bool LearnedOneOffWait(const AmdGpu::Regs& regs) {
     return false;
 }
 
+// FIX-GTS-498: FIX-GTS-468 releases the precompile's pipelines past SHADGT_PRECOMPILE_KEEP and,
+// under memory pressure, the retention trim releases others. A draw that needed one again found
+// no pipeline and, in keep-going mode, was skipped while it was rebuilt: GT Sport's transmission
+// screen popped on every visit (bisected to the ryty-gpu merge that brought FIX-GTS-468 in;
+// SHADGT_PRECOMPILE_KEEP=-1 removed it). Its rebuild is a driver-cache hit of a few ms, so such a
+// draw waits for it. SHADGT_REBUILD_WAIT=0: skipped as before. Lookup mutex held.
+static bool RebuildWaitOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_REBUILD_WAIT");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+void PipelineCache::NoteReleased(const GraphicsPipelineKey& key) {
+    if (RebuildWaitOn()) {
+        released_graphics.try_emplace(key, u8{1});
+    }
+}
+
 bool PipelineCache::NeverSkipped(const std::array<const Shader::Info*, MaxShaderStages>& infos) {
     // shadgt7 FIX-198 / PERF-GT7-020: a one-off target's draw (SetForceWait, SetWaitForShaders)
     // waits for its pipeline and shaders.
     if (force_wait || wait_for_shaders) return true;
+    // FIX-GTS-498: a pipeline this session built and released is rebuilt from the driver cache.
+    if (!released_graphics.empty() && released_graphics.contains(S().graphics_key)) return true;
     if (const auto* fragment = infos[u32(Shader::SwStage::Fragment)];
         fragment && IsGt7OneShotShader(fragment->pgm_hash)) return true;
     // A loading-time shadow bake may run only once. Preserve depth-only output
@@ -9549,6 +9572,7 @@ void PipelineCache::TrimUnusedPipelines() {
             pipeline_last_use.erase(it->second.get());
             if constexpr (std::is_same_v<Key, GraphicsPipelineKey>) {
                 prewarm_unclaimed.erase(key); // FIX-GTS-468
+                NoteReleased(key);            // FIX-GTS-498
             }
             retired.emplace_back(std::move(it.value()));
             cache.erase(it);
@@ -9703,6 +9727,7 @@ void PipelineCache::RetireUnclaimedPrewarm(std::vector<std::shared_ptr<const voi
         retired.emplace_back(std::move(it.value()));
         graphics_pipelines.erase(it);
         prewarm_unclaimed.erase(key);
+        NoteReleased(key); // FIX-GTS-498
         ++taken;
     }
     prewarm_settle_queue.insert(prewarm_settle_queue.begin(), busy.begin(), busy.end());

@@ -4256,8 +4256,8 @@ bool PipelineCache::RaceNeverWaits() {
     // for the draws and dispatches that still waited for their pipeline: one-off pictures
     // (FIX-198, FIX-GT7-121/135/153), GT7's one-shot list, learned one-off kinds, and every
     // compute dispatch (built one by one, the game waiting: 472 waits, 160 s over eight cold GT7
-    // sessions, RTX 4070 only), up to frames of 80 s at a race load. In a race, from its loading
-    // to its end, they are now skipped like every other draw until their build is done, and a
+    // sessions, RTX 4070 only), up to frames of 80 s at a race load. While a race runs (see
+    // below) they are now skipped like every other draw until their build is done, and a
     // compute dispatch until its pipeline is built on a worker: the game never stops for a
     // pipeline. The price: a picture the game draws only once, or a dispatch it runs only once,
     // may stay missing for the race (the end-of-race report lists them, see ReportRaceMissing).
@@ -4299,11 +4299,13 @@ void PipelineCache::ReportRaceMissing(std::chrono::steady_clock::time_point now)
     // when the race stops running or the race session ends, and every 60 s in a race.
     const bool in_race = RytyGtsInRace();
     const bool running = RytyRaceRunning();
-    const bool ended = (race_report.in_race && !in_race) || (race_report.running && !running);
-    const bool periodic = in_race && now - race_report.last >= std::chrono::seconds{60};
+    const bool session_ended = race_report.in_race && !in_race;
+    const bool ended = session_ended || (race_report.running && !running);
+    const bool periodic = in_race && !pending_computes.empty() &&
+                          now - race_report.last >= std::chrono::seconds{60};
     race_report.in_race = in_race;
     race_report.running = running;
-    if (!ended && !periodic) return;
+    if ((!ended && !periodic) || pending_computes.empty()) return; // nothing missing: no line
     race_report.last = now;
     u32 building = 0, never_installed = 0;
     u64 skipped = 0;
@@ -4324,7 +4326,10 @@ void PipelineCache::ReportRaceMissing(std::chrono::steady_clock::time_point now)
     LOG_WARNING(Render_Vulkan,
                 "PERF-GTS-493 {}: compute pipelines not installed: {} built whose dispatch never "
                 "came back, {} still building; {} dispatches skipped for them{}{}",
-                ended ? "end of race" : "race report (60 s)", never_installed, building, skipped,
+                session_ended ? "end of the race session"
+                : ended       ? "race stopped (pause, retry or finish)"
+                              : "race report (60 s)",
+                never_installed, building, skipped,
                 list.empty() ? "" : ":", list);
 #else
     (void)now;

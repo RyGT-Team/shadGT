@@ -1708,14 +1708,13 @@ std::atomic<u64> g_gt7_org_race_ms{0};
 // the start is requested and the countdown begins (GT Sport P+0xae, GT7 P+0xb8: onStartRequest,
 // GT Sport 0x1409c8510 / GT7 0x141f43620 in Ghidra), a byte set when the start time is reached
 // (GT Sport P+0x69, which its endSession logs as "in Race" against "Immediate"; GT7 P+0x75), both
-// cleared by the race's finish block (read in the code). Replays never request a start (mode 3,
-// a deduction). Read from the code (Ghidra, GT7 1.71 and GT Sport 1.68). Seen in play (11-16):
-// both games raised it once during the loading or pre-race screen, dropped it for about a second,
-// then raised it at the real start. The pre-race screen probably runs a DEMO session (race type
-// 3, read in the code, not confirmed), now left out; so is the race's pause menu. A trace line
-// gives every change of the fields read, to confirm both. The retry and the results board were
-// not observed. The renderer's play state follows it
-// (PERF-GTS-494); SHADGT_RACE_START_SIGNAL=0 leaves the play state to the frame-time measure.
+// cleared by the race's finish block. Read from the code (Ghidra, GT7 1.71 and GT Sport 1.69) and
+// seen in play (11-16, both games, SHADGT_RACE_TRACE=1): the pre-race screen runs a session of
+// race type 3 (DEMO), left out; the race starts at its countdown; the pause menu (offline) stops
+// it and Continue resumes it; Retry ends the session and the next countdown starts it again; the
+// finish (results board) ends it. GT Sport's replays and results never request a start, so they
+// are never "running" (only the countdown-to-finish time is). The renderer's play state follows
+// it (PERF-GTS-494); SHADGT_RACE_START_SIGNAL=0 leaves the play state to the frame-time measure.
 std::atomic<bool> g_race_running{false};
 std::atomic<bool> g_race_signal{false}; ///< GAME-006: a hook reads the start bytes
 std::atomic<u64> g_race_signal_ms{0};
@@ -1728,22 +1727,29 @@ bool RaceStartSignalOn() {
     return on;
 }
 
+// GAME-006: a hook that reads the race's state is in, from its install (before the race module
+// first runs: GT Sport's race flag rises with the race project, before org_race's first call, and
+// the renderer must already know that the race is not running yet). The flag falls when the
+// module stops running for five seconds (the menus).
+void StartRaceSignal() {
+    if (g_race_signal.exchange(true, std::memory_order_relaxed)) {
+        return;
+    }
+    std::thread([] {
+        for (;;) {
+            Sleep(250);
+            const u64 last = g_race_signal_ms.load(std::memory_order_relaxed);
+            if (last != 0 && GetTickCount64() - last > 5000 &&
+                g_race_running.exchange(false, std::memory_order_relaxed)) {
+                std::fprintf(stderr, "[patch] GAME-006: the race module has not run for five "
+                                     "seconds: race not running\n");
+            }
+        }
+    }).detach();
+}
+
 void NoteRaceRunning(bool running, const char* game) {
     g_race_signal_ms.store(GetTickCount64(), std::memory_order_relaxed);
-    if (!g_race_signal.exchange(true, std::memory_order_relaxed)) {
-        // The flag falls when the module stops running (the menus).
-        std::thread([] {
-            for (;;) {
-                Sleep(250);
-                const u64 last = g_race_signal_ms.load(std::memory_order_relaxed);
-                if (last != 0 && GetTickCount64() - last > 5000 &&
-                    g_race_running.exchange(false, std::memory_order_relaxed)) {
-                    std::fprintf(stderr, "[patch] GAME-006: the race module has not run for five "
-                                         "seconds: race not running\n");
-                }
-            }
-        }).detach();
-    }
     if (g_race_running.exchange(running, std::memory_order_relaxed) == running) {
         return;
     }
@@ -1770,13 +1776,24 @@ const u8* Readable(const u8* p, size_t size, ReadCheck& check) {
 }
 
 // GAME-006: the race's state as the hook reads it, written to stderr when any field changes (at
-// most 400 lines): what tells the pre-race screen, the race, the pause and a retry apart.
+// most 400 lines, SHADGT_RACE_TRACE=1): what tells the pre-race screen, the race, the pause and a
+// retry apart.
 struct RaceTrace {
     int gate = -1, requested = -1, started = -1, phase = -1, type = -1, number = -1;
     int paused = -1, grid_wait = -1, demo = -1;
     bool operator==(const RaceTrace&) const = default;
 };
+// SHADGT_RACE_TRACE=1: the trace below (off by default).
+bool RaceTraceOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_RACE_TRACE");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
 void NoteRaceTrace(const char* game, const RaceTrace& t, bool running) {
+    if (!RaceTraceOn()) return;
     static RaceTrace last;
     static std::atomic<u32> lines{};
     if (t == last || lines.load(std::memory_order_relaxed) >= 400) return;
@@ -1814,9 +1831,9 @@ void PS4_SYSV_ABI Gt7OrgRaceHook(void* self) {
     // GAME-006: G is the race's context P; +0xb8 the start requested (countdown), +0x75 started,
     // +0x118 the session phase (0 open, 1 start requested, 2 finished, 3 none), +0x11c the race
     // number. The race's parameter ([[R+0x30]], R = holder): race type at +0 (3 = DEMO, the
-    // pre-race screen's session, a deduction), grid wait at +0x40. The pause menu:
+    // pre-race screen's session), grid wait at +0x40. The pause menu:
     // GTFramework::PauseManager [Impl+0x33620], paused at +0x18; offline only ([R+0x5a0] null,
-    // online the menu does not stop the race). Read in the code (Ghidra), being confirmed in play.
+    // online the menu does not stop the race). Read in the code (Ghidra), seen in play.
     if (RaceStartSignalOn()) {
         static ReadCheck holder_check, param_holder_check, param_check, pause_check;
         RaceTrace t;
@@ -1910,6 +1927,7 @@ void InstallGt7RaceSignal(u8* base) {
         }
     }).detach();
     std::fprintf(stderr, "[patch] GAME-002 GT7 race signal applied (org_race's gate)\n");
+    if (RaceStartSignalOn()) StartRaceSignal(); // GAME-006
 }
 
 // GAME-006 (GT Sport): org_race's std::function body is a lambda that loads Impl = [self+8] and
@@ -1931,9 +1949,9 @@ u64 PS4_SYSV_ABI GtsOrgRaceHook(void* self) {
     const u8* const context = race ? *reinterpret_cast<u8* const*>(race + 0x18) : nullptr;
     // As the module's gate: in a session (P+0x68) and not ended (P+0x6b). P+0xae start requested,
     // P+0x69 started, P+0x108 phase, P+0x10c race number; the race's parameter [P]: race type
-    // at +4 (3 = DEMO, the pre-race screen's session, a deduction), grid wait in bits 1-7 of
-    // +0x20; P+0x7eb the race's pause (the pause menu, offline only); Impl+0x82e50 the script's
-    // demo mode. Read in the code (Ghidra), being confirmed in play.
+    // at +4 (3 = DEMO, the pre-race screen's session), grid wait in bits 1-7 of +0x20; P+0x7eb
+    // the race's pause (the pause menu, offline only); Impl+0x82e50 the script's demo mode (for
+    // the trace). Read in the code (Ghidra), seen in play.
     static ReadCheck context_check, param_check;
     RaceTrace t;
     bool running = false;
@@ -1948,7 +1966,7 @@ u64 PS4_SYSV_ABI GtsOrgRaceHook(void* self) {
             t.type = param[4];
             t.grid_wait = (param[0x20] >> 1) & 0x7f;
         }
-        t.demo = impl[0x82e50];
+        if (RaceTraceOn()) t.demo = impl[0x82e50]; // the script's demo mode, for the trace only
         running = t.gate && (t.requested != 0 || t.started != 0) && t.type != 3 && t.paused == 0;
     }
     NoteRaceTrace("GT Sport", t, running);
@@ -1998,6 +2016,7 @@ void InstallGtsRaceStartSignal(u8* base) {
     DWORD ignored = 0;
     VirtualProtect(lambda, sizeof(kGtsOrgRaceLambdaBytes), old_protect, &ignored);
     FlushInstructionCache(GetCurrentProcess(), lambda, sizeof(kGtsOrgRaceLambdaBytes));
+    StartRaceSignal();
     std::fprintf(stderr, "[patch] GAME-006 GT Sport race start signal applied (org_race)\n");
 }
 

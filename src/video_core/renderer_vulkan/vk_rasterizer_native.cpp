@@ -47,6 +47,7 @@
 #include "video_core/renderer_vulkan/immutable_upload_memo.h"
 #include "ryty_gpu/native/snapshot_backing_protocol.h"
 #include "video_core/renderer_vulkan/snapshot_protection_receipt.h"
+#include "common/mapping_writeback_gate.h"
 #include "common/scope_exit.h"
 #include "video_core/renderer_vulkan/snapshot_source_hints.h"
 #include "video_core/renderer_vulkan/freshness_range_search.h"
@@ -4469,13 +4470,25 @@ void NativeRenderer::FlushWritebacks() {
                 // FIX-GTS-499: the game may unmap a picture's memory while its write-back is
                 // pending (GT7 11-16, cold start: DIAG-132 dropped the views of 0x103f000000+
                 // 0x6400000 on the unmap, then the import of a picture inside it failed and this
-                // stopped the renderer). Nothing is left to write back to: the picture's write-back
-                // is skipped, with a line, instead of a crash.
+                // stopped the renderer). When the range is no longer mapped, or an unmap of it has
+                // begun (the mapping gate holds it unavailable until the host unmap is done),
+                // nothing is left to write back to: the picture's write-back is skipped, with a
+                // line. A failure on mapped memory (a driver refusing the import, a limit) still
+                // stops here.
+                auto& gate = Common::GuestMappingWritebackGate();
+                const auto token = gate.ProtocolAvailable()
+                                       ? gate.Capture(address, size)
+                                       : Common::MappingWritebackGate::Token{};
+                const bool unmapping = token && !gate.Complete(token, [] {});
+                if (!unmapping && Core::RytyMemory::IsValidMapping(address, size)) {
+                    UNREACHABLE_MSG("native image download import failed");
+                    return;
+                }
                 static std::atomic<u32> logged{};
                 if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
                     LOG_WARNING(Render_Vulkan,
-                                "FIX-GTS-499: write-back of the picture at {:#x}+{:#x} skipped: its "
-                                "memory could not be imported (unmapped by the game?)",
+                                "FIX-GTS-499: write-back of the picture at {:#x}+{:#x} skipped: "
+                                "the game unmapped its memory",
                                 address, size);
                 }
                 continue;
@@ -6867,12 +6880,13 @@ void NativeRenderer::CheckRaceMissing() {
     const bool in_race = RytyGtsInRace();
     const bool running = RytyRaceRunning();
     const auto now = std::chrono::steady_clock::now();
-    const bool ended = (race_missing_state.in_race && !in_race) ||
-                       (race_missing_state.running && !running);
-    const bool periodic = in_race && now - race_missing_state.last >= std::chrono::seconds{60};
+    const bool session_ended = race_missing_state.in_race && !in_race;
+    const bool ended = session_ended || (race_missing_state.running && !running);
+    const bool periodic = in_race && !race_missing.empty() &&
+                          now - race_missing_state.last >= std::chrono::seconds{60};
     race_missing_state.in_race = in_race;
     race_missing_state.running = running;
-    if (!ended && !periodic) {
+    if ((!ended && !periodic) || race_missing.empty()) { // nothing missing: no line
         return;
     }
     race_missing_state.last = now;
@@ -6892,7 +6906,10 @@ void NativeRenderer::CheckRaceMissing() {
     }
     LOG_WARNING(Render_Vulkan,
                 "PERF-GTS-493 {}: {} one-off pictures skipped in the race and not drawn since{}{}",
-                ended ? "end of race" : "race report (60 s)", race_missing.size(),
+                session_ended ? "end of the race session"
+                : ended       ? "race stopped (pause, retry or finish)"
+                              : "race report (60 s)",
+                race_missing.size(),
                 list.empty() ? "" : ":", list);
     if (ended && !in_race) {
         race_missing.clear(); // a new session's pictures are its own

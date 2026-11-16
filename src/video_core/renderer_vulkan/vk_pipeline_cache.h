@@ -326,9 +326,10 @@ private:
     /// FEAT-GTS-471: this GPU's stored pipelines as the manifest's recipe file (see the .cpp).
     void ExportPipelineRecipes(std::stop_token stop);
 public:
-    /// PERF-GTS-493: in a race (its loading and pre-race screen included) no draw and no compute
-    /// dispatch waits for its pipeline; it is skipped until its build is done (draws that write
-    /// memory, and some translations, still wait: see the .cpp).
+    /// PERF-GTS-493: in a race, from its start countdown (GAME-006; without that hook, the whole
+    /// race session), no draw and no compute dispatch waits for its pipeline; it is skipped until
+    /// its build is done (draws that write memory, and some translations, still wait: see the .cpp).
+    /// Waits come back during an offline pause, after the finish and in GT Sport's replays.
     static bool RaceNeverWaits();
     /// PERF-GTS-494: the play state comes from the race's own state (GAME-006), in a race.
     static bool RaceSignalPlay();

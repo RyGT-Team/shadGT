@@ -445,7 +445,12 @@ Rasterizer::SelectedPipelinePtr Rasterizer::SelectComputePipelineAhead() {
     selected.is_compute = true;
     std::scoped_lock lk{pipeline_cache.LookupMutex()};
     selected.compute = pipeline_cache.GetComputePipeline(true);
-    selected.compute_deferred = pipeline_cache.TakeComputeDeferred(); // PERF-GTS-501
+    if (pipeline_cache.TakeComputeDeferred()) {
+        // PERF-GTS-501: its build started; no selection, so the dispatch is a barrier job for
+        // the buffer stage and the recorder looks the pipeline up itself (and waits for it).
+        selected_recycler.Give(std::move(snapshot));
+        return nullptr;
+    }
     selected.keepalive[1] = pipeline_cache.KeepAlive(selected.compute);
     if (selected.compute) {
         CopyComputeStage(selected.stages);
@@ -456,15 +461,14 @@ Rasterizer::SelectedPipelinePtr Rasterizer::SelectComputePipelineAhead() {
 const ComputePipeline* Rasterizer::AcquireComputePipeline() {
     if (SelectsPipelinesAhead() && selected_pipeline && selected_pipeline->is_compute) {
         const auto* pipeline = selected_pipeline->compute;
-        if (!pipeline && !selected_pipeline->compute_deferred) {
+        if (!pipeline) {
 #ifndef NDEBUG
             ++select_stats.compute_ahead;
             if (GeometryTrace::current) GeometryTrace::Record("compute_no_pipeline", GeometryTrace::current, 1);
 #endif
             return nullptr;
         }
-        // PERF-GTS-501: a deferred selection falls through to the lookup below, which waits.
-        if (pipeline && InstallDrawStages(pipeline, selected_pipeline->stages, true)) {
+        if (InstallDrawStages(pipeline, selected_pipeline->stages, true)) {
 #ifndef NDEBUG
             ++select_stats.compute_ahead;
 #endif

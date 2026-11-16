@@ -13883,16 +13883,17 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     PreparedDraw* prepared = nullptr;
     if (prepare && !indirect && !r.FrameDumpCollecting() && PrepareScope()) { // NAT-161: direct draws only
         prepared = TakePrepared(Rasterizer::t_draw_packet);
-        // FIX-GTS-492: a prepared draw kept under this packet's address but made for a draw of
-        // other programs is never installed (a cold GT Sport race lost the GPU device on a
-        // tessellated pipeline taken that way for a plain draw). The draw goes the ordinary way.
+        // FIX-GTS-492: a prepared draw kept under this packet's address but made for another
+        // draw (other programs, or the same ones with other user data: its own frame's tables)
+        // is never installed. A cold GT Sport race lost the GPU device on a tessellated pipeline
+        // taken that way for a plain draw. The draw goes the ordinary way.
         if (prepared && PreparedLifetimeOn() && !PreparedIsForDraw(*prepared, regs)) {
             prepared_mismatched.fetch_add(1, std::memory_order_relaxed);
             static std::atomic<u32> logged{};
             if (const u32 n = ++logged; n <= 8 || n % 10000 == 0) {
                 LOG_WARNING(Render_Vulkan,
-                            "FIX-GTS-492: a prepared draw at {} was made for a draw of other "
-                            "programs: dropped ({} times)",
+                            "FIX-GTS-492: a prepared draw at {} was made for another draw "
+                            "(other programs or other user data): dropped ({} times)",
                             fmt::ptr(Rasterizer::t_draw_packet), n);
             }
             FreePrepared(prepared);
@@ -17131,23 +17132,58 @@ void NativeRenderer::RetirePreparedDraws(std::vector<Native::CommandRange>& rang
     }
     prepared_retired.fetch_add(dropped.size() - aged, std::memory_order_relaxed);
     prepared_aged.fetch_add(aged, std::memory_order_relaxed);
+    if (!dropped.empty()) {
+        // Rare (twice in a six-minute cold race): each one is a prepared draw that would have
+        // stayed for another draw before this fix. The counts say which rule works.
+        static std::atomic<u32> logged{};
+        if (const u32 n = ++logged; n <= 16 || n % 1000 == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-GTS-492: {} prepared draws left untaken were dropped at an "
+                        "end-of-pipe interrupt ({} with their command memory, {} by age); since "
+                        "the start: {} with their memory, {} by age, {} publications refused, {} "
+                        "taken for another draw, {} published over one left there ({} times)",
+                        dropped.size(), dropped.size() - aged, aged,
+                        prepared_retired.load(std::memory_order_relaxed),
+                        prepared_aged.load(std::memory_order_relaxed),
+                        prepared_refused.load(std::memory_order_relaxed),
+                        prepared_mismatched.load(std::memory_order_relaxed),
+                        prepared_replaced.load(std::memory_order_relaxed), n);
+        }
+    }
     for (PreparedDraw* draw : dropped) {
         FreePrepared(draw);
     }
 }
 
 bool NativeRenderer::PreparedIsForDraw(const PreparedDraw& p, const AmdGpu::Regs& regs) {
-    const std::array<VAddr, 6> programs{
-        regs.vs_program.Address<VAddr>(), regs.ps_program.Address<VAddr>(),
-        regs.gs_program.Address<VAddr>(), regs.es_program.Address<VAddr>(),
-        regs.hs_program.Address<VAddr>(), regs.ls_program.Address<VAddr>()};
+    // The programs of the stages the registers enable (a disabled stage keeps whatever program
+    // earlier work left), each with the user data registers it reads.
+    constexpr u32 HardwareStages = 6;
+    std::array<Native::StageIdentity, HardwareStages> draw;
+    size_t programs = 0;
+    for (u32 stage = 0; stage < HardwareStages; ++stage) {
+        if (!regs.stage_enable.IsStageEnabled(stage)) {
+            continue;
+        }
+        const AmdGpu::ShaderProgram* program = regs.ProgramForStage(stage);
+        if (program->address == 0) {
+            continue;
+        }
+        const size_t read = std::min<size_t>(program->settings.num_user_regs,
+                                             program->user_data.size());
+        draw[programs++] = {program->Address<VAddr>(),
+                            std::span<const u32>{program->user_data.data(), read}};
+    }
+    std::array<Native::StageIdentity, Shader::MaxStageTypes> prepared;
+    size_t stages = 0;
     for (const auto& copy : p.stage_copies) {
-        if (copy.present &&
-            std::find(programs.begin(), programs.end(), copy.pgm_base) == programs.end()) {
-            return false;
+        if (copy.present) {
+            prepared[stages++] = {copy.pgm_base,
+                                  std::span<const u32>{copy.user_data.data(), copy.num_user_data}};
         }
     }
-    return true;
+    return Native::PreparedStagesAreTheDraws(std::span{prepared.data(), stages},
+                                             std::span{draw.data(), programs});
 }
 
 bool NativeRenderer::HasPrepared(const void* packet) {
@@ -17608,7 +17644,8 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
             // ran late): nothing is published, another draw's packet may be there by now. Under
             // the shard's lock, so a retirement either sees this entry or is seen here.
             refused = retired_commands.RetiredSince(t_walk_serial, reinterpret_cast<u64>(packet));
-        } else if (shard.draws.size() > 1024) {
+        }
+        if (shard.draws.size() > 1024) {
             // Draws the recorder never took (not submitted, or filtered): from a few
             // submissions ago, they go.
             for (auto it = shard.draws.begin(); it != shard.draws.end();) {
@@ -17628,6 +17665,7 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
                 } else {
                     dropped.push_back(it->second);
                     it->second = p;
+                    prepared_replaced.fetch_add(1, std::memory_order_relaxed); // FIX-GTS-492
                     NATIVE_DIAGNOSTIC(++prepare_stats.replaced);
                 }
             }

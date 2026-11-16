@@ -15,8 +15,9 @@
 // (2026-11-16: a prepared draw 1,384 submissions old, a tessellated pipeline on a plain draw).
 //
 // The command thread notes the command memory it decodes; at each end-of-pipe interrupt that
-// memory is retired: the prepared draws in it are dropped before the game is told, and a walk
-// that began before the interrupt can no longer publish into it.
+// memory is retired: the prepared draws in it are dropped before the game is told (before the
+// event's label is written, which a game may poll, and before the interrupt), and a walk of a
+// job that ended before the interrupt can no longer publish into it.
 
 #include <algorithm>
 #include <array>
@@ -39,6 +40,35 @@ constexpr u32 MaxPreparedDrawAge = 64;
 /// Whether a prepared draw made at submission count `made` is past that age at `now`.
 constexpr bool PreparedDrawTooOld(u32 made, u32 now) noexcept {
     return static_cast<u32>(now - made) > MaxPreparedDrawAge;
+}
+
+/// One stage of a prepared draw, or one program the draw's registers name with its stage enabled:
+/// the program's address and its user data registers (a prepared stage's as the job copied them;
+/// a draw program's first ones, the ones the program reads).
+struct StageIdentity {
+    u64 program = 0;
+    std::span<const u32> user_data;
+};
+
+/// Whether a prepared draw was made for the draw the registers describe: each of its stages is
+/// a program an enabled stage names, and the user data registers that program reads hold what
+/// the job saw. A prepared draw left under a packet's address and met by another draw written
+/// there fails this even with the same shaders: its registers point at its own frame's tables.
+/// Registers past the ones a program reads may differ (earlier work leaves anything there).
+inline bool PreparedStagesAreTheDraws(std::span<const StageIdentity> prepared,
+                                      std::span<const StageIdentity> draw) {
+    for (const StageIdentity& stage : prepared) {
+        const auto program =
+            std::find_if(draw.begin(), draw.end(), [&](const StageIdentity& candidate) {
+                return candidate.program == stage.program;
+            });
+        if (program == draw.end() || stage.user_data.size() < program->user_data.size() ||
+            !std::equal(program->user_data.begin(), program->user_data.end(),
+                        stage.user_data.begin())) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /// A stretch of command memory, [begin, end).
@@ -72,8 +102,9 @@ inline bool InCommandRanges(std::span<const CommandRange> normalized, u64 addres
 }
 
 /// The command memory retired at the last end-of-pipe interrupts. A job reads Serial() while its
-/// command memory is certainly its own (as it ends); whoever publishes that job's prepared draws
-/// later asks RetiredSince: true once the game has had that memory back.
+/// command memory is certainly its own (right before the game's own job end, which is what lets
+/// its frame be submitted); whoever publishes that job's prepared draws later asks RetiredSince:
+/// true once the game has had that memory back.
 class RetiredCommandMemory {
 public:
     static constexpr u64 Kept = 8;

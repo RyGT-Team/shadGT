@@ -2686,8 +2686,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto event = *reinterpret_cast<const PM4CmdEventWriteEop*>(header);
                 const u64 eop_submit = decoding_submit.load(std::memory_order_relaxed);
                 // FIX-GTS-492: when this event raises the interrupt, the game takes back the
-                // command memory decoded up to here: the prepared draws in it are dropped where
-                // the interrupt is sent, right before it.
+                // command memory decoded so far (whole buffers, the rest of this one included):
+                // the prepared draws in it are dropped where the event is signaled, before its
+                // label is written (a game may poll it) and before the interrupt.
                 std::function<void()> retire_prepared = [] {};
 #ifdef RYTY_GPU
                 if (auto* native = rasterizer ? rasterizer->Native() : nullptr;
@@ -2704,12 +2705,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 #endif
                 if (draw_pipe && rasterizer && (EarlyFencesActive() || EarlyFenceAllowed())) {
                     // EXP-063: signaled now; the recorder only submits at this point.
+                    retire_prepared();
                     event.SignalFence(
                         [](void* address, u64 data, u32 num_bytes) {
                             Core::Memory::Instance()->TryWriteBacking(address, &data, num_bytes);
                         },
-                        [eop_submit, retire_prepared] {
-                            retire_prepared();
+                        [eop_submit] {
                             NoteEop(eop_submit);
                             Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
                         });
@@ -2732,12 +2733,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             rasterizer->DeferFenceSignal(
                                 reinterpret_cast<VAddr>(event_eop->Address<u32>()),
                                 [event, eop_submit, retire_prepared] {
+                                    retire_prepared();
                                     event.SignalFence(
                                         [](void* address, u64 data, u32 num_bytes) {
                                             WriteDeferredFence(address, &data, num_bytes);
                                         },
-                                        [eop_submit, retire_prepared] {
-                                            retire_prepared();
+                                        [eop_submit] {
                                             NoteEop(eop_submit);
                                             #ifndef NDEBUG
 ++g_eops_deferred;
@@ -2754,13 +2755,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             if (rasterizer) {
                                 rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::GfxEop);
                             }
+                            retire_prepared();
                             event_eop->SignalFence(
                                 [](void* address, u64 data, u32 num_bytes) {
                                     auto* memory = Core::Memory::Instance();
                                     ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
                                 },
-                                [eop_submit, retire_prepared] {
-                                    retire_prepared();
+                                [eop_submit] {
                                     NoteEop(eop_submit);
                                     #ifndef NDEBUG
 ++g_eops_immediate;

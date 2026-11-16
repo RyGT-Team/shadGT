@@ -196,11 +196,6 @@ public:
     }
     /// FIX-GTS-492: the calling thread walks a job that read `serial` as it ended.
     static void SetWalkSerial(u64 serial);
-    /// FIX-GTS-492: whether the game has had the command memory at `address` back since a job
-    /// read `serial`: that job is no longer worth walking.
-    bool CommandMemoryRetiredSince(u64 serial, u64 address) const {
-        return retired_commands.RetiredSince(serial, address);
-    }
     /// FIX-GTS-492: an end-of-pipe interrupt is about to tell the game it has this command memory
     /// back (what the command thread decoded since the last one): the prepared draws kept under
     /// packets in it are dropped, and no walk begun before can publish there. Any thread;
@@ -1567,11 +1562,13 @@ private:
     Native::RetiredCommandMemory retired_commands;
     /// FIX-GTS-492: prepared draws dropped with their command memory, dropped by age (their
     /// job's commands never reached the command thread), publications refused (the walk ran
-    /// after its frame ended, or a newer one was there), and ones taken for a draw of other
-    /// programs.
+    /// after its frame ended, or a newer one was there), ones taken for another draw, and
+    /// ones published over one still in the table (left by a job never decoded, or a second
+    /// walk of the same commands).
     std::atomic<u64> prepared_retired{0}, prepared_aged{0}, prepared_refused{0},
-        prepared_mismatched{0};
-    /// FIX-GTS-492: whether the prepared draw's programs are the ones the draw's registers name.
+        prepared_mismatched{0}, prepared_replaced{0};
+    /// FIX-GTS-492: whether the prepared draw was made for the draw the registers describe
+    /// (Native::PreparedStagesAreTheDraws).
     static bool PreparedIsForDraw(const PreparedDraw& p, const AmdGpu::Regs& regs);
     PreparedShard& ShardFor(const void* packet) {
         return prepared_shards[(reinterpret_cast<u64>(packet) * 0x9E3779B97F4A7C15ULL) >> 58];

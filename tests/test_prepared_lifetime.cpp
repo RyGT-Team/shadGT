@@ -108,4 +108,62 @@ TEST(PreparedLifetime, OnlyAnOldPreparedDrawGoesByAge) {
     EXPECT_FALSE(Native::PreparedDrawTooOld(0xfffffffeu, 2)); // the count wrapped: 4 old
 }
 
+// The recorder's check at the take. Programs and registers as in a race draw: a vertex and a
+// pixel shader, the vertex shader's register 2 pointing at the draw's own V# table.
+struct Stage {
+    u64 program;
+    std::vector<u32> user_data;
+};
+std::vector<Native::StageIdentity> Identities(const std::vector<Stage>& stages) {
+    std::vector<Native::StageIdentity> out;
+    for (const Stage& stage : stages) {
+        out.push_back({stage.program, stage.user_data});
+    }
+    return out;
+}
+bool Matches(const std::vector<Stage>& prepared, const std::vector<Stage>& draw) {
+    return Native::PreparedStagesAreTheDraws(Identities(prepared), Identities(draw));
+}
+constexpr u64 Vs = 0x2001000, Ps = 0x2002000, Ls = 0x2003000, Hs = 0x2004000, Ds = 0x2005000;
+// 16 registers as a job copies them; the draw's programs read the first 4 and 2.
+std::vector<u32> Copied(u32 table, u32 leftover = 0) {
+    std::vector<u32> registers(16, leftover);
+    registers[0] = 0x11;
+    registers[2] = table;
+    return registers;
+}
+
+TEST(PreparedIdentity, TheDrawItWasMadeFor) {
+    EXPECT_TRUE(Matches({{Ps, Copied(0x7000)}, {Vs, Copied(0x8000)}},
+                        {{Ps, {0x11, 0}}, {Vs, {0x11, 0, 0x8000, 0}}}));
+}
+
+TEST(PreparedIdentity, RegistersTheProgramDoesNotReadMayDiffer) {
+    // NAT-007: what earlier work left past the program's own registers is not the draw's.
+    EXPECT_TRUE(Matches({{Vs, Copied(0x8000, 0xdead)}}, {{Vs, {0x11, 0xdead, 0x8000, 0xdead}}}));
+    EXPECT_TRUE(Matches({{Vs, Copied(0x8000, 0xdead)}}, {{Vs, {0x11, 0xdead, 0x8000}}}));
+}
+
+// The common stale case: the same material's shaders, another frame's tables.
+TEST(PreparedIdentity, TheSameShadersWithAnotherDrawsTablesIsRefused) {
+    EXPECT_FALSE(Matches({{Ps, Copied(0x7000)}, {Vs, Copied(0x8000)}},
+                         {{Ps, {0x11, 0}}, {Vs, {0x11, 0, 0x9000, 0}}}));
+}
+
+// The lost device: a tessellated prepared draw met by a plain draw. The LS and HS registers
+// still name its programs, but their stages are off: they are not among the draw's programs.
+TEST(PreparedIdentity, ATessellatedOneOnAPlainDrawIsRefused) {
+    const std::vector<Stage> tessellated{
+        {Ps, Copied(0x7000)}, {Hs, Copied(0x7100)}, {Ds, Copied(0x7200)}, {Ls, Copied(0x8000)}};
+    EXPECT_FALSE(Matches(tessellated, {{Ps, {0x11, 0}}, {Vs, {0x11, 0, 0x8000, 0}}}));
+    EXPECT_TRUE(Matches(tessellated, {{Ps, {0x11, 0}},
+                                      {Ds, {0x11, 0, 0x7200}},
+                                      {Hs, {0x11, 0, 0x7100}},
+                                      {Ls, {0x11, 0, 0x8000}}}));
+}
+
+TEST(PreparedIdentity, AProgramReadingMoreRegistersThanWereCopiedIsRefused) {
+    EXPECT_FALSE(Matches({{Vs, {0x11, 0}}}, {{Vs, {0x11, 0, 0x8000}}}));
+}
+
 } // namespace

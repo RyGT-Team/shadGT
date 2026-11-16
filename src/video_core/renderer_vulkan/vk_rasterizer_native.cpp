@@ -2559,7 +2559,11 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
 }
 
 static bool ParallelRingOn(); // PERF-GTS-399, below
+/// PERF-GT7-133: moves on when a renderer goes, so no thread keeps its set of owned handles.
+static std::atomic<u64> g_lds_owned_epoch{1};
+
 NativeRenderer::~NativeRenderer() {
+    g_lds_owned_epoch.fetch_add(1, std::memory_order_acq_rel); // PERF-GT7-133
     auto expected_observer = one_off_observer;
     g_one_off_observer.compare_exchange_strong(expected_observer, {}, std::memory_order_acq_rel);
     if(PreparedSampledProofRequested())prepared_proof_contexts.Close(this);
@@ -5252,7 +5256,21 @@ void NativeRenderer::SortRegionWrites() {
         return;
     }
     const bool mirror_diag=MirrorDiagnosticEnabled();
-    std::vector<std::pair<VAddr, VAddr>> writes, stack_retirements;
+    // PERF-GT7-134: the lists taken are this thread's, kept from one call to the next, and the
+    // pending ones get their emptied storage back: local lists freed both at every call (and the
+    // pending ones grew again from nothing), ~0.4 ms a frame of the recorder in a GT7 race. A
+    // nested call (none is known) takes lists of its own.
+    static thread_local std::vector<std::pair<VAddr, VAddr>> kept_writes, kept_retirements;
+    static thread_local u32 sort_depth = 0;
+    std::vector<std::pair<VAddr, VAddr>> nested_writes, nested_retirements;
+    auto& writes = sort_depth == 0 ? kept_writes : nested_writes;
+    auto& stack_retirements = sort_depth == 0 ? kept_retirements : nested_retirements;
+    ++sort_depth;
+    SCOPE_EXIT {
+        --sort_depth;
+    };
+    writes.clear();
+    stack_retirements.clear();
     {
         std::scoped_lock lock{region_dirty_mutex};
         writes.swap(pending_region_writes);
@@ -13239,7 +13257,9 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
             u64 version;
         };
         boost::container::small_vector<LayerPick, 64> best;
-        std::vector<u64> source_subs;
+        // PERF-GT7-135: kept by the thread, as `sources` above (the nested refreshes of FIX-207 are
+        // over by now): each source's copy had a list allocated and freed at every refresh.
+        static thread_local std::vector<u64> source_subs;
         for (const auto& [source, place] : sources) {
             if (WholeVersion(*source) == 0 || !source->image ||
                 source->reused.load(std::memory_order_relaxed)) {
@@ -16362,13 +16382,56 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             !stage->has_storage_images && !stage->uses_shader_clock &&
             std::ranges::none_of(stage->buffers, [](const auto& buffer) { return buffer.is_written; }));
     });
+    // PERF-GT7-133 (SHADGT_LDS_OWNED_MEMO=0: as before): the handles of the regions and mirrors,
+    // sorted, kept while neither map changes. Each tessellated draw walked both maps for each of
+    // its buffers, with a NativeHandle() call per entry, and a buffer that is in neither (a
+    // wrapper over imported guest memory, the usual case) walked them whole: ~0.6 ms a frame of the
+    // recorder in a GT7 race (~145 such draws a frame, a few hundred regions). The maps change
+    // under buffer_generation (OPT-003, which the buffer memos already rely on); their sizes are
+    // checked too. The chunks are the list's own and few: still walked.
+    static const bool owned_memo_on = [] {
+        const char* env = std::getenv("SHADGT_LDS_OWNED_MEMO");
+        return !(env && env[0] == '0');
+    }();
+    struct OwnedHandles {
+        const NativeRenderer* owner = nullptr;
+        u64 epoch = 0;
+        u64 generation = 0;
+        size_t regions = 0;
+        size_t mirrors = 0;
+        std::vector<VkBuffer> handles;
+    };
+    static thread_local OwnedHandles owned_handles;
+    const auto handle_of = [](const auto& buffer) {
+        return vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())};
+    };
+    const u64 owned_epoch = g_lds_owned_epoch.load(std::memory_order_acquire);
+    if (owned_memo_on && pipeline->LdsEmulation() &&
+        (owned_handles.owner != this || owned_handles.epoch != owned_epoch ||
+         owned_handles.generation != buffer_generation ||
+         owned_handles.regions != regions.size() || owned_handles.mirrors != mirrors.size())) {
+        owned_handles.owner = this;
+        owned_handles.epoch = owned_epoch;
+        owned_handles.generation = buffer_generation;
+        owned_handles.regions = regions.size();
+        owned_handles.mirrors = mirrors.size();
+        owned_handles.handles.clear();
+        for (const auto& [_, region] : regions) {
+            if (region.buffer) owned_handles.handles.push_back(static_cast<VkBuffer>(handle_of(region.buffer)));
+        }
+        for (const auto& [_, mirror] : mirrors) {
+            if (mirror.buffer) owned_handles.handles.push_back(static_cast<VkBuffer>(handle_of(mirror.buffer)));
+        }
+        std::ranges::sort(owned_handles.handles);
+    }
     const auto lds_owned_buffer = [&](vk::Buffer handle) {
         if (!handle) return true;
-        const auto matches = [handle](const auto& buffer) {
-            return buffer && vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())} == handle;
-        };
+        const auto matches = [&](const auto& buffer) { return buffer && handle_of(buffer) == handle; };
         // s.keep can also contain non-owning wrappers over imported guest memory.
         if (std::ranges::any_of(s.chunks, [&](const auto& chunk) { return matches(chunk.buffer); })) return true;
+        if (owned_memo_on) {
+            return std::ranges::binary_search(owned_handles.handles, static_cast<VkBuffer>(handle));
+        }
         for (const auto& [_, region] : regions) if (matches(region.buffer)) return true;
         for (const auto& [_, mirror] : mirrors) if (matches(mirror.buffer)) return true;
         return false;

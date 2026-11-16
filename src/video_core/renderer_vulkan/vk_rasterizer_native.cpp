@@ -10632,6 +10632,15 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
 #if !defined(NDEBUG)
                 if (mirror_bound) note_path(2); // DIAG-GTS-456: bound from the mirror
 #endif
+                // PERF-GTS-479: a slot learned off that would read in place here is learned back.
+                // Not gated on RegionOver: the region over such a buffer is the one its copy made
+                // (and it kept the other shaders' direct reads off the range too).
+                if (desc.IsDirectCandidate() && desc.NoDirect() && !freeze_fill_args &&
+                    !mirror_bound && !in_view && direct &&
+                    !(descriptor_postprocess && !desc.is_written) && size < (u64{1} << 32) &&
+                    (desc.is_written || size > SnapshotBelow())) {
+                    Shader::DirectLearning::NoteWouldReadInPlace(stage.pgm_hash, buffer_index);
+                }
                 if (!freeze_fill_args && !mirror_bound && !in_view && direct &&
                     !(descriptor_postprocess && !desc.is_written) &&
                     desc.IsDirectEligible() && size < (u64{1} << 32) &&
@@ -18853,6 +18862,11 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                     region_over = RegionOver(base, size) != nullptr;
                 }
                 p.buffer_ranges.emplace_back(base, base + size);
+                // PERF-GTS-479: as in BindBuffers, a slot learned off is learned back.
+                if (direct && !(descriptor_postprocess && !desc.is_written) &&
+                    desc.IsDirectCandidate() && desc.NoDirect() && size < (u64{1} << 32)) {
+                    Shader::DirectLearning::NoteWouldReadInPlace(stage.pgm_hash, buffer_index);
+                }
                 if (direct && !(descriptor_postprocess && !desc.is_written) &&
                     desc.IsDirectEligible() && size < (u64{1} << 32) && !region_over &&
                     direct->EnsureImported(base, size)) {

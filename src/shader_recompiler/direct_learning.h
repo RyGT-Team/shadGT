@@ -49,6 +49,7 @@ struct State {
     bool dirty{};
     std::chrono::steady_clock::time_point last_save{};
     std::atomic<u64> no_direct_slots{}; // decisions made this run (log)
+    std::atomic<u64> relearned{};       // slots found read in place again this run (log)
 };
 
 inline State& GetState() {
@@ -204,6 +205,31 @@ inline void NoteBind(u64 hash, std::span<const std::array<u32, 4>> entries,
         state.last_save = now;
         SaveLocked(state);
     }
+}
+
+/// PERF-GTS-479 (unified renderer): a slot translated without the direct path whose bind met every
+/// other condition for a read in place. Such a slot's draws give the table no entry for it, so
+/// NoteBind could never see it read in place again and a wrong guess stayed for good. The copy
+/// that replaced it was cheap in GT Sport, but in GT7 the buffers its races read in place were
+/// learned off in the menus, and binding them as copies made thousands of GPU allocations a
+/// second (510 ms frames on an 8 GB RTX 4070 Laptop). Recording the slot gives it its direct path
+/// back at the next start; the same rule for every game.
+inline void NoteWouldReadInPlace(u64 hash, u32 slot) {
+    if (!Enabled() || slot >= MaxSlots) {
+        return;
+    }
+    thread_local std::unordered_map<u64, u64> reported;
+    const u64 bit = u64{1} << slot;
+    auto& mine = reported[hash];
+    if (mine & bit) {
+        return;
+    }
+    mine |= bit;
+    auto& state = GetState();
+    std::scoped_lock lock{state.mutex};
+    state.session[hash].in_place |= bit;
+    state.dirty = true;
+    state.relearned.fetch_add(1, std::memory_order_relaxed);
 }
 
 } // namespace Shader::DirectLearning

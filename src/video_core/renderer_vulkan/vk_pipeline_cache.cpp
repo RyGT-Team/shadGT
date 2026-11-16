@@ -3568,6 +3568,20 @@ bool ReplayTranslate(const Shader::Profile& profile, Shader::Pools& pools,
     try {
         Common::RecoverableScope recoverable;
         const auto ir = Shader::TranslateProgram(params.code, pools, info, runtime_info, profile);
+        // PERF-GTS-490: this translation applies this run's learned direct paths (PERF-GTS-479),
+        // the record keeps the paths of the run that made it. SPIR-V stored under a record must
+        // have the record's paths: one slot without the direct path would read nothing where the
+        // record says in place, and a stage without its direct table shifts every later binding.
+        // A record that differs stays without SPIR-V (the listing skips it; the game translates
+        // the program when it draws it).
+        if (info.buffers.size() != stored.buffers.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < info.buffers.size(); ++i) {
+            if (info.buffers[i].NoDirect() != stored.buffers[i].NoDirect()) {
+                return false;
+            }
+        }
         spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir, binding);
         if (inspect) {
             // PB-4: the translation's resources (their sharps come from the record's user data).
@@ -6048,17 +6062,33 @@ PipelineCache::StoredListing PipelineCache::ReadStoredListing(u64 pgm_hash,
     return listing;
 }
 
-// PERF-GTS-479: a stored translation is used only when each direct candidate's path (direct or
-// SSBO only) is what this run decides, so learned buffers are translated again once, and a
-// buffer later seen read in place gets its direct path back. Without D2 the flag changes nothing.
+// PERF-GTS-479: a stored translation whose buffer has no direct path (SSBO only) is refused when
+// the learned file no longer says that buffer is never read in place (a read in place was seen
+// since, or learning is off or not loaded): that buffer gets its direct path back. Without D2 the
+// flag changes nothing.
+// PERF-GTS-490: a stored translation WITH the direct path is kept even when the learned file says
+// the buffer is never read in place. Binding follows the translation's own flags, and the direct
+// path reads both ways (the run that stored it played with it); dropping it only saved compile time
+// already paid, and the new SPIR-V then missed the driver cache. A second cold GT7 start had
+// translated 2,201 shaders and built ~2,000 pipelines again (median 334 ms, freezes up to 2.4 s);
+// with this, 34 programs of the first start and median builds of 1 ms (RTX 4070 only). New
+// translations still follow the learned path. SHADGT_KEEP_DIRECT_TRANSLATIONS=0: PERF-GTS-479's
+// strict rule (any difference refused).
 static bool LearnedDirectMatches(const Shader::Info& info, const Shader::Profile& profile) {
     if (!profile.direct_buffers) {
         return true;
     }
+    static const bool keep_direct = [] {
+        const char* env = std::getenv("SHADGT_KEEP_DIRECT_TRANSLATIONS");
+        return !(env && env[0] == '0');
+    }();
     for (u32 i = 0; i < info.buffers.size(); ++i) {
         const auto& buffer = info.buffers[i];
-        if (buffer.IsDirectCandidate() &&
-            buffer.NoDirect() != Shader::DirectLearning::NoDirect(info.pgm_hash, i)) {
+        if (!buffer.IsDirectCandidate()) {
+            continue;
+        }
+        const bool learned_off = Shader::DirectLearning::NoDirect(info.pgm_hash, i);
+        if (buffer.NoDirect() ? !learned_off : (learned_off && !keep_direct)) {
             return false;
         }
     }
@@ -6104,7 +6134,7 @@ void PipelineCache::ApplyStoredListing(StoredListing&& listing, Program& program
             fixed != else_scope_fixed.end() && perm_idx < fixed->second.boundary) {
             continue;
         }
-        // PERF-GTS-479: translated with other learned direct paths than this run's.
+        // PERF-GTS-479/490: translated without a direct path the learned file now wants back.
         if (!LearnedDirectMatches(*info, profile)) {
             continue;
         }

@@ -4266,11 +4266,17 @@ bool PipelineCache::RaceNeverWaits() {
     // (SkipTranslationWait), and a capture in progress (MenusWait). Both games: the race flag is
     // GT Sport's race projects and GT7's org_race gate (GAME-002). SHADGT_RACE_NEVER_WAITS=0:
     // as before.
+    // With GAME-006's race state, only from the start countdown on: the loading and the pre-race
+    // screen wait for these as before (a picture or a dispatch made only there, such as GT
+    // Sport's 16384x16384 circuit shadow map, was otherwise lost for the whole race; the user's
+    // rule: waits are allowed before the 3-2-1, never after it). Without the hook: the whole
+    // race session.
     static const bool enabled = [] {
         const char* env = std::getenv("SHADGT_RACE_NEVER_WAITS");
         return !(env && env[0] == '0');
     }();
-    return enabled && AsyncPipelines() && RytyGtsInRace();
+    return enabled && AsyncPipelines() && RytyGtsInRace() &&
+           (RytyRaceRunning() || !RytyRaceStartSignal());
 #else
     return false;
 #endif

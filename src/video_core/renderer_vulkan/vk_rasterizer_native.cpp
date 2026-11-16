@@ -14442,8 +14442,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
         return r.AcquireGraphicsPipeline(params, !indirect && !quad_list, &pipeline_owner);
     }();
-    // PERF-GTS-493: in a race no one-off draw waits (FIX-198, FIX-GT7-121/135/153): skipped as
-    // other draws are, and still watched.
+    // PERF-GTS-493: in a race (from its countdown with GAME-006) no one-off draw waits (FIX-198,
+    // FIX-GT7-121/135/153): looked up again without waiting, skipped if not ready, and watched.
     const bool one_off = !pipeline && DrawMustNotSkip(regs);
     const bool must_wait = one_off && !PipelineCache::RaceNeverWaits();
     // FIX-GT7-121: a picture known to be sampled before any redraw waits whatever the budget.
@@ -14501,10 +14501,20 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         stats.kept_shadow_skips += one_off_kept_shadow ? 1 : 0; // FIX-GT7-153: a redraw in play
         WatchOneOffs(regs, true);
     } else if (one_off) {
-        ++stats.one_off_race_skips; // PERF-GTS-493
-        stats.kept_shadow_skips += one_off_kept_shadow ? 1 : 0;
-        NoteRaceMissing(regs); // PERF-GTS-493: for the end-of-race report
-        WatchOneOffs(regs, true);
+        // PERF-GTS-493: the recorder's own lookup, not the command thread's selection (which said
+        // "no pipeline"): it starts the pipeline's build, or installs it once built, and skips
+        // otherwise, as for any draw in a race. Left to the selection only, some of GT7's one-off
+        // pictures were never looked up again and stayed missing for the whole race (their skips
+        // kept growing with the compile queue empty).
+        pipeline = r.AcquireGraphicsPipeline(params, false, &pipeline_owner);
+        if (pipeline) {
+            WatchOneOffs(regs, false);
+        } else {
+            ++stats.one_off_race_skips;
+            stats.kept_shadow_skips += one_off_kept_shadow ? 1 : 0;
+            NoteRaceMissing(regs); // for the end-of-race report
+            WatchOneOffs(regs, true);
+        }
     } else if (!pipeline && !one_off_hits.empty()) {
         // PERF-GT7-023: one-off pictures of kinds that no longer wait only: skipped as other
         // draws are, and still watched (one sampled before its redraw makes its kind wait again).

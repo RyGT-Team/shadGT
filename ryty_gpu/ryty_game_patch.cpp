@@ -1836,10 +1836,11 @@ void PS4_SYSV_ABI Gt7OrgRaceHook(void* self) {
                 }
             }
         }
+        // The field alone is checked: Impl spans more than one memory region (a check over
+        // Impl..Impl+0x33628 failed in play and the pause was never read).
         static ReadCheck impl_check;
-        if (const u8* im = Readable(impl, 0x33628, impl_check)) {
-            if (const u8* pm = Readable(*reinterpret_cast<u8* const*>(im + 0x33620), 0x28,
-                                        pause_check)) {
+        if (const u8* field = Readable(impl + 0x33620, 8, impl_check)) {
+            if (const u8* pm = Readable(*reinterpret_cast<u8* const*>(field), 0x28, pause_check)) {
                 t.paused = pm[0x18];
             }
         }

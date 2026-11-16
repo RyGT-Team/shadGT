@@ -6562,9 +6562,24 @@ bool KeptShadowMapsOn() {
     return enabled;
 }
 
+// FIX-GTS-497: the first part of FIX-GT7-153 (a draw into a circuit's shadow map waits for its
+// pipeline, without a deadline at its first drawing) for both games. GT Sport's terrain shadow
+// map has the same shape (square 16-bit depth, 16384x16384 at 0x2900000000 at Northern Isle) and
+// was skipped there while its pipeline built on a cold first race, then never drawn again: no
+// shadow past the cascades for the whole race (seen 11-16 morning; end-of-race report of 18:12).
+// Keeping the drawn map in memory stays each game's own rule (EvictImages). SHADGT_KEPT_SHADOW_MAPS=0
+// turns both parts off.
+bool KeptShadowMapWaitOn() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_KEPT_SHADOW_MAPS");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+
 bool KeptShadowMapTarget(const AmdGpu::Regs& regs) {
     const auto& db = regs.depth_buffer;
-    return KeptShadowMapsOn() &&
+    return KeptShadowMapWaitOn() &&
            IsKeptShadowMapShape(db.z_info.format == AmdGpu::DepthBuffer::ZFormat::Z16, db.Pitch(),
                                 db.Height(), regs.depth_view.NumSlices(), db.NumSamples());
 }

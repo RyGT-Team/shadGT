@@ -24,10 +24,12 @@
 namespace Shader::Backend::SPIRV {
 
 bool DirectLoadGroupsEnabled() {
-    // SHADGT_DIRECT_LOAD_GROUPS=0 gives every read its own branch again (a separate store).
+    // PERF-GTS-487: off by default. Grouped reads compile faster but run slower: a GT7 race took
+    // ~19 ms of GPU work a frame with them, ~12 ms without (RTX 4070). SHADGT_DIRECT_LOAD_GROUPS=1
+    // turns them on (a separate store).
     static const bool enabled = [] {
         const char* env = std::getenv("SHADGT_DIRECT_LOAD_GROUPS");
-        return !(env && env[0] == '0');
+        return env && env[0] == '1';
     }();
     return enabled;
 }

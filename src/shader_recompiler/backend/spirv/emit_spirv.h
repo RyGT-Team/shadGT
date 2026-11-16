@@ -15,7 +15,7 @@ namespace Shader::Backend::SPIRV {
 bool FloatAtomicExact();
 
 /// PERF-GTS-473: reads of a direct-eligible buffer share one direct/SSBO branch per run of reads
-/// (SHADGT_DIRECT_LOAD_GROUPS=0: a branch per read, as before; it uses a store of its own).
+/// Off by default (PERF-GTS-487); SHADGT_DIRECT_LOAD_GROUPS=1 turns it on, with a store of its own.
 bool DirectLoadGroupsEnabled();
 
 [[nodiscard]] std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info,

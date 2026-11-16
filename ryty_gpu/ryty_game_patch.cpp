@@ -1702,6 +1702,54 @@ using OrgRaceFn = void(PS4_SYSV_ABI*)(void*);
 OrgRaceFn g_gt7_org_race = nullptr;
 std::atomic<u64> g_gt7_org_race_ms{0};
 
+// GAME-006: the race runs, from its start countdown (3-2-1, or a rolling start's start) to its
+// finish: the time the player drives. Both games keep it in the race's context P (the race
+// object R's [R+0x18]), which their Organizer's per-frame module org_race reads: a byte set when
+// the start is requested and the countdown begins (GT Sport P+0xae, GT7 P+0xb8: onStartRequest,
+// GT Sport 0x1409c8510 / GT7 0x141f43620 in Ghidra), a byte set when the start time is reached
+// (GT Sport P+0x69, which its endSession logs as "in Race" against "Immediate"; GT7 P+0x75), both
+// cleared by the race's finish. The pre-race screen (cars on the grid until Start is pressed)
+// sets neither. Replays never request a start. Read from the code (Ghidra, GT7 1.71 and GT Sport
+// 1.68), the retry and the results board not observed yet. The renderer's play state follows it
+// (PERF-GTS-494); SHADGT_RACE_START_SIGNAL=0 leaves the play state to the frame-time measure.
+std::atomic<bool> g_race_running{false};
+std::atomic<bool> g_race_signal{false}; ///< GAME-006: a hook reads the start bytes
+std::atomic<u64> g_race_signal_ms{0};
+
+bool RaceStartSignalOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_RACE_START_SIGNAL");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+void NoteRaceRunning(bool running, const char* game) {
+    g_race_signal_ms.store(GetTickCount64(), std::memory_order_relaxed);
+    if (!g_race_signal.exchange(true, std::memory_order_relaxed)) {
+        // The flag falls when the module stops running (the menus).
+        std::thread([] {
+            for (;;) {
+                Sleep(250);
+                const u64 last = g_race_signal_ms.load(std::memory_order_relaxed);
+                if (last != 0 && GetTickCount64() - last > 5000 &&
+                    g_race_running.exchange(false, std::memory_order_relaxed)) {
+                    std::fprintf(stderr, "[patch] GAME-006: the race module has not run for five "
+                                         "seconds: race not running\n");
+                }
+            }
+        }).detach();
+    }
+    if (g_race_running.exchange(running, std::memory_order_relaxed) == running) {
+        return;
+    }
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    std::fprintf(stderr, "[patch] GAME-006 %02d:%02d:%02d.%03d %s race %s\n", now.wHour,
+                 now.wMinute, now.wSecond, now.wMilliseconds, game,
+                 running ? "starts (countdown or start)" : "not running (pre-race, finish, menus)");
+}
+
 void NoteGt7Race(bool race, const char* why) {
     if (g_in_race.exchange(race) == race) {
         return;
@@ -1721,6 +1769,8 @@ void PS4_SYSV_ABI Gt7OrgRaceHook(void* self) {
     const bool open = gate[0x74] != 0 && gate[0x77] == 0;
     g_gt7_org_race_ms.store(GetTickCount64(), std::memory_order_relaxed);
     NoteGt7Race(open, open ? "org_race's gate is open" : "org_race's gate is closed");
+    // GAME-006: G is the race's context; +0xb8 the start requested (countdown), +0x75 started.
+    if (RaceStartSignalOn()) NoteRaceRunning(open && (gate[0xb8] != 0 || gate[0x75] != 0), "GT7");
     g_gt7_org_race(self);
 }
 
@@ -1782,6 +1832,74 @@ void InstallGt7RaceSignal(u8* base) {
         }
     }).detach();
     std::fprintf(stderr, "[patch] GAME-002 GT7 race signal applied (org_race's gate)\n");
+}
+
+// GAME-006 (GT Sport): org_race's std::function body is a lambda that loads Impl = [self+8] and
+// jumps to the module (0x14060f510: mov rdi, [rdi+8]; jmp 0x1406486a0 in Ghidra). Its first five
+// bytes become a jump to a stub that jumps to GtsOrgRaceHook, which reads R = [Impl+0x25b0],
+// P = [R+0x18] as the module does and calls the module itself. Applied only where every byte
+// checked is GT Sport's.
+constexpr u64 kGtsOrgRaceLambda = 0x5ff510;
+constexpr u64 kGtsOrgRaceBody = 0x6386a0;
+constexpr u8 kGtsOrgRaceLambdaBytes[] = {0x48, 0x8b, 0x7f, 0x08, 0xe9, 0x87, 0x91, 0x03, 0x00};
+constexpr u8 kGtsOrgRaceBodyStart[] = {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89,
+                                       0xfb, 0x48, 0x8d, 0x0d, 0x10, 0x14, 0x44, 0x00};
+using GtsOrgRaceBodyFn = u64(PS4_SYSV_ABI*)(void*);
+GtsOrgRaceBodyFn g_gts_org_race_body = nullptr;
+
+u64 PS4_SYSV_ABI GtsOrgRaceHook(void* self) {
+    u8* const impl = *reinterpret_cast<u8* const*>(static_cast<u8*>(self) + 8);
+    const u8* const race = impl ? *reinterpret_cast<u8* const*>(impl + 0x25b0) : nullptr;
+    const u8* const context = race ? *reinterpret_cast<u8* const*>(race + 0x18) : nullptr;
+    // As the module's gate: in a session (P+0x68) and not ended (P+0x6b).
+    const bool session = context && context[0x68] != 0 && context[0x6b] == 0;
+    NoteRaceRunning(session && (context[0xae] != 0 || context[0x69] != 0), "GT Sport");
+    return g_gts_org_race_body(impl);
+}
+
+void InstallGtsRaceStartSignal(u8* base) {
+    u8* const lambda = base + kGtsOrgRaceLambda + kTextRvaShift;
+    u8* const body = base + kGtsOrgRaceBody + kTextRvaShift;
+    if (!ReadableRange(lambda, sizeof(kGtsOrgRaceLambdaBytes)) ||
+        std::memcmp(lambda, kGtsOrgRaceLambdaBytes, sizeof(kGtsOrgRaceLambdaBytes)) != 0 ||
+        !ReadableRange(body, sizeof(kGtsOrgRaceBodyStart)) ||
+        std::memcmp(body, kGtsOrgRaceBodyStart, sizeof(kGtsOrgRaceBodyStart)) != 0) {
+        return; // GT7 (its own hook reads the bytes), or another GT Sport version
+    }
+    if (!RaceStartSignalOn()) {
+        std::fprintf(stderr, "[patch] GAME-006: off (SHADGT_RACE_START_SIGNAL=0)\n");
+        return;
+    }
+    u8* const stub = AllocNear(base);
+    if (!stub) {
+        std::fprintf(stderr, "[patch] GAME-006: no memory near the game's code for the hook\n");
+        return;
+    }
+    g_gts_org_race_body = reinterpret_cast<GtsOrgRaceBodyFn>(body);
+    const u8 jump[6] = {0xff, 0x25, 0, 0, 0, 0}; // jmp qword ptr [rip]
+    const void* const hook = reinterpret_cast<void*>(&GtsOrgRaceHook);
+    std::memcpy(stub, jump, 6);
+    std::memcpy(stub + 6, &hook, 8);
+    FlushInstructionCache(GetCurrentProcess(), stub, 14);
+    const s64 rel = s64(stub) - s64(lambda + 5);
+    if (rel < INT32_MIN || rel > INT32_MAX) {
+        std::fprintf(stderr, "[patch] GAME-006: the hook's stub is out of reach\n");
+        return;
+    }
+    DWORD old_protect = 0;
+    if (!VirtualProtect(lambda, sizeof(kGtsOrgRaceLambdaBytes), PAGE_EXECUTE_READWRITE,
+                        &old_protect)) {
+        return;
+    }
+    const s32 rel32 = s32(rel);
+    u8 patch[sizeof(kGtsOrgRaceLambdaBytes)] = {0xe9};
+    std::memcpy(patch + 1, &rel32, 4);
+    std::memset(patch + 5, 0x90, sizeof(patch) - 5);
+    std::memcpy(lambda, patch, sizeof(patch));
+    DWORD ignored = 0;
+    VirtualProtect(lambda, sizeof(kGtsOrgRaceLambdaBytes), old_protect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), lambda, sizeof(kGtsOrgRaceLambdaBytes));
+    std::fprintf(stderr, "[patch] GAME-006 GT Sport race start signal applied (org_race)\n");
 }
 
 // GAME-003: GT7 culls its scenery with the code GT Sport uses. GT7 has two implementations of
@@ -3771,6 +3889,7 @@ void RytyApplyGamePatches() {
     InstallScriptPatches(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallGt7ScriptDump(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // DIAG-GT7-043
     InstallGt7RaceSignal(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // GAME-002
+    InstallGtsRaceStartSignal(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // GAME-006
     InstallGt7CpuOcclusion(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // GAME-003
     Gt7Cipher::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));     // PERF-GT7-113
     Gt7RaceContextGuard::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // FIX-GT7-162
@@ -3787,6 +3906,13 @@ void RytyApplyGamePatches() {
 }
 
 namespace Vulkan {
+// GAME-006: the race runs (from its start countdown to its finish), and whether a hook reads it.
+bool RytyRaceRunning() {
+    return g_race_running.load(std::memory_order_relaxed);
+}
+bool RytyRaceStartSignal() {
+    return RaceStartSignalOn() && g_race_signal.load(std::memory_order_relaxed);
+}
 // FIX-110: true while a race project runs (see NoteProjectScript).
 bool RytyGtsInRace() {
     return g_in_race.load(std::memory_order_relaxed);

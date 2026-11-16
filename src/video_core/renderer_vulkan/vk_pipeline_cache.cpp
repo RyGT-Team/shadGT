@@ -294,6 +294,8 @@ bool CompilationInProgress() {
 
 #ifdef RYTY_GPU
 bool RytyGtsInRace(); // FIX-110, ryty_game_patch.cpp
+bool RytyRaceRunning();     // GAME-006, ryty_game_patch.cpp
+bool RytyRaceStartSignal(); // GAME-006
 bool RytyGtsProjectHooks(); // FIX-GT7-140
 bool RytyGtsMenuCaptureCanContinue();
 bool RytyGtsMenuCaptureAvailable();
@@ -930,6 +932,8 @@ static void NoteSkippedDraw() {
 
 #ifdef RYTY_GPU
 bool RytyGtsInRace(); // FIX-110, ryty_game_patch.cpp
+bool RytyRaceRunning();     // GAME-006, ryty_game_patch.cpp
+bool RytyRaceStartSignal(); // GAME-006
 #endif
 
 bool CompileSlowMotion() {
@@ -3354,7 +3358,13 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
             const double fps = 1000.0 / std::max(ms, 0.001);
             const bool slow = state.in_play ? ms > 17.5 : ms > 19.0;
             const bool held = state.in_play && hold_draws > 0.0 && draws_a_frame >= hold_draws;
-            const bool play = fps >= 5.0 && (slow || held);
+            // PERF-GTS-494: with GAME-006 the play state is the race's own: from its start
+            // countdown to its finish. The loading and the pre-race screen are not play: the
+            // compiles are not held back there (every core once many draws wait, FIX-GT7-106);
+            // from the countdown, two at once below normal priority (the frame rate first). Without the hook (another game version, or
+            // SHADGT_RACE_START_SIGNAL=0): the frame-time measure above.
+            const bool play = RytyRaceStartSignal() ? RytyRaceRunning()
+                                                    : fps >= 5.0 && (slow || held);
             g_game_in_play.store(play, std::memory_order_relaxed);
             if (play != state.in_play) {
                 state.in_play = play;

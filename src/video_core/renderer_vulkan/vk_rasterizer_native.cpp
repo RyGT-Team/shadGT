@@ -7157,6 +7157,133 @@ static void NoteSampleLocations(const AmdGpu::Regs& regs) {
                 key[18], ps_hash);
 }
 
+// DIAG-GTS-509 (PS4 Pro mode only, with DIAG-GTS-507's switch): what the checkerboard needs to be
+// rebuilt right on a GPU with a 1x1 sample-location grid (RECHERCHE-DAMIER-PRO.md section 6). A
+// checkerboard draw is a 2-sample draw whose quad pixels ask for different positions. For each
+// distinct one (64 lines at most): its shaders, the pixel-shader input and control registers,
+// DB_EQAA and the AA masks, its colour and depth targets, whether a hull shader runs. For the first
+// 60 frames that have such draws: the frame and its pattern (A: sample 0 left on even rows). And
+// every shader that binds as a texture an image a checkerboard draw wrote (64 at most).
+namespace CheckerboardDiag {
+inline std::mutex mutex;
+inline std::vector<std::array<u64, 16>> seen;
+inline std::unordered_set<VAddr> targets;
+inline std::vector<std::pair<VAddr, u64>> readers;
+inline u64 last_frame = ~u64{0};
+inline u32 frames = 0;
+} // namespace CheckerboardDiag
+
+static bool CheckerboardDiagOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_SAMPLE_LOCS_DIAG");
+        return Libraries::Kernel::sceKernelIsNeoMode() != 0 && !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+static void NoteCheckerboardDraw(const AmdGpu::Regs& regs, u64 frame) {
+    if (!CheckerboardDiagOn() || regs.aa_config.NumSamples() != 2) {
+        return;
+    }
+    constexpr u32 kLocs = 0xA2FE;
+    // Sample 0 of pixel X0Y0 (first register, low byte) against sample 0 of pixel X0Y1.
+    const u32 even = regs.reg_array[kLocs] & 0xff;
+    const u32 odd = regs.reg_array[kLocs + 8] & 0xff;
+    if (even == odd) {
+        return;
+    }
+    const int even_x = static_cast<int>(even & 0xf) - ((even & 0x8) ? 16 : 0);
+    const auto raw = [](const auto& field) {
+        u32 value = 0;
+        std::memcpy(&value, &field, sizeof(value));
+        return value;
+    };
+    const auto stage_hash = [&](Shader::HwStage stage) -> u64 {
+        if (!regs.stage_enable.IsStageEnabled(u32(stage))) {
+            return 0;
+        }
+        const auto* pgm = regs.ProgramForStage(u32(stage));
+        return pgm && pgm->Address<u32*>() ? AmdGpu::GetParams(*pgm).hash : 0;
+    };
+    const u64 ps = stage_hash(Shader::HwStage::Fragment);
+    const u64 vs = stage_hash(Shader::HwStage::Vertex);
+    const u64 hs = stage_hash(Shader::HwStage::Hull);
+    const auto& db = regs.depth_buffer;
+    std::array<u64, 16> key{ps, vs, hs, raw(regs.ps_input_ena), raw(regs.ps_input_addr),
+                            raw(regs.barycentric_control), raw(regs.depth_shader_control),
+                            regs.db_alpha_to_mask, regs.reg_array[0xA201] /* DB_EQAA */,
+                            regs.reg_array[0xA30E], regs.reg_array[0xA30F] /* PA_SC_AA_MASK */,
+                            db.DepthAddress(), regs.color_target_mask.raw, 0, 0, 0};
+    std::string colours;
+    u32 slot = 13;
+    for (u32 i = 0; i < AmdGpu::NUM_COLOR_BUFFERS; ++i) {
+        const auto& cb = regs.color_buffers[i];
+        if (((regs.color_target_mask.raw >> (i * 4)) & 0xf) == 0 || cb.Address() == 0) {
+            continue;
+        }
+        colours += fmt::format(" cb{} {:#x} {}x{} samples {} fmt {}", i, cb.Address(), cb.Pitch(),
+                               cb.Height(), cb.NumSamples(), u32(cb.GetDataFmt()));
+        if (slot < key.size()) {
+            key[slot++] = cb.Address();
+        }
+    }
+    bool new_draw = false;
+    bool log_frame = false;
+    {
+        std::scoped_lock lock{CheckerboardDiag::mutex};
+        if (db.DepthAddress() != 0) {
+            CheckerboardDiag::targets.insert(db.DepthAddress());
+        }
+        for (u32 i = 0; i < AmdGpu::NUM_COLOR_BUFFERS; ++i) {
+            const auto& cb = regs.color_buffers[i];
+            if (((regs.color_target_mask.raw >> (i * 4)) & 0xf) != 0 && cb.Address() != 0) {
+                CheckerboardDiag::targets.insert(cb.Address());
+            }
+        }
+        if (frame != CheckerboardDiag::last_frame && CheckerboardDiag::frames < 60) {
+            CheckerboardDiag::last_frame = frame;
+            ++CheckerboardDiag::frames;
+            log_frame = true;
+        }
+        if (CheckerboardDiag::seen.size() < 64 &&
+            std::ranges::find(CheckerboardDiag::seen, key) == CheckerboardDiag::seen.end()) {
+            CheckerboardDiag::seen.push_back(key);
+            new_draw = true;
+        }
+    }
+    if (log_frame) {
+        LOG_WARNING(Render_Vulkan, "DIAG-GTS-509: frame {} checkerboard pattern {} (sample 0 on even "
+                                   "rows at x {})",
+                    frame, even_x < 0 ? "A" : "B", even_x);
+    }
+    if (new_draw) {
+        LOG_WARNING(Render_Vulkan,
+                    "DIAG-GTS-509: checkerboard draw ps {:#x} vs {:#x} hs {:#x}; ps_input_ena {:#x} "
+                    "addr {:#x}; baryc_cntl {:#x}; db_shader_control {:#x}; alpha_to_mask {:#x}; "
+                    "db_eqaa {:#x}; aa_mask {:#010x} {:#010x}; depth {:#x} {}x{} samples {};{}",
+                    ps, vs, hs, key[3], key[4], key[5], key[6], key[7], key[8], key[9], key[10],
+                    db.DepthAddress(), db.Pitch(), db.Height(), db.NumSamples(), colours);
+    }
+}
+
+// DIAG-GTS-509: a shader binding as a texture an image a checkerboard draw wrote.
+static void NoteCheckerboardRead(VAddr address, u64 program, bool storage) {
+    if (!CheckerboardDiagOn()) {
+        return;
+    }
+    {
+        std::scoped_lock lock{CheckerboardDiag::mutex};
+        if (!CheckerboardDiag::targets.contains(address) || CheckerboardDiag::readers.size() >= 64 ||
+            std::ranges::find(CheckerboardDiag::readers, std::pair{address, program}) !=
+                CheckerboardDiag::readers.end()) {
+            return;
+        }
+        CheckerboardDiag::readers.emplace_back(address, program);
+    }
+    LOG_WARNING(Render_Vulkan, "DIAG-GTS-509: shader {:#x} reads the checkerboard image {:#x}{}",
+                program, address, storage ? " as storage" : "");
+}
+
 void NativeRenderer::NoteRaceMissing(const AmdGpu::Regs& regs) {
     u64 ps_hash = 0;
     if (regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Fragment))) {
@@ -11512,6 +11639,8 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                 if (Native::WatchedTexture(entry->info.guest_address,
                                            entry->info.guest_address + 1)) {
                     WatchBind(*entry, tsharp, storage, true, stage.pgm_hash); // FIX-157
+                    NoteCheckerboardRead(entry->info.guest_address, stage.pgm_hash,
+                                         storage); // DIAG-GTS-509
                 }
 #endif
                 SeqBind(*entry, tsharp, storage, stage.pgm_hash); // DIAG-208 (diagnosis)
@@ -11727,6 +11856,8 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
 #if !defined(NDEBUG)
         if (Native::WatchedTexture(desc.info.guest_address, desc.info.guest_address + 1)) {
             WatchBind(*entry, tsharp, storage, false, stage.pgm_hash); // FIX-157 (diagnosis)
+            NoteCheckerboardRead(entry->info.guest_address, stage.pgm_hash,
+                                 storage); // DIAG-GTS-509
         }
 #endif
         SeqBind(*entry, tsharp, storage, stage.pgm_hash); // DIAG-208 (diagnosis)
@@ -14833,6 +14964,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         return r.AcquireGraphicsPipeline(params, !indirect && !quad_list, &pipeline_owner);
     }();
     NoteSampleLocations(regs); // DIAG-GTS-507
+    NoteCheckerboardDraw(regs, frame); // DIAG-GTS-509
     // PERF-GTS-493: in a race (from its countdown with GAME-006) no one-off draw waits (FIX-198,
     // FIX-GT7-121/135/153): looked up again without waiting, skipped if not ready, and watched.
     const bool one_off = !pipeline && DrawMustNotSkip(regs);

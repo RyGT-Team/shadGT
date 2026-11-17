@@ -4925,6 +4925,82 @@ void PipelineCache::WaitForBuild(PipelineBuild& build, const DrawIndirectParams 
 #endif
 }
 
+// DIAG-GTS-515: out of races (menus, loads), the draws that waited for their new pipeline
+// instead of being skipped, by the rule that made them wait, and how long: every 10 s a summary,
+// and a line for each wait of 20 ms or more (64 at most). At a car selection (GT Sport) or GT7's
+// dealership every new car stopped the menu (RECHERCHE-MENUS-FROIDS.md). Waits under 1 ms (the
+// pipeline was ready within the quick wait) are not counted.
+namespace MenuWaits {
+constexpr std::array<const char*, 10> kNames{
+    "legacy translations", "writes memory",     "capture or menu policy", "one-off picture (FIX-198)",
+    "rebuild (FIX-GTS-498)", "GT7 one-shot shader", "depth only",          "learned one-off",
+    "tessellation",          "other"};
+inline std::array<std::atomic<u64>, 10> count{};
+inline std::array<std::atomic<u64>, 10> us{};
+inline std::atomic<s64> last_ms{0};
+inline std::atomic<u32> lines{0};
+} // namespace MenuWaits
+
+struct PipelineCache::MenuWaitTally {
+    MenuWaitTally(bool on_, u32 reason_, u64 hash_, const AmdGpu::Regs& regs)
+        : on{on_}, reason{std::min<u32>(reason_, 9)}, hash{hash_},
+          start{std::chrono::steady_clock::now()} {
+        if (on && regs.depth_buffer.DepthValid()) {
+            depth = regs.depth_buffer.DepthAddress();
+            width = regs.depth_buffer.Pitch();
+            height = regs.depth_buffer.Height();
+        }
+    }
+    ~MenuWaitTally() {
+        if (!on) {
+            return;
+        }
+        using namespace std::chrono;
+        const auto now = steady_clock::now();
+        const u64 waited = u64(duration_cast<microseconds>(now - start).count());
+        if (waited < 1000) {
+            return;
+        }
+        MenuWaits::count[reason].fetch_add(1, std::memory_order_relaxed);
+        MenuWaits::us[reason].fetch_add(waited, std::memory_order_relaxed);
+        if (waited >= 20000 && MenuWaits::lines.fetch_add(1, std::memory_order_relaxed) < 64) {
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-GTS-515: a draw waited {:.1f} ms for its new pipeline {:#x} out of "
+                        "a race: {}; depth {:#x} {}x{}",
+                        waited / 1000.0, hash, MenuWaits::kNames[reason], depth, width, height);
+        }
+        const s64 ms = duration_cast<milliseconds>(now.time_since_epoch()).count();
+        s64 last = MenuWaits::last_ms.load(std::memory_order_relaxed);
+        if (last == 0) {
+            MenuWaits::last_ms.compare_exchange_strong(last, ms, std::memory_order_relaxed);
+            return;
+        }
+        if (ms - last < 10000 || !MenuWaits::last_ms.compare_exchange_strong(last, ms)) {
+            return;
+        }
+        std::string text;
+        for (u32 i = 0; i < MenuWaits::kNames.size(); ++i) {
+            const u64 n = MenuWaits::count[i].exchange(0, std::memory_order_relaxed);
+            const u64 t = MenuWaits::us[i].exchange(0, std::memory_order_relaxed);
+            if (n != 0) {
+                text += fmt::format("{}{} {} ({:.0f} ms)", text.empty() ? "" : ", ",
+                                    MenuWaits::kNames[i], n, t / 1000.0);
+            }
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "DIAG-GTS-515: out of races, draws that waited for their new pipeline in the "
+                    "last {} s: {}",
+                    (ms - last) / 1000, text);
+    }
+    bool on;
+    u32 reason;
+    u64 hash;
+    std::chrono::steady_clock::time_point start;
+    VAddr depth{};
+    u32 width{};
+    u32 height{};
+};
+
 const GraphicsPipeline* PipelineCache::GetGraphicsPipelineUnlocked(
     const DrawIndirectParams params, std::unique_lock<LookupLock>& lock) {
     ASSERT(lock.owns_lock());
@@ -5440,6 +5516,8 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             NoteAsyncSkip(build, false);
             return nullptr;
         }
+        // DIAG-GTS-515: out of races, why this draw waits for its pipeline, and how long.
+        MenuWaitTally menu_wait_tally{!RaceNeverWaits(), WaitReason(), pipeline_hash, Regs()};
         if (build) {
             // A read-ahead job becomes urgent once this draw actually needs it.
             // Requeue the shared build at the front rather than waiting behind
@@ -7377,6 +7455,19 @@ bool PipelineCache::PreservesDepthOutput() const {
     if (!race_depth_wait && CompileMode() == 2 && RytyGtsInRace()) {
         return false;
     }
+    // FIX-GTS-514 (test switch, SHADGT_MENU_DEPTH_WAIT=0): out of races too, a depth-only draw
+    // does not wait here for its new pipeline, as on shadgt7 (which never had this rule): at a
+    // car selection or GT7's dealership every new car's shadow and depth passes waited, the menu
+    // crawled and D-pad presses were lost while the guest clocks were held. The native renderer's
+    // one-off rule (FIX-198, DrawMustNotSkip) still makes a draw into a depth picture not drawn
+    // lately wait, within its frame's budget. Default: waits, as before.
+    static const bool menu_depth_wait = [] {
+        const char* env = std::getenv("SHADGT_MENU_DEPTH_WAIT");
+        return !(env && env[0] == '0');
+    }();
+    if (!menu_depth_wait && CompileMode() == 2) {
+        return false;
+    }
 #endif
     const auto& regs = Regs();
     if (!regs.depth_control.depth_enable || !regs.depth_control.depth_write_enable ||
@@ -7427,22 +7518,27 @@ void PipelineCache::NoteReleased(const GraphicsPipelineKey& key) {
 }
 
 bool PipelineCache::NeverSkipped(const std::array<const Shader::Info*, MaxShaderStages>& infos) {
-    if (RaceNeverWaits()) return false; // PERF-GTS-493
+    return NeverSkippedReason(infos) != 0;
+}
+
+u32 PipelineCache::NeverSkippedReason(
+    const std::array<const Shader::Info*, MaxShaderStages>& infos) {
+    if (RaceNeverWaits()) return 0; // PERF-GTS-493
     // shadgt7 FIX-198 / PERF-GT7-020: a one-off target's draw (SetForceWait, SetWaitForShaders)
     // waits for its pipeline and shaders.
-    if (force_wait || wait_for_shaders) return true;
+    if (force_wait || wait_for_shaders) return 1;
     // FIX-GTS-498: a pipeline this session built and released is rebuilt from the driver cache.
-    if (!released_graphics.empty() && released_graphics.contains(S().graphics_key)) return true;
+    if (!released_graphics.empty() && released_graphics.contains(S().graphics_key)) return 2;
     if (const auto* fragment = infos[u32(Shader::SwStage::Fragment)];
-        fragment && IsGt7OneShotShader(fragment->pgm_hash)) return true;
+        fragment && IsGt7OneShotShader(fragment->pgm_hash)) return 3;
     // A loading-time shadow bake may run only once. Preserve depth-only output
     // without forcing ordinary menu color draws to wait for compilation.
     if (PreservesDepthOutput()) {
-        return true;
+        return 4;
     }
-    if (LearnedOneOffWait(Regs())) return true;
+    if (LearnedOneOffWait(Regs())) return 5;
     // Keep going: rendering must not wait for a cosmetic pipeline.
-    if (CompileMode() == 2) return false;
+    if (CompileMode() == 2) return 0;
     // FIX-064: tessellated draws wait for their pipeline. On GT Sport's race summary they are
     // the driver figure; skipped while each of its pipelines built, parts of it blinked out
     // frame after frame. -DisablePerf 88 skips them like other draws.
@@ -7453,10 +7549,21 @@ bool PipelineCache::NeverSkipped(const std::array<const Shader::Info*, MaxShader
     static const bool skip_in_races = Common::PerfFeatureEnabled(138);
 #ifdef RYTY_GPU
     if (AsyncMenuPipelines() || (skip_in_races && RytyGtsInRace())) {
-        return false;
+        return 0;
     }
 #endif
-    return wait_for_tessellation && infos[u32(Shader::SwStage::TessellationControl)] != nullptr;
+    return wait_for_tessellation && infos[u32(Shader::SwStage::TessellationControl)] != nullptr
+               ? 6
+               : 0;
+}
+
+u32 PipelineCache::WaitReason() {
+    // DIAG-GTS-515: in the order of the skip condition (GetGraphicsPipeline).
+    if (LegacyWaits()) return 0;
+    if (WritesMemory(S().infos)) return 1;
+    if (const u32 rule = NeverSkippedReason(S().infos); rule != 0) return 2 + rule;
+    if (MenusWait()) return 2;
+    return 9;
 }
 
 bool PipelineCache::WritesMemory(const std::array<const Shader::Info*, MaxShaderStages>& infos) {

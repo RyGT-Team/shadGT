@@ -676,6 +676,12 @@ private:
     static bool WritesMemory(const std::array<const Shader::Info*, MaxShaderStages>& infos);
     bool PreservesDepthOutput() const;
     bool NeverSkipped(const std::array<const Shader::Info*, MaxShaderStages>& infos);
+    /// DIAG-GTS-515: which of NeverSkipped's rules holds (0: none; 1 one-off, 2 rebuild, 3 GT7
+    /// one-shot, 4 depth only, 5 learned one-off, 6 tessellation).
+    u32 NeverSkippedReason(const std::array<const Shader::Info*, MaxShaderStages>& infos);
+    /// DIAG-GTS-515: why a draw waits for its pipeline instead of being skipped (MenuWaits).
+    u32 WaitReason();
+    struct MenuWaitTally; ///< DIAG-GTS-515
     struct AsyncStats {
         u64 deferred{};
         u64 installed{};

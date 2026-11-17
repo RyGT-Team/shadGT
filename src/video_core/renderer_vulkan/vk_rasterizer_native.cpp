@@ -8111,7 +8111,15 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
             return !(env && env[0] == '0');
         }();
         const std::pair<VAddr, VAddr> range{address, address + size};
-        if (revalidate && (memo.region || memo.mirror) &&
+        // FIX-GTS-520: never for a range in the listed in-place ranges or GT7's per-frame memory.
+        // There the same addresses are bound in place for some work and through a region for
+        // other work, and regions come and go every frame (FIX-GT7-122). A revalidated memo kept
+        // one binding while the range had moved to the other: GT7's GPU culling then read its
+        // depth pyramid (cs 0xebdbf166 -> 0xaca0d43e, 0x1020000f00) from a copy that its writer no
+        // longer updated, and scenery dropped out every other culling run until a restart.
+        // SHADGT_NATIVE_BUFFER_REVALIDATE=0 removed it. GT Sport lists no such ranges.
+        const bool listed = ListedInPlace(address, size);
+        if (revalidate && !listed && (memo.region || memo.mirror) &&
             memo.hard_generation == buffer_hard_generation &&
             buffer_log.Seq() - memo.log_seq <= 64 &&
             buffer_log.Untouched(memo.log_seq, {&range, 1})) {

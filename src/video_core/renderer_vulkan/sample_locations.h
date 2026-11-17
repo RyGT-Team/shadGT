@@ -82,7 +82,14 @@ inline Pattern FromRegisters(const std::array<std::uint32_t, 16>& regs,
             return Standard(samples);
         }
     }
-    if (!alike && !quad_grid) {
+    // NEO-GTS-508: 2-sample draws keep the standard positions on every GPU for now. The PS4 Pro
+    // checkerboard is 2-sample (its quad pixels differ); the RTX 4070 does take a 2x2 grid for it
+    // (vkGetPhysicalDeviceMultisamplePropertiesEXT: 2x grid 2x4), and given the game's positions
+    // there, GT7's trees and grass showed black blocks (11-17): some of its 2-sample draws keep
+    // the standard positions (pipelines that may interpolate at a sample) on the same depth, and
+    // depth tested at other positions than it was written at is undefined. The checkerboard needs
+    // the whole fix of RECHERCHE-DAMIER-PRO.md (option 3) first.
+    if (samples == 2 || (!alike && !quad_grid)) {
         return Standard(samples);
     }
     Pattern pattern;

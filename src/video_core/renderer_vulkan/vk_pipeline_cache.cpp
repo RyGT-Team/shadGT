@@ -3452,6 +3452,24 @@ void PipelineCache::BuildOnScreen() {
     if (best) FinishBuild(*best);
 }
 
+// FIX-GTS-516: PERF-GTS-494 made the play state the race's own wherever GAME-006's race signal
+// exists, menus included: there the game was never "in play". shadgt7 measured it by frame time
+// everywhere, so a heavy menu scene (GT7's dealership, at a cold start under 50 fps) counted as
+// play: one-off draws waited 12 ms a frame at most and were skipped after. Out of play the rules
+// made for Scapes' photos apply (FIX-GT7-131 layouts, FIX-GT7-135 texture levels waiting whatever
+// the budget, 40 ms a frame): with shaders not compiled the dealership stopped up to 1.3 s a draw
+// and its guest clocks were held 24 s in 3 minutes (DIAG-GTS-515), D-pad presses lost. Now the
+// race's state applies in a race session only (RytyGtsInRace: its loading and pre-race screen stay
+// out of play, as PERF-GTS-494 wants); elsewhere the frame-time measure. SHADGT_MENU_PLAY_MEASURE=0:
+// the race's state everywhere, as before.
+static bool RaceStatePlay(bool race_signal) {
+    static const bool menu_measure = [] {
+        const char* env = std::getenv("SHADGT_MENU_PLAY_MEASURE");
+        return !(env && env[0] == '0');
+    }();
+    return race_signal && (!menu_measure || RytyGtsInRace());
+}
+
 void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
     static const bool enabled = [] { const char* v = std::getenv("SHADGT_COMPILE_CATCH_UP"); return !(v && v[0] == '0'); }();
     static const bool paced = [] { const char* v = std::getenv("SHADGT_CATCH_UP_PACE"); return !(v && v[0] == '0'); }();
@@ -3492,8 +3510,10 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
             // race's own (from its start countdown to its finish), see below. Elsewhere
             // (menus, Scapes, without the hook or with SHADGT_RACE_START_SIGNAL=0): the
             // frame-time measure above.
-            const bool play = RaceSignalPlay() ? RytyRaceRunning()
-                                               : fps >= 5.0 && (slow || held);
+            // FIX-GTS-516: the race's state only in a race session; out of one (menus, GT7's
+            // dealership, Scapes) the frame-time measure, as shadgt7 always did, see RaceStatePlay.
+            const bool play =
+                RaceStatePlay(RaceSignalPlay()) ? RytyRaceRunning() : fps >= 5.0 && (slow || held);
             g_game_in_play.store(play, std::memory_order_relaxed);
             if (play != state.in_play) {
                 state.in_play = play;
@@ -3507,7 +3527,7 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
         // loading and the pre-race screen are not play (the compiles are not held back there,
         // every core once many draws wait, FIX-GT7-106); from the countdown, two builds at once
         // below normal priority, the frame rate first.
-        if (RaceSignalPlay()) {
+        if (RaceStatePlay(RaceSignalPlay())) {
             const bool play = RytyRaceRunning();
             g_game_in_play.store(play, std::memory_order_relaxed);
             if (play != state.in_play) {

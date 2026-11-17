@@ -283,6 +283,14 @@ struct HwFragmentRuntimeInfo {
     bool SampleTable() const noexcept {
         return (mrtz_mask & MrtzSampleTable) != 0;
     }
+    // NEO-GTS-512: bit 6 with bit 7 (a pixel-rate shader of the checkerboard's colour draws)
+    // reads its per-sample barycentrics at the game's sample 0 (the table's entry for its quad
+    // pixel), where the PS4 Pro shades the colour, not at the pixel centre. Bit 4 adds that
+    // offset to FragCoord.xy too, when SPI_BARYC_CNTL puts the position at the sample.
+    static constexpr u8 MrtzFragCoordSample = 0x10;
+    bool FragCoordAtSample() const noexcept {
+        return (mrtz_mask & MrtzFragCoordSample) != 0;
+    }
     bool front_face_all_bits{false};
     bool dual_source_blending{false};
     bool clip_distance_emulation{false};

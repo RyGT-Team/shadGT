@@ -175,6 +175,11 @@ public:
     bool PerPixelFallback() const noexcept {
         return per_pixel_fallback;
     }
+    /// NEO-GTS-512: its pixel shader runs once per pixel (NEO-GT7-005): 1 at the game's sample 0
+    /// (with the table), 2 at the centre; 0 it does not.
+    u32 PixelRateShading() const noexcept {
+        return pixel_rate_shading;
+    }
     const std::array<vk::ShaderEXT, 4>& ShaderObjects() const noexcept {
         return shader_objects;
     }
@@ -255,6 +260,7 @@ private:
     u32 sample_location_exclusion{}; ///< NEO-GTS-511
     bool uses_sample_table{}; ///< NEO-GTS-511
     bool per_pixel_fallback{}; ///< NEO-GTS-511
+    u32 pixel_rate_shading{}; ///< NEO-GTS-512
 
     GraphicsPipelineKey key;
     u32 lds_emulation{};

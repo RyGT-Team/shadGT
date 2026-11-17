@@ -124,7 +124,9 @@ struct PsInput {
 };
 
 struct BarycentricControl {
-    u32 : 24;
+    u32 : 16;
+    u32 pos_float_location : 2; ///< NEO-GTS-512: 0 centre, 1 centroid, 2 sample
+    u32 : 6;
     u32 front_face_all_bits : 1;
 };
 static_assert(sizeof(BarycentricControl) == sizeof(u32));

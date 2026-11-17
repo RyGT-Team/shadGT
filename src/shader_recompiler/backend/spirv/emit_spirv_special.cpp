@@ -171,21 +171,29 @@ void EmitPrologue(EmitContext& ctx) {
             ctx.OpStore(ctx.OpAccessChain(ctx.output_u32, ctx.sample_mask, ctx.u32_zero_value),
                         ctx.quad_sample_mask);
         }
-        if (ctx.runtime_info.hw.fs.SampleTable() && Sirit::ValidId(ctx.bary_coord) &&
-            Sirit::ValidId(ctx.sample_index) && Sirit::ValidId(ctx.frag_coord)) {
+        // NEO-GTS-512: a pixel-rate shader (one invocation a pixel, sample 0) reads sample 0's
+        // entry, for its barycentrics and, with FragCoordAtSample, for FragCoord.
+        const bool pixel_rate = ctx.runtime_info.hw.fs.PixelRate();
+        const bool table_needed =
+            Sirit::ValidId(ctx.bary_coord) ||
+            (pixel_rate && ctx.runtime_info.hw.fs.FragCoordAtSample());
+        if (ctx.runtime_info.hw.fs.SampleTable() && table_needed &&
+            (pixel_rate || Sirit::ValidId(ctx.sample_index)) && Sirit::ValidId(ctx.frag_coord)) {
             // NEO-GTS-511: the offset of this sample from the pixel centre, from the positions
             // table in PushData::quad_sample_mask: byte (pixel * 2 + sample), pixel = x + 2y of
             // the 2x2 quad (FragCoord's integer part; FragCoord is at the sample when shading
-            // per sample), x in the low nibble and y in the high one, in 1/16 pixel from the
-            // pixel's corner (Vulkan's sample locations).
+            // per sample, at the centre once per pixel), x in the low nibble and y in the high
+            // one, in 1/16 pixel from the pixel's corner (Vulkan's sample locations).
             const Id coordinates =
                 ctx.OpConvertFToU(ctx.U32[4], ctx.OpLoad(ctx.F32[4], ctx.frag_coord));
             const Id x = ctx.OpBitwiseAnd(
                 ctx.U32[1], ctx.OpCompositeExtract(ctx.U32[1], coordinates, 0u), ctx.u32_one_value);
             const Id y = ctx.OpBitwiseAnd(
                 ctx.U32[1], ctx.OpCompositeExtract(ctx.U32[1], coordinates, 1u), ctx.u32_one_value);
-            const Id sample = ctx.OpBitwiseAnd(
-                ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.sample_index), ctx.u32_one_value);
+            const Id sample =
+                pixel_rate ? ctx.u32_zero_value
+                           : ctx.OpBitwiseAnd(ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.sample_index),
+                                              ctx.u32_one_value);
             const Id index = ctx.OpBitwiseOr(
                 ctx.U32[1],
                 ctx.OpBitwiseOr(ctx.U32[1], ctx.OpShiftLeftLogical(ctx.U32[1], x, ctx.ConstU32(1u)),

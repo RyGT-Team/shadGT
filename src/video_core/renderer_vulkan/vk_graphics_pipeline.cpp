@@ -627,6 +627,9 @@ GraphicsPipeline::GraphicsPipeline(
     uses_sample_table = fragment_stage && fs_info.SampleTable();
     per_pixel_fallback = fragment_stage && (fs_info.mrtz_mask &
                                             Shader::HwFragmentRuntimeInfo::MrtzPixelRateFallback);
+    pixel_rate_shading = !fragment_stage || !fs_info.PixelRate() || per_pixel_fallback ? 0
+                         : fs_info.SampleTable()                                     ? 1
+                                                                                     : 2;
 
     const vk::PipelineViewportDepthClipControlCreateInfoEXT clip_control = {
         // FIX-GTS-443: 0..1 when the vertex shader converts the depth. A geometry shader's

@@ -7287,7 +7287,7 @@ static void NoteCheckerboardDraw(const AmdGpu::Regs& regs, u64 frame) {
 // why. On a GPU with a 2x2 grid for 2 samples the standard count should stay 0: a depth written
 // at some positions and tested at others is undefined (black blocks in GT7's trees).
 namespace TwoSampleCount {
-enum Kind : u32 { Game, PerPixel, Device, Shader, Count, OnePoint, Quad, Kinds };
+enum Kind : u32 { Game, PerPixel, Device, Shader, Count, OnePoint, Quad, Sample0, Centre, Kinds };
 inline std::array<std::atomic<u64>, Kinds> counts{};
 inline std::atomic<s64> last_ms{0};
 } // namespace TwoSampleCount
@@ -7310,6 +7310,11 @@ static void CountTwoSampleDraw(const GraphicsPipeline& pipeline, SampleLocations
     if (kind == Game && pipeline.PerPixelFallback()) {
         counts[PerPixel].fetch_add(1, std::memory_order_relaxed);
     }
+    // NEO-GTS-512: the colour draws run once per pixel, shaded at sample 0 or at the centre.
+    if (pipeline.PixelRateShading() != 0) {
+        counts[pipeline.PixelRateShading() == 1 ? Sample0 : Centre].fetch_add(
+            1, std::memory_order_relaxed);
+    }
     const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now().time_since_epoch())
                         .count();
@@ -7329,10 +7334,12 @@ static void CountTwoSampleDraw(const GraphicsPipeline& pipeline, SampleLocations
                 "NEO-GTS-511: 2-sample draws in the last {} s of race: {} at the game's positions "
                 "({} of them once per pixel, no positions table); at the standard positions: {} "
                 "(device or switch {}, shader interpolates at a sample {}, PA_SC_AA_CONFIG count "
-                "differs {}, registers on one point {}, quad pixels differ on a 1x1 grid {})",
+                "differs {}, registers on one point {}, quad pixels differ on a 1x1 grid {}); "
+                "colour once per pixel: shaded at the game's sample 0 {}, at the centre {} "
+                "(NEO-GTS-512)",
                 (now - last) / 1000, n[Game], n[PerPixel],
                 n[Device] + n[Shader] + n[Count] + n[OnePoint] + n[Quad], n[Device], n[Shader],
-                n[Count], n[OnePoint], n[Quad]);
+                n[Count], n[OnePoint], n[Quad], n[Sample0], n[Centre]);
 }
 
 // DIAG-GTS-509: a shader binding as a texture an image a checkerboard draw wrote.

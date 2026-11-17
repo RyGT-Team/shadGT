@@ -1603,6 +1603,61 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
                 }
             }
         }
+        // NEO-GTS-512: a pixel-rate shader (NEO-GT7-005: the checkerboard's colour draws under
+        // NVIDIA's mixed samples) of a 2-sample draw at the game's positions reads its
+        // per-sample barycentrics at the game's sample 0, with the positions table: where the
+        // PS4 Pro shades the colour (its UVs, velocities and derivatives), not at the centre of
+        // the checkerboard pixel (painted lines zigzagged half a 4K pixel). FragCoord too when
+        // SPI_BARYC_CNTL puts it at the sample. Same slot rule as the per-sample table: with a
+        // game AA mask or a hull shader (FIX-227) it stays at the centre, as before.
+        // SHADGT_NEO_SAMPLE0=0: at the centre.
+        static const bool neo_sample0 = [] {
+            const char* env = std::getenv("SHADGT_NEO_SAMPLE0");
+            return !(env && env[0] == '0');
+        }();
+        const bool fragcoord_at_sample = regs.barycentric_control.pos_float_location == 2 &&
+                                         (regs.ps_input_addr.pos_x_float_ena ||
+                                          regs.ps_input_addr.pos_y_float_ena);
+        if (neo_sample0 && info.hw.fs.PixelRate() &&
+            !(info.hw.fs.mrtz_mask & Shader::HwFragmentRuntimeInfo::MrtzPixelRateFallback) &&
+            (info.hw.fs.addr_flags.persp_sample_ena || fragcoord_at_sample) &&
+            !profile.supports_amd_shader_explicit_vertex_parameter &&
+            profile.supports_fragment_shader_barycentric &&
+            !info.hw.fs.single_sample_barycentric) {
+            u32 raster = S().graphics_key.num_samples; // the depth's, at this point
+            for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+                const auto& col_buf = regs.color_buffers[cb];
+                if (col_buf && regs.color_target_mask.GetMask(cb) != 0) {
+                    raster = std::max<u32>(raster, col_buf.NumSamples());
+                }
+            }
+            if (raster == 2 && instance.TakesSampleLocations(2)) {
+                const bool table = instance.TakesSampleTable() && !info.hw.fs.quad_sample_mask &&
+                                   !regs.stage_enable.hs_en;
+                if (table) {
+                    info.hw.fs.mrtz_mask |= u8(
+                        Shader::HwFragmentRuntimeInfo::MrtzSampleTable |
+                        (fragcoord_at_sample ? Shader::HwFragmentRuntimeInfo::MrtzFragCoordSample
+                                             : u8{0}));
+                }
+                static std::atomic<u32> logged_sample0{};
+                static std::atomic<u32> logged_centre{};
+                if ((table ? logged_sample0 : logged_centre)
+                        .fetch_add(1, std::memory_order_relaxed) < 3) {
+                    LOG_WARNING(Render_Vulkan,
+                                "NEO-GTS-512: pixel shader at {:#x} (once per pixel, 2 samples): "
+                                "{}",
+                                regs.ps_program.Address<VAddr>(),
+                                table ? (fragcoord_at_sample
+                                             ? "inputs and FragCoord at the game's sample 0"
+                                             : "inputs at the game's sample 0")
+                                : !instance.TakesSampleTable()
+                                    ? "at the centre (interpolation offsets out of range)"
+                                : info.hw.fs.quad_sample_mask ? "at the centre (AA mask set)"
+                                                              : "at the centre (hull shader)");
+                }
+            }
+        }
         const auto& cb0_blend = regs.blend_control[0];
         if (cb0_blend.enable) {
             info.hw.fs.dual_source_blending =

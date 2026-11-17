@@ -451,8 +451,11 @@ void EmitContext::DefineInputs() {
     }
     case SwStage::Fragment: {
         // NEO-GTS-511: the sample table is indexed by the pixel's place in its 2x2 quad.
+        // NEO-GTS-512: so is a pixel-rate shader's at sample 0, FragCoord's offset included.
         const bool sample_table = runtime_info.hw.fs.SampleTable() &&
-                                  info.loads.GetAny(IR::Attribute::BaryCoordSmoothSample);
+                                  (info.loads.GetAny(IR::Attribute::BaryCoordSmoothSample) ||
+                                   (runtime_info.hw.fs.FragCoordAtSample() &&
+                                    info.loads.GetAny(IR::Attribute::FragCoord)));
         if (info.loads.GetAny(IR::Attribute::FragCoord) || runtime_info.hw.fs.quad_sample_mask ||
             sample_table ||
             (info.loads.GetAny(IR::Attribute::BaryCoordPullModel) &&

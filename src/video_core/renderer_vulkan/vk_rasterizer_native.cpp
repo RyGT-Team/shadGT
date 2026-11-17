@@ -8409,6 +8409,36 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     }
     last_bound = Bound::Region;
     NotePerFrameRange(address, size); // FIX-GT7-122
+    // FIX-SGT-004 (SHADGT_LISTED_IN_PLACE=0: as before): a range in the listed in-place ranges is
+    // bound in guest memory even when a region reaches over it. Writes there never made a region,
+    // but reads took any region over them: a neighbour's region grown over the list (PERF-GTS-369's
+    // room past the end, or a read reaching into a small region) left GT7's GPU culling writing its
+    // depth pyramid and visibility states in place (cs 0xebdbf166, 0xc959ee53 at 0x1020235600 and
+    // 0x1020407f00) while its visibility test (cs 0xaca0d43e) read a region copy the writers no
+    // longer updated. Scenery, the ground or the shadows went missing for single frames, every few
+    // frames, until a restart (DIAG-SGT-003). GT7's moving per-frame memory keeps FIX-GT7-122's
+    // handling; GT Sport lists no ranges.
+    static const bool listed_only = [] {
+        const char* env = std::getenv("SHADGT_LISTED_IN_PLACE");
+        return !(env && env[0] == '0');
+    }();
+    if (listed_only && std::ranges::any_of(InplaceRanges(), [&](const auto& range) {
+            return address < range.second && address + size > range.first;
+        })) {
+        if (auto* direct = r.buffer_cache.GetDirectMemory();
+            direct && direct->EnsureImported(address, size)) {
+            if (const auto found = direct->FindBuffer(address, size)) {
+                last_bound = Bound::InPlace;
+                if (write) {
+                    DropMirrors(address, size); // NAT-150: the GPU writes guest memory there
+                } else if (!mirror) {
+                    memo_kind = MemoKind::InPlace; // OPT-003
+                }
+                if (write) memo_kind = MemoKind::InPlace;
+                return std::pair{found->first->Handle(), found->second};
+            }
+        }
+    }
     // NAT-114: ranges in (or reaching into) a region use it.
     if (Region* region = RegionOver(address, size)) {
         NotePerFrameRegion(*region); // FIX-GT7-122: dropped before the next work binds

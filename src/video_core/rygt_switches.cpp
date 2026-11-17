@@ -146,6 +146,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_DIAG_SPEC_MISS|flag|Diagnostics & tracing|off|1 = on|Logs why stored shader translations (also another GPU's manifest) did not match when the game has to translate a shader again.",
     // Native recorder & sync
     "RYGTSW1|SHADGT_LONG_LIVED_SETS|flag|Native recorder & sync|on|unset or 1 = on, any other value = off (needs SHADGT_DYNAMIC_BUFFER_OFFSETS on)|Keeps descriptor sets across command lists and drops one when an object it uses is destroyed (PERF-GTS-375). Experimental.",
+    "RYGTSW1|SHADGT_LISTED_IN_PLACE|flag|Native recorder & sync|on|0 = off|Ranges in the listed in-place ranges (GT7's launcher sets them) are always read and written in guest memory, even under a video-memory copy, so GPU culling reads what it wrote (FIX-SGT-004).",
     "RYGTSW1|SHADGT_MIRROR_PROMOTE_STARTS|int|Native recorder & sync|32|1 or more; 4 = as before|Video-memory copies of vertex and index data made per frame at most; fewer leave new scenes read over PCIe for longer (PERF-GTS-525).",
     "RYGTSW1|SHADGT_MIRROR_PROMOTE_MB|int|Native recorder & sync|64|MB, 1 or more; 8 = as before|Megabytes of vertex and index data copied to video memory per frame at most (PERF-GTS-525).",
     "RYGTSW1|SHADGT_MIRROR_PROMOTE_US|int|Native recorder & sync|4000|microseconds, 1 or more; 1000 = as before|Recorder time per frame spent making video-memory copies of vertex and index data at most (PERF-GTS-525).",

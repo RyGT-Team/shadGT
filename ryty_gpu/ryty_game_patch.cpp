@@ -3796,6 +3796,9 @@ u8* FindPresetCopy(u8* base) {
 }
 
 void Install(u8* base) {
+    if (!Common::IsGt7()) {
+        return; // NEO-GTS-506: GT Sport's options are GtsProOptions'
+    }
     const char* env = std::getenv("SHADGT_NEO_EXTRAS");
     if (!env || !*env) {
         return;
@@ -3857,11 +3860,15 @@ void Install(u8* base) {
 //   time: not proven in the code), flag at 0x140861b59, applied at 0x1406452ea;
 // - lod: a view scale of 1.3 instead of 1.0 (+0x138, GT7's level-of-detail factor), chosen at
 //   0x14110fd51.
-// GT7's replayblur and garage60 have no GT Sport counterpart found. Unset: the game's own rules
-// (a Pro on a 1080p TV has the three, on a 4K TV none). Set: the listed options on, the others
-// off, in the base mode and either Pro mode. Still left to the game: VR, and the cameras whose
-// own flags ask for blur or 60 fps on any PS4. Not measured: the GPU cost of an option forced on
-// a base PS4 (rule: no frame over 50 ms, never under 30 fps).
+// GT7's replayblur and garage60 have no GT Sport counterpart found. Unset or empty: the game's own
+// rules (a Pro on a 1080p TV has the three, on a 4K TV none). Set: the listed options on, the
+// others off, in the base mode and either Pro mode; the Pro mode's other differences stay (a Pro
+// with "none" is not a base PS4). Still left to the game: VR for blur only (replays60 and lod are
+// forced in VR too, which the emulator never reports), and the cameras whose own flags ask for
+// blur or 60 fps on any PS4. Forced on outside a Pro 1080p, blur enters code only that mode ran:
+// +0x264 and two fields with no reader found (+0x1d45/+0x1d46); whether the blur pass needs more
+// is to be seen in the game. Not measured: the GPU cost of an option forced on a base PS4 (rule: no
+// frame over 50 ms, never under 30 fps).
 namespace GtsProOptions {
 
 using namespace Gt7PresetOptions;
@@ -3879,8 +3886,8 @@ void Install(u8* base) {
         return;
     }
     const char* env = std::getenv("SHADGT_NEO_EXTRAS");
-    if (!env) {
-        return;
+    if (!env || !*env) {
+        return; // as GT7: empty is unset
     }
     const uint32_t options = Parse(env, [](std::string_view unknown) {
         std::fprintf(stderr, "[patch] NEO-GTS-506: unknown option '%.*s' in SHADGT_NEO_EXTRAS, "
@@ -3932,13 +3939,24 @@ void Install(u8* base) {
         if (bytes.empty()) {
             continue;
         }
-        Apply(base, Patch{site.rva, site.original, bytes,
-                          std::string{"NEO-GTS-506 "} + site.what + (wanted(site) ? " on" : " off")});
+        if (!Apply(base, Patch{site.rva, site.original, bytes,
+                               std::string{"NEO-GTS-506 "} + site.what +
+                                   (wanted(site) ? " on" : " off")})) {
+            // The code stays valid either way; the options are then partly the game's own.
+            std::fprintf(stderr, "[patch] NEO-GTS-506: stopped at %s, the remaining options are "
+                                 "the game's own\n",
+                         site.what);
+            return;
+        }
     }
+    // The launcher's "disable motion blur" (InstallMotionBlurOption) wins over blur: it patches
+    // the reader of the same field.
+    const bool blur_disabled = ConfigFlag("disable_motion_blur", false);
     std::fprintf(stderr, "[patch] NEO-GTS-506 GT Sport Pro options: blur %s, replays60 %s, lod %s "
                          "(SHADGT_NEO_EXTRAS=%s)\n",
-                 options & Blur ? "on" : "off", options & Replays60 ? "on" : "off",
-                 options & Lod ? "on" : "off", env);
+                 options & Blur ? (blur_disabled ? "on but disabled by disable_motion_blur" : "on")
+                                : "off",
+                 options & Replays60 ? "on" : "off", options & Lod ? "on" : "off", env);
 }
 
 } // namespace GtsProOptions

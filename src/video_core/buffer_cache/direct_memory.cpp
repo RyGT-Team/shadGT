@@ -262,6 +262,27 @@ std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr addr
 }
 
 namespace {
+// FIX-SGT-005: the listed in-place ranges (GT7's launcher sets them; GT Sport has none), as
+// [begin, end). The renderer reads the same list in vk_rasterizer_native.cpp (InplaceRanges).
+const std::vector<std::pair<VAddr, VAddr>>& ListedInPlaceRanges() {
+    static const auto ranges = [] {
+        std::vector<std::pair<VAddr, VAddr>> out;
+        const char* value = std::getenv("SHADGT_NATIVE_INPLACE_RANGES");
+        for (const char* at = value; at && *at;) {
+            char* end = nullptr;
+            const VAddr begin = std::strtoull(at, &end, 16);
+            if (end == at || *end != '+') break;
+            at = end + 1;
+            const u64 size = std::strtoull(at, &end, 16);
+            if (end == at || size == 0) break;
+            out.emplace_back(begin, begin + size);
+            at = *end == ',' ? end + 1 : end;
+        }
+        return out;
+    }();
+    return ranges;
+}
+
 // PERF-GT7-022 (Will Scarlett): import a bounded piece when first used rather
 // than pinning a whole multi-GiB allocation in one driver call. Zero restores
 // the original whole-allocation policy. Invalid/overflowing input uses 256 MiB.
@@ -309,6 +330,52 @@ bool DirectMemory::ImportView(VAddr address, VAddr want_end) {
     if (const auto next = views.upper_bound(base); next != views.end()) {
         end = std::min(end, next->second.begin);
     }
+    // FIX-SGT-005: a listed in-place range is imported as one view even when the game mapped it in
+    // several pieces. GT7 maps its culling memory 2 MB at a time (0x1020200000 and 0x1020400000 are
+    // two Windows allocations), so a view stopped at 0x1020400000 and its buffer 0x10203e0e00+
+    // 0x27100 was in no single view: its writes fell back to a video-memory region that the rest
+    // of the culling did not read, and scenery, the ground or shadows went missing for single
+    // frames until a restart (DIAG-SGT-003). The view now runs from the allocation where the
+    // listed range starts to the one where it ends, when that memory is contiguous and nothing
+    // imported is in the way; GuestArenaMapAlias makes one alias across the pieces.
+    // SHADGT_LISTED_ONE_VIEW=0: as before.
+    static const bool listed_one_view = [] {
+        const char* env = std::getenv("SHADGT_LISTED_ONE_VIEW");
+        return !(env && env[0] == '0');
+    }();
+    const VAddr unwidened_base = base, unwidened_end = end;
+    for (const auto& [listed_begin, listed_end] : ListedInPlaceRanges()) {
+        if (!listed_one_view) break;
+        if (address < listed_begin || address >= listed_end) continue;
+        VAddr lo = GuestViewBase(listed_begin);
+        if (lo == 0 || lo > base) lo = base;
+        if (auto prev = views.upper_bound(address); prev != views.begin()) {
+            lo = std::max(lo, std::prev(prev)->second.end);
+        }
+        VAddr hi = lo;
+        for (int step = 0; step < 32 && hi < std::max(end, listed_end); ++step) {
+            const VAddr more = GuestViewEnd(hi, 64_MB);
+            if (more <= hi) break;
+            hi = more;
+        }
+        if (const auto next = views.upper_bound(address); next != views.end()) {
+            hi = std::min(hi, next->second.begin);
+        }
+        if (lo <= base && hi >= end && (lo < base || hi > end) && hi - lo <= 256_MB) {
+            static std::mutex log_mutex;
+            static std::map<VAddr, u32> logged; // per listed range
+            std::scoped_lock log_lock{log_mutex};
+            if (logged[listed_begin]++ < 4) {
+                LOG_INFO(Render_Vulkan,
+                         "FIX-SGT-005: view {:#x}+{:#x} widened to {:#x}+{:#x} for listed range "
+                         "{:#x}-{:#x}",
+                         base, end - base, lo, hi - lo, listed_begin, listed_end);
+            }
+            base = lo;
+            end = hi;
+        }
+        break;
+    }
     const auto fail = [&](const char* why) {
         // An unmap/remap can leave the allocation temporarily uncommitted or split
         // before the requested page. That is not a permanent import failure.
@@ -335,6 +402,18 @@ bool DirectMemory::ImportView(VAddr address, VAddr want_end) {
     }
     trace.Next(1, base, end - base);
     void* alias = map_alias(base, end - base);
+    if (!alias && (base != unwidened_base || end != unwidened_end)) {
+        // FIX-SGT-005: no alias across the pieces; import the piece alone, as before.
+        static std::atomic<u32> warned{};
+        if (warned.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-SGT-005: no alias over {:#x}+{:#x}; importing {:#x}+{:#x}", base,
+                        end - base, unwidened_base, unwidened_end - unwidened_base);
+        }
+        base = unwidened_base;
+        end = unwidened_end;
+        alias = map_alias(base, end - base);
+    }
     if (!alias) {
         return fail("no alias (not shared memory)");
     }

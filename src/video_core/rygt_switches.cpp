@@ -249,6 +249,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_WRITE_THROUGH|flag|Native recorder & sync|off|exactly 1 = on; -DisablePerf 103 keeps it off|CPU stores to pages with GPU-written bytes go through without waiting for the GPU (FIX-079). Opt-in: froze some sessions at scene changes.",
     // Memory & VRAM
     "RYGTSW1|RYGT_BATCH_MAP_MERGE|flag|Memory & VRAM|off|1 = on|Maps a run of the renderer's fixed batch maps as one direct-memory map (PERF-GTS-268); off because it caused 30-80 ms recorder stalls in races. Runtime (libkernel).",
+    "RYGTSW1|SHADGT_LISTED_ONE_VIEW|flag|Memory & VRAM|on|0 = off|Imports each listed in-place range (GT7's culling memory) as one view even when the game mapped it in 2 MB pieces, so its buffers are bound in place (FIX-SGT-005).",
     "RYGTSW1|SHADGT_PIPELINE_IDLE_S|int|Memory & VRAM|120|seconds, 1 or more; 5 = as before|Under memory pressure, pipelines unused for this long are freed. Too short and things that leave the view lose theirs and pop back in (FIX-GTS-523).",
     "RYGTSW1|SHADGT_COMPUTE_PREFIX_COPY|flag|Memory & VRAM|off|1 = on|Menus: copies each compute shader's 4 KB constant snapshot to video memory before the dispatch, as before PERF-GTS-461. Slower; for comparison.",
     "RYGTSW1|SHADGT_D1_VIEW_MB|int|Memory & VRAM|256|MB per imported piece; 0 = whole allocation at once|Imports large GPU memory allocations in pieces of this many MB when first used (PERF-GT7-022); 0 pins the whole allocation.",

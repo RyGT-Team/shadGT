@@ -4104,8 +4104,9 @@ void NativeRenderer::FlushLdsReaders(u32) {
             so018_pipeline = pipeline.Handle(); so018_kind = 1;
         }
 #endif
-        BindGraphics(s, pipeline, reader.pipeline_owner);
+        // NEO-GTS-508: the reader's state first, so the bind resends its sample positions.
         s.dynamic = reader.dynamic;
+        BindGraphics(s, pipeline, reader.pipeline_owner);
         s.dynamic.Invalidate();
         s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
         RecordVertexIndex(reader.vertices);
@@ -15692,8 +15693,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
         // NEO-GTS-508: a multi-sample depth target the draw tests with the game's sample
         // positions keeps them through its layout change (VkSampleLocationsInfoEXT in its
-        // barrier): the draw's own positions, used on both sides of the change. Recorded with
-        // the structure built when the command runs (the ring copies no chained structures).
+        // barrier). Recorded with the structure built when the command runs (the ring copies no
+        // chained structures). Limits: the positions are this draw's, taken as those of the
+        // last write on both sides of the change; no other layout change of a depth image
+        // carries positions (the native renderer keeps images in GENERAL). On a 1x1-grid GPU
+        // (NVIDIA) only 4-sample and larger draws whose quad pixels ask for the same positions
+        // take the game's; 2-sample draws stay standard (TakesSampleLocations).
         const SampleLocations::Pattern locations = r.SampleLocationPattern(pipeline);
         for (size_t i = 0; i < feedback.size() && locations.samples != 0; ++i) {
             const auto* entry = feedback[i];

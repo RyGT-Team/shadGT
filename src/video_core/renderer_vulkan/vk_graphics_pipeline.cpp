@@ -601,11 +601,20 @@ GraphicsPipeline::GraphicsPipeline(
         .alphaToCoverageEnable = key.alpha_to_coverage && writes_coverage_alpha,
     };
     // NEO-GTS-508: with VK_EXT_sample_locations on (PS4 Pro mode), a multi-sample pipeline takes
-    // the game's sample positions, set per draw (dynamic state). Not for a count the device has
-    // no custom positions for, nor for shader objects (sample_location_samples stays 0 then).
+    // the game's sample positions, set per draw (dynamic state). Not for a count the device can't
+    // take them for (Instance::TakesSampleLocations). Not when the pixel shader may interpolate at
+    // a sample with InterpolateAtSample (per-sample barycentrics without AMD's explicit vertex
+    // parameter, as emit_spirv_context_get_set.cpp emits them), which custom locations forbid
+    // (VUID-VkGraphicsPipelineCreateInfo-sampleLocationsEnable-01524); a shader whose loads are
+    // not known counts as one. The dynamic state list and the fragment library key follow this.
     const u32 raster_samples = static_cast<u32>(sdata.multisampling.rasterizationSamples);
+    const bool interpolates_at_sample =
+        fragment_stage && !fs_info.single_sample_barycentric && !fs_info.PixelRate() &&
+        !profile.supports_amd_shader_explicit_vertex_parameter &&
+        (!fragment_stage->attribute_flags_known ||
+         fragment_stage->loads.GetAny(Shader::IR::Attribute::BaryCoordSmoothSample));
     const bool sample_locations =
-        raster_samples > 1 && instance.GetSampleLocationGrid(raster_samples).width != 0;
+        instance.TakesSampleLocations(raster_samples) && !interpolates_at_sample;
 
     const vk::PipelineViewportDepthClipControlCreateInfoEXT clip_control = {
         // FIX-GTS-443: 0..1 when the vertex shader converts the depth. A geometry shader's
@@ -2048,12 +2057,6 @@ void GraphicsPipeline::BindShaderObjects(
         cmd.setRasterizationSamplesEXT(s.samples);
         const vk::SampleMask mask = ~vk::SampleMask{0};
         cmd.setSampleMaskEXT(s.samples, &mask);
-    }
-    if (!p && instance.IsSampleLocationsOn() &&
-        VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdSetSampleLocationsEnableEXT) {
-        // NEO-GTS-508: with VK_EXT_sample_locations enabled a shader-object draw must set this
-        // state. Shader objects keep the standard positions (sample_location_samples is 0).
-        cmd.setSampleLocationsEnableEXT(VK_FALSE);
     }
     if (!p && instance.IsCoverageTruncateOn()) {
         // NEO-GT7-016: with the coverage reduction feature on, a shader-object draw must have

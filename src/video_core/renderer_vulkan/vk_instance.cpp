@@ -737,7 +737,9 @@ bool Instance::CreateDevice() {
     // draw by DynamicState). Only when the device takes every position the game can ask for
     // (1/16 pixel, 0..0.9375), lets them change from draw to draw, has the standard positions
     // (what draws it cannot express keep), and takes the depth images' flag. The extension is
-    // enabled only then: once it is, every shader-object draw must set the state too.
+    // enabled only then. Off with shader objects: their draws would keep the standard positions
+    // while pipelines draw into the same depth target with the game's, and depth tested at other
+    // positions than it was written with is undefined.
     // SHADGT_SAMPLE_LOCATIONS=0: Vulkan's standard positions, as before.
     {
         std::string off;
@@ -745,6 +747,8 @@ bool Instance::CreateDevice() {
             off = "not the PS4 Pro mode";
         } else if (const char* env = std::getenv("SHADGT_SAMPLE_LOCATIONS"); env && env[0] == '0') {
             off = "SHADGT_SAMPLE_LOCATIONS=0";
+        } else if (shader_object) {
+            off = "shader objects are on";
         } else if (std::ranges::none_of(available_extensions, [](const auto& name) {
                        return name == VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME;
                    })) {
@@ -767,11 +771,16 @@ bool Instance::CreateDevice() {
             } else if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceMultisamplePropertiesEXT) {
                 off = "no vkGetPhysicalDeviceMultisamplePropertiesEXT";
             }
-            // The depth formats the renderer makes, as it makes them (formats the device lacks
-            // are left out).
-            constexpr vk::ImageUsageFlags depth_usage =
+            // The depth formats the renderer makes, with the usage and flags it makes them with
+            // (UsageOf, ImageUsageFlags; formats the device lacks are left out). Each must take
+            // the flag with its multi-sample counts, else no pipeline gets custom positions: a
+            // depth attachment without the flag would break VUID-vkCmdDraw-sampleLocationsEnable-02689.
+            vk::ImageUsageFlags depth_usage =
                 vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
                 vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eDepthStencilAttachment;
+            if (attachment_feedback_loop) {
+                depth_usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
+            }
             constexpr vk::ImageCreateFlags depth_flags =
                 vk::ImageCreateFlagBits::eMutableFormat | vk::ImageCreateFlagBits::eExtendedUsage;
             for (const vk::Format format : {vk::Format::eD16Unorm, vk::Format::eD32Sfloat,
@@ -787,13 +796,15 @@ bool Instance::CreateDevice() {
                     .usage = depth_usage,
                     .flags = depth_flags,
                 };
-                if (physical_device.getImageFormatProperties2(info).result !=
-                    vk::Result::eSuccess) {
+                const auto plain = physical_device.getImageFormatProperties2(info);
+                if (plain.result != vk::Result::eSuccess) {
                     continue;
                 }
                 info.flags |= vk::ImageCreateFlagBits::eSampleLocationsCompatibleDepthEXT;
-                if (physical_device.getImageFormatProperties2(info).result !=
-                    vk::Result::eSuccess) {
+                const auto flagged = physical_device.getImageFormatProperties2(info);
+                const auto counts = plain.value.imageFormatProperties.sampleCounts;
+                if (flagged.result != vk::Result::eSuccess ||
+                    (flagged.value.imageFormatProperties.sampleCounts & counts) != counts) {
                     off = fmt::format("{} images refuse the sample-locations flag",
                                       vk::to_string(format));
                 }
@@ -805,6 +816,7 @@ bool Instance::CreateDevice() {
                 }
             }
             if (sample_locations) {
+                depth_flag_usage = depth_usage;
                 sample_locations_properties = p;
                 sample_locations_properties.pNext = nullptr;
                 for (u32 i = 1; i < sample_location_grids.size(); ++i) {
@@ -825,8 +837,9 @@ bool Instance::CreateDevice() {
             }
         }
         LOG_WARNING(Render_Vulkan, "NEO-GTS-508: the game's sample positions: {}",
-                    sample_locations ? fmt::format("on,{} (a draw whose 2x2 quad pixels differ "
-                                                   "keeps the standard positions on a 1x1 grid)",
+                    sample_locations ? fmt::format("on,{} (on a 1x1 grid, 2-sample draws and "
+                                                   "draws whose quad pixels differ keep the "
+                                                   "standard positions)",
                                                    grids)
                                      : fmt::format("off ({})", off));
     }
@@ -1681,6 +1694,15 @@ vk::ImageCreateFlags Instance::SampleLocationsDepthFlag(vk::Format format, vk::I
         return {};
     }
     constexpr auto flag = vk::ImageCreateFlagBits::eSampleLocationsCompatibleDepthEXT;
+    // The device's answer for each format, type, usage and flags, asked once.
+    const u64 key = (u64(format) << 40) ^ (u64(type) << 36) ^
+                    (u64(VkImageUsageFlags(usage)) << 16) ^ u64(VkImageCreateFlags(flags));
+    {
+        std::scoped_lock lock{depth_flag_mutex};
+        if (const auto it = depth_flag_answers.find(key); it != depth_flag_answers.end()) {
+            return it->second ? vk::ImageCreateFlags{flag} : vk::ImageCreateFlags{};
+        }
+    }
     const auto result = physical_device
                             .getImageFormatProperties2(vk::PhysicalDeviceImageFormatInfo2{
                                 .format = format,
@@ -1690,18 +1712,19 @@ vk::ImageCreateFlags Instance::SampleLocationsDepthFlag(vk::Format format, vk::I
                                 .flags = flags | flag,
                             })
                             .result;
-    if (result == vk::Result::eSuccess) {
-        return flag;
+    const bool takes = result == vk::Result::eSuccess;
+    if (!takes) {
+        // Not expected: CreateDevice checked these formats with the usage and flags the
+        // renderer makes depth images with (depth_flag_usage).
+        LOG_ERROR(Render_Vulkan,
+                  "NEO-GTS-508: {} depth images made without the sample-locations flag (usage {}, "
+                  "checked {}; flags {}): {}",
+                  vk::to_string(format), vk::to_string(usage), vk::to_string(depth_flag_usage),
+                  vk::to_string(flags), vk::to_string(result));
     }
-    static std::atomic<u32> refused{};
-    if (refused.fetch_add(1, std::memory_order_relaxed) < 4) {
-        LOG_WARNING(Render_Vulkan,
-                    "NEO-GTS-508: a {} depth image made without the sample-locations flag "
-                    "(usage {}, flags {}): {}",
-                    vk::to_string(format), vk::to_string(usage), vk::to_string(flags),
-                    vk::to_string(result));
-    }
-    return {};
+    std::scoped_lock lock{depth_flag_mutex};
+    depth_flag_answers.emplace(key, takes);
+    return takes ? vk::ImageCreateFlags{flag} : vk::ImageCreateFlags{};
 }
 
 bool Instance::IsFormatSupported(const vk::Format format,

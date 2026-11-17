@@ -402,6 +402,15 @@ public:
         return grid.width >= 2 && grid.height >= 2 && grid.width % 2 == 0 && grid.height % 2 == 0;
     }
 
+    /// NEO-GTS-508: pipelines with this sample count take the game's positions. Not 2 samples
+    /// on a 1x1 grid (NVIDIA): there the checkerboard's pattern (rows swapped in the quad) can't
+    /// be given and keeps the standard positions, and other 2-sample draws on the same depth
+    /// target would test it at other positions than it was written with (undefined).
+    bool TakesSampleLocations(u32 samples) const {
+        return samples > 1 && GetSampleLocationGrid(samples).width != 0 &&
+               (samples != 2 || HasSampleLocationQuadGrid(samples));
+    }
+
     /// NEO-GTS-508: VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT for a depth image
     /// when the feature is on and the device takes it with this format, usage and flags; else none.
     vk::ImageCreateFlags SampleLocationsDepthFlag(vk::Format format, vk::ImageType type,
@@ -791,6 +800,9 @@ private:
     bool sample_locations{}; ///< NEO-GTS-508
     vk::PhysicalDeviceSampleLocationsPropertiesEXT sample_locations_properties{}; ///< NEO-GTS-508
     std::array<vk::Extent2D, 5> sample_location_grids{}; ///< NEO-GTS-508: 1, 2, 4, 8, 16 samples
+    vk::ImageUsageFlags depth_flag_usage{}; ///< NEO-GTS-508: the depth usage CreateDevice checked
+    mutable std::mutex depth_flag_mutex; ///< NEO-GTS-508
+    mutable std::unordered_map<u64, bool> depth_flag_answers; ///< NEO-GTS-508
     bool shader_atomic_float{};
     bool shader_atomic_float2{};
     bool workgroup_memory_explicit_layout{};

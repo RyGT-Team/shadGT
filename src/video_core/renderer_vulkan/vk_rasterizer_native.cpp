@@ -433,6 +433,7 @@ struct ParallelRuntime {
     std::array<ProofPhaseStats,9> proof_phases{};
     std::array<ProofPhaseStats,8> whole_phases{};
     Native::Parallel::PositiveHandleCache<vk::Sampler> sampler_proof;
+    u64 sampler_proof_drops{}; ///< FIX-GTS-503: samplers dropped when it was last cleared
     u64 sampler_proof_hits{},sampler_proof_misses{},sampler_scan_steps{},sampler_scan_positives{};
     u64 natural_preclosed{},natural_captured{},natural_serial_fallback{},natural_binding_skip{};
     u64 absent_mode0_attempts{},absent_mode0_accepted{},absent_mode0_rejected{};
@@ -1865,7 +1866,8 @@ void NativeRenderer::ForgetBindings(Stream& s) {
 }
 
 u64 NativeRenderer::ReuseGeneration() const {
-    // FIX-GTS-503: a dropped sampler's handle may come back for another sampler.
+    // FIX-GTS-503: a dropped sampler's handle may come back for another sampler (no caller in
+    // the merged renderer; the binding commands' generation carries the same count).
     return registry->Generation() + unmap_generation.load(std::memory_order_relaxed) +
            buffer_generation + samplers_dropped.load(std::memory_order_relaxed);
 }
@@ -3454,7 +3456,9 @@ vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
                      (custom ? u64(border.Address()) << 1 : 0);
     static thread_local Native::EpochValueMemo<vk::Sampler> memo;
     // FIX-GTS-503: the memo holds for one cache epoch (a drop moves it) and one recycling epoch
-    // (its first use in a new one goes through the table and marks the sampler used).
+    // (its first use in a new one goes through the table and marks the sampler used). A sampler
+    // is dropped only after a whole epoch (2 s or more) nobody asked for it: a thread stopped
+    // longer than that between these loads and its use could still get a dropped handle.
     const auto epoch = (sampler_cache_epoch.load(std::memory_order_acquire) << 32) +
                        sampler_epoch.load(std::memory_order_acquire);
     if (const auto found = memo.Find(this, epoch, hash)) return *found;
@@ -12115,11 +12119,10 @@ void NativeRenderer::BindLate(PreparedDraw& p,
             const u64 dead = long_sets.dead_ring[n % long_sets.dead_ring.size()];
             died = std::ranges::find(handles, dead) != handles.end();
         }
-        if (died) {
+        if (died || !StoreLongSet(wide.low64, wide.high64, layout, set, handles)) {
             long_sets.retired.push_back({p.late_retire_tick, layout_key, set});
             ++long_sets.late_not_kept;
         } else {
-            StoreLongSet(wide.low64, wide.high64, layout, set, handles);
             ++long_sets.late_made;
         }
         sets[index] = set;
@@ -12188,8 +12191,14 @@ bool NativeRenderer::AheadRetained(const PreparedDraw& p, size_t info_index,
     return false;
 }
 
-void NativeRenderer::StoreLongSet(u64 hash, u64 check, vk::DescriptorSetLayout layout,
+bool NativeRenderer::StoreLongSet(u64 hash, u64 check, vk::DescriptorSetLayout layout,
                                   vk::DescriptorSet set, std::span<const u64> handles) {
+    // FIX-GTS-503: a sampler dropped between the draw's lookups and here (its note possibly taken
+    // before this set existed) would leave the set kept for good, found again by a new sampler
+    // given the same handle value. Used for this draw only, as a set whose handle died.
+    if (HoldsDroppedSampler(handles)) {
+        return false;
+    }
     long_sets.entries.Insert(hash, check, u64(VkDescriptorSetLayout(layout)), set);
     // PERF-GTS-378: a list per handle. In a multimap every set's entry for a handle they all
     // hold (the ahead upload arena, a sampler) was inserted after a walk over that handle's
@@ -12207,6 +12216,21 @@ void NativeRenderer::StoreLongSet(u64 hash, u64 check, vk::DescriptorSetLayout l
         list.emplace_back(hash, check);
     }
     ++long_sets.made;
+    return true;
+}
+
+bool NativeRenderer::HoldsDroppedSampler(std::span<const u64> handles) {
+    if (samplers_dropped.load(std::memory_order_acquire) == 0) {
+        return false; // none ever dropped (the usual case: the table far from its budget)
+    }
+    std::scoped_lock lock{sampler_mutex};
+    for (const auto& [tick, sampler] : retired_samplers) {
+        const u64 dropped = u64(VkSampler(sampler->Handle()));
+        if (std::ranges::find(handles, dropped) != handles.end()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void NativeRenderer::DropLongSets(std::span<const u64> dead_handles) {
@@ -12609,7 +12633,10 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
                     }
                 }
             }
-            StoreLongSet(key_hash, key_check, layout, set, handles);
+            if (!StoreLongSet(key_hash, key_check, layout, set, handles)) {
+                // FIX-GTS-503: written again once the GPU ran this list.
+                long_sets.retired.push_back({r.scheduler.CurrentTick() + 1, layout_key, set});
+            }
         } else if (cacheable) s.descriptor_sets.Store(key_hash, descriptor_key, set);
         sets[index] = set;
     }} catch(...) {
@@ -16447,6 +16474,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                             if(sampler_cache_enabled) {
                                 const auto handle_key=reinterpret_cast<u64>(static_cast<VkSampler>(info.sampler));
                                 const bool diag=ParallelGateDiagEnabled();
+                                // FIX-GTS-503: what it vouched for may have been destroyed.
+                                if(const u64 drops=samplers_dropped.load(std::memory_order_acquire);drops!=parallel->sampler_proof_drops) {parallel->sampler_proof.Clear();parallel->sampler_proof_drops=drops;}
                                 known=parallel->sampler_proof.Contains(info.sampler,handle_key);
                                 if(known) {if(diag)NATIVE_DIAGNOSTIC(++parallel->sampler_proof_hits);}
                                 else {

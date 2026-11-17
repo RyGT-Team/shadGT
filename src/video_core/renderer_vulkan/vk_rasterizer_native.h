@@ -621,7 +621,9 @@ private:
     /// the list being recorded. False when they were written over.
     bool AheadCommit(u64 position, u32 size, vk::DescriptorBufferInfo& info);
     vk::DescriptorSet MakeLongSet(vk::DescriptorSetLayout layout);
-    void StoreLongSet(u64 hash, u64 check, vk::DescriptorSetLayout layout, vk::DescriptorSet set,
+    /// FIX-GTS-503: false (the set not kept) when it holds a sampler dropped since its handles
+    /// were looked up: the drop's note may already have been taken, and nothing would drop it.
+    bool StoreLongSet(u64 hash, u64 check, vk::DescriptorSetLayout layout, vk::DescriptorSet set,
                       std::span<const u64> handles);
     void DropLongSets(std::span<const u64> dead_handles);
     void FlushLongSets();
@@ -1879,6 +1881,8 @@ private:
     u32 SamplerLimit() const;
     void RecycleSamplers();
     void DestroyRetiredSamplers();
+    /// FIX-GTS-503: one of these handles is a dropped sampler not yet destroyed.
+    bool HoldsDroppedSampler(std::span<const u64> handles);
 
     std::mutex views_mutex;
     std::unordered_map<const Native::ImageEntry*, std::vector<ViewRecord>> views;

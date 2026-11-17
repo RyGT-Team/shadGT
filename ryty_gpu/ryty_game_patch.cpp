@@ -2035,6 +2035,11 @@ void InstallGtsRaceStartSignal(u8* base) {
 // reads visibility answers from the GPU. Other versions (other bytes) keep the game's own choice,
 // with one line. SHADGT_GT7_OCCLUSION=gpu: the game's own choice. Played on an RTX 4070 and a
 // Ryzen 7 8700G (16 threads) only; the cost on CPUs with fewer threads is not measured.
+// GAME-007: off by default again. The flicker was the renderer's: a buffer memo revalidated in
+// listed in-place memory read GT7's depth pyramid from a copy its writer no longer updated
+// (FIX-GTS-520). With that fixed, the compute culling shows no drops, cold or warm, and takes
+// 18 ms of GPU time a frame where the CPU culling's frames took 38-48 ms on the same replay.
+// SHADGT_GT7_OCCLUSION=cpu applies GAME-003.
 constexpr u64 kGt7OcclusionMode = 0x363f2b0;
 constexpr u8 kGt7OcclusionModeCode[] = {
     0x55, 0x48, 0x89, 0xe5, 0x53, 0x48, 0x83, 0xec, 0x28, 0x48, 0x8b, 0x1d,
@@ -2063,9 +2068,9 @@ void InstallGt7CpuOcclusion(u8* base) {
         return;
     }
     const char* env = std::getenv("SHADGT_GT7_OCCLUSION");
-    if (env && std::string_view{env} == "gpu") {
-        std::fprintf(stderr, "[patch] GAME-003: off (SHADGT_GT7_OCCLUSION=gpu), GT7 picks its "
-                             "occlusion culling itself\n");
+    if (!(env && std::string_view{env} == "cpu")) {
+        std::fprintf(stderr, "[patch] GAME-003: off (GAME-007 default, SHADGT_GT7_OCCLUSION=cpu "
+                             "turns it on), GT7 picks its occlusion culling itself\n");
         return;
     }
     Apply(base, Patch{rva + kGt7OcclusionModeOne, {0x01}, {0x00},

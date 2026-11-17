@@ -346,7 +346,11 @@ bool DirectMemory::ImportView(VAddr address, VAddr want_end) {
     const VAddr unwidened_base = base, unwidened_end = end;
     for (const auto& [listed_begin, listed_end] : ListedInPlaceRanges()) {
         if (!listed_one_view) break;
-        if (address < listed_begin || address >= listed_end) continue;
+        // The view, not only the address, decides: the first import over GT7's culling memory
+        // came from just below the listed range (0x1020200000), and a plain piece made then kept
+        // the range split for the session.
+        if (end <= listed_begin || base >= listed_end) continue;
+        if (listed_begin >= base && listed_end <= end) continue; // already inside this view
         VAddr lo = GuestViewBase(listed_begin);
         if (lo == 0 || lo > base) lo = base;
         if (auto prev = views.upper_bound(address); prev != views.begin()) {

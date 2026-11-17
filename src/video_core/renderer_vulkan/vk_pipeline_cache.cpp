@@ -7611,6 +7611,13 @@ bool PipelineCache::OneOffBounded() {
 
 u32 PipelineCache::NeverSkippedReason(
     const std::array<const Shader::Info*, MaxShaderStages>& infos) {
+    // FIX-GTS-498: a pipeline this session built and released is rebuilt from the driver cache.
+    // FIX-SGT-001: before PERF-GTS-493's race rule, which is for new pipelines (cold compiles of
+    // hundreds of ms). After it, a pipeline the trim had retired was skipped in a race while it
+    // was rebuilt, and that scenery popped back in: GT7 on an 8 GB GPU went over the trim's
+    // reserve in races (6437 of 7180 MiB), and 1945 pipelines were retired in one session. A
+    // rebuild here is a driver-cache hit of a few ms. (FIX-GTS-504 before the merge of 11-17.)
+    if (!released_graphics.empty() && released_graphics.contains(S().graphics_key)) return 2;
     if (RaceNeverWaits()) return 0; // PERF-GTS-493
     // shadgt7 FIX-198: a one-off target's draw past its bounded wait (SetForceWait) waits for its
     // pipeline. FIX-GTS-517: not one in its bounded wait (SetWaitForShaders, PERF-GT7-020): its
@@ -7620,8 +7627,6 @@ u32 PipelineCache::NeverSkippedReason(
     // compiled GT7's dealership stopped up to 1.9 s a draw (DIAG-GTS-515).
     // SHADGT_ONE_OFF_BOUNDED=0: as the merge did.
     if (force_wait || (wait_for_shaders && !OneOffBounded())) return 1;
-    // FIX-GTS-498: a pipeline this session built and released is rebuilt from the driver cache.
-    if (!released_graphics.empty() && released_graphics.contains(S().graphics_key)) return 2;
     if (const auto* fragment = infos[u32(Shader::SwStage::Fragment)];
         fragment && IsGt7OneShotShader(fragment->pgm_hash)) return 3;
     // A loading-time shadow bake may run only once. Preserve depth-only output

@@ -624,12 +624,24 @@ GraphicsPipeline::GraphicsPipeline(
     sample_location_exclusion = sample_locations                                  ? 0
                                 : !instance.TakesSampleLocations(raster_samples) ? 1
                                                                                   : 2;
-    uses_sample_table = fragment_stage && fs_info.SampleTable();
-    per_pixel_fallback = fragment_stage && (fs_info.mrtz_mask &
-                                            Shader::HwFragmentRuntimeInfo::MrtzPixelRateFallback);
+    uses_sample_table = fragment_stage && fs_info.SampleTable() && !fs_info.SampleTableInOffsets();
+    // NEO-GTS-513: the same rule as the translation (EmitPrologue).
+    const bool offsets_too_many =
+        fragment_stage && fs_info.SampleTableInOffsets() &&
+        fragment_stage->buffers.size() > Shader::PushData::Sample0OffsetsMaxBuffers;
+    uses_sample0_offsets =
+        fragment_stage && fs_info.SampleTableInOffsets() && !offsets_too_many;
+    per_pixel_fallback = fragment_stage && fs_info.PerPixelFallback();
+    const bool reads_sample =
+        fragment_stage && (fragment_stage->attribute_flags_known
+                               ? fragment_stage->loads.GetAny(
+                                     Shader::IR::Attribute::BaryCoordSmoothSample)
+                               : fs_info.addr_flags.persp_sample_ena != 0);
     pixel_rate_shading = !fragment_stage || !fs_info.PixelRate() || per_pixel_fallback ? 0
-                         : fs_info.SampleTable()                                     ? 1
-                                                                                     : 2;
+                         : uses_sample_table || uses_sample0_offsets                ? 1
+                         : offsets_too_many                                         ? 4
+                         : reads_sample                                             ? 3
+                                                                                    : 2;
 
     const vk::PipelineViewportDepthClipControlCreateInfoEXT clip_control = {
         // FIX-GTS-443: 0..1 when the vertex shader converts the depth. A geometry shader's

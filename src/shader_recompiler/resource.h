@@ -357,6 +357,12 @@ struct PushData {
     /// mask's place (only draws whose mask is all ones use it), so the push block keeps its size
     /// and every cached pipeline stays valid.
     static constexpr u32 LdsScratchIndex = QuadSampleMaskIndex;
+    /// NEO-GTS-513: when that slot is taken (a game AA mask, FIX-227's LDS scratch), a pixel-rate
+    /// shader of the PS4 Pro checkerboard finds its sample 0 positions (a byte a quad pixel) in
+    /// the last word of the pixel shader's buffer offsets (Backend::StageBufferOffsetBase: bytes
+    /// 0-15), free when it has 12 buffers at most (one offset byte a buffer, from 0).
+    static constexpr u32 Sample0OffsetsByte = 12;
+    static constexpr u32 Sample0OffsetsMaxBuffers = 12;
 
     float xoffset;
     float yoffset;

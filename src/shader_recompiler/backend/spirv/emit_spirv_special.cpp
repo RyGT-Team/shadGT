@@ -177,7 +177,11 @@ void EmitPrologue(EmitContext& ctx) {
         const bool table_needed =
             Sirit::ValidId(ctx.bary_coord) ||
             (pixel_rate && ctx.runtime_info.hw.fs.FragCoordAtSample());
-        if (ctx.runtime_info.hw.fs.SampleTable() && table_needed &&
+        // NEO-GTS-513: sample 0's entries in the buffer offsets' last word, which a shader with
+        // more than 12 buffers uses for its own offsets: then it stays at the centre.
+        const bool in_offsets = ctx.runtime_info.hw.fs.SampleTableInOffsets();
+        const bool offsets_free = ctx.info.buffers.size() <= PushData::Sample0OffsetsMaxBuffers;
+        if (ctx.runtime_info.hw.fs.SampleTable() && table_needed && (!in_offsets || offsets_free) &&
             (pixel_rate || Sirit::ValidId(ctx.sample_index)) && Sirit::ValidId(ctx.frag_coord)) {
             // NEO-GTS-511: the offset of this sample from the pixel centre, from the positions
             // table in PushData::quad_sample_mask: byte (pixel * 2 + sample), pixel = x + 2y of
@@ -199,12 +203,27 @@ void EmitPrologue(EmitContext& ctx) {
                 ctx.OpBitwiseOr(ctx.U32[1], ctx.OpShiftLeftLogical(ctx.U32[1], x, ctx.ConstU32(1u)),
                                 ctx.OpShiftLeftLogical(ctx.U32[1], y, ctx.ConstU32(2u))),
                 sample);
-            const Id word_ptr = ctx.OpAccessChain(
-                ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1]), ctx.push_data_block,
-                ctx.ConstU32(PushData::QuadSampleMaskIndex),
-                ctx.OpShiftRightLogical(ctx.U32[1], index, ctx.ConstU32(2u)));
-            const Id shift = ctx.OpShiftLeftLogical(
-                ctx.U32[1], ctx.OpBitwiseAnd(ctx.U32[1], index, ctx.ConstU32(3u)), ctx.ConstU32(3u));
+            Id word_ptr;
+            Id shift;
+            if (in_offsets) {
+                // NEO-GTS-513: one byte a quad pixel (sample 0 only), pixel = x + 2y = index / 2.
+                word_ptr = ctx.OpAccessChain(
+                    ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1]),
+                    ctx.push_data_block,
+                    ctx.ConstU32(PushData::BufOffsetIndex + PushData::Sample0OffsetsByte / 16),
+                    ctx.ConstU32((PushData::Sample0OffsetsByte % 16) / 4));
+                shift = ctx.OpShiftLeftLogical(
+                    ctx.U32[1], ctx.OpShiftRightLogical(ctx.U32[1], index, ctx.u32_one_value),
+                    ctx.ConstU32(3u));
+            } else {
+                word_ptr = ctx.OpAccessChain(
+                    ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1]),
+                    ctx.push_data_block, ctx.ConstU32(PushData::QuadSampleMaskIndex),
+                    ctx.OpShiftRightLogical(ctx.U32[1], index, ctx.ConstU32(2u)));
+                shift = ctx.OpShiftLeftLogical(
+                    ctx.U32[1], ctx.OpBitwiseAnd(ctx.U32[1], index, ctx.ConstU32(3u)),
+                    ctx.ConstU32(3u));
+            }
             const Id byte = ctx.OpBitwiseAnd(
                 ctx.U32[1], ctx.OpShiftRightLogical(ctx.U32[1], ctx.OpLoad(ctx.U32[1], word_ptr), shift),
                 ctx.ConstU32(0xffu));

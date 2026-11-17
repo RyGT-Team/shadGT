@@ -291,6 +291,17 @@ struct HwFragmentRuntimeInfo {
     bool FragCoordAtSample() const noexcept {
         return (mrtz_mask & MrtzFragCoordSample) != 0;
     }
+    // NEO-GTS-513: bits 7, 6 and 5 together: as NEO-GTS-512, but the table's slot is taken (a
+    // game AA mask, FIX-227's LDS scratch), so sample 0's entries come from the pixel shader's
+    // buffer offsets (PushData::Sample0OffsetsByte), when it has 12 buffers at most (else the
+    // centre). Bit 5 alone with bit 7 stays NEO-GTS-511's per-pixel fallback.
+    static constexpr u8 MrtzSample0InOffsets = MrtzPixelRate | MrtzSampleTable | MrtzPixelRateFallback;
+    bool SampleTableInOffsets() const noexcept {
+        return (mrtz_mask & MrtzSample0InOffsets) == MrtzSample0InOffsets;
+    }
+    bool PerPixelFallback() const noexcept {
+        return (mrtz_mask & MrtzPixelRateFallback) != 0 && !SampleTable();
+    }
     bool front_face_all_bits{false};
     bool dual_source_blending{false};
     bool clip_distance_emulation{false};

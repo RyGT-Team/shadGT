@@ -7287,7 +7287,10 @@ static void NoteCheckerboardDraw(const AmdGpu::Regs& regs, u64 frame) {
 // why. On a GPU with a 2x2 grid for 2 samples the standard count should stay 0: a depth written
 // at some positions and tested at others is undefined (black blocks in GT7's trees).
 namespace TwoSampleCount {
-enum Kind : u32 { Game, PerPixel, Device, Shader, Count, OnePoint, Quad, Sample0, Centre, Kinds };
+enum Kind : u32 {
+    Game, PerPixel, Device, Shader, Count, OnePoint, Quad,
+    Sample0, CentreNormal, CentreNoTable, CentreBuffers, Kinds
+};
 inline std::array<std::atomic<u64>, Kinds> counts{};
 inline std::atomic<s64> last_ms{0};
 } // namespace TwoSampleCount
@@ -7311,9 +7314,12 @@ static void CountTwoSampleDraw(const GraphicsPipeline& pipeline, SampleLocations
         counts[PerPixel].fetch_add(1, std::memory_order_relaxed);
     }
     // NEO-GTS-512: the colour draws run once per pixel, shaded at sample 0 or at the centre.
-    if (pipeline.PixelRateShading() != 0) {
-        counts[pipeline.PixelRateShading() == 1 ? Sample0 : Centre].fetch_add(
-            1, std::memory_order_relaxed);
+    if (const u32 shading = pipeline.PixelRateShading(); shading != 0) {
+        counts[shading == 1   ? Sample0
+               : shading == 2 ? CentreNormal
+               : shading == 3 ? CentreNoTable
+                              : CentreBuffers]
+            .fetch_add(1, std::memory_order_relaxed);
     }
     const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now().time_since_epoch())
@@ -7335,11 +7341,13 @@ static void CountTwoSampleDraw(const GraphicsPipeline& pipeline, SampleLocations
                 "({} of them once per pixel, no positions table); at the standard positions: {} "
                 "(device or switch {}, shader interpolates at a sample {}, PA_SC_AA_CONFIG count "
                 "differs {}, registers on one point {}, quad pixels differ on a 1x1 grid {}); "
-                "colour once per pixel: shaded at the game's sample 0 {}, at the centre {} "
-                "(NEO-GTS-512)",
+                "colour once per pixel: shaded at the game's sample 0 {}, at the centre {} (as "
+                "on the console {}, no table {}, too many buffers {}) (NEO-GTS-512/513)",
                 (now - last) / 1000, n[Game], n[PerPixel],
                 n[Device] + n[Shader] + n[Count] + n[OnePoint] + n[Quad], n[Device], n[Shader],
-                n[Count], n[OnePoint], n[Quad], n[Sample0], n[Centre]);
+                n[Count], n[OnePoint], n[Quad], n[Sample0],
+                n[CentreNormal] + n[CentreNoTable] + n[CentreBuffers], n[CentreNormal],
+                n[CentreNoTable], n[CentreBuffers]);
 }
 
 // DIAG-GTS-509: a shader binding as a texture an image a checkerboard draw wrote.
@@ -15762,11 +15770,18 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     // NEO-GTS-511: the pixel shader's positions table (the draw's own positions, as given to
     // Vulkan) replaces PA_SC_AA_MASK in the push constants: such a pipeline has no AA mask and
     // no hull shader (vk_pipeline_cache.cpp). Before any push of the bindings below.
-    if (pipeline->UsesSampleTable() || pipeline->RasterSamples() == 2) {
+    if (pipeline->UsesSampleTable() || pipeline->UsesSample0Offsets() ||
+        pipeline->RasterSamples() == 2) {
         SampleLocations::Why why = SampleLocations::Why::Game;
         const SampleLocations::Pattern locations = r.SampleLocationPattern(pipeline, &why);
         if (pipeline->UsesSampleTable()) {
             b.push.quad_sample_mask = SampleLocations::QuadTable(locations);
+        }
+        if (pipeline->UsesSample0Offsets()) {
+            // NEO-GTS-513: past the pixel shader's own offsets (12 buffers at most).
+            const u32 word = SampleLocations::Sample0Word(locations);
+            std::memcpy(&b.push.buf_offsets[Shader::PushData::Sample0OffsetsByte], &word,
+                        sizeof(word));
         }
         CountTwoSampleDraw(*pipeline, why);
     }

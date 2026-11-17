@@ -4323,6 +4323,11 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             ctx->push_data.quad_sample_mask =
                 SampleLocations::QuadTable(SampleLocationPattern(graphics));
         }
+        if (graphics->UsesSample0Offsets()) { // NEO-GTS-513
+            const u32 word = SampleLocations::Sample0Word(SampleLocationPattern(graphics));
+            std::memcpy(&ctx->push_data.buf_offsets[Shader::PushData::Sample0OffsetsByte], &word,
+                        sizeof(word));
+        }
     }
     for (u32 i = 0; i < stages.size(); ++i) {
         const auto* stage = stages[i];

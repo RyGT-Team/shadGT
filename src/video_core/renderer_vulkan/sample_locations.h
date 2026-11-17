@@ -124,6 +124,18 @@ inline std::array<std::uint32_t, 2> QuadTable(const Pattern& pattern) {
     return table;
 }
 
+/// NEO-GTS-513: sample 0's entries of QuadTable, a byte a quad pixel (x + 2 * y), for the
+/// pixel-rate shaders that find them in the buffer offsets (PushData::Sample0OffsetsByte).
+inline std::uint32_t Sample0Word(const Pattern& pattern) {
+    const std::array<std::uint32_t, 2> table = QuadTable(pattern);
+    std::uint32_t word = 0;
+    for (std::uint32_t pixel = 0; pixel < 4; ++pixel) {
+        const std::uint32_t i = pixel * 2;
+        word |= ((table[i / 4] >> ((i % 4) * 8)) & 0xffu) << (pixel * 8);
+    }
+    return word;
+}
+
 /// The Vulkan structure of a pattern; `storage` holds its locations.
 inline vk::SampleLocationsInfoEXT ToVulkan(const Pattern& pattern,
                                            std::array<vk::SampleLocationEXT, 64>& storage) {

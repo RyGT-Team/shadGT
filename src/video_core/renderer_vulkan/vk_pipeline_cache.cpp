@@ -1581,8 +1581,10 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
                 }
             }
             if (raster == 2 && instance.TakesSampleLocations(2)) {
+                // NEO-GTS-513: the slot is taken only where FIX-227 emulates the LDS
+                // (TessLdsEmulation), not by every hull shader.
                 const bool table = instance.TakesSampleTable() && !info.hw.fs.quad_sample_mask &&
-                                   !regs.stage_enable.hs_en;
+                                   TessLdsEmulation(regs) == 0;
                 info.hw.fs.mrtz_mask |=
                     table ? Shader::HwFragmentRuntimeInfo::MrtzSampleTable
                           : u8(Shader::HwFragmentRuntimeInfo::MrtzPixelRate |
@@ -1599,7 +1601,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
                                 : !instance.TakesSampleTable()
                                     ? "once per pixel (interpolation offsets out of range)"
                                 : info.hw.fs.quad_sample_mask ? "once per pixel (AA mask set)"
-                                                              : "once per pixel (hull shader)");
+                                                              : "once per pixel (hull shader LDS)");
                 }
             }
         }
@@ -1632,29 +1634,36 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
                 }
             }
             if (raster == 2 && instance.TakesSampleLocations(2)) {
-                const bool table = instance.TakesSampleTable() && !info.hw.fs.quad_sample_mask &&
-                                   !regs.stage_enable.hs_en;
+                // NEO-GTS-513: where the table's slot is taken (a game AA mask, FIX-227's LDS
+                // scratch), sample 0's entries go in the pixel shader's buffer offsets instead
+                // (bits 7, 6 and 5; the translation and the draw check its 12 buffers at most).
+                const bool table = instance.TakesSampleTable();
+                const bool slot_free =
+                    !info.hw.fs.quad_sample_mask && TessLdsEmulation(regs) == 0;
                 if (table) {
                     info.hw.fs.mrtz_mask |= u8(
                         Shader::HwFragmentRuntimeInfo::MrtzSampleTable |
+                        (slot_free ? u8{0} : Shader::HwFragmentRuntimeInfo::MrtzPixelRateFallback) |
                         (fragcoord_at_sample ? Shader::HwFragmentRuntimeInfo::MrtzFragCoordSample
                                              : u8{0}));
                 }
-                static std::atomic<u32> logged_sample0{};
+                static std::atomic<u32> logged_slot{};
+                static std::atomic<u32> logged_offsets{};
                 static std::atomic<u32> logged_centre{};
-                if ((table ? logged_sample0 : logged_centre)
-                        .fetch_add(1, std::memory_order_relaxed) < 3) {
+                auto& logged = !table ? logged_centre : slot_free ? logged_slot : logged_offsets;
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 3) {
                     LOG_WARNING(Render_Vulkan,
                                 "NEO-GTS-512: pixel shader at {:#x} (once per pixel, 2 samples): "
-                                "{}",
+                                "{}{}",
                                 regs.ps_program.Address<VAddr>(),
-                                table ? (fragcoord_at_sample
-                                             ? "inputs and FragCoord at the game's sample 0"
-                                             : "inputs at the game's sample 0")
-                                : !instance.TakesSampleTable()
-                                    ? "at the centre (interpolation offsets out of range)"
-                                : info.hw.fs.quad_sample_mask ? "at the centre (AA mask set)"
-                                                              : "at the centre (hull shader)");
+                                !table ? "at the centre (interpolation offsets out of range)"
+                                : fragcoord_at_sample
+                                    ? "inputs and FragCoord at the game's sample 0"
+                                    : "inputs at the game's sample 0",
+                                !table || slot_free ? ""
+                                : info.hw.fs.quad_sample_mask
+                                    ? " (NEO-GTS-513: in the buffer offsets, AA mask set)"
+                                    : " (NEO-GTS-513: in the buffer offsets, hull shader LDS)");
                 }
             }
         }

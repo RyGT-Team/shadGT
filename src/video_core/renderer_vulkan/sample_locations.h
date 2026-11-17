@@ -52,17 +52,26 @@ inline Pattern Standard(std::uint32_t samples) {
     return pattern;
 }
 
+/// NEO-GTS-511: why FromRegisters gave the standard positions (Game: it gave the game's).
+enum class Why : std::uint8_t { Game, CountDiffers, OnePoint, QuadDiffers };
+
 /// From the 16 registers PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0..X1Y1 (4 a pixel of the quad, in the
 /// order X0Y0, X1Y0, X0Y1, X1Y1; a byte a sample, 4 a register: a signed 4-bit x then y in 1/16
 /// pixel from the pixel's centre). register_samples: PA_SC_AA_CONFIG's count; samples: the
 /// pipeline's; quad_grid: the device takes a 2x2 grid for this count. Vulkan's standard positions
 /// when the counts differ, when the quad's pixels differ and quad_grid is false, or when all the
-/// samples of a pixel sit on one point (registers never written).
+/// samples of a pixel sit on one point (registers never written); `why` says which.
 inline Pattern FromRegisters(const std::array<std::uint32_t, 16>& regs,
                              std::uint32_t register_samples, std::uint32_t samples,
-                             bool quad_grid) {
-    if (samples < 2 || samples > 16 || register_samples != samples) {
+                             bool quad_grid, Why* why = nullptr) {
+    const auto standard = [&](Why reason) {
+        if (why) {
+            *why = reason;
+        }
         return Standard(samples);
+    };
+    if (samples < 2 || samples > 16 || register_samples != samples) {
+        return standard(Why::CountDiffers);
     }
     // Signed nibbles -8..7 from the centre become 0..15 from the corner: add 8 to each.
     const auto position = [&](std::uint32_t pixel, std::uint32_t sample) {
@@ -79,18 +88,17 @@ inline Pattern FromRegisters(const std::array<std::uint32_t, 16>& regs,
             one_point = one_point && position(pixel, sample) == position(pixel, 0);
         }
         if (one_point) {
-            return Standard(samples);
+            return standard(Why::OnePoint);
         }
     }
-    // NEO-GTS-508: 2-sample draws keep the standard positions on every GPU for now. The PS4 Pro
-    // checkerboard is 2-sample (its quad pixels differ); the RTX 4070 does take a 2x2 grid for it
-    // (vkGetPhysicalDeviceMultisamplePropertiesEXT: 2x grid 2x4), and given the game's positions
-    // there, GT7's trees and grass showed black blocks (11-17): some of its 2-sample draws keep
-    // the standard positions (pipelines that may interpolate at a sample) on the same depth, and
-    // depth tested at other positions than it was written at is undefined. The checkerboard needs
-    // the whole fix of RECHERCHE-DAMIER-PRO.md (option 3) first.
-    if (samples == 2 || (!alike && !quad_grid)) {
-        return Standard(samples);
+    // NEO-GTS-511: 2-sample draws take the game's positions again (9d6b3efa kept them standard):
+    // which 2-sample pipelines take custom positions is decided by Instance::TakesSampleLocations
+    // and by the translation (no pipeline left at the standard positions on the same depth).
+    if (!alike && !quad_grid) {
+        return standard(Why::QuadDiffers);
+    }
+    if (why) {
+        *why = Why::Game;
     }
     Pattern pattern;
     pattern.samples = static_cast<std::uint8_t>(samples);
@@ -101,6 +109,19 @@ inline Pattern FromRegisters(const std::array<std::uint32_t, 16>& regs,
         }
     }
     return pattern;
+}
+
+/// NEO-GTS-511: a 2-sample pattern as the pixel shaders' positions table (in
+/// PushData::quad_sample_mask): byte pixel * 2 + sample, pixel = x + 2 * y in the 2x2 quad, each
+/// a position as in Pattern. Another count (a pipeline without the state) gives the standard ones.
+inline std::array<std::uint32_t, 2> QuadTable(const Pattern& pattern) {
+    const Pattern used = pattern.samples == 2 ? pattern : Standard(2);
+    std::array<std::uint32_t, 2> table{};
+    for (std::uint32_t i = 0; i < 8; ++i) {
+        const std::uint32_t byte = used.positions[used.grid == 2 ? i : i % 2];
+        table[i / 4] |= byte << ((i % 4) * 8);
+    }
+    return table;
 }
 
 /// The Vulkan structure of a pattern; `storage` holds its locations.

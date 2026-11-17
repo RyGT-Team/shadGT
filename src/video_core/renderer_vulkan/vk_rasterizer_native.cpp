@@ -7281,6 +7281,60 @@ static void NoteCheckerboardDraw(const AmdGpu::Regs& regs, u64 frame) {
     }
 }
 
+// NEO-GTS-511 (PS4 Pro mode): every 30 s while a race runs, how the 2-sample draws (the
+// checkerboard, its depth passes) got their sample positions: the game's (and how many of those
+// run once per pixel because they could not have the positions table), or the standard ones and
+// why. On a GPU with a 2x2 grid for 2 samples the standard count should stay 0: a depth written
+// at some positions and tested at others is undefined (black blocks in GT7's trees).
+namespace TwoSampleCount {
+enum Kind : u32 { Game, PerPixel, Device, Shader, Count, OnePoint, Quad, Kinds };
+inline std::array<std::atomic<u64>, Kinds> counts{};
+inline std::atomic<s64> last_ms{0};
+} // namespace TwoSampleCount
+
+static void CountTwoSampleDraw(const GraphicsPipeline& pipeline, SampleLocations::Why why) {
+    static const bool pro = Libraries::Kernel::sceKernelIsNeoMode() != 0;
+    if (!pro || pipeline.RasterSamples() != 2 || !RytyRaceRunning()) {
+        return;
+    }
+    using namespace TwoSampleCount;
+    Kind kind = Game;
+    if (pipeline.SampleLocationSamples() == 0) {
+        kind = pipeline.SampleLocationExclusion() == 2 ? Shader : Device;
+    } else if (why != SampleLocations::Why::Game) {
+        kind = why == SampleLocations::Why::CountDiffers ? Count
+               : why == SampleLocations::Why::OnePoint   ? OnePoint
+                                                         : Quad;
+    }
+    counts[kind].fetch_add(1, std::memory_order_relaxed);
+    if (kind == Game && pipeline.PerPixelFallback()) {
+        counts[PerPixel].fetch_add(1, std::memory_order_relaxed);
+    }
+    const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    s64 last = last_ms.load(std::memory_order_relaxed);
+    if (last == 0) {
+        last_ms.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 30000 || !last_ms.compare_exchange_strong(last, now)) {
+        return;
+    }
+    std::array<u64, Kinds> n{};
+    for (u32 i = 0; i < Kinds; ++i) {
+        n[i] = counts[i].exchange(0, std::memory_order_relaxed);
+    }
+    LOG_WARNING(Render_Vulkan,
+                "NEO-GTS-511: 2-sample draws in the last {} s of race: {} at the game's positions "
+                "({} of them once per pixel, no positions table); at the standard positions: {} "
+                "(device or switch {}, shader interpolates at a sample {}, PA_SC_AA_CONFIG count "
+                "differs {}, registers on one point {}, quad pixels differ on a 1x1 grid {})",
+                (now - last) / 1000, n[Game], n[PerPixel],
+                n[Device] + n[Shader] + n[Count] + n[OnePoint] + n[Quad], n[Device], n[Shader],
+                n[Count], n[OnePoint], n[Quad]);
+}
+
 // DIAG-GTS-509: a shader binding as a texture an image a checkerboard draw wrote.
 static void NoteCheckerboardRead(VAddr address, u64 program, bool storage) {
     if (!CheckerboardDiagOn()) {
@@ -15698,6 +15752,17 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         (db_feedback.has_stencil && regs.depth_control.stencil_enable);
     const auto depth_feedback = Native::DecideDepthFeedback(
         sampled_depth, depth_writes, r.instance.IsAttachmentFeedbackLoopLayoutSupported());
+    // NEO-GTS-511: the pixel shader's positions table (the draw's own positions, as given to
+    // Vulkan) replaces PA_SC_AA_MASK in the push constants: such a pipeline has no AA mask and
+    // no hull shader (vk_pipeline_cache.cpp). Before any push of the bindings below.
+    if (pipeline->UsesSampleTable() || pipeline->RasterSamples() == 2) {
+        SampleLocations::Why why = SampleLocations::Why::Game;
+        const SampleLocations::Pattern locations = r.SampleLocationPattern(pipeline, &why);
+        if (pipeline->UsesSampleTable()) {
+            b.push.quad_sample_mask = SampleLocations::QuadTable(locations);
+        }
+        CountTwoSampleDraw(*pipeline, why);
+    }
     struct DepthSnapshot {
         std::unique_ptr<Native::Rhi::Image> image;
         std::vector<vk::UniqueImageView> views;
@@ -15839,18 +15904,20 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 },
             });
         }
-        // NEO-GTS-508: a multi-sample depth target the draw tests with the game's sample
-        // positions keeps them through its layout change (VkSampleLocationsInfoEXT in its
-        // barrier). Recorded with the structure built when the command runs (the ring copies no
-        // chained structures). Limits: the positions are this draw's, taken as those of the
-        // last write on both sides of the change; no other layout change of a depth image
-        // carries positions (the native renderer keeps images in GENERAL). On a 1x1-grid GPU
-        // (NVIDIA) only 4-sample and larger draws whose quad pixels ask for the same positions
-        // take the game's; 2-sample draws stay standard (TakesSampleLocations).
-        const SampleLocations::Pattern locations = r.SampleLocationPattern(pipeline);
-        for (size_t i = 0; i < feedback.size() && locations.samples != 0; ++i) {
+        // NEO-GTS-508: a multi-sample depth target written with the game's sample positions
+        // keeps them through its layout change (VkSampleLocationsInfoEXT in its barrier).
+        // Recorded with the structure built when the command runs (the ring copies no chained
+        // structures). NEO-GTS-511: the positions of the depth's last write (written_locations,
+        // set before each draw that writes it), on both sides of the change. These feedback-loop
+        // changes are the only layout changes a game depth image goes through with its content
+        // kept: the native renderer keeps images in GENERAL, the others start from UNDEFINED, and
+        // DLSS and FSR copy the depth into their own images. On a 1x1-grid GPU only 4-sample and
+        // larger draws whose quad pixels ask for the same positions take the game's; 2-sample
+        // draws stay standard (TakesSampleLocations).
+        for (size_t i = 0; i < feedback.size(); ++i) {
             const auto* entry = feedback[i];
-            if (entry != targets.depth || !entry->info.props.is_depth ||
+            const SampleLocations::Pattern locations = entry->written_locations;
+            if (entry != targets.depth || !entry->info.props.is_depth || locations.samples == 0 ||
                 entry->image->Desc().samples != locations.samples) {
                 continue;
             }
@@ -17289,6 +17356,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
     };
 
+    // NEO-GTS-511: the positions a multi-sample depth is written with, for its layout changes.
+    if (targets.depth && depth_writes && !depth_feedback.read_only &&
+        targets.depth->image->Desc().samples > 1) {
+        targets.depth->written_locations = r.SampleLocationPattern(pipeline);
+    }
     // The renderer's dynamic state code, filling this list's state.
     {
         PhaseClock part{stats.record_ns[2]};

@@ -196,6 +196,13 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
         } else if (ctx.runtime_info.hw.fs.PixelRate()) {
             // NEO-GT7-005: once per pixel, the sample's barycentrics are the centre's.
             return ctx.OpCompositeExtract(ctx.F32[1], ctx.OpLoad(ctx.F32[3], ctx.bary_coord), comp);
+        } else if (ctx.runtime_info.hw.fs.SampleTable()) {
+            // NEO-GTS-511: at the game's sample position (EmitPrologue's offset), not with
+            // InterpolateAtSample, which custom sample locations forbid (VUID 01524).
+            return ctx.OpCompositeExtract(
+                ctx.F32[1],
+                ctx.OpInterpolateAtOffset(ctx.F32[3], ctx.bary_coord, ctx.sample_table_offset),
+                comp);
         } else {
             return ctx.OpCompositeExtract(
                 ctx.F32[1],

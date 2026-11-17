@@ -158,6 +158,23 @@ public:
     u32 SampleLocationSamples() const noexcept {
         return sample_location_samples;
     }
+    /// NEO-GTS-511: the rasterization sample count.
+    u32 RasterSamples() const noexcept {
+        return pipeline_raster_samples;
+    }
+    /// NEO-GTS-511: why it has no custom positions: 0 it has (or shader objects), 1 the device
+    /// or a switch, 2 its pixel shader interpolates at a sample.
+    u32 SampleLocationExclusion() const noexcept {
+        return sample_location_exclusion;
+    }
+    /// NEO-GTS-511: its pixel shader reads the positions table from PushData::quad_sample_mask.
+    bool UsesSampleTable() const noexcept {
+        return uses_sample_table;
+    }
+    /// NEO-GTS-511: its pixel shader runs once per pixel because the draw can't have the table.
+    bool PerPixelFallback() const noexcept {
+        return per_pixel_fallback;
+    }
     const std::array<vk::ShaderEXT, 4>& ShaderObjects() const noexcept {
         return shader_objects;
     }
@@ -234,6 +251,10 @@ private:
     std::array<vk::ShaderEXT, 4> shader_objects{};
     ShaderObjectState so_state;
     u32 sample_location_samples{}; ///< NEO-GTS-508
+    u32 pipeline_raster_samples{1}; ///< NEO-GTS-511
+    u32 sample_location_exclusion{}; ///< NEO-GTS-511
+    bool uses_sample_table{}; ///< NEO-GTS-511
+    bool per_pixel_fallback{}; ///< NEO-GTS-511
 
     GraphicsPipelineKey key;
     u32 lds_emulation{};

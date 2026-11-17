@@ -606,15 +606,27 @@ GraphicsPipeline::GraphicsPipeline(
     // a sample with InterpolateAtSample (per-sample barycentrics without AMD's explicit vertex
     // parameter, as emit_spirv_context_get_set.cpp emits them), which custom locations forbid
     // (VUID-VkGraphicsPipelineCreateInfo-sampleLocationsEnable-01524); a shader whose loads are
-    // not known counts as one. The dynamic state list and the fragment library key follow this.
+    // not known counts as one if it has per-sample inputs. NEO-GTS-511: one translated with the
+    // positions table (SampleTable) reads them with InterpolateAtOffset instead, so its pipeline
+    // takes the game's positions (every 2-sample shader is translated so where the GPU takes
+    // them: vk_pipeline_cache.cpp). The dynamic state list and the fragment library key follow.
     const u32 raster_samples = static_cast<u32>(sdata.multisampling.rasterizationSamples);
     const bool interpolates_at_sample =
         fragment_stage && !fs_info.single_sample_barycentric && !fs_info.PixelRate() &&
-        !profile.supports_amd_shader_explicit_vertex_parameter &&
-        (!fragment_stage->attribute_flags_known ||
-         fragment_stage->loads.GetAny(Shader::IR::Attribute::BaryCoordSmoothSample));
+        !fs_info.SampleTable() && !profile.supports_amd_shader_explicit_vertex_parameter &&
+        (fragment_stage->attribute_flags_known
+             ? fragment_stage->loads.GetAny(Shader::IR::Attribute::BaryCoordSmoothSample)
+             : fs_info.addr_flags.persp_sample_ena != 0);
     const bool sample_locations =
         instance.TakesSampleLocations(raster_samples) && !interpolates_at_sample;
+    // NEO-GTS-511: for the 2-sample draw counter and the positions table.
+    pipeline_raster_samples = raster_samples;
+    sample_location_exclusion = sample_locations                                  ? 0
+                                : !instance.TakesSampleLocations(raster_samples) ? 1
+                                                                                  : 2;
+    uses_sample_table = fragment_stage && fs_info.SampleTable();
+    per_pixel_fallback = fragment_stage && (fs_info.mrtz_mask &
+                                            Shader::HwFragmentRuntimeInfo::MrtzPixelRateFallback);
 
     const vk::PipelineViewportDepthClipControlCreateInfoEXT clip_control = {
         // FIX-GTS-443: 0..1 when the vertex shader converts the depth. A geometry shader's

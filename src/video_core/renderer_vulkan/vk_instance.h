@@ -402,13 +402,22 @@ public:
         return grid.width >= 2 && grid.height >= 2 && grid.width % 2 == 0 && grid.height % 2 == 0;
     }
 
-    /// NEO-GTS-508: pipelines with this sample count take the game's positions. Not 2 samples
-    /// on a 1x1 grid (NVIDIA): there the checkerboard's pattern (rows swapped in the quad) can't
-    /// be given and keeps the standard positions, and other 2-sample draws on the same depth
-    /// target would test it at other positions than it was written with (undefined).
+    /// NEO-GTS-508: pipelines with this sample count take the game's positions. 2 samples only
+    /// on a GPU with a 2x2 grid for them (NEO-GTS-511: then every 2-sample draw takes them) and
+    /// with SHADGT_SAMPLE_LOCATIONS_2X not 0. On a 1x1 grid the checkerboard's pattern (rows
+    /// swapped in the quad) can't be given, and other 2-sample draws with the game's positions
+    /// on its depth would test it at other positions than it was written with (undefined).
     bool TakesSampleLocations(u32 samples) const {
         return samples > 1 && GetSampleLocationGrid(samples).width != 0 &&
-               (samples != 2 || HasSampleLocationQuadGrid(samples));
+               (samples != 2 || (two_sample_locations && HasSampleLocationQuadGrid(samples)));
+    }
+
+    /// NEO-GTS-511: InterpolateAtOffset reaches every offset the positions table can hold
+    /// (-0.5..0.4375 pixel in 1/16).
+    bool TakesSampleTable() const {
+        return properties.limits.minInterpolationOffset <= -0.5f &&
+               properties.limits.maxInterpolationOffset >= 0.4375f &&
+               properties.limits.subPixelInterpolationOffsetBits >= 4;
     }
 
     /// NEO-GTS-508: VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT for a depth image
@@ -798,6 +807,7 @@ private:
     bool nv_coverage_reduction{}; ///< NEO-GT7-016
     std::vector<CoverageReduction::Combination> truncate_combinations; ///< NEO-GT7-016
     bool sample_locations{}; ///< NEO-GTS-508
+    bool two_sample_locations{}; ///< NEO-GTS-511: SHADGT_SAMPLE_LOCATIONS_2X not 0
     vk::PhysicalDeviceSampleLocationsPropertiesEXT sample_locations_properties{}; ///< NEO-GTS-508
     std::array<vk::Extent2D, 5> sample_location_grids{}; ///< NEO-GTS-508: 1, 2, 4, 8, 16 samples
     vk::ImageUsageFlags depth_flag_usage{}; ///< NEO-GTS-508: the depth usage CreateDevice checked

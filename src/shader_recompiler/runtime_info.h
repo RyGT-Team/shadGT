@@ -272,6 +272,17 @@ struct HwFragmentRuntimeInfo {
     bool PixelRate() const noexcept {
         return (mrtz_mask & MrtzPixelRate) != 0;
     }
+    // NEO-GTS-511: bit 6 asks for per-sample barycentrics read at the game's sample positions
+    // (InterpolateAtOffset with the positions table PushData::quad_sample_mask carries) instead of
+    // InterpolateAtSample, which pipelines with custom sample locations must not use. Bit 5 marks
+    // a pixel-rate shader (bit 7) that runs once per pixel only because its draw can't have that
+    // table; the translation reads only bit 7. Set only in the PS4 Pro mode, for 2-sample draws
+    // that take the game's positions, so other translations are unchanged.
+    static constexpr u8 MrtzSampleTable = 0x40;
+    static constexpr u8 MrtzPixelRateFallback = 0x20;
+    bool SampleTable() const noexcept {
+        return (mrtz_mask & MrtzSampleTable) != 0;
+    }
     bool front_face_all_bits{false};
     bool dual_source_blending{false};
     bool clip_distance_emulation{false};

@@ -171,6 +171,45 @@ void EmitPrologue(EmitContext& ctx) {
             ctx.OpStore(ctx.OpAccessChain(ctx.output_u32, ctx.sample_mask, ctx.u32_zero_value),
                         ctx.quad_sample_mask);
         }
+        if (ctx.runtime_info.hw.fs.SampleTable() && Sirit::ValidId(ctx.bary_coord) &&
+            Sirit::ValidId(ctx.sample_index) && Sirit::ValidId(ctx.frag_coord)) {
+            // NEO-GTS-511: the offset of this sample from the pixel centre, from the positions
+            // table in PushData::quad_sample_mask: byte (pixel * 2 + sample), pixel = x + 2y of
+            // the 2x2 quad (FragCoord's integer part; FragCoord is at the sample when shading
+            // per sample), x in the low nibble and y in the high one, in 1/16 pixel from the
+            // pixel's corner (Vulkan's sample locations).
+            const Id coordinates =
+                ctx.OpConvertFToU(ctx.U32[4], ctx.OpLoad(ctx.F32[4], ctx.frag_coord));
+            const Id x = ctx.OpBitwiseAnd(
+                ctx.U32[1], ctx.OpCompositeExtract(ctx.U32[1], coordinates, 0u), ctx.u32_one_value);
+            const Id y = ctx.OpBitwiseAnd(
+                ctx.U32[1], ctx.OpCompositeExtract(ctx.U32[1], coordinates, 1u), ctx.u32_one_value);
+            const Id sample = ctx.OpBitwiseAnd(
+                ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.sample_index), ctx.u32_one_value);
+            const Id index = ctx.OpBitwiseOr(
+                ctx.U32[1],
+                ctx.OpBitwiseOr(ctx.U32[1], ctx.OpShiftLeftLogical(ctx.U32[1], x, ctx.ConstU32(1u)),
+                                ctx.OpShiftLeftLogical(ctx.U32[1], y, ctx.ConstU32(2u))),
+                sample);
+            const Id word_ptr = ctx.OpAccessChain(
+                ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1]), ctx.push_data_block,
+                ctx.ConstU32(PushData::QuadSampleMaskIndex),
+                ctx.OpShiftRightLogical(ctx.U32[1], index, ctx.ConstU32(2u)));
+            const Id shift = ctx.OpShiftLeftLogical(
+                ctx.U32[1], ctx.OpBitwiseAnd(ctx.U32[1], index, ctx.ConstU32(3u)), ctx.ConstU32(3u));
+            const Id byte = ctx.OpBitwiseAnd(
+                ctx.U32[1], ctx.OpShiftRightLogical(ctx.U32[1], ctx.OpLoad(ctx.U32[1], word_ptr), shift),
+                ctx.ConstU32(0xffu));
+            const auto offset = [&](Id nibble) {
+                return ctx.OpFSub(ctx.F32[1],
+                                  ctx.OpFMul(ctx.F32[1], ctx.OpConvertUToF(ctx.F32[1], nibble),
+                                             ctx.ConstF32(1.0f / 16.0f)),
+                                  ctx.ConstF32(0.5f));
+            };
+            ctx.sample_table_offset = ctx.OpCompositeConstruct(
+                ctx.F32[2], offset(ctx.OpBitwiseAnd(ctx.U32[1], byte, ctx.ConstU32(0xfu))),
+                offset(ctx.OpShiftRightLogical(ctx.U32[1], byte, ctx.ConstU32(4u))));
+        }
     }
     if (ctx.sw_stage == SwStage::TessellationControl && ctx.runtime_info.sw.tcs.lds_emulation) {
         EmitLdsEmulationPrologue(ctx); // FIX-227

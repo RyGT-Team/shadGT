@@ -816,6 +816,10 @@ bool Instance::CreateDevice() {
                 }
             }
             if (sample_locations) {
+                // NEO-GTS-511: SHADGT_SAMPLE_LOCATIONS_2X=0 keeps every 2-sample draw at the
+                // standard positions (the checkerboard and its depth passes), as 9d6b3efa did.
+                const char* two = std::getenv("SHADGT_SAMPLE_LOCATIONS_2X");
+                two_sample_locations = !(two && two[0] == '0');
                 depth_flag_usage = depth_usage;
                 sample_locations_properties = p;
                 sample_locations_properties.pNext = nullptr;
@@ -837,10 +841,14 @@ bool Instance::CreateDevice() {
             }
         }
         LOG_WARNING(Render_Vulkan, "NEO-GTS-508: the game's sample positions: {}",
-                    sample_locations ? fmt::format("on,{} (on a 1x1 grid, 2-sample draws and "
-                                                   "draws whose quad pixels differ keep the "
-                                                   "standard positions)",
-                                                   grids)
+                    sample_locations
+                        ? fmt::format("on,{} 2-sample draws {} (on a 1x1 grid, 2-sample draws "
+                                      "and draws whose quad pixels differ keep the standard "
+                                      "positions)",
+                                      grids,
+                                      !two_sample_locations ? "standard (SHADGT_SAMPLE_LOCATIONS_2X=0)"
+                                      : HasSampleLocationQuadGrid(2) ? "at the game's positions"
+                                                                     : "standard (1x1 grid)")
                                      : fmt::format("off ({})", off));
     }
     shader_atomic_float = add_extension(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);

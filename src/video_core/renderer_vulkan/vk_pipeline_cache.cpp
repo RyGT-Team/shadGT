@@ -1556,6 +1556,53 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
                 }
             }
         }
+        // NEO-GTS-511: a 2-sample draw that takes the game's sample positions (a GPU with a 2x2
+        // grid for 2 samples) and runs its pixel shader per sample reads its per-sample
+        // barycentrics at those positions: InterpolateAtOffset with the positions table the draw
+        // pushes in PushData::quad_sample_mask (MrtzSampleTable). Without it the translation uses
+        // InterpolateAtSample, which pipelines with custom positions must not use, and such a
+        // pipeline kept the standard positions on the depth every other draw wrote at the game's
+        // (black blocks in GT7's trees: their alpha-tested depth passes run per sample). The
+        // table needs that push slot free: no game AA mask (it would use it), no hull shader
+        // (FIX-227's LDS emulation puts its scratch address there). Else the shader runs once
+        // per pixel (centre, sample 0) at the game's positions: it loses its per-sample alpha
+        // test, never the depth's positions. Only where the translation would interpolate at a
+        // sample (KHR barycentrics; AMD's explicit vertex parameter interpolates at the
+        // positions itself).
+        if (!info.hw.fs.PixelRate() && info.hw.fs.addr_flags.persp_sample_ena &&
+            !profile.supports_amd_shader_explicit_vertex_parameter &&
+            profile.supports_fragment_shader_barycentric &&
+            !info.hw.fs.single_sample_barycentric) {
+            u32 raster = S().graphics_key.num_samples; // the depth's, at this point
+            for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+                const auto& col_buf = regs.color_buffers[cb];
+                if (col_buf && regs.color_target_mask.GetMask(cb) != 0) {
+                    raster = std::max<u32>(raster, col_buf.NumSamples());
+                }
+            }
+            if (raster == 2 && instance.TakesSampleLocations(2)) {
+                const bool table = instance.TakesSampleTable() && !info.hw.fs.quad_sample_mask &&
+                                   !regs.stage_enable.hs_en;
+                info.hw.fs.mrtz_mask |=
+                    table ? Shader::HwFragmentRuntimeInfo::MrtzSampleTable
+                          : u8(Shader::HwFragmentRuntimeInfo::MrtzPixelRate |
+                               Shader::HwFragmentRuntimeInfo::MrtzPixelRateFallback);
+                static std::atomic<u32> logged_table{};
+                static std::atomic<u32> logged_pixel{};
+                if ((table ? logged_table : logged_pixel).fetch_add(1, std::memory_order_relaxed) <
+                    3) {
+                    LOG_WARNING(Render_Vulkan,
+                                "NEO-GTS-511: pixel shader at {:#x} (2 samples, per-sample "
+                                "inputs): {}",
+                                regs.ps_program.Address<VAddr>(),
+                                table ? "per sample at the game's positions (table)"
+                                : !instance.TakesSampleTable()
+                                    ? "once per pixel (interpolation offsets out of range)"
+                                : info.hw.fs.quad_sample_mask ? "once per pixel (AA mask set)"
+                                                              : "once per pixel (hull shader)");
+                }
+            }
+        }
         const auto& cb0_blend = regs.blend_control[0];
         if (cb0_blend.enable) {
             info.hw.fs.dual_source_blending =

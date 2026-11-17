@@ -4316,6 +4316,14 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     std::array<StageResourceBindings, Shader::MaxStageTypes> stage_bindings{};
     const auto stages = pipeline->GetStages();
     ctx->push_data = MakeUserData(liverpool->DrawRegs());
+    if (!pipeline->IsCompute()) {
+        // NEO-GTS-511: the pixel shader's positions table (as the native renderer's Draw).
+        const auto* graphics = static_cast<const GraphicsPipeline*>(pipeline);
+        if (graphics->UsesSampleTable()) {
+            ctx->push_data.quad_sample_mask =
+                SampleLocations::QuadTable(SampleLocationPattern(graphics));
+        }
+    }
     for (u32 i = 0; i < stages.size(); ++i) {
         const auto* stage = stages[i];
         if (!stage) {
@@ -7118,8 +7126,8 @@ void Rasterizer::UpdateRasterizationState(const GraphicsPipeline* pipeline) cons
     dynamic_state.SetSampleLocations(SampleLocationPattern(pipeline)); // NEO-GTS-508
 }
 
-SampleLocations::Pattern Rasterizer::SampleLocationPattern(
-    const GraphicsPipeline* pipeline) const {
+SampleLocations::Pattern Rasterizer::SampleLocationPattern(const GraphicsPipeline* pipeline,
+                                                           SampleLocations::Why* why) const {
     // NEO-GTS-508: PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0..X1Y1 (DIAG-GTS-507's decoding), for a
     // pipeline with the dynamic sample-locations state; none for the others.
     const u32 samples = pipeline ? pipeline->SampleLocationSamples() : 0;
@@ -7133,7 +7141,7 @@ SampleLocations::Pattern Rasterizer::SampleLocationPattern(
         locs[i] = regs.reg_array[kLocs + i];
     }
     return SampleLocations::FromRegisters(locs, regs.aa_config.NumSamples(), samples,
-                                          instance.HasSampleLocationQuadGrid(samples));
+                                          instance.HasSampleLocationQuadGrid(samples), why);
 }
 
 void Rasterizer::UpdateColorBlendingState(const GraphicsPipeline* pipeline) const {

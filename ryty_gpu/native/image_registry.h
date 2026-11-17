@@ -25,6 +25,7 @@
 #include "common/types.h"
 #include "ryty_gpu/native/recent_fills.h"
 #include "ryty_gpu/native/rhi/rhi.h"
+#include "video_core/renderer_vulkan/sample_locations.h"
 #include "video_core/texture_cache/image_info.h"
 
 namespace Native {
@@ -182,6 +183,10 @@ public:
     std::shared_ptr<RememberedFillReceipt> remembered_fill_receipt;
     bool stencil_clear_pending = false;
     u8 stencil_clear_value = 0;
+    /// NEO-GTS-511: on a multi-sample depth image, the sample positions of the last draw that
+    /// wrote it (samples 0: the standard ones), which its layout changes must carry. Recorder
+    /// thread only, set in draw order.
+    mutable Vulkan::SampleLocations::Pattern written_locations{};
 
     /// A view, made on first use.
     const Rhi::ImageView* View(Rhi::Device& device, const ImageViewKey& key);

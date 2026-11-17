@@ -450,7 +450,11 @@ void EmitContext::DefineInputs() {
         break;
     }
     case SwStage::Fragment: {
+        // NEO-GTS-511: the sample table is indexed by the pixel's place in its 2x2 quad.
+        const bool sample_table = runtime_info.hw.fs.SampleTable() &&
+                                  info.loads.GetAny(IR::Attribute::BaryCoordSmoothSample);
         if (info.loads.GetAny(IR::Attribute::FragCoord) || runtime_info.hw.fs.quad_sample_mask ||
+            sample_table ||
             (info.loads.GetAny(IR::Attribute::BaryCoordPullModel) &&
              !profile.supports_amd_shader_explicit_vertex_parameter)) {
             frag_coord = DefineVariable(F32[4], spv::BuiltIn::FragCoord, spv::StorageClass::Input);

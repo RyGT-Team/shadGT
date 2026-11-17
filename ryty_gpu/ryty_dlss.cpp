@@ -11,6 +11,7 @@
 #include "common/logging/log.h"
 #include "common/game_title.h"
 #include "core/emulator_settings.h"
+#include "ryty_gpu/ryty_pro_mode.h"
 #include "ryty_gpu/ryty_dlss.h"
 #include "ryty_gpu/ryty_dlssg.h"
 #include "ryty_gpu/rygt_dlss_api.h"
@@ -53,7 +54,15 @@ bool TemporalRequested() {
             return false;
         }
         const char* value = std::getenv("SHADGT_DLSS_TEMPORAL");
-        return value ? std::strcmp(value, "1") == 0 : EmulatorSettings.IsDlssEnabled();
+        const bool wanted = value ? std::strcmp(value, "1") == 0 : EmulatorSettings.IsDlssEnabled();
+        // NEO-GTS-505: as GT7's (DLSS-GT7-001), off in the PS4 Pro mode on a 4K TV: the game
+        // rebuilds its checkerboard itself, and DLSS's history over it would accumulate twice.
+        if (wanted && Ryty::GetProMode() == Ryty::ProMode::Neo4K) {
+            LOG_WARNING(Render_Vulkan, "NEO-GTS-505: temporal DLSS off in the PS4 Pro mode on a "
+                                       "4K TV (the game rebuilds its checkerboard itself)");
+            return false;
+        }
+        return wanted;
     }();
     return requested;
 }

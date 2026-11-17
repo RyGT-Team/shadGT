@@ -7,6 +7,7 @@
 #include <string_view>
 #include <utility>
 
+#include "common/game_title.h"
 #include "common/ryty_config.h"
 
 #ifdef _WIN32
@@ -86,21 +87,22 @@ inline bool ProConfigEnabled() {
     return ConfigTrue("ps4_pro");
 }
 
-// NEO-GTS-505: the PS4 Pro mode has one switch for both games, GT7's: SHADGT_NEO=1 (ryGT7's
-// runtime reads it as RYGT_NEO), with SHADGT_NEO_TV=1080 for a Pro on a 1080p TV (2160, the
-// default, for a 4K TV). GT Sport's runtime does not know it, so for GT Sport the renderer answers
-// the game itself. SHADGT_PS4_PRO and the GPU.ps4_pro config of RyGTS's launcher are still read
-// after it: SHADGT_PS4_PRO overrides the config (0 forces base mode); the config option means
-// Neo 1080.
+// GT Sport's PS4 Pro mode, which the renderer answers to the game (GT Sport's runtime has none;
+// GT7's is its runtime's, read through sceKernelIsNeoMode, and this stays Base there as before).
+// NEO-GTS-505: in order, SHADGT_PS4_PRO (0 forces the base mode, 1080, 1 or 2160), then the switch
+// GT7 uses, SHADGT_NEO=1 with SHADGT_NEO_TV=1080 for a Pro on a 1080p TV (2160, the default, for
+// a 4K TV), then the GPU.ps4_pro config of RyGTS's launcher (Neo 1080).
 inline ProMode GetProMode() {
     static const ProMode mode = [] {
+        if (Common::IsGt7()) {
+            return ProMode::Base;
+        }
+        if (const char* value = std::getenv("SHADGT_PS4_PRO")) {
+            return ParseProMode(std::string_view{value});
+        }
         if (const char* neo = std::getenv("SHADGT_NEO"); neo && std::string_view{neo} == "1") {
             const char* tv = std::getenv("SHADGT_NEO_TV");
             return tv && std::string_view{tv} == "1080" ? ProMode::Neo1080 : ProMode::Neo4K;
-        }
-        const char* value = std::getenv("SHADGT_PS4_PRO");
-        if (value) {
-            return ParseProMode(std::string_view{value});
         }
         return ProConfigEnabled() ? ProMode::Neo1080 : ProMode::Base;
     }();
@@ -109,17 +111,6 @@ inline ProMode GetProMode() {
 
 constexpr bool IsProMode(ProMode mode) {
     return mode != ProMode::Base;
-}
-
-constexpr std::pair<unsigned, unsigned> ProOutputSize(ProMode mode, unsigned width,
-                                                     unsigned height) {
-    if (mode == ProMode::Neo4K) {
-        return {3840, 2160};
-    }
-    if (mode == ProMode::Neo1080) {
-        return {1920, 1080};
-    }
-    return {width, height};
 }
 
 } // namespace Ryty

@@ -56,9 +56,10 @@ namespace {
 std::string StoreTag() {
     const char* env = std::getenv("SHADGT_SHADER_STORE_TAG");
     std::string tag = env && *env ? std::string{"-"} + env : std::string{};
+    // NEO-GTS-505: whatever turned the Pro mode on (GT Sport's SHADGT_PS4_PRO or config too):
+    // the base mode has no SDWA, so the tag costs it nothing.
     const char* sdwa = std::getenv("SHADGT_NEO_SDWA_CMP");
-    const char* neo = std::getenv("SHADGT_NEO");
-    if (sdwa && sdwa[0] == '0' && neo && neo[0] == '1' && neo[1] == '\0') {
+    if (sdwa && sdwa[0] == '0') {
         tag += "-sdwa-vcc";
     }
     return tag;

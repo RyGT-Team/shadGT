@@ -5050,7 +5050,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineUnlocked(
         auto listings = std::move(unlocked_listings);
         t_required_lookup_lock = nullptr;
         WaitOutsideLookup(lock, unlocked_required_waits, [&] {
-            Common::GuestClock::CompilePause pause;
+            Common::GuestClock::CompilePause pause{Common::GuestClock::HoldSite::LookupTranslations};
             for (const auto& job : jobs) {
                 std::unique_lock job_lock{job->mutex};
                 job->cv.wait(job_lock, [&] { return job->done.load(); });
@@ -5567,7 +5567,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 ++build->required_waiters;
                 SCOPE_EXIT { --build->required_waiters; };
                 WaitOutsideLookup(*lock, unlocked_required_waits, [&] {
-                    Common::GuestClock::CompilePause pause;
+                    Common::GuestClock::CompilePause pause{Common::GuestClock::HoldSite::RequiredBuild};
                     Common::SetCompileCoresWide(true);
                     SCOPE_EXIT { Common::SetCompileCoresWide(false); };
                     while (build->done.wait_for(std::chrono::milliseconds{5}) !=
@@ -5593,7 +5593,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             const bool widen_compile = build->done.wait_for(std::chrono::microseconds{0}) !=
                                        std::future_status::ready;
             if (widen_compile) {
-                hold.emplace();
+                hold.emplace(Common::GuestClock::HoldSite::BuildWait);
                 Common::SetCompileCoresWide(true);
             }
             SCOPE_EXIT { if (widen_compile) Common::SetCompileCoresWide(false); };
@@ -5807,7 +5807,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline(bool select_ahead) {
             }
         }
         if (completion.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
-            hold.emplace();
+            hold.emplace(Common::GuestClock::HoldSite::Compute);
         }
         it.value() = completion.get();
         hold.reset();
@@ -6350,7 +6350,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 #endif
     // FIX-044: translating a shader on the GPU thread holds the guest clocks; a PS4 runs
     // precompiled shaders, so the game never sees this time pass.
-    Common::GuestClock::CompilePause hold;
+    Common::GuestClock::CompilePause hold{Common::GuestClock::HoldSite::CompileModule};
     ++Common::GetWorkCounters().shaders_compiled;
     RYDIAG_SCOPE(ShaderCompile, info.pgm_hash);
     last_spv_hash = 0;
@@ -8858,7 +8858,7 @@ bool PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
             if (MatchesTranslationRequest(*job, hw_stage, sw_stage, runtime_info, binding) &&
                 !job->done) {
                 // As CompileModule: the game never sees a PS4 wait for a shader.
-                Common::GuestClock::CompilePause hold;
+                Common::GuestClock::CompilePause hold{Common::GuestClock::HoldSite::TranslationJob};
                 // PERF-GTS-494: a thread waits for this translation: the compiles' jobs taken
                 // meanwhile run at normal priority (one already running keeps its own).
                 Common::SetCompileCoresWide(true);
@@ -9838,7 +9838,7 @@ void PipelineCache::RecoverAttributeFlags(Shader::Info& info,
     // FIX-012: a shader from a cache entry stored without its attribute loads/stores is
     // translated again for them (its stored SPIR-V is kept), because the rect/quad-list helper
     // shaders forward exactly the outputs these flags name. The entry is stored again with them.
-    Common::GuestClock::CompilePause hold; // FIX-044
+    Common::GuestClock::CompilePause hold{Common::GuestClock::HoldSite::Retranslate}; // FIX-044
     Shader::Info translated{info.hw_stage, info.sw_stage, params};
     auto translate_runtime_info = runtime_info;
     [[maybe_unused]] const auto program =

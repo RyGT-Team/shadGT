@@ -587,33 +587,31 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
 #ifdef RYTY_GPU
     u32 port_width = EmulatorSettings.GetInternalScreenWidth();
     u32 port_height = EmulatorSettings.GetInternalScreenHeight();
-    if (Common::IsGt7()) {
-        // NEO-GT7-001: in the PS4 Pro mode (SHADGT_NEO=1 in libkernel.prx) the port reports a 2160p
-        // TV, as a Pro on a 4K set does: GT7 picks its 3200x1800 (or 2160p=1: 3840x2160) picture
-        // from the TV height. The base mode keeps the configured port.
-        // NEO-GT7-013: SHADGT_NEO_TV=1080 reports a 1080p TV instead, as a Pro on a 1080p set: GT7
-        // then draws 1920x1080 without its checkerboard and takes its third preset,
-        // GT7_PS4Pro_2K (60 fps replays and photo mode, motion blur in the race; see NEO-GT7-014
-        // in ryty_game_patch.cpp).
-        if (Libraries::Kernel::sceKernelIsNeoMode()) {
+    // NEO-GT7-001: in the PS4 Pro mode the port reports a 2160p TV, as a Pro on a 4K set does:
+    // both games pick their 3200x1800 checkerboard picture from the TV height (GT7's video init
+    // 0x1417a6ea0, GT Sport's 0x141c6de30: the same choice, and 3840x2160 display surfaces on a
+    // Pro). The base mode keeps the configured port.
+    // NEO-GT7-013: SHADGT_NEO_TV=1080 reports a 1080p TV instead, as a Pro on a 1080p set: both
+    // draw 1920x1080 without the checkerboard; GT7 takes its third preset, GT7_PS4Pro_2K (60 fps
+    // replays and photo mode, motion blur in the race; NEO-GT7-014 in ryty_game_patch.cpp).
+    // NEO-GTS-505: one port for both games. GT7's Pro mode is its runtime's answer; GT Sport's
+    // runtime has none, so the renderer decides it (ryty_pro_mode.h) and answers the game.
+    if (Libraries::Kernel::sceKernelIsNeoMode()) {
+        bool tv_1080;
+        if (Common::IsGt7()) {
             const char* tv = std::getenv("SHADGT_NEO_TV");
-            const bool tv_1080 = tv && std::string_view{tv} == "1080";
-            port_width = tv_1080 ? 1920 : 3840;
-            port_height = tv_1080 ? 1080 : 2160;
-            LOG_WARNING(Lib_VideoOut, "{}: video port {}x{} (PS4 Pro on a {} TV)",
-                        tv_1080 ? "NEO-GT7-013" : "NEO-GT7-001", port_width, port_height,
-                        tv_1080 ? "1080p" : "2160p");
+            tv_1080 = tv && std::string_view{tv} == "1080";
+        } else {
+            tv_1080 = Ryty::GetProMode() == Ryty::ProMode::Neo1080;
         }
-    } else {
-        // GT Sport: the Pro mode is decided in the renderer (ryty_pro_mode.h), which answers
-        // the game's sceKernelIsNeoMode too.
-        const auto mode = Ryty::GetProMode();
-        const auto [width, height] = Ryty::ProOutputSize(mode, port_width, port_height);
-        port_width = width;
-        port_height = height;
+        port_width = tv_1080 ? 1920 : 3840;
+        port_height = tv_1080 ? 1080 : 2160;
+        LOG_WARNING(Lib_VideoOut, "{}: video port {}x{} (PS4 Pro on a {} TV)",
+                    tv_1080 ? "NEO-GT7-013" : "NEO-GT7-001", port_width, port_height,
+                    tv_1080 ? "1080p" : "2160p");
+    }
+    if (!Common::IsGt7()) {
         LIB_FUNCTION("WslcK1FQcGI", "libkernel", 1, "libkernel", Kernel::sceKernelIsNeoMode);
-        LOG_INFO(Lib_VideoOut, "PRO-EXPERIMENT: hardware {}, reported output {}x{}",
-                 Ryty::IsProMode(mode) ? "Neo" : "base", width, height);
     }
     driver = std::make_unique<VideoOutDriver>(port_width, port_height);
 #else

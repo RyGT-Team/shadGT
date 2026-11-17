@@ -86,9 +86,18 @@ inline bool ProConfigEnabled() {
     return ConfigTrue("ps4_pro");
 }
 
-// SHADGT_PS4_PRO overrides the config (0 forces base mode); the config option means Neo 1080.
+// NEO-GTS-505: the PS4 Pro mode has one switch for both games, GT7's: SHADGT_NEO=1 (ryGT7's
+// runtime reads it as RYGT_NEO), with SHADGT_NEO_TV=1080 for a Pro on a 1080p TV (2160, the
+// default, for a 4K TV). GT Sport's runtime does not know it, so for GT Sport the renderer answers
+// the game itself. SHADGT_PS4_PRO and the GPU.ps4_pro config of RyGTS's launcher are still read
+// after it: SHADGT_PS4_PRO overrides the config (0 forces base mode); the config option means
+// Neo 1080.
 inline ProMode GetProMode() {
     static const ProMode mode = [] {
+        if (const char* neo = std::getenv("SHADGT_NEO"); neo && std::string_view{neo} == "1") {
+            const char* tv = std::getenv("SHADGT_NEO_TV");
+            return tv && std::string_view{tv} == "1080" ? ProMode::Neo1080 : ProMode::Neo4K;
+        }
         const char* value = std::getenv("SHADGT_PS4_PRO");
         if (value) {
             return ParseProMode(std::string_view{value});

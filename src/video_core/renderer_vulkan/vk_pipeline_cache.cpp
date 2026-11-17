@@ -1532,7 +1532,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         // has no such rule: AMD keeps the shader as it is. SHADGT_NEO_PIXEL_RATE=0: as before.
         static const bool neo_pixel_rate = [] {
             const char* env = std::getenv("SHADGT_NEO_PIXEL_RATE");
-            return Common::IsGt7() && Libraries::Kernel::sceKernelIsNeoMode() != 0 &&
+            return Libraries::Kernel::sceKernelIsNeoMode() != 0 && // NEO-GTS-505: both games
                    !(env && env[0] == '0');
         }();
         if (neo_pixel_rate && instance.IsMixedDepthSamplesSupported() &&
@@ -9101,9 +9101,8 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         // never cleared for another build here (FIX-271), so the check stays on. Bit 4096: 2048
         // is the lane-read marker of this tree (lane_read_policy.h).
         // At a program's first use only: this block also runs at every compute lookup, and
-        // the census decodes the whole program. GT7's Pro mode only (GT Sport's is its own).
-        static const bool neo =
-            Common::IsGt7() && Libraries::Kernel::sceKernelIsNeoMode() != 0;
+        // the census decodes the whole program. Both games' Pro mode (NEO-GTS-505).
+        static const bool neo = Libraries::Kernel::sceKernelIsNeoMode() != 0; // NEO-GTS-505
         if (neo && first_use) {
             const auto use = Shader::NeoCodeCensus(params.code);
             if (use.sdwa_compares_to_sgpr + use.sdwa_selects != 0) {

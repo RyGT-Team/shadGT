@@ -708,8 +708,9 @@ bool Instance::CreateDevice() {
     // structure). Only in the PS4 Pro mode: sceKernelIsNeoMode is answered (and kept) before the
     // device is made, and the base mode has no mixed-sample draws.
     // SHADGT_NEO_COVERAGE_TRUNCATE=0: MERGE, as before.
+    // NEO-GTS-505: in both games' Pro mode.
     if (nv_framebuffer_mixed_samples && !amd_mixed_attachment_samples &&
-        Common::IsGt7() && Libraries::Kernel::sceKernelIsNeoMode() != 0) {
+        Libraries::Kernel::sceKernelIsNeoMode() != 0) {
         const char* env = std::getenv("SHADGT_NEO_COVERAGE_TRUNCATE");
         const bool wanted = !(env && env[0] == '0');
         const bool available = std::ranges::any_of(available_extensions, [](const auto& name) {

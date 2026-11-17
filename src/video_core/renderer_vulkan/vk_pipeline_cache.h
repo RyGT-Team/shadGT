@@ -618,6 +618,7 @@ private:
         std::chrono::steady_clock::time_point play_window{};
         u64 play_frames{}, play_us{}, play_draws{};
         bool in_play{};
+        std::chrono::steady_clock::time_point stall_since{}; ///< FIX-GTS-519
         bool backlog{}; ///< FIX-GT7-106 (port)
         std::chrono::steady_clock::time_point backlog_checked{};
     } catch_up;

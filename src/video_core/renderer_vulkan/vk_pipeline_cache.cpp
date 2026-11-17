@@ -3512,8 +3512,25 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
             // frame-time measure above.
             // FIX-GTS-516: the race's state only in a race session; out of one (menus, GT7's
             // dealership, Scapes) the frame-time measure, as shadgt7 always did, see RaceStatePlay.
-            const bool play =
-                RaceStatePlay(RaceSignalPlay()) ? RytyRaceRunning() : fps >= 5.0 && (slow || held);
+            bool measured = fps >= 5.0 && (slow || held);
+            // FIX-GTS-519: a stall (under 5 frames a second) while in play keeps play for
+            // SHADGT_PLAY_STALL_HOLD_MS (3000; 0: as before); only a longer one counts as a load.
+            // In GT7's dealership with shaders not compiled each stall turned play off, which
+            // turned on the waits without a deadline (FIX-GT7-135, harmful kinds) and the next
+            // stall: play went off and on every second (DIAG-GTS-518, 6.7 s of draws waited for).
+            static const auto stall_hold = std::chrono::milliseconds{[] {
+                const char* env = std::getenv("SHADGT_PLAY_STALL_HOLD_MS");
+                return env && *env ? std::strtol(env, nullptr, 10) : 3000L;
+            }()};
+            if (fps < 5.0 && state.in_play && stall_hold.count() > 0) {
+                if (state.stall_since == std::chrono::steady_clock::time_point{}) {
+                    state.stall_since = now;
+                }
+                measured = now - state.stall_since < stall_hold;
+            } else {
+                state.stall_since = {};
+            }
+            const bool play = RaceStatePlay(RaceSignalPlay()) ? RytyRaceRunning() : measured;
             g_game_in_play.store(play, std::memory_order_relaxed);
             if (play != state.in_play) {
                 state.in_play = play;
@@ -7552,7 +7569,13 @@ bool PipelineCache::OneOffBounded() {
         const char* env = std::getenv("SHADGT_ONE_OFF_BOUNDED");
         return !(env && env[0] == '0');
     }();
+    // Out of a race session only: a race's loading and pre-race screen keep the waits they had
+    // (GT Sport's 16384x16384 circuit shadow map is drawn once there, see RaceNeverWaits).
+#ifdef RYTY_GPU
+    return on && !RytyGtsInRace();
+#else
     return on;
+#endif
 }
 
 u32 PipelineCache::NeverSkippedReason(

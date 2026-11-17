@@ -24045,6 +24045,27 @@ void NativeRenderer::Report() {
                         text.empty() ? std::string{" none"} : text);
         }
     }
+    static std::chrono::steady_clock::time_point sampler_last{};
+    if (std::chrono::steady_clock::now() - sampler_last >= std::chrono::seconds{10}) {
+        // FIX-GTS-503: dropped samplers the GPU is done with go; the counts when they moved (every
+        // 10 s, in every build).
+        sampler_last = std::chrono::steady_clock::now();
+        std::scoped_lock lock{sampler_mutex};
+        DestroyRetiredSamplers();
+        const std::array<u64, 4> counts{samplers_made,
+                                        samplers_dropped.load(std::memory_order_relaxed),
+                                        sampler_stand_ins,
+                                        samplers_refused.load(std::memory_order_relaxed)};
+        if (counts != sampler_report) {
+            LOG_INFO(Render_Vulkan,
+                     "FIX-GTS-503: {} samplers ({} more waiting for the GPU), limit {}; in all {} "
+                     "made, {} dropped, {} lookups served by a stand-in, {} lookups of an S# with "
+                     "reserved bits got the default sampler",
+                     samplers.size(), retired_samplers.size(), SamplerLimit(), counts[0],
+                     counts[1], counts[2], counts[3]);
+            sampler_report = counts;
+        }
+    }
 #if !defined(NDEBUG)
     const auto now = std::chrono::steady_clock::now();
     if (now - last_report < std::chrono::seconds{10}) {
@@ -24070,24 +24091,6 @@ void NativeRenderer::Report() {
     }();
     if (!recorder_parts.empty()) {
         LOG_INFO(Render_Vulkan, "DIAG-GT7-005 (10 s): recorder ms a second in {}", recorder_parts);
-    }
-    {
-        // FIX-GTS-503: dropped samplers the GPU is done with go; the counts when they moved.
-        std::scoped_lock lock{sampler_mutex};
-        DestroyRetiredSamplers();
-        const std::array<u64, 4> counts{samplers_made,
-                                        samplers_dropped.load(std::memory_order_relaxed),
-                                        sampler_stand_ins,
-                                        samplers_refused.load(std::memory_order_relaxed)};
-        if (counts != sampler_report) {
-            LOG_INFO(Render_Vulkan,
-                     "FIX-GTS-503: {} samplers ({} more waiting for the GPU), limit {}; in all {} "
-                     "made, {} dropped, {} lookups served by a stand-in, {} lookups of an S# with "
-                     "reserved bits got the default sampler",
-                     samplers.size(), retired_samplers.size(), SamplerLimit(), counts[0],
-                     counts[1], counts[2], counts[3]);
-            sampler_report = counts;
-        }
     }
     const auto& registry_stats = registry->GetStats();
     const u64 uploads = registry_stats.uploads.load();

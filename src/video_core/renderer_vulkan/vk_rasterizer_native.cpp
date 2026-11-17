@@ -7181,17 +7181,28 @@ static bool CheckerboardDiagOn() {
     return on;
 }
 
+// DIAG-GTS-510 (replaces DIAG-GTS-509's draw lines): every draw into a 2-sample depth (the PS4 Pro
+// checkerboard's depth and whatever else draws there), one line for each distinct one (128 at
+// most; DB_ALPHA_TO_MASK, whose dither changes every frame, and the A/B pattern are left out of the
+// key): its shaders and what decides how its samples would be treated with the game's positions
+// (per-sample inputs, kill, Z or mask export, coverage to mask, alpha to mask), its colour targets
+// and their sample counts, the kind of positions it asks for (standard, alike, differ) and whether
+// the race runs. Its targets join the images whose readers are logged below.
 static void NoteCheckerboardDraw(const AmdGpu::Regs& regs, u64 frame) {
-    if (!CheckerboardDiagOn() || regs.aa_config.NumSamples() != 2) {
+    if (!CheckerboardDiagOn()) {
+        return;
+    }
+    const auto& db = regs.depth_buffer;
+    if (db.DepthAddress() == 0 || db.NumSamples() != 2) {
         return;
     }
     constexpr u32 kLocs = 0xA2FE;
-    // Sample 0 of pixel X0Y0 (first register, low byte) against sample 0 of pixel X0Y1.
+    const u32 samples = regs.aa_config.NumSamples();
     const u32 even = regs.reg_array[kLocs] & 0xff;
     const u32 odd = regs.reg_array[kLocs + 8] & 0xff;
-    if (even == odd) {
-        return;
-    }
+    const char* positions = samples != 2 ? "aa_config not 2 samples"
+                            : even != odd ? "differ (checkerboard)"
+                                          : "alike";
     const int even_x = static_cast<int>(even & 0xf) - ((even & 0x8) ? 16 : 0);
     const auto raw = [](const auto& field) {
         u32 value = 0;
@@ -7208,14 +7219,15 @@ static void NoteCheckerboardDraw(const AmdGpu::Regs& regs, u64 frame) {
     const u64 ps = stage_hash(Shader::HwStage::Fragment);
     const u64 vs = stage_hash(Shader::HwStage::Vertex);
     const u64 hs = stage_hash(Shader::HwStage::Hull);
-    const auto& db = regs.depth_buffer;
-    std::array<u64, 16> key{ps, vs, hs, raw(regs.ps_input_ena), raw(regs.ps_input_addr),
-                            raw(regs.barycentric_control), raw(regs.depth_shader_control),
-                            regs.db_alpha_to_mask, regs.reg_array[0xA201] /* DB_EQAA */,
+    const u32 input = raw(regs.ps_input_ena);
+    const u32 control = raw(regs.depth_shader_control);
+    std::array<u64, 18> key{ps, vs, hs, input, raw(regs.ps_input_addr), raw(regs.barycentric_control),
+                            control, regs.reg_array[0xA201] /* DB_EQAA */,
                             regs.reg_array[0xA30E], regs.reg_array[0xA30F] /* PA_SC_AA_MASK */,
-                            db.DepthAddress(), regs.color_target_mask.raw, 0, 0, 0};
+                            db.DepthAddress(), regs.color_target_mask.raw, samples,
+                            even != odd ? 1u : 0u, 0, 0, 0, 0};
     std::string colours;
-    u32 slot = 13;
+    u32 slot = 14;
     for (u32 i = 0; i < AmdGpu::NUM_COLOR_BUFFERS; ++i) {
         const auto& cb = regs.color_buffers[i];
         if (((regs.color_target_mask.raw >> (i * 4)) & 0xf) == 0 || cb.Address() == 0) {
@@ -7231,38 +7243,41 @@ static void NoteCheckerboardDraw(const AmdGpu::Regs& regs, u64 frame) {
     bool log_frame = false;
     {
         std::scoped_lock lock{CheckerboardDiag::mutex};
-        if (db.DepthAddress() != 0) {
-            CheckerboardDiag::targets.insert(db.DepthAddress());
-        }
+        CheckerboardDiag::targets.insert(db.DepthAddress());
         for (u32 i = 0; i < AmdGpu::NUM_COLOR_BUFFERS; ++i) {
             const auto& cb = regs.color_buffers[i];
             if (((regs.color_target_mask.raw >> (i * 4)) & 0xf) != 0 && cb.Address() != 0) {
                 CheckerboardDiag::targets.insert(cb.Address());
             }
         }
-        if (frame != CheckerboardDiag::last_frame && CheckerboardDiag::frames < 60) {
+        if (even != odd && frame != CheckerboardDiag::last_frame && CheckerboardDiag::frames < 12) {
             CheckerboardDiag::last_frame = frame;
             ++CheckerboardDiag::frames;
             log_frame = true;
         }
-        if (CheckerboardDiag::seen.size() < 64 &&
-            std::ranges::find(CheckerboardDiag::seen, key) == CheckerboardDiag::seen.end()) {
-            CheckerboardDiag::seen.push_back(key);
+        static std::vector<std::array<u64, 18>> seen;
+        if (seen.size() < 128 && std::ranges::find(seen, key) == seen.end()) {
+            seen.push_back(key);
             new_draw = true;
         }
     }
     if (log_frame) {
-        LOG_WARNING(Render_Vulkan, "DIAG-GTS-509: frame {} checkerboard pattern {} (sample 0 on even "
+        LOG_WARNING(Render_Vulkan, "DIAG-GTS-510: frame {} checkerboard pattern {} (sample 0 on even "
                                    "rows at x {})",
                     frame, even_x < 0 ? "A" : "B", even_x);
     }
     if (new_draw) {
-        LOG_WARNING(Render_Vulkan,
-                    "DIAG-GTS-509: checkerboard draw ps {:#x} vs {:#x} hs {:#x}; ps_input_ena {:#x} "
-                    "addr {:#x}; baryc_cntl {:#x}; db_shader_control {:#x}; alpha_to_mask {:#x}; "
-                    "db_eqaa {:#x}; aa_mask {:#010x} {:#010x}; depth {:#x} {}x{} samples {};{}",
-                    ps, vs, hs, key[3], key[4], key[5], key[6], key[7], key[8], key[9], key[10],
-                    db.DepthAddress(), db.Pitch(), db.Height(), db.NumSamples(), colours);
+        LOG_WARNING(
+            Render_Vulkan,
+            "DIAG-GTS-510: draw into the 2-sample depth {:#x} ({}x{}), race {}: ps {:#x} vs {:#x} hs "
+            "{:#x}; positions {}; ps inputs {:#x} (persp_sample {}, linear_sample {}, coverage {}); "
+            "db_shader_control {:#x} (kill {}, z export {}, mask export {}, coverage to mask {}); "
+            "alpha to mask {:#x}; baryc_cntl {:#x}; db_eqaa {:#x}; aa_mask {:#010x} {:#010x};{}",
+            db.DepthAddress(), db.Pitch(), db.Height(), RytyRaceRunning() ? "on" : "off", ps, vs, hs,
+            positions, input, input & 1, (input >> 4) & 1, (input >> 14) & 1, control,
+            (control >> 6) & 1, control & 1, (control >> 8) & 1, (control >> 7) & 1,
+            regs.db_alpha_to_mask, key[5], key[7], key[8], key[9],
+            colours.empty() ? std::string{" no colour target"} : colours);
     }
 }
 
@@ -7273,14 +7288,15 @@ static void NoteCheckerboardRead(VAddr address, u64 program, bool storage) {
     }
     {
         std::scoped_lock lock{CheckerboardDiag::mutex};
-        if (!CheckerboardDiag::targets.contains(address) || CheckerboardDiag::readers.size() >= 64 ||
+        if (!CheckerboardDiag::targets.contains(address) || CheckerboardDiag::readers.size() >= 128 ||
             std::ranges::find(CheckerboardDiag::readers, std::pair{address, program}) !=
                 CheckerboardDiag::readers.end()) {
             return;
         }
         CheckerboardDiag::readers.emplace_back(address, program);
     }
-    LOG_WARNING(Render_Vulkan, "DIAG-GTS-509: shader {:#x} reads the checkerboard image {:#x}{}",
+    LOG_WARNING(Render_Vulkan, "DIAG-GTS-510: shader {:#x} binds as a texture the image {:#x} a "
+                               "2-sample-depth draw wrote{}",
                 program, address, storage ? " as storage" : "");
 }
 

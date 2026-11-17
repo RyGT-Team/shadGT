@@ -621,6 +621,9 @@ private:
     std::atomic<u64> decoding_submit{};
     /// OPT-012: the draw packet RecordDraw records (direct draws), for the prepared-draw check.
     const void* decode_draw_packet{};
+    /// FIX-GTS-492: the command memory decoded since the last end-of-pipe interrupt (begin, end):
+    /// what the game takes back at the next one. Command thread only.
+    std::vector<std::pair<u64, u64>> decoded_command_ranges;
 
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);

@@ -5,6 +5,7 @@
 #include "video_core/renderer_vulkan/optional_mirror_budget.h"
 #include "ryty_gpu/native/prepared_sampled_view_proof.h"
 #include "ryty_gpu/native/prepared_proof_context.h"
+#include "ryty_gpu/native/prepared_lifetime.h"
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -185,6 +186,21 @@ public:
     /// OPT-012: on the command thread, whether a job thread prepared the draw at the packet
     /// (with its stages): then the command thread doesn't select its pipeline.
     bool HasPrepared(const void* packet);
+    /// FIX-GTS-492: whether a prepared draw ends with the command memory it was made from
+    /// (SHADGT_PREPARED_LIFETIME=0: it stays until a draw takes it, as before).
+    static bool PreparedLifetimeOn();
+    /// FIX-GTS-492: what a job reads as it ends, while its command memory is certainly its own,
+    /// for the walk that prepares its draws (now, or later on a prepare worker).
+    u64 PreparedSerial() const {
+        return retired_commands.Serial();
+    }
+    /// FIX-GTS-492: the calling thread walks a job that read `serial` as it ended.
+    static void SetWalkSerial(u64 serial);
+    /// FIX-GTS-492: an end-of-pipe interrupt is about to tell the game it has this command memory
+    /// back (what the command thread decoded since the last one): the prepared draws kept under
+    /// packets in it are dropped, and no walk begun before can publish there. Any thread;
+    /// `ranges` comes back sorted and merged.
+    void RetirePreparedDraws(std::vector<Native::CommandRange>& ranges);
     /// OPT-010: on a game job thread whose walk reached a draw (`regs` its state there) and
     /// found its built pipeline, the stage infos holding the draw's user data: the draw's
     /// bindings worked out ahead for the recorder (see PreparedDraw).
@@ -1542,6 +1558,18 @@ private:
         std::unordered_map<const void*, PreparedDraw*> draws;
     };
     std::array<PreparedShard, 64> prepared_shards;
+    /// FIX-GTS-492: the command memory the game took back at the last end-of-pipe interrupts.
+    Native::RetiredCommandMemory retired_commands;
+    /// FIX-GTS-492: prepared draws dropped with their command memory, dropped by age (their
+    /// job's commands never reached the command thread), publications refused (the walk ran
+    /// after its frame ended, or a newer one was there), ones taken for another draw, and
+    /// ones published over one still in the table (left by a job never decoded, or a second
+    /// walk of the same commands).
+    std::atomic<u64> prepared_retired{0}, prepared_aged{0}, prepared_refused{0},
+        prepared_mismatched{0}, prepared_replaced{0};
+    /// FIX-GTS-492: whether the prepared draw was made for the draw the registers describe
+    /// (Native::PreparedStagesAreTheDraws).
+    static bool PreparedIsForDraw(const PreparedDraw& p, const AmdGpu::Regs& regs);
     PreparedShard& ShardFor(const void* packet) {
         return prepared_shards[(reinterpret_cast<u64>(packet) * 0x9E3779B97F4A7C15ULL) >> 58];
     }

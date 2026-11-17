@@ -43,6 +43,8 @@ void ShadowJobDecode();
 /// Command processor: the registers at the start of a graphics submission (the base state jobs
 /// start from), and at each draw packet.
 void ShadowSubmitBase(const AmdGpu::Regs& regs);
+/// FIX-GTS-492: graphics submissions seen so far (what a prepared draw's epoch counts).
+u32 ShadowSubmissions();
 void ShadowCheckDraw(const void* packet, const AmdGpu::Regs& regs);
 /// NAT-030: right after ShadowCheckDraw, the pipeline the command processor selected for that
 /// draw (nullptr if none; `cp_selected` false if it did not select one ahead).

@@ -31,14 +31,6 @@ void RPC::init(const std::string&, const std::string&) {
 }
 
 static void SetImage(DiscordRichPresence& rpc, bool gt7) {
-    if (gt7) {
-        rpc.largeImageKey = Gt7Icon;
-        rpc.largeImageText = "Gran Turismo 7";
-        return;
-    }
-    rpc.largeImageKey = "https://raw.githubusercontent.com/mlgprorektm8/shadPS4/main/assets/"
-                        "GranTurismoSportIcon.jpg";
-    rpc.largeImageText = "Gran Turismo Sport";
 }
 
 void RPC::setStatusIdling() {

@@ -5457,6 +5457,9 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
 #endif
                 NoteSkippedDraw(); // PERF-103
                 NoteAsyncSkip(stored, true);
+                if (wait_for_shaders && OneOffBounded()) {
+                    skipped_build = stored; // FIX-GTS-517: waited for with a deadline
+                }
                 return nullptr;
             }
             if (!(t_required_lookup_lock &&
@@ -5534,6 +5537,9 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
 #endif
             NoteSkippedDraw(); // PERF-103
             NoteAsyncSkip(build, false);
+            if (wait_for_shaders && OneOffBounded()) {
+                skipped_build = build; // FIX-GTS-517: waited for with a deadline
+            }
             return nullptr;
         }
         // DIAG-GTS-515: out of races, why this draw waits for its pipeline, and how long.
@@ -7541,12 +7547,25 @@ bool PipelineCache::NeverSkipped(const std::array<const Shader::Info*, MaxShader
     return NeverSkippedReason(infos) != 0;
 }
 
+bool PipelineCache::OneOffBounded() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_ONE_OFF_BOUNDED");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
 u32 PipelineCache::NeverSkippedReason(
     const std::array<const Shader::Info*, MaxShaderStages>& infos) {
     if (RaceNeverWaits()) return 0; // PERF-GTS-493
-    // shadgt7 FIX-198 / PERF-GT7-020: a one-off target's draw (SetForceWait, SetWaitForShaders)
-    // waits for its pipeline and shaders.
-    if (force_wait || wait_for_shaders) return 1;
+    // shadgt7 FIX-198: a one-off target's draw past its bounded wait (SetForceWait) waits for its
+    // pipeline. FIX-GTS-517: not one in its bounded wait (SetWaitForShaders, PERF-GT7-020): its
+    // build is handed back (skipped_build) and waited for out of the lookup lock until the frame's
+    // deadline (Rasterizer::AcquireGraphicsPipelineWaiting, FIX-GT7-109), as on shadgt7. The
+    // 11-09 merge made it wait here, under the lock and without a deadline: with shaders not
+    // compiled GT7's dealership stopped up to 1.9 s a draw (DIAG-GTS-515).
+    // SHADGT_ONE_OFF_BOUNDED=0: as the merge did.
+    if (force_wait || (wait_for_shaders && !OneOffBounded())) return 1;
     // FIX-GTS-498: a pipeline this session built and released is rebuilt from the driver cache.
     if (!released_graphics.empty() && released_graphics.contains(S().graphics_key)) return 2;
     if (const auto* fragment = infos[u32(Shader::SwStage::Fragment)];

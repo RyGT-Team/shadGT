@@ -681,6 +681,8 @@ private:
     u32 NeverSkippedReason(const std::array<const Shader::Info*, MaxShaderStages>& infos);
     /// DIAG-GTS-515: why a draw waits for its pipeline instead of being skipped (MenuWaits).
     u32 WaitReason();
+    /// FIX-GTS-517: a one-off draw's bounded wait hands its build back (skipped_build).
+    static bool OneOffBounded();
     struct MenuWaitTally; ///< DIAG-GTS-515
     struct AsyncStats {
         u64 deferred{};
@@ -713,7 +715,7 @@ private:
     bool force_wait{};       ///< shadgt7 FIX-198 (lookup lock held)
     bool wait_for_shaders{}; ///< shadgt7 PERF-GT7-020 (lookup lock held)
     bool shaders_unlocked{}; ///< shadgt7 PERF-GT7-036 (lookup lock held)
-    std::shared_ptr<PipelineBuild> skipped_build; ///< shadgt7 PERF-GT7-020: never set here
+    std::shared_ptr<PipelineBuild> skipped_build; ///< shadgt7 PERF-GT7-020 (FIX-GTS-517)
 
     /// FIX-078: a shader the read-ahead found with no matching translation is translated on a
     /// worker thread; the draw that needs it takes the result (or waits for it) instead of

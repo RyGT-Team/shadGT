@@ -4885,7 +4885,20 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
         ++started;
         return true;
     };
-    if (RetryBlockedReadAhead() && !force_legacy && !fallback_nested) {
+    // FIX-SGT-007 (shadgt7's FIX-GT7-015, lost in the merge): blocked states are retried only
+    // while a draw waits for its pipeline or a state is restored (the game stopped, as at a new
+    // track's start, which they are for). Retried during play, up to 3 s after their draw, their
+    // user data had moved on: in a GT7 race they started ~500 builds a second of keys no draw
+    // asked for, compiled by the workers for minutes. Otherwise they are dropped once 3 s old,
+    // as before. SHADGT_READ_AHEAD_RETRY_ALWAYS=1: retried whenever, as PERF-311 did.
+    static const bool retry_always = [] {
+        const char* env = std::getenv("SHADGT_READ_AHEAD_RETRY_ALWAYS");
+        return env && env[0] == '1';
+    }();
+    if (RetryBlockedReadAhead() && !retry_always && !waiting) {
+        blocked_ahead_states.ExpireOld(std::chrono::steady_clock::now());
+    }
+    if (RetryBlockedReadAhead() && (waiting || retry_always) && !force_legacy && !fallback_nested) {
         const auto now = std::chrono::steady_clock::now();
         for (size_t remaining = blocked_ahead_states.size(); remaining && in_budget(); --remaining) {
             auto item = blocked_ahead_states.TakeReady(now);

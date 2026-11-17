@@ -129,6 +129,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_READ_AHEAD_NEW_SHADERS|flag|Shader compiling|off (RyGT build)|exactly 1 = on|Lets pipeline read-ahead start translations of shaders not seen before; off in the RyGT build.",
     "RYGTSW1|SHADGT_READ_AHEAD_OWN_MATCH|flag|Shader compiling|on|0 = off|Read-ahead shader matching keeps its own search memo apart from the draws' (PERF-044); 0 shares one.",
     "RYGTSW1|SHADGT_READ_AHEAD_RETRY|flag|Shader compiling|on|0 = off|Retries pipeline read-ahead lookups that were blocked instead of giving up on them; 0 turns retrying off.",
+    "RYGTSW1|SHADGT_READ_AHEAD_RETRY_ALWAYS|flag|Shader compiling|off|1 = on|Retries blocked read-ahead lookups during play too, not only while a draw waits for its pipeline (as before FIX-SGT-007); during play they start builds no draw asks for.",
     "RYGTSW1|SHADGT_RACE_DEPTH_WAIT|flag|Shader compiling|off|1 = on|In keep-going compile mode, races wait for new depth-only (shadow) pipelines instead of skipping their draws. May pause races for seconds.",
     "RYGTSW1|SHADGT_SPEC_FAST|choice|Shader compiling|1|0 = off; 1 = fast mode 1; 2 = fast mode 2|Fast path that matches a shader permutation by comparing packed inputs; 0 turns it off. Meaning of 2 vs 1 not documented in code.",
     "RYGTSW1|SHADGT_TESS_BUILDS|choice|Shader compiling|4|1 = one at a time; 2..16|How many tessellated (car) pipelines may build at once, still under a memory check (PERF-419-GTS). Higher uses more RAM.",

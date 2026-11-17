@@ -7081,6 +7081,73 @@ void NativeRenderer::WatchOneOffs(const AmdGpu::Regs& regs, bool skipped) {
 // PERF-GTS-493: a one-off picture skipped in a race (its pipeline was not built yet), kept until a
 // draw writes it. What is left when the race stops running (or every 60 s in a race) is written to
 // the log: pictures the game drew only while their pipeline was missing, so missing for the race.
+// DIAG-GTS-507 (PS4 Pro mode only, SHADGT_SAMPLE_LOCS_DIAG=0 turns it off): the sample positions
+// a multi-sample draw asks for (PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0..X1Y1, 0xA2FE, 4 registers a pixel
+// of the 2x2 quad, 4 samples a register, each a signed 4-bit x then y in 1/16 pixel from the pixel's
+// centre), with PA_SC_AA_CONFIG and PA_SC_CENTROID_PRIORITY. The renderer does not give them to
+// Vulkan yet (RECHERCHE-POSITIONS-ECHANTILLONS-PRO.md); a GPU with a 1x1 sample-location grid
+// (NVIDIA) can only take them if the four pixels of the quad ask for the same ones. One line for
+// each distinct setting (64 at most), with the pixel shader of its first draw.
+static void NoteSampleLocations(const AmdGpu::Regs& regs) {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_SAMPLE_LOCS_DIAG");
+        return Libraries::Kernel::sceKernelIsNeoMode() != 0 && !(env && env[0] == '0');
+    }();
+    if (!on || regs.aa_config.msaa_num_samples == 0) {
+        return;
+    }
+    constexpr u32 kLocs = 0xA2FE;
+    constexpr u32 kCentroid = 0xA2F5;
+    std::array<u32, 19> key{};
+    std::memcpy(&key[0], &regs.aa_config, sizeof(u32));
+    for (u32 i = 0; i < 16; ++i) {
+        key[1 + i] = regs.reg_array[kLocs + i];
+    }
+    key[17] = regs.reg_array[kCentroid];
+    key[18] = regs.reg_array[kCentroid + 1];
+    static std::mutex mutex;
+    static std::vector<std::array<u32, 19>> seen;
+    {
+        std::scoped_lock lock{mutex};
+        if (seen.size() >= 64 || std::ranges::find(seen, key) != seen.end()) {
+            return;
+        }
+        seen.push_back(key);
+    }
+    const u32 samples = regs.aa_config.NumSamples();
+    const auto position = [&](u32 pixel, u32 sample) {
+        const u32 word = regs.reg_array[kLocs + pixel * 4 + sample / 4];
+        const u32 byte = (word >> ((sample % 4) * 8)) & 0xff;
+        const int x = static_cast<int>(byte & 0xf) - ((byte & 0x8) ? 16 : 0);
+        const int y = static_cast<int>(byte >> 4) - ((byte & 0x80) ? 16 : 0);
+        return std::pair{x, y};
+    };
+    std::string text;
+    bool same = true;
+    for (u32 pixel = 0; pixel < 4; ++pixel) {
+        text += fmt::format(" {}:", pixel == 0 ? "X0Y0" : pixel == 1 ? "X1Y0" : pixel == 2 ? "X0Y1" : "X1Y1");
+        for (u32 sample = 0; sample < std::min<u32>(samples, 16); ++sample) {
+            const auto [x, y] = position(pixel, sample);
+            text += fmt::format(" ({},{})", x, y);
+            same = same && position(0, sample) == position(pixel, sample);
+        }
+    }
+    u64 ps_hash = 0;
+    if (regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Fragment))) {
+        if (const auto* pgm = regs.ProgramForStage(u32(Shader::HwStage::Fragment));
+            pgm && pgm->Address<u32*>()) {
+            ps_hash = AmdGpu::GetParams(*pgm).hash;
+        }
+    }
+    LOG_WARNING(Render_Vulkan,
+                "DIAG-GTS-507: {} samples (aa_config {:#010x}, max dist {}, exposed {}), quad "
+                "pixels {}: positions in 1/16 pixel from the centre{}; centroid priority "
+                "{:#010x} {:#010x}; ps {:#x}",
+                samples, key[0], u32(regs.aa_config.max_sample_dst),
+                1u << regs.aa_config.msaa_exposed_samples, same ? "alike" : "DIFFER", text, key[17],
+                key[18], ps_hash);
+}
+
 void NativeRenderer::NoteRaceMissing(const AmdGpu::Regs& regs) {
     u64 ps_hash = 0;
     if (regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Fragment))) {
@@ -14740,6 +14807,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
         return r.AcquireGraphicsPipeline(params, !indirect && !quad_list, &pipeline_owner);
     }();
+    NoteSampleLocations(regs); // DIAG-GTS-507
     // PERF-GTS-493: in a race (from its countdown with GAME-006) no one-off draw waits (FIX-198,
     // FIX-GT7-121/135/153): looked up again without waiting, skipped if not ready, and watched.
     const bool one_off = !pipeline && DrawMustNotSkip(regs);

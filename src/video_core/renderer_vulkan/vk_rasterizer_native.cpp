@@ -8116,6 +8116,97 @@ bool InPlaceDiagOn() {
 }
 } // namespace
 
+// DIAG-SGT-003 (SHADGT_DIAG_BIND_SPLIT=1): guest memory bound two ways within two frames, through a
+// video-memory region by some work and in place (imported view or the D3 page-table path) by
+// other work, at least one of them writing. GT7's GPU culling lost its depth pyramid that way
+// (FIX-GTS-520): its writer and reader saw different copies, and scenery dropped out until a
+// restart. Logged once per 64 KiB granule a minute, with the shader that bound it (0 when not a
+// shader buffer), and counted every 5 s.
+namespace {
+enum BindKind : u8 {
+    BindRegionRead = 1, BindRegionWrite = 2, BindInPlaceRead = 4, BindInPlaceWrite = 8,
+    BindDirectRead = 16, BindDirectWrite = 32,
+};
+thread_local u64 g_bind_hash = 0;
+bool BindSplitDiagOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_DIAG_BIND_SPLIT");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+std::string BindKinds(u8 m) {
+    std::string out;
+    const auto add = [&](u8 bit, const char* name) {
+        if (m & bit) out += out.empty() ? std::string{name} : std::string{","} + name;
+    };
+    add(BindRegionRead, "region read");
+    add(BindRegionWrite, "region write");
+    add(BindInPlaceRead, "in place read");
+    add(BindInPlaceWrite, "in place write");
+    add(BindDirectRead, "direct read");
+    add(BindDirectWrite, "direct write");
+    return out.empty() ? std::string{"none"} : out;
+}
+} // namespace
+
+static void NoteBindSplit(VAddr address, u64 size, u8 kind, u64 frame, u64 hash) {
+    struct Granule {
+        u64 frame = 0;
+        u8 now = 0, before = 0;
+        u64 hash_region = 0, hash_other = 0;
+        u64 logged_frame = 0;
+    };
+    static std::mutex mutex;
+    static std::unordered_map<u64, Granule> granules;
+    static u64 splits = 0, logged = 0;
+    static auto since = std::chrono::steady_clock::now();
+    if (size == 0) return;
+    std::scoped_lock lock{mutex};
+    const u64 first = address >> 16, last = (address + size - 1) >> 16;
+    for (u64 g = first; g <= last && g - first < 4096; ++g) {
+        Granule& e = granules[g];
+        if (e.frame != frame) {
+            e.before = e.frame + 1 == frame ? e.now : 0;
+            e.now = 0;
+            e.frame = frame;
+        }
+        e.now |= kind;
+        if (kind & (BindRegionRead | BindRegionWrite)) {
+            e.hash_region = hash;
+        } else {
+            e.hash_other = hash;
+        }
+        const u8 m = e.now | e.before;
+        const bool region = (m & (BindRegionRead | BindRegionWrite)) != 0;
+        const bool other =
+            (m & (BindInPlaceRead | BindInPlaceWrite | BindDirectRead | BindDirectWrite)) != 0;
+        const bool written = (m & (BindRegionWrite | BindInPlaceWrite | BindDirectWrite)) != 0;
+        if (!(region && other && written)) continue;
+        ++splits;
+        if (e.logged_frame != 0 && frame - e.logged_frame < 3600) continue;
+        e.logged_frame = frame;
+        if (logged++ < 400) {
+            LOG_INFO(Render_Vulkan,
+                     "DIAG-SGT-003: {:#x} (64 KiB) bound two ways in frames {}-{}: this frame {}; "
+                     "frame before {}; region by shader {:#x}, other by shader {:#x}; this bind "
+                     "{:#x}+{:#x}",
+                     g << 16, frame - 1, frame, BindKinds(e.now), BindKinds(e.before),
+                     e.hash_region, e.hash_other, address, size);
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - since >= std::chrono::seconds{5}) {
+        if (splits) {
+            LOG_INFO(Render_Vulkan, "DIAG-SGT-003: {} split binds of 64 KiB granules in 5 s",
+                     splits);
+        }
+        splits = 0;
+        since = now;
+        if (granules.size() > (1u << 20)) granules.clear();
+    }
+}
+
 static void NoteBoundBytes(VAddr address, u64 size, bool write, int kind, u64 frame, int miss = 0) {
     // kind: 0 read in place, 1 written in place, 2 upload copy, 3 region, 4 mirror
     static std::mutex mutex;
@@ -8230,6 +8321,13 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
             last_bound = memo.bound;
             last_mirror = memo.mirror; // OPT-004
             NATIVE_DIAGNOSTIC(++stats.buffer_memo_hits);
+            if (BindSplitDiagOn() && last_bound != Bound::Mirror) { // DIAG-SGT-003
+                NoteBindSplit(address, size,
+                              last_bound == Bound::Region ? (write ? BindRegionWrite : BindRegionRead)
+                              : write                     ? BindInPlaceWrite
+                                                          : BindInPlaceRead,
+                              frame, g_bind_hash);
+            }
             if (InPlaceDiagOn()) { // DIAG-GTS-524
                 NoteBoundBytes(address, size, write,
                                last_bound == Bound::InPlace  ? (write ? 1 : 0)
@@ -8246,6 +8344,14 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
     g_inplace_diag_snapshot = false; // DIAG-GTS-524
     g_mirror_miss = 0;
     const auto result = GuestBufferLookup(address, size, write, mirror);
+    if (result && BindSplitDiagOn() && last_bound != Bound::Mirror &&
+        !(last_bound == Bound::InPlace && g_inplace_diag_snapshot)) { // DIAG-SGT-003
+        NoteBindSplit(address, size,
+                      last_bound == Bound::Region ? (write ? BindRegionWrite : BindRegionRead)
+                      : write                     ? BindInPlaceWrite
+                                                  : BindInPlaceRead,
+                      frame, g_bind_hash);
+    }
     if (result && InPlaceDiagOn()) {
         NoteBoundBytes(address, size, write,
                        last_bound == Bound::InPlace  ? (g_inplace_diag_snapshot ? 2 : write ? 1 : 0)
@@ -11293,6 +11399,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                 return !(env && env[0] == '0');
             }();
             auto* readable_direct = r.buffer_cache.GetDirectMemory();
+            g_bind_hash = stage.pgm_hash; // DIAG-SGT-003
             if (bindable) size = Native::ReadableBindingSize(base, size, desc.is_written,
                 readable_cut, readable_direct != nullptr,
                 [&](u64 a, u64 n) { std::shared_lock lock{buffer_map_mutex}; return RegionOver(a, n) != nullptr; },
@@ -11391,6 +11498,9 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                         if (const auto view = direct->FindBuffer(base, size)) {
                             in_view = std::pair{view->first->Handle(), view->second};
                             last_bound = Bound::InPlace;
+                            if (BindSplitDiagOn()) { // DIAG-SGT-003
+                                NoteBindSplit(base, size, BindInPlaceRead, frame, stage.pgm_hash);
+                            }
                         }
                     }
                 }
@@ -11413,6 +11523,10 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                     !RegionOver(base, size) && direct->EnsureImported(base, size)) {
                     // D3: read in place through the page table; nothing bound.
                     direct_entries[buffer_index] = {u32(base), u32(base >> 32), u32(size), 1u};
+                    if (BindSplitDiagOn()) { // DIAG-SGT-003
+                        NoteBindSplit(base, size, desc.is_written ? BindDirectWrite : BindDirectRead,
+                                      frame, stage.pgm_hash);
+                    }
                     if (SnapshotBelow() >= 4_KB && stage.hw_stage == Shader::HwStage::Compute &&
                         size >= 4_KB &&
                         desc.post_op == Shader::SharpFetchPostOp::ReadConstPointer) {
@@ -19924,6 +20038,7 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                 return !(env && env[0] == '0');
             }();
             auto* readable_direct = r.buffer_cache.GetDirectMemory();
+            g_bind_hash = stage.pgm_hash; // DIAG-SGT-003
             if (bindable) size = Native::ReadableBindingSize(base, size, desc.is_written,
                 readable_cut, readable_direct != nullptr,
                 [&](u64 a, u64 n) { std::shared_lock lock{buffer_map_mutex}; return RegionOver(a, n) != nullptr; },

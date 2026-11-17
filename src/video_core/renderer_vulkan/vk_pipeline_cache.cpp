@@ -4369,12 +4369,43 @@ bool PipelineCache::LegacyWaits() const {
 }
 
 std::chrono::microseconds PipelineCache::QuickWait() {
-    if (CompileMode() == 2) return std::chrono::microseconds{0};
+    // FIX-GTS-522: keep going (compile mode 2) and races skipped every draw whose pipeline was not
+    // built yet, even one the driver had cached: 1,434 of 1,476 GT7 builds in a race took under
+    // 2 ms and each of their draws still popped in a frame later. Their draws now wait a little:
+    // per 16 ms window SHADGT_QUICK_WAIT_US in all (4000; 2000 in a race), half of it per draw at
+    // most. 0: no wait in keep-going mode or races, as before.
+    static const std::chrono::microseconds keep_going_budget = [] {
+        const char* env = std::getenv("SHADGT_QUICK_WAIT_US");
+        return std::chrono::microseconds{env && *env ? std::max(0ll, std::strtoll(env, nullptr, 10))
+                                                     : 4000ll};
+    }();
+    std::chrono::microseconds window_budget{4000};
+    bool limited = false;
+    if (CompileMode() == 2) {
+        if (keep_going_budget.count() == 0) return std::chrono::microseconds{0};
+        window_budget = keep_going_budget;
+        limited = true;
+    }
 #ifdef RYTY_GPU
-    // Deferrable race draws poll the worker result, rather than spending up to 4 ms per
-    // frame waiting. Memory-writing and never-skipped draws still take the required wait.
-    if (RytyGtsInRace()) return std::chrono::microseconds{0};
+    if (RytyGtsInRace()) {
+        if (keep_going_budget.count() == 0) return std::chrono::microseconds{0};
+        window_budget = keep_going_budget / 2;
+        limited = true;
+    }
 #endif
+    if (limited) {
+        using namespace std::chrono;
+        static thread_local steady_clock::time_point window{};
+        static thread_local microseconds used{};
+        const auto now = steady_clock::now();
+        if (now - window > milliseconds{16}) {
+            window = now;
+            used = microseconds{0};
+        }
+        const auto wait = std::clamp(window_budget - used, microseconds{0}, window_budget / 2);
+        used += wait;
+        return wait;
+    }
     // FIX-114: a draw whose new pipeline is building waits for it a little, so the pipelines
     // that build quickly (the driver had them, or small ones) are drawn at once and only the
     // slow ones pop in a moment later. At most 4 ms of waiting in any 16 ms, 2 ms per draw.

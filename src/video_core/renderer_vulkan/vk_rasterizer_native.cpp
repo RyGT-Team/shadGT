@@ -5698,12 +5698,18 @@ bool NativeRenderer::IsDynamic(VAddr begin, VAddr end, u64* blocked_granule, u64
     return false;
 }
 
+// DIAG-GTS-524: why the last MirrorBuffer call gave no mirror (1 off or over 64 MB, 2 refresh
+// refused, 3 first sighting, 4 seen this frame already, 5 rewritten memory, 6 queued).
+static thread_local u8 g_mirror_miss = 0;
+
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr address, u64 size) {
+    g_mirror_miss = 0;
     static const bool enabled = [] {
         const char* env = std::getenv("SHADGT_NATIVE_MIRRORS");
         return !(env && env[0] == '0');
     }();
     if (!enabled || size == 0 || size > 64_MB) {
+        g_mirror_miss = 1;
         return std::nullopt;
     }
     SortRegionWrites();
@@ -5713,7 +5719,10 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr add
         mirror = MirrorHolding(address, size);
     }
     if (mirror) {
-        if (!RefreshMirror(*mirror)) return std::nullopt;
+        if (!RefreshMirror(*mirror)) {
+            g_mirror_miss = 2;
+            return std::nullopt;
+        }
         mirror->used_frame = frame;
         NATIVE_DIAGNOSTIC(++stats.mirror_binds);
         memo_kind = MemoKind::Mirror; // OPT-003
@@ -5746,22 +5755,26 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr add
     const bool mirror_diag=MirrorDiagnosticEnabled();
     if (inserted) {
         if(mirror_diag)NoteMirrorDiagnostic(MirrorCandidateNew,address,address+size,begin,end,unmap_generation.load());
+        g_mirror_miss = 3;
         return std::nullopt;
     }
     candidate.end = std::max(candidate.end, end);
     if (candidate.frame == frame) {
         if(mirror_diag)NoteMirrorDiagnostic(MirrorCandidateSameFrame,address,address+size,begin,candidate.end,unmap_generation.load());
+        g_mirror_miss = 4;
         return std::nullopt;
     }
     candidate.frame = frame; // looked at again next frame at the earliest
     u64 blocked_granule=~u64{0},blocked_age=~u64{0};
     if (IsDynamic(begin, candidate.end,mirror_diag?&blocked_granule:nullptr,mirror_diag?&blocked_age:nullptr)) {
         if(mirror_diag)NoteMirrorDiagnostic(MirrorCandidateDynamic,address,address+size,begin,candidate.end,unmap_generation.load(),blocked_granule,blocked_age);
+        g_mirror_miss = 5;
         return std::nullopt;
     }
     pending_mirrors.emplace_back(begin, candidate.end);
     if(mirror_diag)NoteMirrorDiagnostic(MirrorCandidateQueued,address,address+size,begin,candidate.end,unmap_generation.load());
     mirror_candidates.erase(it);
+    g_mirror_miss = 6;
     return std::nullopt;
 }
 
@@ -8087,6 +8100,73 @@ u64 NativeRenderer::SnapshotBelow() {
     return RytyGtsMenuSnapshotsAllowed() ? below : 0;
 }
 
+// DIAG-GTS-524 (SHADGT_DIAG_INPLACE_BYTES=1): every 5 s, the bytes GuestBuffer bound per frame by
+// kind (guest memory read or written in place over PCIe, copied to upload memory, a video-memory
+// region, a vertex mirror) and the in-place ranges that took the most, by 1 MiB. GT7's GPU sat at
+// 95% busy at 32 W while reading 6-9 GB/s over PCIe. These are bound sizes, not bytes the shaders
+// read: a range bound once a frame and read in part still counts whole.
+namespace {
+thread_local bool g_inplace_diag_snapshot = false;
+bool InPlaceDiagOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_DIAG_INPLACE_BYTES");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+} // namespace
+
+static void NoteBoundBytes(VAddr address, u64 size, bool write, int kind, u64 frame, int miss = 0) {
+    // kind: 0 read in place, 1 written in place, 2 upload copy, 3 region, 4 mirror
+    static std::mutex mutex;
+    static u64 bytes[5]{}, calls[5]{};
+    static u64 miss_bytes[7]{}; // in-place reads of vertex/index ranges, by g_mirror_miss
+    static std::unordered_map<u64, std::array<u64, 3>> ranges; // MiB -> bytes, calls, writes
+    static u64 first_frame = ~u64{0};
+    static auto since = std::chrono::steady_clock::now();
+    std::scoped_lock lock{mutex};
+    if (first_frame == ~u64{0}) first_frame = frame;
+    bytes[kind] += size;
+    ++calls[kind];
+    if (kind == 0 && miss > 0 && miss < 7) miss_bytes[miss] += size;
+    if (kind <= 1) {
+        auto& range = ranges[address >> 20];
+        range[0] += size;
+        ++range[1];
+        range[2] += write;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - since < std::chrono::seconds{5}) return;
+    const double frames = double(std::max<u64>(1, frame - first_frame));
+    std::vector<std::pair<u64, std::array<u64, 3>>> top(ranges.begin(), ranges.end());
+    std::ranges::sort(top, [](const auto& a, const auto& b) { return a.second[0] > b.second[0]; });
+    std::string list;
+    for (size_t i = 0; i < std::min<size_t>(top.size(), 8); ++i) {
+        const auto& [mib, v] = top[i];
+        list += fmt::format(" {:#x}: {:.1f} MB/frame in {:.0f} binds{}{};", mib << 20,
+                            double(v[0]) / frames / 1e6, double(v[1]) / frames,
+                            v[2] ? " (written)" : "", ListedInPlace(mib << 20, 1_MB) ? " (listed)" : "");
+    }
+    LOG_INFO(Render_Vulkan,
+             "DIAG-GTS-524: {:.0f} frames; MB bound per frame: in place read {:.1f} written {:.1f}, "
+             "upload copy {:.1f}, region {:.1f}, mirror {:.1f}; in-place binds per frame {:.0f}; "
+             "vertex/index in place, MB per frame: off or over 64 MB {:.1f}, refresh refused {:.1f}, "
+             "first sighting {:.1f}, seen this frame {:.1f}, rewritten memory {:.1f}, queued {:.1f}; "
+             "top in-place ranges:{}",
+             frames, double(bytes[0]) / frames / 1e6, double(bytes[1]) / frames / 1e6,
+             double(bytes[2]) / frames / 1e6, double(bytes[3]) / frames / 1e6,
+             double(bytes[4]) / frames / 1e6, double(calls[0] + calls[1]) / frames,
+             double(miss_bytes[1]) / frames / 1e6, double(miss_bytes[2]) / frames / 1e6,
+             double(miss_bytes[3]) / frames / 1e6, double(miss_bytes[4]) / frames / 1e6,
+             double(miss_bytes[5]) / frames / 1e6, double(miss_bytes[6]) / frames / 1e6, list);
+    std::fill(std::begin(miss_bytes), std::end(miss_bytes), 0);
+    std::fill(std::begin(bytes), std::end(bytes), 0);
+    std::fill(std::begin(calls), std::end(calls), 0);
+    ranges.clear();
+    first_frame = frame;
+    since = now;
+}
+
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr address, u64 size,
                                                                       bool write, bool mirror) {
     if (size == 0) {
@@ -8150,13 +8230,29 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
             last_bound = memo.bound;
             last_mirror = memo.mirror; // OPT-004
             NATIVE_DIAGNOSTIC(++stats.buffer_memo_hits);
+            if (InPlaceDiagOn()) { // DIAG-GTS-524
+                NoteBoundBytes(address, size, write,
+                               last_bound == Bound::InPlace  ? (write ? 1 : 0)
+                               : last_bound == Bound::Region ? 3
+                                                             : 4,
+                               frame);
+            }
             return std::pair{memo.buffer, memo.offset};
         }
     }
     memo_kind = MemoKind::None;
     memo_region = nullptr;
     memo_mirror = nullptr;
+    g_inplace_diag_snapshot = false; // DIAG-GTS-524
+    g_mirror_miss = 0;
     const auto result = GuestBufferLookup(address, size, write, mirror);
+    if (result && InPlaceDiagOn()) {
+        NoteBoundBytes(address, size, write,
+                       last_bound == Bound::InPlace  ? (g_inplace_diag_snapshot ? 2 : write ? 1 : 0)
+                       : last_bound == Bound::Region ? 3
+                                                     : 4,
+                       frame, mirror ? g_mirror_miss : 0);
+    }
     if (result && memo_kind == MemoKind::Mirror) {
         last_mirror = memo_mirror; // OPT-004
     }
@@ -8260,6 +8356,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     // (constants) are copied when the draw is recorded instead of read in place by the GPU later.
     if (!mirror && !write && size <= SnapshotBelow()) {
         last_bound = Bound::InPlace;
+        g_inplace_diag_snapshot = true; // DIAG-GTS-524
         return SnapshotRange(address, size);
     }
     if (mirror && !write) {
@@ -8325,6 +8422,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
         }
         return std::nullopt;
     }
+    g_inplace_diag_snapshot = true; // DIAG-GTS-524
     return SnapshotRange(address, size);
 }
 

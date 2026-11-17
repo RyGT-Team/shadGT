@@ -10058,7 +10058,15 @@ void PipelineCache::TrimUnusedPipelines() {
     if (PipelineRetirementWorker().PendingCount() >= 512) return;
     // Queued selections hold a shared reference; retirement cannot invalidate them.
     constexpr size_t retire_batch = 128;
-    const auto cutoff = now - seconds{5};
+    // FIX-GTS-523: a pipeline unused for this long may be retired under pressure (it was 5 s). On
+    // an 8 GB GPU GT7 is always within the reserve, so the trim ran all the time and retired every
+    // pipeline five seconds out of view; back in view, its draw was skipped while it was rebuilt
+    // and the scenery popped every 3-5 s. SHADGT_PIPELINE_IDLE_S sets it (5: as before).
+    static const auto idle = [] {
+        const char* env = std::getenv("SHADGT_PIPELINE_IDLE_S");
+        return seconds{env && *env ? std::max<long long>(1, std::strtoll(env, nullptr, 10)) : 120};
+    }();
+    const auto cutoff = now - idle;
     std::vector<std::shared_ptr<const void>> retired;
     // FIX-GTS-468: without pressure too, the precompile's pipelines no draw used go once it is
     // done (beyond SHADGT_PRECOMPILE_KEEP); the driver's cache rebuilds one quickly if needed.

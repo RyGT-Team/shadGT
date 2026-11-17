@@ -75,6 +75,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_WARM_COMPUTE_REFRESH|flag|Shader objects & caches|on for GT7, off for GT Sport|1 = on, 0 = off|Rewrites a warm-up compute recipe whose code changed when its build was slow, so startup warm-up builds current code (FIX-GT7-150).",
     // Shader compiling
     "RYGTSW1|SHADGT_CAPTURE_SCOPED_MENUS|flag|Shader compiling|on|exactly 0 = off; unsupported game versions keep the old waits|Tracks GT7 icon captures so menu pipeline-compile waits apply only while a capture runs. 0 keeps the old menu waits.",
+    "RYGTSW1|SHADGT_QUICK_WAIT_US|int|Shader compiling|4000|microseconds per 16 ms (half of it in a race, half per draw at most); 0 = off|In keep-going mode a draw whose new pipeline is building waits this long at most, so pipelines the driver has cached draw at once instead of popping in (FIX-GTS-522).",
     "RYGTSW1|SHADGT_CATCH_UP_LOW|flag|Shader compiling|on|0 = catch-up uses every core at normal priority|During a compile catch-up, compiles use every core below normal priority; 0 widens them to every core instead.",
     "RYGTSW1|SHADGT_CATCH_UP_PACE|flag|Shader compiling|on|0 = off|Paces compile catch-up against the game's frame times; 0 turns the pacing off.",
     "RYGTSW1|SHADGT_COMPILE_BACKLOG|int|Shader compiling|256|draws waiting for pipelines; off again below n/4; 0 = never|When this many draws wait for pipelines (outside races), compiles use every core, 8 at a time, below normal priority (FIX-GT7-106).",
@@ -242,6 +243,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_WRITE_THROUGH|flag|Native recorder & sync|off|exactly 1 = on; -DisablePerf 103 keeps it off|CPU stores to pages with GPU-written bytes go through without waiting for the GPU (FIX-079). Opt-in: froze some sessions at scene changes.",
     // Memory & VRAM
     "RYGTSW1|RYGT_BATCH_MAP_MERGE|flag|Memory & VRAM|off|1 = on|Maps a run of the renderer's fixed batch maps as one direct-memory map (PERF-GTS-268); off because it caused 30-80 ms recorder stalls in races. Runtime (libkernel).",
+    "RYGTSW1|SHADGT_PIPELINE_IDLE_S|int|Memory & VRAM|120|seconds, 1 or more; 5 = as before|Under memory pressure, pipelines unused for this long are freed. Too short and things that leave the view lose theirs and pop back in (FIX-GTS-523).",
     "RYGTSW1|SHADGT_COMPUTE_PREFIX_COPY|flag|Memory & VRAM|off|1 = on|Menus: copies each compute shader's 4 KB constant snapshot to video memory before the dispatch, as before PERF-GTS-461. Slower; for comparison.",
     "RYGTSW1|SHADGT_D1_VIEW_MB|int|Memory & VRAM|256|MB per imported piece; 0 = whole allocation at once|Imports large GPU memory allocations in pieces of this many MB when first used (PERF-GT7-022); 0 pins the whole allocation.",
     "RYGTSW1|SHADGT_GATHER_REUSE|flag|Memory & VRAM|on|0 = off|Draws in one command list that read the same guest buffer spanning several imported pieces share one GPU copy of it, instead of a new copy each (PERF-GTS-365; VRAM filled at the Nurburgring without it).",

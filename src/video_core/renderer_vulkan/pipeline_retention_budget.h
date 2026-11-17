@@ -4,8 +4,17 @@
 
 namespace Vulkan {
 // Saturating subtraction also handles devices with a budget below the reserve.
+// FIX-GTS-521: the reserve is an eighth of the budget, between 512 MB and 2 GB (2 GB flat before).
+// On an 8 GB GPU (7.2 GB budget) GT7 passes budget - 2 GB with its textures alone after a few
+// minutes, so the trim retired pipelines all session for little VRAM (pipelines are mostly in
+// system RAM): the scenery of each lap lost its pipelines and popped back in.
+constexpr std::uint64_t PipelineRetentionReserve(std::uint64_t budget) {
+    constexpr std::uint64_t MiB = 1ull << 20;
+    return budget / 8 < 512 * MiB ? 512 * MiB : budget / 8 > 2048 * MiB ? 2048 * MiB : budget / 8;
+}
+
 constexpr bool PipelineRetentionUnderPressure(std::uint64_t usage, std::uint64_t budget) {
-    constexpr std::uint64_t reserve = 2ull << 30;
+    const std::uint64_t reserve = PipelineRetentionReserve(budget);
     return budget != 0 && usage > (budget > reserve ? budget - reserve : 0);
 }
 

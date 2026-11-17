@@ -10074,7 +10074,11 @@ void PipelineCache::TrimUnusedPipelines() {
     };
     if (under_pressure) {
         trim(graphics_pipelines);
-        trim(compute_pipelines);
+        // FIX-GTS-521: compute pipelines stay under VRAM pressure. They are few and small, and one
+        // retired was built again while its dispatches were skipped (keep going, PERF-GTS-493):
+        // GT7's GPU culling then tested against a depth pyramid that was not built, and scenery
+        // dropped out while the pressure lasted. Under RAM pressure alone they still go.
+        if (ram_pressure && !vram_pressure) trim(compute_pipelines);
     }
     if (retired.empty()) return;
     const auto count = retired.size();
@@ -10088,8 +10092,9 @@ void PipelineCache::TrimUnusedPipelines() {
     });
     if (!under_pressure) return; // RetireUnclaimedPrewarm logs its own progress
     LOG_INFO(Render_Vulkan, "Pipeline memory pressure: {} MiB used / {} MiB budget, "
-             "2048 MiB reserve, {} MiB RAM free{}; retired {} unused pipelines, {} cached, "
-             "{} stored never drawn", usage_bytes >> 20, budget_bytes >> 20, ram_available >> 20,
+             "{} MiB reserve, {} MiB RAM free{}; retired {} unused pipelines, {} cached, "
+             "{} stored never drawn", usage_bytes >> 20, budget_bytes >> 20,
+             PipelineRetentionReserve(budget_bytes) >> 20, ram_available >> 20,
              ram_pressure ? " (RAM pressure)" : "", count,
              graphics_pipelines.size() + compute_pipelines.size(), prewarm_unclaimed.size());
 }

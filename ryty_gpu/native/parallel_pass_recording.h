@@ -77,6 +77,7 @@ inline void ApplyDynamicSnapshot(Vulkan::DynamicState& d,const Vulkan::DynamicSt
     d.SetCullMode(s.cull_mode);d.SetFrontFace(s.front_face);d.SetBlendConstants(s.blend_constants);
     d.SetColorWriteMasks(s.color_write_masks);d.SetLineWidth(s.line_width);
     d.SetAttachmentFeedbackLoopEnabled(s.feedback_loop_enabled);
+    d.SetSampleLocations(s.sample_locations); // NEO-GTS-508
 }
 // Exact pass traversal, shared by the Vulkan wrapper and CPU sequence tests.
 // Validation must finish before calling this: after begin there is no rollback.

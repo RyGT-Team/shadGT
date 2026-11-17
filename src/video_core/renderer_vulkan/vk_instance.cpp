@@ -384,7 +384,8 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 48> enabled_extensions;
+    // NEO-GTS-508: room for every extension asked for below (over 48 call sites).
+    boost::container::static_vector<const char*, 64> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -729,6 +730,105 @@ bool Instance::CreateDevice() {
                     !wanted                 ? "MERGE (SHADGT_NEO_COVERAGE_TRUNCATE=0)"
                     : nv_coverage_reduction ? "TRUNCATE where the driver lists it"
                                             : "MERGE (no VK_NV_coverage_reduction_mode)");
+    }
+    // NEO-GTS-508: in the PS4 Pro mode both games set their own sample positions for multi-sample
+    // draws (PA_SC_AA_SAMPLE_LOCS_PIXEL_*: the checkerboard, a 4-sample pass). With
+    // VK_EXT_sample_locations multi-sample pipelines take them (vk_graphics_pipeline.cpp, set per
+    // draw by DynamicState). Only when the device takes every position the game can ask for
+    // (1/16 pixel, 0..0.9375), lets them change from draw to draw, has the standard positions
+    // (what draws it cannot express keep), and takes the depth images' flag. The extension is
+    // enabled only then: once it is, every shader-object draw must set the state too.
+    // SHADGT_SAMPLE_LOCATIONS=0: Vulkan's standard positions, as before.
+    {
+        std::string off;
+        if (Libraries::Kernel::sceKernelIsNeoMode() == 0) {
+            off = "not the PS4 Pro mode";
+        } else if (const char* env = std::getenv("SHADGT_SAMPLE_LOCATIONS"); env && env[0] == '0') {
+            off = "SHADGT_SAMPLE_LOCATIONS=0";
+        } else if (std::ranges::none_of(available_extensions, [](const auto& name) {
+                       return name == VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME;
+                   })) {
+            off = "no VK_EXT_sample_locations";
+        } else {
+            const auto chain =
+                physical_device.getProperties2<vk::PhysicalDeviceProperties2,
+                                               vk::PhysicalDeviceSampleLocationsPropertiesEXT>();
+            const auto& p = chain.get<vk::PhysicalDeviceSampleLocationsPropertiesEXT>();
+            if (!p.variableSampleLocations) {
+                off = "positions cannot change between draws (variableSampleLocations)";
+            } else if (p.sampleLocationSubPixelBits < 4) {
+                off = fmt::format("{} sub-pixel bits", p.sampleLocationSubPixelBits);
+            } else if (p.sampleLocationCoordinateRange[0] > 0.0f ||
+                       p.sampleLocationCoordinateRange[1] < 0.9375f) {
+                off = fmt::format("range {}..{}", p.sampleLocationCoordinateRange[0],
+                                  p.sampleLocationCoordinateRange[1]);
+            } else if (!properties.limits.standardSampleLocations) {
+                off = "no standard sample locations";
+            } else if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceMultisamplePropertiesEXT) {
+                off = "no vkGetPhysicalDeviceMultisamplePropertiesEXT";
+            }
+            // The depth formats the renderer makes, as it makes them (formats the device lacks
+            // are left out).
+            constexpr vk::ImageUsageFlags depth_usage =
+                vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
+                vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eDepthStencilAttachment;
+            constexpr vk::ImageCreateFlags depth_flags =
+                vk::ImageCreateFlagBits::eMutableFormat | vk::ImageCreateFlagBits::eExtendedUsage;
+            for (const vk::Format format : {vk::Format::eD16Unorm, vk::Format::eD32Sfloat,
+                                            vk::Format::eD24UnormS8Uint,
+                                            vk::Format::eD32SfloatS8Uint}) {
+                if (!off.empty()) {
+                    break;
+                }
+                vk::PhysicalDeviceImageFormatInfo2 info{
+                    .format = format,
+                    .type = vk::ImageType::e2D,
+                    .tiling = vk::ImageTiling::eOptimal,
+                    .usage = depth_usage,
+                    .flags = depth_flags,
+                };
+                if (physical_device.getImageFormatProperties2(info).result !=
+                    vk::Result::eSuccess) {
+                    continue;
+                }
+                info.flags |= vk::ImageCreateFlagBits::eSampleLocationsCompatibleDepthEXT;
+                if (physical_device.getImageFormatProperties2(info).result !=
+                    vk::Result::eSuccess) {
+                    off = fmt::format("{} images refuse the sample-locations flag",
+                                      vk::to_string(format));
+                }
+            }
+            if (off.empty()) {
+                sample_locations = add_extension(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME);
+                if (!sample_locations) {
+                    off = "the extension could not be enabled";
+                }
+            }
+            if (sample_locations) {
+                sample_locations_properties = p;
+                sample_locations_properties.pNext = nullptr;
+                for (u32 i = 1; i < sample_location_grids.size(); ++i) {
+                    const auto count = static_cast<vk::SampleCountFlagBits>(1u << i);
+                    if (p.sampleLocationSampleCounts & count) {
+                        sample_location_grids[i] =
+                            physical_device.getMultisamplePropertiesEXT(count)
+                                .maxSampleLocationGridSize;
+                    }
+                }
+            }
+        }
+        std::string grids;
+        for (u32 i = 1; i < sample_location_grids.size(); ++i) {
+            if (sample_location_grids[i].width != 0) {
+                grids += fmt::format(" {}x: grid {}x{};", 1u << i, sample_location_grids[i].width,
+                                     sample_location_grids[i].height);
+            }
+        }
+        LOG_WARNING(Render_Vulkan, "NEO-GTS-508: the game's sample positions: {}",
+                    sample_locations ? fmt::format("on,{} (a draw whose 2x2 quad pixels differ "
+                                                   "keeps the standard positions on a 1x1 grid)",
+                                                   grids)
+                                     : fmt::format("off ({})", off));
     }
     shader_atomic_float = add_extension(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
     shader_atomic_float2 = add_extension(VK_EXT_SHADER_ATOMIC_FLOAT_2_EXTENSION_NAME);
@@ -1559,6 +1659,49 @@ vk::FormatFeatureFlags2 Instance::GetFormatFeatureFlags(vk::Format format) const
     }
 
     return it->second.optimalTilingFeatures | it->second.bufferFeatures;
+}
+
+vk::ImageCreateFlags Instance::SampleLocationsDepthFlag(vk::Format format, vk::ImageType type,
+                                                        vk::ImageUsageFlags usage,
+                                                        vk::ImageCreateFlags flags) const {
+    // NEO-GTS-508: a depth attachment of a pipeline with custom sample locations must have it
+    // (VUID-vkCmdDraw-sampleLocationsEnable-02689). Depth formats only.
+    if (!sample_locations) {
+        return {};
+    }
+    switch (format) {
+    case vk::Format::eD16Unorm:
+    case vk::Format::eX8D24UnormPack32:
+    case vk::Format::eD32Sfloat:
+    case vk::Format::eD16UnormS8Uint:
+    case vk::Format::eD24UnormS8Uint:
+    case vk::Format::eD32SfloatS8Uint:
+        break;
+    default:
+        return {};
+    }
+    constexpr auto flag = vk::ImageCreateFlagBits::eSampleLocationsCompatibleDepthEXT;
+    const auto result = physical_device
+                            .getImageFormatProperties2(vk::PhysicalDeviceImageFormatInfo2{
+                                .format = format,
+                                .type = type,
+                                .tiling = vk::ImageTiling::eOptimal,
+                                .usage = usage,
+                                .flags = flags | flag,
+                            })
+                            .result;
+    if (result == vk::Result::eSuccess) {
+        return flag;
+    }
+    static std::atomic<u32> refused{};
+    if (refused.fetch_add(1, std::memory_order_relaxed) < 4) {
+        LOG_WARNING(Render_Vulkan,
+                    "NEO-GTS-508: a {} depth image made without the sample-locations flag "
+                    "(usage {}, flags {}): {}",
+                    vk::to_string(format), vk::to_string(usage), vk::to_string(flags),
+                    vk::to_string(result));
+    }
+    return {};
 }
 
 bool Instance::IsFormatSupported(const vk::Format format,

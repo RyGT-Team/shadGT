@@ -2963,6 +2963,10 @@ Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bo
     vk::FormatFeatureFlags2 features = FeaturesOf(usage);
     vk::Format format = instance.GetSupportedFormat(info.pixel_format, features);
     const vk::ImageType type = TypeOf(info.type);
+    if (info.props.is_depth) {
+        // NEO-GTS-508: depth attachments of pipelines with the game's sample positions.
+        flags |= instance.SampleLocationsDepthFlag(format, type, usage, flags);
+    }
     auto properties =
         instance.GetPhysicalDevice().getImageFormatProperties2(vk::PhysicalDeviceImageFormatInfo2{
             .format = format,
@@ -4047,6 +4051,9 @@ void NativeRenderer::BindGraphics(Stream& s, const GraphicsPipeline& pipeline,
         s.so_known = false;
         s.pipelines.Graphics(pipeline.Handle(), [&] {
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.Handle());
+            if (pipeline.SampleLocationSamples() != 0) {
+                s.dynamic.ResendSampleLocations(cmdbuf); // NEO-GTS-508
+            }
         });
     }
 }
@@ -15666,6 +15673,29 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 },
             });
         }
+        // NEO-GTS-508: a multi-sample depth target the draw tests with the game's sample
+        // positions keeps them through its layout change (VkSampleLocationsInfoEXT in its
+        // barrier): the draw's own positions, used on both sides of the change. Recorded with
+        // the structure built when the command runs (the ring copies no chained structures).
+        const SampleLocations::Pattern locations = r.SampleLocationPattern(pipeline);
+        for (size_t i = 0; i < feedback.size() && locations.samples != 0; ++i) {
+            const auto* entry = feedback[i];
+            if (entry != targets.depth || !entry->info.props.is_depth ||
+                entry->image->Desc().samples != locations.samples) {
+                continue;
+            }
+            s.cmd.Run([barriers, locations, i](vk::CommandBuffer cmd) mutable {
+                std::array<vk::SampleLocationEXT, 64> storage;
+                const vk::SampleLocationsInfoEXT info =
+                    SampleLocations::ToVulkan(locations, storage);
+                barriers[i].pNext = &info;
+                cmd.pipelineBarrier2(vk::DependencyInfo{
+                    .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
+                    .pImageMemoryBarriers = barriers.data(),
+                });
+            });
+            return;
+        }
         s.cmd.pipelineBarrier2(vk::DependencyInfo{
             .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
             .pImageMemoryBarriers = barriers.data(),
@@ -17110,7 +17140,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         hud_view_state(); // DLSS-GT7-001
         r.UpdateDepthStencilState();
         r.UpdatePrimitiveState(is_indexed, quad_triangles);
-        r.UpdateRasterizationState();
+        r.UpdateRasterizationState(pipeline);
         r.UpdateColorBlendingState(pipeline);
         if (scale_composition) {
             auto viewports = s.dynamic.viewports;
@@ -17412,7 +17442,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             hud_view_state();
             r.UpdateDepthStencilState();
             r.UpdatePrimitiveState(is_indexed, quad_triangles);
-            r.UpdateRasterizationState();
+            r.UpdateRasterizationState(pipeline);
             r.UpdateColorBlendingState(pipeline);
             s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
             Rasterizer::t_dynamic_state = saved;

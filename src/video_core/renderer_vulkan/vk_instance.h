@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+#include <bit>
 #include <mutex>
 #include <span>
 #include <unordered_map>
@@ -373,6 +375,38 @@ public:
     std::span<const CoverageReduction::Combination> GetTruncateCombinations() const {
         return truncate_combinations;
     }
+
+    /// NEO-GTS-508: VK_EXT_sample_locations is on: multi-sample pipelines take the game's sample
+    /// positions (PS4 Pro mode, SHADGT_SAMPLE_LOCATIONS not 0, the device able to).
+    bool IsSampleLocationsOn() const {
+        return sample_locations;
+    }
+
+    /// NEO-GTS-508: the device's VK_EXT_sample_locations properties (zeros when it is off).
+    const vk::PhysicalDeviceSampleLocationsPropertiesEXT& GetSampleLocationsProperties() const {
+        return sample_locations_properties;
+    }
+
+    /// NEO-GTS-508: the largest sample-location grid for a sample count (1, 2, 4, 8 or 16;
+    /// 0x0 when the count takes no custom positions or the feature is off).
+    vk::Extent2D GetSampleLocationGrid(u32 samples) const {
+        const u32 index = static_cast<u32>(std::countr_zero(samples));
+        return sample_locations && std::has_single_bit(samples) && index < sample_location_grids.size()
+                   ? sample_location_grids[index]
+                   : vk::Extent2D{};
+    }
+
+    /// NEO-GTS-508: the device takes one pattern for each pixel of a 2x2 quad at this count.
+    bool HasSampleLocationQuadGrid(u32 samples) const {
+        const vk::Extent2D grid = GetSampleLocationGrid(samples);
+        return grid.width >= 2 && grid.height >= 2 && grid.width % 2 == 0 && grid.height % 2 == 0;
+    }
+
+    /// NEO-GTS-508: VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT for a depth image
+    /// when the feature is on and the device takes it with this format, usage and flags; else none.
+    vk::ImageCreateFlags SampleLocationsDepthFlag(vk::Format format, vk::ImageType type,
+                                                  vk::ImageUsageFlags usage,
+                                                  vk::ImageCreateFlags flags) const;
 
     /// Returns true when geometry shaders are supported by the device
     bool IsGeometryStageSupported() const {
@@ -754,6 +788,9 @@ private:
     bool amd_mixed_attachment_samples{};
     bool nv_coverage_reduction{}; ///< NEO-GT7-016
     std::vector<CoverageReduction::Combination> truncate_combinations; ///< NEO-GT7-016
+    bool sample_locations{}; ///< NEO-GTS-508
+    vk::PhysicalDeviceSampleLocationsPropertiesEXT sample_locations_properties{}; ///< NEO-GTS-508
+    std::array<vk::Extent2D, 5> sample_location_grids{}; ///< NEO-GTS-508: 1, 2, 4, 8, 16 samples
     bool shader_atomic_float{};
     bool shader_atomic_float2{};
     bool workgroup_memory_explicit_layout{};

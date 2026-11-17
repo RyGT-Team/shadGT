@@ -2479,6 +2479,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    if (pipeline->SampleLocationSamples() != 0) {
+        DynState().ResendSampleLocations(cmdbuf); // NEO-GTS-508
+    }
 
     if (quad_triangles) {
         // Non-indexed quads index from 0 with the first vertex as the vertex offset, which
@@ -2795,6 +2798,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    if (pipeline->SampleLocationSamples() != 0) {
+        DynState().ResendSampleLocations(cmdbuf); // NEO-GTS-508
+    }
 
     if (is_indexed) {
         ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
@@ -6782,7 +6788,7 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
     UpdateViewportScissorState();
     UpdateDepthStencilState();
     UpdatePrimitiveState(is_indexed, quad_triangles);
-    UpdateRasterizationState();
+    UpdateRasterizationState(pipeline);
     UpdateColorBlendingState(pipeline);
 
     auto& dynamic_state = DynState(); // NAT-101
@@ -7105,10 +7111,29 @@ void Rasterizer::UpdatePrimitiveState(const bool is_indexed, const bool quad_tri
     dynamic_state.SetFrontFace(front_face);
 }
 
-void Rasterizer::UpdateRasterizationState() const {
+void Rasterizer::UpdateRasterizationState(const GraphicsPipeline* pipeline) const {
     const auto& regs = liverpool->DrawRegs();
     auto& dynamic_state = DynState(); // NAT-101
     dynamic_state.SetLineWidth(regs.line_control.Width());
+    dynamic_state.SetSampleLocations(SampleLocationPattern(pipeline)); // NEO-GTS-508
+}
+
+SampleLocations::Pattern Rasterizer::SampleLocationPattern(
+    const GraphicsPipeline* pipeline) const {
+    // NEO-GTS-508: PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0..X1Y1 (DIAG-GTS-507's decoding), for a
+    // pipeline with the dynamic sample-locations state; none for the others.
+    const u32 samples = pipeline ? pipeline->SampleLocationSamples() : 0;
+    if (samples == 0) {
+        return {};
+    }
+    constexpr u32 kLocs = 0xA2FE;
+    const auto& regs = liverpool->DrawRegs();
+    std::array<u32, 16> locs;
+    for (u32 i = 0; i < locs.size(); ++i) {
+        locs[i] = regs.reg_array[kLocs + i];
+    }
+    return SampleLocations::FromRegisters(locs, regs.aa_config.NumSamples(), samples,
+                                          instance.HasSampleLocationQuadGrid(samples));
 }
 
 void Rasterizer::UpdateColorBlendingState(const GraphicsPipeline* pipeline) const {

@@ -13,6 +13,7 @@
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
+#include "video_core/renderer_vulkan/sample_locations.h"
 #include "video_core/renderer_vulkan/vk_command_stream.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
@@ -131,6 +132,7 @@ struct DynamicState {
         bool color_write_masks : 1;
         bool line_width : 1;
         bool feedback_loop_enabled : 1;
+        bool sample_locations : 1; ///< NEO-GTS-508
     } dirty_state{};
 
     Viewports viewports{};
@@ -168,6 +170,8 @@ struct DynamicState {
     ColorWriteMasks color_write_masks{};
     float line_width{};
     vk::ImageAspectFlags feedback_loop_enabled{};
+    /// NEO-GTS-508: the draw's sample positions; samples 0 when its pipeline has none (static).
+    SampleLocations::Pattern sample_locations{};
 
     /// Commits the dynamic state to the provided command buffer.
     void Commit(const Instance& instance, const CmdBuf& cmdbuf);
@@ -350,6 +354,19 @@ struct DynamicState {
             dirty_state.feedback_loop_enabled = true;
         }
     }
+
+    /// NEO-GTS-508: every draw sets it (samples 0 for a pipeline without the state), so a
+    /// pipeline with it after one without sees a change.
+    void SetSampleLocations(const SampleLocations::Pattern& pattern) {
+        if (sample_locations != pattern) {
+            sample_locations = pattern;
+            dirty_state.sample_locations = true;
+        }
+    }
+
+    /// NEO-GTS-508: after an actual bind of a pipeline with the state. Commit runs before the
+    /// bind, and a pipeline bound since without the state (static) made the value undefined.
+    void ResendSampleLocations(const CmdBuf& cmdbuf);
 };
 
 using SessionFunc = Common::UniqueFunction<void>;

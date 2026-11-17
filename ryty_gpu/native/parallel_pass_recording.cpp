@@ -197,6 +197,9 @@ static bool RecordPassImpl(const Vulkan::CmdBuf& commands,const Vulkan::Instance
                 const auto t_pipeline_start = probe.Start();
 #endif
                 commands.bindPipeline(vk::PipelineBindPoint::eGraphics,draw.pipeline);bound_pipeline=draw.pipeline;
+                // NEO-GTS-508: a pipeline with the sample-locations state gets them again after
+                // its bind (Commit ran before it; samples 0 for pipelines without the state).
+                dynamic.ResendSampleLocations(commands);
 #if !defined(NDEBUG)
                 probe.Add(probe.local.pipeline_bind_ns,t_pipeline_start);
                 if(probe.enabled) ++probe.local.pipeline_change_count;

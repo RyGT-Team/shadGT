@@ -153,6 +153,11 @@ public:
     const ShaderObjectState& GetShaderObjectState() const noexcept {
         return so_state;
     }
+    /// NEO-GTS-508: the pipeline's sample count when it takes the game's sample positions
+    /// (dynamic VK_EXT_sample_locations state), else 0.
+    u32 SampleLocationSamples() const noexcept {
+        return sample_location_samples;
+    }
     const std::array<vk::ShaderEXT, 4>& ShaderObjects() const noexcept {
         return shader_objects;
     }
@@ -228,6 +233,7 @@ private:
     /// Vertex, tessellation control, tessellation evaluation and fragment shader objects.
     std::array<vk::ShaderEXT, 4> shader_objects{};
     ShaderObjectState so_state;
+    u32 sample_location_samples{}; ///< NEO-GTS-508
 
     GraphicsPipelineKey key;
     u32 lds_emulation{};

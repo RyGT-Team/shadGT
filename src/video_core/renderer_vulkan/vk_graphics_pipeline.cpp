@@ -600,6 +600,12 @@ GraphicsPipeline::GraphicsPipeline(
             !(fragment_stage && fs_info.PixelRate()),
         .alphaToCoverageEnable = key.alpha_to_coverage && writes_coverage_alpha,
     };
+    // NEO-GTS-508: with VK_EXT_sample_locations on (PS4 Pro mode), a multi-sample pipeline takes
+    // the game's sample positions, set per draw (dynamic state). Not for a count the device has
+    // no custom positions for, nor for shader objects (sample_location_samples stays 0 then).
+    const u32 raster_samples = static_cast<u32>(sdata.multisampling.rasterizationSamples);
+    const bool sample_locations =
+        raster_samples > 1 && instance.GetSampleLocationGrid(raster_samples).width != 0;
 
     const vk::PipelineViewportDepthClipControlCreateInfoEXT clip_control = {
         // FIX-GTS-443: 0..1 when the vertex shader converts the depth. A geometry shader's
@@ -641,9 +647,19 @@ GraphicsPipeline::GraphicsPipeline(
     } else if (!sdata.vertex_bindings.empty()) {
         dynamic_states.push_back(vk::DynamicState::eVertexInputBindingStride);
     }
+    // NEO-GTS-508: last in the list, and only in the fragment libraries and the whole pipeline:
+    // the vertex input and pre-rasterization libraries (and their keys) stay as they were.
+    const u32 pre_raster_dynamic_count = static_cast<u32>(dynamic_states.size());
+    if (sample_locations) {
+        dynamic_states.push_back(vk::DynamicState::eSampleLocationsEXT);
+    }
 
     const vk::PipelineDynamicStateCreateInfo dynamic_info = {
         .dynamicStateCount = static_cast<u32>(dynamic_states.size()),
+        .pDynamicStates = dynamic_states.data(),
+    };
+    const vk::PipelineDynamicStateCreateInfo pre_raster_dynamic_info = {
+        .dynamicStateCount = pre_raster_dynamic_count,
         .pDynamicStates = dynamic_states.data(),
     };
 
@@ -1064,6 +1080,7 @@ GraphicsPipeline::GraphicsPipeline(
                                 infos[u32(Shader::SwStage::Fragment)] != nullptr,
                                 independent_sets)) return;
     }
+    sample_location_samples = sample_locations ? raster_samples : 0; // NEO-GTS-508
 
 #ifndef NDEBUG
     if (instance.IsShaderObjectEnabled()) {
@@ -1132,6 +1149,24 @@ GraphicsPipeline::GraphicsPipeline(
                                    : "combination not listed by the driver, MERGE kept");
             }
         }
+    }
+    // NEO-GTS-508: custom sample locations, their values dynamic (sampleLocationsInfo ignored).
+    // In the interface library's state (in front of NEO-GT7-016's coverage reduction) and in the
+    // fragment library's, so both keep the same sample-locations state
+    // (VUID-VkGraphicsPipelineCreateInfo-pLibraries-06636/09567). sdata.multisampling, stored
+    // with the pipeline and given to the vertex input and pre-rasterization libraries, never
+    // carries it (nor a pointer).
+    vk::PipelineSampleLocationsStateCreateInfoEXT output_sample_locations{
+        .sampleLocationsEnable = VK_TRUE,
+    };
+    const vk::PipelineSampleLocationsStateCreateInfoEXT fragment_sample_locations{
+        .sampleLocationsEnable = VK_TRUE,
+    };
+    vk::PipelineMultisampleStateCreateInfo fragment_multisampling = sdata.multisampling;
+    if (sample_locations) {
+        output_sample_locations.pNext = output_multisampling.pNext;
+        output_multisampling.pNext = &output_sample_locations;
+        fragment_multisampling.pNext = &fragment_sample_locations;
     }
 
     const vk::GraphicsPipelineCreateInfo pipeline_info = {
@@ -1240,7 +1275,12 @@ GraphicsPipeline::GraphicsPipeline(
             part_info.pStages = nullptr;
             if (i != 3) {
                 // NEO-GT7-016: the coverage reduction is the interface library's alone.
-                part_info.pMultisampleState = &sdata.multisampling;
+                // NEO-GTS-508: the sample locations are the fragment libraries' alone.
+                part_info.pMultisampleState =
+                    i == 2 ? &fragment_multisampling : &sdata.multisampling;
+            }
+            if (i < 2) {
+                part_info.pDynamicState = &pre_raster_dynamic_info; // NEO-GTS-508
             }
             if (i == 1) {
                 part_info.stageCount = static_cast<u32>(pre_raster_stages.size());
@@ -1377,8 +1417,8 @@ GraphicsPipeline::GraphicsPipeline(
         pre_raster_key.Add(key.provoking_vtx_last);
         pre_raster_key.Add(key.depth_clip_enable);
         pre_raster_key.Add(key.clip_space);
-        for (const auto state : dynamic_states) {
-            pre_raster_key.Add(state);
+        for (const auto state : std::span{dynamic_states}.first(pre_raster_dynamic_count)) {
+            pre_raster_key.Add(state); // NEO-GTS-508: the pre-rasterization library's list
         }
 
         // AMD-320: libraries with and without link-time data are different libraries.
@@ -1393,6 +1433,9 @@ GraphicsPipeline::GraphicsPipeline(
         // Keep FS/fragment-output multisampling identical even without sample
         // shading. The old key could link a cached 1x FS library to 4x output.
         AddFragmentMultisampleKey(fragment_key, sdata.multisampling);
+        // NEO-GTS-508: a fragment library with custom sample locations is another library (also
+        // keyed by its dynamic state list below).
+        fragment_key.Add(sample_locations);
         fragment_key.Add(pipeline_rendering_ci.viewMask);
         // FIX-GT7-030: tessellated pipelines' libraries are not optimized (FIX-057): the others must
         // not draw with them.
@@ -2005,6 +2048,12 @@ void GraphicsPipeline::BindShaderObjects(
         cmd.setRasterizationSamplesEXT(s.samples);
         const vk::SampleMask mask = ~vk::SampleMask{0};
         cmd.setSampleMaskEXT(s.samples, &mask);
+    }
+    if (!p && instance.IsSampleLocationsOn() &&
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdSetSampleLocationsEnableEXT) {
+        // NEO-GTS-508: with VK_EXT_sample_locations enabled a shader-object draw must set this
+        // state. Shader objects keep the standard positions (sample_location_samples is 0).
+        cmd.setSampleLocationsEnableEXT(VK_FALSE);
     }
     if (!p && instance.IsCoverageTruncateOn()) {
         // NEO-GT7-016: with the coverage reduction feature on, a shader-object draw must have

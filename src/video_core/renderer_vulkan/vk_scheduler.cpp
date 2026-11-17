@@ -930,6 +930,18 @@ void DynamicState::Commit(const Instance& instance, const CmdBuf& cmdbuf) {
         dirty_state.feedback_loop_enabled = false;
         cmdbuf.setAttachmentFeedbackLoopEnableEXT(feedback_loop_enabled);
     }
+    if (dirty_state.sample_locations) {
+        ResendSampleLocations(cmdbuf); // NEO-GTS-508
+    }
+}
+
+void DynamicState::ResendSampleLocations(const CmdBuf& cmdbuf) {
+    dirty_state.sample_locations = false;
+    if (sample_locations.samples == 0) {
+        return;
+    }
+    std::array<vk::SampleLocationEXT, 64> storage;
+    cmdbuf.setSampleLocationsEXT(SampleLocations::ToVulkan(sample_locations, storage));
 }
 
 } // namespace Vulkan

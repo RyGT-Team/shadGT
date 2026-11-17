@@ -1865,8 +1865,9 @@ void NativeRenderer::ForgetBindings(Stream& s) {
 }
 
 u64 NativeRenderer::ReuseGeneration() const {
+    // FIX-GTS-503: a dropped sampler's handle may come back for another sampler.
     return registry->Generation() + unmap_generation.load(std::memory_order_relaxed) +
-           buffer_generation;
+           buffer_generation + samplers_dropped.load(std::memory_order_relaxed);
 }
 
 std::pair<vk::Buffer, u64> NativeRenderer::UploadBytes(u32 slot, const void* data, u32 size,
@@ -2645,7 +2646,11 @@ NativeRenderer::~NativeRenderer() {
         vk_device.destroyQueryPool(timing->pool);
     }
     views.clear();
+    sampler_lookup.clear(); // FIX-GTS-503: it points into the table
+    sampler_stand_in_lines.clear();
     samplers.clear();
+    retired_samplers.clear();
+    spare_samplers = {};
 }
 
 static bool FaultAheadEnabled() {
@@ -3214,15 +3219,38 @@ static float TemporalSamplerBias(const AmdGpu::Sampler& sampler, bool is_depth,
     return material ? bias : 0.0f;
 }
 
+// FIX-GTS-503: SHADGT_SAMPLER_JUNK_FILTER=0: an S# with reserved bits set gets a sampler of its
+// own, as before.
+static bool SamplerJunkFilterOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_SAMPLER_JUNK_FILTER");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
 vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& original,
                                        AmdGpu::BorderColorBuffer border, bool is_depth,
                                        bool explicit_lod) {
     auto sharp = original;
+    // FIX-GTS-503 (shadgt7's FIX-GT7-178): an S# with reserved bits set is not a sampler, and
+    // gets the default one. A shader's sampler slots are all bound before the draw, the ones it
+    // will not read too: GT7's depth-to-distance pass (ps 0x2a265dff) samples only in a branch
+    // that races leave off, the game writes nothing to that slot, and what the memory held
+    // before (floats, counts, addresses) came through here as some ten new sampler states a
+    // second: 2,778 of the 2,839 samplers made in 6 minutes on 11-13, against 61 for everything
+    // the game really reads. Reserved bits tell 64% of that junk and none of the game's 72 S#s;
+    // the rest is dropped once unused (RecycleSamplers).
+    if (sharp.HasReservedBits() && SamplerJunkFilterOn()) {
+        sharp = AmdGpu::Sampler{};
+        samplers_refused.fetch_add(1, std::memory_order_relaxed);
+    }
     if (is_depth && (DiagnosticPassOptions(frame).first & 1)) {
         sharp.depth_compare_func.Assign(AmdGpu::DepthCompare::Always);
     }
     // PERF-GT7-015 (C): the samplers this thread looked up last, by raw S#, without the lock and
-    // the hash map (a draw binds ~4; samplers live as long as the renderer).
+    // the hash map (a draw binds ~4). FIX-GTS-503: for the sampler epoch they were looked up in
+    // only: the first use in a new epoch goes through MakeSampler, which marks the sampler used.
     struct CachedSampler {
         std::array<u64, 2> sharp;
         u64 extra;
@@ -3230,6 +3258,7 @@ vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& original,
         const NativeRenderer* owner = nullptr;
         u64 epoch = 0;
         float resolution_bias{};
+        u64 recycle_epoch = 0;
     };
     const float resolution_bias = TemporalSamplerBias(sharp, is_depth, explicit_lod);
     static thread_local std::array<CachedSampler, 256> cached{};
@@ -3241,21 +3270,178 @@ vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& original,
     // (explicit_lod in the key: one S# read both ways would else evict itself from its slot)
     const u64 extra = (is_depth ? 1u : 0u) | (custom ? u64(border.Address()) << 1 : 0) |
                       (explicit_lod ? u64{1} << 63 : 0);
+    const u64 recycle_epoch = sampler_epoch.load(std::memory_order_acquire);
     if (NextMemoEnabled()) {
         cache = &cached[MemoHash(raw.data(), raw.size(), extra) & (cached.size() - 1)];
         if (cache->sampler && cache->owner == this &&
             cache->epoch == sampler_cache_epoch.load(std::memory_order_acquire) &&
-            cache->sharp == raw && cache->extra == extra &&
-            cache->resolution_bias == resolution_bias) {
+            cache->recycle_epoch == recycle_epoch && cache->sharp == raw &&
+            cache->extra == extra && cache->resolution_bias == resolution_bias) {
             return cache->sampler;
         }
     }
+    // FIX-GTS-503: the cache epoch read before the lookup: a drop during it moves the epoch on,
+    // and the entry stored here then never matches.
+    const u64 cache_epoch = sampler_cache_epoch.load(std::memory_order_acquire);
     const vk::Sampler sampler = MakeSampler(sharp, border, is_depth, resolution_bias);
     if (cache) {
-        *cache = {raw, extra, sampler, this, sampler_cache_epoch.load(std::memory_order_acquire),
-                  resolution_bias};
+        *cache = {raw, extra, sampler, this, cache_epoch, resolution_bias, recycle_epoch};
     }
     return sampler;
+}
+
+// FIX-GTS-503: SHADGT_SAMPLER_RECYCLE=0: no sampler is ever destroyed, and past the limit a
+// sampler already made stands in for every new state.
+static bool SamplerRecycleOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_SAMPLER_RECYCLE");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+// FIX-GTS-503: the sampler budget: the device's limit, 4000 at most with the recycling on (that
+// is NVIDIA's limit; AMD's and Intel's drivers allow many more, and with their own limit the
+// table would grow by the thousands of junk states an hour of racing brings and the recycling
+// would never run there: one budget, so every GPU takes the path the others were checked on).
+// SHADGT_TEST_SAMPLER_LIMIT=<n> (256 at least): a lower one for a test, reached within minutes.
+u32 NativeRenderer::SamplerLimit() const {
+    static const u32 limit = [this] {
+        constexpr u32 Budget = 4000;
+        const u32 reported = r.instance.GetMaxSamplerAllocationCount();
+        const u32 device = SamplerRecycleOn() ? std::min(reported, Budget) : reported;
+        const char* env = std::getenv("SHADGT_TEST_SAMPLER_LIMIT");
+        const u32 test = env && *env ? u32(std::strtoul(env, nullptr, 10)) : 0;
+        if (test == 0 || test >= device) {
+            return device;
+        }
+        const u32 lowered = std::max<u32>(test, 256);
+        LOG_WARNING(Render_Vulkan, "FIX-GTS-503: sampler limit {} for a test (the device's is {})",
+                    lowered, device);
+        return lowered;
+    }();
+    return limit;
+}
+
+// FIX-GTS-503: samplers dropped by one recycling pass, and destroyed by one call, at most. Junk
+// states come some ten a second and a pass at most every two seconds: 128 a second is ample.
+constexpr size_t SamplersAPass = 256;
+
+void NativeRenderer::RecycleSamplers() {
+    // FIX-GTS-503 (sampler_mutex held; shadgt7's FIX-GT7-174/177, never pushed there). A sampler
+    // per state, never destroyed, reached NVIDIA's 4000 within a long session, and FIX-GT7-002's
+    // stand-in, the last sampler made, then served every new state to the end: Spa's trees as
+    // opaque crowns (11-13), colours everywhere and a blue sky on the merge (11-17). Here the
+    // samplers not handed out since the current epoch began are dropped, at most every two
+    // seconds; the epoch then moves on. Each is destroyed once the GPU passed the tick.
+    DestroyRetiredSamplers();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - sampler_epoch_start < std::chrono::seconds{2}) {
+        return;
+    }
+    const u64 epoch = sampler_epoch.load(std::memory_order_relaxed);
+    const u64 tick = r.scheduler.CurrentTick() + 1;
+    // SamplersAPass at most: the first pass of a session finds everything the table took to fill,
+    // and this runs under the lock every sampler lookup takes. What is left keeps its old epoch
+    // and goes with the next passes.
+    std::vector<const SamplerEntry*> gone;
+    gone.reserve(SamplersAPass);
+    for (auto it = samplers.begin(); it != samplers.end() && gone.size() < SamplersAPass;) {
+        if (it->second.epoch < epoch) {
+            // Kept descriptor sets written with it go before anything can bind them again
+            // (PERF-GTS-375: the recorder takes the note before its next lookup).
+            Native::DeadHandles::Note(static_cast<VkSampler>(it->second.sampler->Handle()));
+            gone.push_back(&it->second);
+            retired_samplers.emplace_back(tick, std::move(it->second.sampler));
+            it = samplers.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    sampler_epoch.store(epoch + 1, std::memory_order_release);
+    sampler_epoch_start = now;
+    sampler_stand_in_lines.clear(); // each was for the epoch that ends here
+    if (!gone.empty()) {
+        samplers_dropped.fetch_add(gone.size(), std::memory_order_acq_rel);
+        // Every memo holding a sampler handle (the thread caches, the job draws' proofs and
+        // sealed image batches) is keyed by this epoch: none outlives the drop.
+        sampler_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
+        // The raw S#s of the dropped states go with them: their lines point at entries that no
+        // longer exist. A junk S# is never asked for again, so nothing else would take its line
+        // out, some ten a second in a race.
+        std::ranges::sort(gone);
+        std::erase_if(sampler_lookup, [&gone](const auto& raw) {
+            return std::ranges::binary_search(gone, static_cast<const SamplerEntry*>(raw.second));
+        });
+    }
+}
+
+void NativeRenderer::DestroyRetiredSamplers() {
+    // sampler_mutex held. SamplersAPass at most a call, as the drops.
+    const u64 done = r.scheduler.GetWorkSemaphore()->KnownGpuTick();
+    for (u32 n = 0; n < SamplersAPass && !retired_samplers.empty() &&
+                    retired_samplers.front().first <= done;
+         ++n) {
+        retired_samplers.pop_front();
+    }
+}
+
+vk::Sampler NativeRenderer::StandInSampler(const AmdGpu::Sampler& state,
+                                           AmdGpu::BorderColorBuffer border, bool is_depth) {
+    // FIX-GTS-503. Only a sampler of the same kind will do: a plain one for a compare read, or
+    // one with another comparison, is not a worse picture but an undefined or an inverted one.
+    // Among those, what a wrong sampler costs, worst first: the levels of detail it may read
+    // (11-13: leaves read from mip 6 on were opaque hulls), the border it answers with outside a
+    // shadow map, its filters (11-09: blocks), then how it wraps and its anisotropy.
+    const auto likeness = [&](const AmdGpu::Sampler& made) {
+        int score = 0;
+        if (made.min_lod.Value() == state.min_lod.Value() &&
+            made.max_lod.Value() == state.max_lod.Value()) {
+            score += 32;
+        }
+        score += made.border_color_type.Value() == state.border_color_type.Value() ? 16 : 0;
+        score += made.lod_bias.Value() == state.lod_bias.Value() ? 8 : 0;
+        score += made.xy_mag_filter.Value() == state.xy_mag_filter.Value() ? 4 : 0;
+        score += made.xy_min_filter.Value() == state.xy_min_filter.Value() ? 4 : 0;
+        score += made.mip_filter.Value() == state.mip_filter.Value() ? 4 : 0;
+        score += made.clamp_x.Value() == state.clamp_x.Value() ? 1 : 0;
+        score += made.clamp_y.Value() == state.clamp_y.Value() ? 1 : 0;
+        score += made.clamp_z.Value() == state.clamp_z.Value() ? 1 : 0;
+        score += made.max_aniso.Value() == state.max_aniso.Value() ? 1 : 0;
+        return score;
+    };
+    SamplerEntry* best = nullptr;
+    int best_score = -1;
+    u64 best_key = 0;
+    for (auto& [key, entry] : samplers) {
+        if (entry.depth != is_depth) {
+            continue;
+        }
+        AmdGpu::Sampler made{};
+        std::memcpy(&made, entry.state.data(), sizeof(made));
+        if (is_depth && made.depth_compare_func.Value() != state.depth_compare_func.Value()) {
+            continue;
+        }
+        // The lowest key among equals: the same answer whatever order the table is walked in.
+        const int score = likeness(made);
+        if (score > best_score || (score == best_score && key < best_key)) {
+            best = &entry;
+            best_score = score;
+            best_key = key;
+        }
+    }
+    if (best) {
+        best->epoch = sampler_epoch.load(std::memory_order_relaxed);
+        return best->sampler->Handle();
+    }
+    // None of its kind in the table: one made from the state itself, outside the table (which
+    // is full), one for plain reads and one a comparison at most, within the 64 the limit
+    // leaves for the samplers the table doesn't count.
+    auto& spare = spare_samplers[is_depth ? 1 + u32(state.depth_compare_func.Value()) : 0];
+    if (!spare) {
+        spare = std::make_unique<VideoCore::Sampler>(r.instance, state, border, is_depth);
+    }
+    return spare->Handle();
 }
 
 vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
@@ -3267,12 +3453,35 @@ vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
                      (is_depth ? 0x9E3779B97F4A7C15ULL : 0) ^
                      (custom ? u64(border.Address()) << 1 : 0);
     static thread_local Native::EpochValueMemo<vk::Sampler> memo;
-    const auto epoch = sampler_cache_epoch.load(std::memory_order_acquire);
+    // FIX-GTS-503: the memo holds for one cache epoch (a drop moves it) and one recycling epoch
+    // (its first use in a new one goes through the table and marks the sampler used).
+    const auto epoch = (sampler_cache_epoch.load(std::memory_order_acquire) << 32) +
+                       sampler_epoch.load(std::memory_order_acquire);
     if (const auto found = memo.Find(this, epoch, hash)) return *found;
     std::scoped_lock lock{sampler_mutex};
     if (const auto it = sampler_lookup.find(hash); it != sampler_lookup.end()) {
-        memo.Store(this, epoch, hash, it->second);
-        return it->second;
+        // FIX-GTS-503: handed out in this epoch; the entry is written only when the epoch
+        // changed (this runs for many samplers of many draws).
+        SamplerEntry& entry = *it->second;
+        if (const u64 recycle = sampler_epoch.load(std::memory_order_relaxed);
+            entry.epoch != recycle) {
+            entry.epoch = recycle;
+        }
+        const vk::Sampler handle = entry.sampler->Handle();
+        memo.Store(this, epoch, hash, handle);
+        return handle;
+    }
+    if (const auto it = sampler_stand_in_lines.find(hash); it != sampler_stand_in_lines.end()) {
+        // FIX-GTS-503: the stand-in this S# got, without walking the table again. With the
+        // recycling on it holds for two seconds at most, then the S# is looked at afresh (a pass
+        // may have made room); with it off, to the end, as the stand-in always did.
+        if (it->second.epoch == sampler_epoch.load(std::memory_order_relaxed) &&
+            (!SamplerRecycleOn() ||
+             std::chrono::steady_clock::now() - sampler_epoch_start < std::chrono::seconds{2})) {
+            ++sampler_stand_ins;
+            return it->second.sampler;
+        }
+        sampler_stand_in_lines.erase(it);
     }
     // FIX-GT7-002: one Vulkan sampler per state the device sees. GT7's S#s differ in bits the
     // sampler doesn't use (performance hints, unused bits, the border colour table when the
@@ -3299,18 +3508,16 @@ vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
             custom_color = border.Address<std::array<float, 4>*>()[sharp.border_color_ptr.Value()];
         }
     }
-    const u32 limit = r.instance.GetMaxSamplerAllocationCount();
-    if (samplers.size() >= limit / 4 * 3) {
-        // Close to the limit: levels of detail in quarter steps.
-        const auto quarter = [](float lod) { return std::round(lod * 4.0f) * 64.0f; };
-        state.min_lod.Assign(u64(quarter(sharp.MinLod())));
-        state.max_lod.Assign(u64(quarter(sharp.MaxLod())));
-        state.lod_bias.Assign(u64(s64(quarter(sharp.LodBias()))) & 0x3fff);
-    } else {
-        state.min_lod.Assign(sharp.min_lod.Value());
-        state.max_lod.Assign(sharp.max_lod.Value());
-        state.lod_bias.Assign(sharp.lod_bias.Value());
-    }
+    // FIX-GTS-503 (shadgt7's FIX-GT7-177): the levels of detail as given, whatever the table
+    // holds. Past three quarters of the limit they used to go in quarter steps, and the usual top
+    // level, 0xFFF (15.996), rounded to 16 and wrapped to 0 in its 12 bits: such a sampler read
+    // mip 0 alone, and a state made before no longer matched its own S#s (11-13: 70 of the 72
+    // S#s GT7 really uses have that top level). The states never were the trouble: junk S#s are,
+    // and those are dropped.
+    state.min_lod.Assign(sharp.min_lod.Value());
+    state.max_lod.Assign(sharp.max_lod.Value());
+    state.lod_bias.Assign(sharp.lod_bias.Value());
+    const u32 limit = SamplerLimit();
     // GFX-GT7-001 (the launcher's Texture sharpness, SHADGT_TEXTURE_LOD_BIAS=<levels>): added to every
     // sampler's bias, negative for sharper textures. Compare samplers keep theirs: a bias sharpens
     // nothing in a shadow test.
@@ -3343,28 +3550,49 @@ vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
     };
     const Key key{state, custom_color, is_depth ? 1u : 0u};
     const u64 state_hash = XXH3_64bits(&key, sizeof(key));
-    auto& slot = samplers[state_hash];
-    if (!slot) {
-        if (samplers.size() + 64 > limit && !samplers.empty()) {
-            // At the limit: the last sampler made stands in (logged), rather than a failure.
+    auto it = samplers.find(state_hash);
+    if (it == samplers.end()) {
+        // FIX-GTS-503: past three quarters of the limit, the samplers no longer used go first.
+        const auto allocated = [&] { return samplers.size() + retired_samplers.size(); };
+        if (SamplerRecycleOn() && allocated() >= limit / 4 * 3) {
+            RecycleSamplers();
+        }
+        if (allocated() + 64 > limit && !samplers.empty()) {
+            // At the limit (FIX-GTS-503: every sampler in use for two seconds or still on the
+            // GPU): a sampler already made stands in (logged), rather than a failure: the one of
+            // its kind that reads most like the state asked for, not the last one made (which was
+            // whatever junk an unused slot held when the table filled). Not memoized: its line
+            // holds for this epoch only.
+            ++sampler_stand_ins;
             static std::atomic<u32> logged{};
             if (Sample(logged)) {
                 LOG_ERROR(Render_Vulkan, "FIX-GT7-002: {} samplers, the device's limit is {}",
-                          samplers.size(), limit);
+                          allocated(), limit);
             }
-            samplers.erase(state_hash);
-              memo.Store(this, epoch, hash, last_sampler);
-            return last_sampler;
+            const vk::Sampler stand_in = StandInSampler(state, border, is_depth);
+            if (sampler_stand_in_lines.size() > (1u << 16)) {
+                sampler_stand_in_lines.clear();
+            }
+            sampler_stand_in_lines.insert_or_assign(
+                hash, StandInLine{stand_in, sampler_epoch.load(std::memory_order_relaxed)});
+            return stand_in;
         }
-        slot = std::make_unique<VideoCore::Sampler>(r.instance, state, border, is_depth);
-        last_sampler = slot->Handle();
+        it = samplers
+                 .emplace(state_hash,
+                          SamplerEntry{std::make_unique<VideoCore::Sampler>(r.instance, state,
+                                                                            border, is_depth),
+                                       0, {state.raw0, state.raw1}, is_depth})
+                 .first;
+        ++samplers_made;
     }
+    it->second.epoch = sampler_epoch.load(std::memory_order_relaxed); // FIX-GTS-503
     if (sampler_lookup.size() > (1u << 20)) {
         sampler_lookup.clear();
     }
-    sampler_lookup.emplace(hash, slot->Handle());
-    memo.Store(this, epoch, hash, slot->Handle());
-    return slot->Handle();
+    sampler_lookup.insert_or_assign(hash, &it->second);
+    const vk::Sampler handle = it->second.sampler->Handle();
+    memo.Store(this, epoch, hash, handle);
+    return handle;
 }
 
 
@@ -12052,7 +12280,7 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     if (reuse) {
         s.binding_commands.Prepare(pipeline.GetLayout(), u32(bind_point),
             registry->Generation() + unmap_generation.load(std::memory_order_acquire) +
-                buffer_generation,
+                buffer_generation + samplers_dropped.load(std::memory_order_acquire), // FIX-GTS-503
             s.pipelines.InvalidationEpoch());
     }
     const auto stage_flags =
@@ -15058,6 +15286,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         // MirrorBuffer may process CPU writes after CommitPrepared. A changed
         // range invalidates both prepared bindings and vertices, not only vi.
         if(prepared->unmap_gen!=unmap_generation.load(std::memory_order_acquire) ||
+           prepared->sampler_drops!=samplers_dropped.load(std::memory_order_acquire) || // FIX-GTS-503
            !PreparedBuffersUntouched(*prepared,prepared->buffer_seq)) {
             from_prepared=false;prepared_vertices_valid=false;buffer_freshness_certified=false;
         } else {
@@ -15598,6 +15827,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         // The recorder owns log writes. Reuse only a successful check from this
         // Draw while its sequence is unchanged; otherwise scan the original ranges.
         if(!fast_reject && (prepared->unmap_gen!=unmap_generation.load(std::memory_order_acquire) ||
+           prepared->sampler_drops!=samplers_dropped.load(std::memory_order_acquire) || // FIX-GTS-503
            !(from_prepared && buffer_freshness_certified && buffer_log.Seq()==buffer_freshness_seq) &&
            !PreparedBuffersUntouched(*prepared,prepared->buffer_seq))) fast_reject=true;
         if(fast_reject) {
@@ -16222,11 +16452,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                                 else {
                                     if(diag)NATIVE_DIAGNOSTIC(++parallel->sampler_proof_misses);
                                     std::scoped_lock sampler_lock{sampler_mutex};
-                                    for(const auto& [key,value]:samplers) {if(diag)NATIVE_DIAGNOSTIC(++parallel->sampler_scan_steps);if(value && value->Handle()==info.sampler) {known=true;break;}}
+                                    for(const auto& [key,value]:samplers) {if(diag)NATIVE_DIAGNOSTIC(++parallel->sampler_scan_steps);if(value.sampler && value.sampler->Handle()==info.sampler) {known=true;break;}}
                                     if(known){parallel->sampler_proof.Insert(info.sampler,handle_key);if(diag)NATIVE_DIAGNOSTIC(++parallel->sampler_scan_positives);}
                                 }
                             } else {std::scoped_lock sampler_lock{sampler_mutex};
-                                for(const auto& [key,value]:samplers) if(value && value->Handle()==info.sampler) {known=true;break;}}
+                                for(const auto& [key,value]:samplers) if(value.sampler && value.sampler->Handle()==info.sampler) {known=true;break;}}
                             if(!known){descriptor_fail_reason=6;descriptor_safe=false;break;}
                         } else {
                             SampledProofTimer phase{parallel->proof_phases[2],phase_sample};
@@ -18489,6 +18719,7 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
     p->image_generation = registry->Generation();
     p->buffer_seq = buffer_log.Seq();
     p->unmap_gen = unmap_generation.load(std::memory_order_acquire);
+    p->sampler_drops = samplers_dropped.load(std::memory_order_acquire); // FIX-GTS-503
     p->bindings.push = UserData(regs);
     const u32 count = std::min<u32>(static_cast<u32>(stages.size()), Shader::MaxStageTypes - 1);
     std::array<StageResourceBindings, Shader::MaxStageTypes> plans{};
@@ -19701,7 +19932,9 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
             }
         }
     }
-    if (p.unmap_gen != unmap_generation.load(std::memory_order_acquire)) {
+    // FIX-GTS-503: nor bound with a sampler dropped since (counted as an unmap).
+    if (p.unmap_gen != unmap_generation.load(std::memory_order_acquire) ||
+        p.sampler_drops != samplers_dropped.load(std::memory_order_acquire)) {
         return reject(2);
     }
     trace.Next(1);
@@ -19853,7 +20086,8 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     // then reject the whole prepared draw before selecting its bindings or
     // dereferencing its vertex mirrors if any prepared range changed.
     Begin();
-    if (p.unmap_gen != unmap_generation.load(std::memory_order_acquire)) return reject(2);
+    if (p.unmap_gen != unmap_generation.load(std::memory_order_acquire) ||
+        p.sampler_drops != samplers_dropped.load(std::memory_order_acquire)) return reject(2); // FIX-GTS-503
     if (!PreparedBuffersUntouched(p, recheck_from)) return reject(4);
     // The viewport transform the shaders get, from the registers as recorded.
     trace.Next(7);
@@ -23807,6 +24041,24 @@ void NativeRenderer::Report() {
     }();
     if (!recorder_parts.empty()) {
         LOG_INFO(Render_Vulkan, "DIAG-GT7-005 (10 s): recorder ms a second in {}", recorder_parts);
+    }
+    {
+        // FIX-GTS-503: dropped samplers the GPU is done with go; the counts when they moved.
+        std::scoped_lock lock{sampler_mutex};
+        DestroyRetiredSamplers();
+        const std::array<u64, 4> counts{samplers_made,
+                                        samplers_dropped.load(std::memory_order_relaxed),
+                                        sampler_stand_ins,
+                                        samplers_refused.load(std::memory_order_relaxed)};
+        if (counts != sampler_report) {
+            LOG_INFO(Render_Vulkan,
+                     "FIX-GTS-503: {} samplers ({} more waiting for the GPU), limit {}; in all {} "
+                     "made, {} dropped, {} lookups served by a stand-in, {} lookups of an S# with "
+                     "reserved bits got the default sampler",
+                     samplers.size(), retired_samplers.size(), SamplerLimit(), counts[0],
+                     counts[1], counts[2], counts[3]);
+            sampler_report = counts;
+        }
     }
     const auto& registry_stats = registry->GetStats();
     const u64 uploads = registry_stats.uploads.load();

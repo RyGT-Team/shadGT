@@ -189,6 +189,11 @@ target_include_directories(shadps4_buffer_resource_test PRIVATE ${CMAKE_SOURCE_D
 target_link_libraries(shadps4_buffer_resource_test PRIVATE GTest::gtest_main fmt::fmt)
 gtest_discover_tests(shadps4_buffer_resource_test)
 
+add_executable(shadps4_sampler_sharp_test test_sampler_sharp.cpp)
+target_include_directories(shadps4_sampler_sharp_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_sampler_sharp_test PRIVATE GTest::gtest_main fmt::fmt)
+gtest_discover_tests(shadps4_sampler_sharp_test)
+
 add_executable(shadgt_imported_view_lease_test test_imported_view_lease.cpp)
 target_include_directories(shadgt_imported_view_lease_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(shadgt_imported_view_lease_test PRIVATE GTest::gtest_main)

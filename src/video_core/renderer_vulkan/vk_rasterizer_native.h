@@ -1540,6 +1540,7 @@ private:
         u64 image_generation = 0;
         u64 buffer_seq = 0;
         u64 unmap_gen = 0;
+        u64 sampler_drops = 0; ///< FIX-GTS-503
         DrawBindings bindings;
         // Private heap packet metadata; no NativeRenderer layout change.
         std::vector<Native::Parallel::SampledViewProof<vk::ImageView>> sampled_view_proofs;
@@ -1837,10 +1838,47 @@ private:
     std::deque<std::pair<u64, vk::DescriptorPool>> retiring_pools;
 
     std::mutex sampler_mutex;
-    /// FIX-GT7-002: by the state the device sees; sampler_lookup by the raw S#.
-    std::unordered_map<u64, std::unique_ptr<VideoCore::Sampler>> samplers;
-    std::unordered_map<u64, vk::Sampler> sampler_lookup;
-    vk::Sampler last_sampler{};
+    /// FIX-GT7-002: by the state the device sees; sampler_lookup by the raw S# (to that state).
+    /// FIX-GTS-503: each with the sampler epoch it was last handed out in.
+    struct SamplerEntry {
+        std::unique_ptr<VideoCore::Sampler> sampler;
+        u64 epoch = 0;
+        std::array<u64, 2> state{}; ///< the state it was made from (for a stand-in)
+        bool depth = false;
+    };
+    std::unordered_map<u64, SamplerEntry> samplers;
+    /// FIX-GTS-503: straight to the entry (a table's elements stay where they are); the lines
+    /// of a dropped entry go with it, in the same pass.
+    std::unordered_map<u64, SamplerEntry*> sampler_lookup;
+    /// FIX-GTS-503: with the table full of samplers in use, the sampler of the same kind (plain
+    /// or compare, and then the same comparison) that reads most like the state asked for; with
+    /// none of its kind, one made for it and kept apart, one a kind at most (sampler_mutex held).
+    vk::Sampler StandInSampler(const AmdGpu::Sampler& state, AmdGpu::BorderColorBuffer border,
+                               bool is_depth);
+    std::array<std::unique_ptr<VideoCore::Sampler>, 9> spare_samplers;
+    /// The stand-in a raw S# got, for the epoch it was chosen in (with the recycling on, two
+    /// seconds at most: the state gets a sampler of its own as soon as there is room).
+    struct StandInLine {
+        vk::Sampler sampler;
+        u64 epoch = 0;
+    };
+    std::unordered_map<u64, StandInLine> sampler_stand_in_lines;
+    /// FIX-GTS-503: near the limit, the samplers not handed out for a whole epoch (two seconds
+    /// or more) are dropped, and destroyed once the GPU passed the tick. The thread caches and
+    /// MakeSampler's memo count for the epoch they were filled in only.
+    std::atomic<u64> sampler_epoch{1};
+    std::chrono::steady_clock::time_point sampler_epoch_start{};
+    std::deque<std::pair<u64, std::unique_ptr<VideoCore::Sampler>>> retired_samplers;
+    /// Samplers dropped in all: binding memos and prepared draws made before a drop are not
+    /// used after it.
+    std::atomic<u64> samplers_dropped{0};
+    u64 samplers_made = 0;
+    u64 sampler_stand_ins = 0;
+    std::atomic<u64> samplers_refused{0}; ///< lookups of an S# with reserved bits
+    std::array<u64, 4> sampler_report{}; ///< made, dropped, stand-ins, refused at the last report
+    u32 SamplerLimit() const;
+    void RecycleSamplers();
+    void DestroyRetiredSamplers();
 
     std::mutex views_mutex;
     std::unordered_map<const Native::ImageEntry*, std::vector<ViewRecord>> views;

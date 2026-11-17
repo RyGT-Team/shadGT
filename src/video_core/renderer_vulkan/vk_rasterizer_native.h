@@ -946,7 +946,8 @@ private:
     std::unordered_map<VAddr, MirrorCandidate> mirror_candidates; ///< by page of the range start
     std::vector<std::pair<VAddr, VAddr>> pending_mirrors;          ///< made at a list's start
     VAddr mirror_promotion_resume = 0; ///< fairness hint for merged pending ranges
-    OptionalMirrorBudget mirror_promotion_budget; ///< shared across lists of this frame
+    OptionalMirrorBudget mirror_promotion_budget{
+        OptionalMirrorBudget::FromEnvironment()}; ///< shared across lists of this frame (PERF-GTS-525)
     std::unordered_map<u64, u64> mirror_writes;    ///< granule -> frame the CPU wrote a mirror there
     std::unordered_map<u64, u64> dynamic_granules; ///< granule -> frame it was found CPU-written
     /// PERF-GTS-386: granule -> how often a mirror over it was dropped as CPU-written.

@@ -3846,6 +3846,103 @@ void Install(u8* base) {
 
 } // namespace Gt7Presets
 
+// NEO-GTS-506: GT Sport's PS4 Pro options, one by one, with GT7's names (SHADGT_NEO_EXTRAS,
+// gt7_preset_options.h). GT Sport has no preset table: each option is its own test of the Pro
+// byte (0x1431c9572, set by the video init 0x141c6de30) and of the 4K byte (0x1431c9571, TV taller
+// than 1080). Read in Ghidra (GT Sport 1.69, RECHERCHE-OPTIONS-PRO-GTSPORT.md):
+// - blur: the race cameras' motion blur, which a Pro on a 1080p TV turns on (0x140862250..
+//   0x1408625c1 sets EffectParameter.motionblur.enable, +0x264, the field the launcher's
+//   "disable motion blur" option reads);
+// - replays60: 60 fps instead of 30 in the reduced-rate view (the replays, by the press of the
+//   time: not proven in the code), flag at 0x140861b59, applied at 0x1406452ea;
+// - lod: a view scale of 1.3 instead of 1.0 (+0x138, GT7's level-of-detail factor), chosen at
+//   0x14110fd51.
+// GT7's replayblur and garage60 have no GT Sport counterpart found. Unset: the game's own rules
+// (a Pro on a 1080p TV has the three, on a 4K TV none). Set: the listed options on, the others
+// off, in the base mode and either Pro mode. Still left to the game: VR, and the cameras whose
+// own flags ask for blur or 60 fps on any PS4. Not measured: the GPU cost of an option forced on
+// a base PS4 (rule: no frame over 50 ms, never under 30 fps).
+namespace GtsProOptions {
+
+using namespace Gt7PresetOptions;
+
+struct Site {
+    u64 rva;
+    std::vector<u8> original;
+    std::vector<u8> on;  ///< empty: left as it is when the option is on
+    std::vector<u8> off; ///< empty: left as it is when the option is off
+    const char* what;
+};
+
+void Install(u8* base) {
+    if (Common::IsGt7()) {
+        return;
+    }
+    const char* env = std::getenv("SHADGT_NEO_EXTRAS");
+    if (!env) {
+        return;
+    }
+    const uint32_t options = Parse(env, [](std::string_view unknown) {
+        std::fprintf(stderr, "[patch] NEO-GTS-506: unknown option '%.*s' in SHADGT_NEO_EXTRAS, "
+                             "ignored\n",
+                     static_cast<int>(unknown.size()), unknown.data());
+    });
+    const std::vector<u8> nop6{0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+    const Site sites[] = {
+        // blur: the 4K test no longer skips the forcing (jz -> two nops), the Pro test reads 1
+        // (mov dl,[Pro] -> mov dl,1); off: the jump to the Pro block goes (jnz -> six nops).
+        {0x862261, {0x74, 0x15}, {0x90, 0x90}, {}, "blur: also on a 4K TV"},
+        {0x86226a, {0x8a, 0x15, 0x02, 0x73, 0x96, 0x02}, {0xb2, 0x01, 0x90, 0x90, 0x90, 0x90}, {},
+         "blur: as on a Pro"},
+        {0x862272, {0x0f, 0x85, 0x23, 0x03, 0x00, 0x00}, {}, nop6, "blur: off on a Pro"},
+        // replays60: the 4K test jumps to the Pro test (jz -> jmp), which answers 1 (setnz al ->
+        // mov al,1); off: it answers 0 (xor al,al).
+        {0x861b44, {0x74, 0x13}, {0xeb, 0x13}, {}, "replays60: also on a 4K TV"},
+        {0x861b60, {0x0f, 0x95, 0xc0}, {0xb0, 0x01, 0x90}, {0x30, 0xc0, 0x90}, "replays60"},
+        // lod: the 4K test falls through (jz -> six nops) to the Pro test, which always jumps to the
+        // 1.3 (jnz -> jmp 0x141110fe4); off: the Pro test never jumps (1.0).
+        {0x110fd62, {0x0f, 0x84, 0xea, 0x0c, 0x00, 0x00}, nop6, {}, "lod: also on a 4K TV"},
+        {0x110fd6f, {0x0f, 0x85, 0x6f, 0x12, 0x00, 0x00}, {0xe9, 0x70, 0x12, 0x00, 0x00, 0x90},
+         nop6, "lod"},
+    };
+    const auto wanted = [&](const Site& site) {
+        const std::string_view what{site.what};
+        const uint32_t bit = what.starts_with("blur") ? Blur
+                             : what.starts_with("replays60") ? Replays60
+                                                             : Lod;
+        return (options & bit) != 0;
+    };
+    // Every site checked before any is changed: another executable version stays untouched.
+    for (const Site& site : sites) {
+        MEMORY_BASIC_INFORMATION info{};
+        const u8* target = base + site.rva;
+        if (!VirtualQuery(target, &info, sizeof(info)) || info.State != MEM_COMMIT ||
+            reinterpret_cast<uintptr_t>(target) + site.original.size() >
+                reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize ||
+            (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
+            std::memcmp(target, site.original.data(), site.original.size()) != 0) {
+            std::fprintf(stderr, "[patch] NEO-GTS-506: %s: bytes differ (another GT Sport "
+                                 "version), SHADGT_NEO_EXTRAS not applied\n",
+                         site.what);
+            return;
+        }
+    }
+    for (const Site& site : sites) {
+        const std::vector<u8>& bytes = wanted(site) ? site.on : site.off;
+        if (bytes.empty()) {
+            continue;
+        }
+        Apply(base, Patch{site.rva, site.original, bytes,
+                          std::string{"NEO-GTS-506 "} + site.what + (wanted(site) ? " on" : " off")});
+    }
+    std::fprintf(stderr, "[patch] NEO-GTS-506 GT Sport Pro options: blur %s, replays60 %s, lod %s "
+                         "(SHADGT_NEO_EXTRAS=%s)\n",
+                 options & Blur ? "on" : "off", options & Replays60 ? "on" : "off",
+                 options & Lod ? "on" : "off", env);
+}
+
+} // namespace GtsProOptions
+
 // FIX-GT7-162: launching a replay crashed once (a read of address 0 on a Job thread at GT7.exe
 // +0x1eaac3b). Each frame of an event, GT7's work module org_race (the std::function of
 // GTFramework::Organizer::Impl::initialize's lambda $_7, GT7.exe+0x1eaa5d0) sets the race sound
@@ -3990,6 +4087,7 @@ void RytyApplyGamePatches() {
     InstallIdleKeyboardClose(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     Gt7HdrStatus::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     Gt7Presets::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // NEO-GT7-014
+    GtsProOptions::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // NEO-GTS-506
     InstallWideCamera(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTriggerTelemetry(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTriggerTelemetryGt7(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));

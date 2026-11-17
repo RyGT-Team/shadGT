@@ -4469,12 +4469,30 @@ bool PipelineCache::RaceNeverWaits() {
     // Sport's 16384x16384 circuit shadow map, was otherwise lost for the whole race; the user's
     // rule: waits are allowed before the 3-2-1, never after it). Without the hook: the whole
     // race session.
+    // FIX-SGT-006: once a race session has reached its countdown, it stays "running" until the
+    // session ends. GAME-006 reads "not running" at a time trial's lap line too (finish), and
+    // there the ghost that appears after a lap waited for its new pipelines: GT Sport held its
+    // clocks 257 and 299 ms at that moment (FIX-044, fragment libraries of 310-360 ms). Only the
+    // loading and pre-race screen before the session's first countdown wait now.
+    // SHADGT_RACE_WAITS_AFTER_FINISH=1: waits come back at each finish, as before.
     static const bool enabled = [] {
         const char* env = std::getenv("SHADGT_RACE_NEVER_WAITS");
         return !(env && env[0] == '0');
     }();
-    return enabled && AsyncPipelines() && RytyGtsInRace() &&
-           (RytyRaceRunning() || !RytyRaceStartSignal());
+    static const bool waits_after_finish = [] {
+        const char* env = std::getenv("SHADGT_RACE_WAITS_AFTER_FINISH");
+        return env && env[0] == '1';
+    }();
+    static std::atomic<bool> session_started{false};
+    if (!RytyGtsInRace()) {
+        session_started.store(false, std::memory_order_relaxed);
+        return false;
+    }
+    const bool running = RytyRaceRunning();
+    if (running) session_started.store(true, std::memory_order_relaxed);
+    const bool started =
+        running || (!waits_after_finish && session_started.load(std::memory_order_relaxed));
+    return enabled && AsyncPipelines() && (started || !RytyRaceStartSignal());
 #else
     return false;
 #endif

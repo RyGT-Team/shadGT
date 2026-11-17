@@ -75,6 +75,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_WARM_COMPUTE_REFRESH|flag|Shader objects & caches|on for GT7, off for GT Sport|1 = on, 0 = off|Rewrites a warm-up compute recipe whose code changed when its build was slow, so startup warm-up builds current code (FIX-GT7-150).",
     // Shader compiling
     "RYGTSW1|SHADGT_CAPTURE_SCOPED_MENUS|flag|Shader compiling|on|exactly 0 = off; unsupported game versions keep the old waits|Tracks GT7 icon captures so menu pipeline-compile waits apply only while a capture runs. 0 keeps the old menu waits.",
+    "RYGTSW1|SHADGT_RACE_WAITS_AFTER_FINISH|flag|Shader compiling|off|1 = on|Lets draws wait for new shaders again when a race reports a finish or lap line (as before FIX-SGT-006); off, a race session never waits after its first countdown.",
     "RYGTSW1|SHADGT_QUICK_WAIT_US|int|Shader compiling|4000|microseconds per 16 ms (half of it in a race, half per draw at most); 0 = off|In keep-going mode a draw whose new pipeline is building waits this long at most, so pipelines the driver has cached draw at once instead of popping in (FIX-GTS-522).",
     "RYGTSW1|SHADGT_CATCH_UP_LOW|flag|Shader compiling|on|0 = catch-up uses every core at normal priority|During a compile catch-up, compiles use every core below normal priority; 0 widens them to every core instead.",
     "RYGTSW1|SHADGT_CATCH_UP_PACE|flag|Shader compiling|on|0 = off|Paces compile catch-up against the game's frame times; 0 turns the pacing off.",

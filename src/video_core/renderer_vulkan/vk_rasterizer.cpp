@@ -3786,7 +3786,7 @@ void Rasterizer::FrameDumpFlip() {
         }
         return;
     }
-    if (++frames_seen < (debug_frame_dump_active ? 1u : dump_frames)) {
+    if (++frames_seen < (debug_frame_dump_active ? VideoCore::DebugFrameDumpFrames() : dump_frames)) {
         FrameDumpEvent(fmt::format("---- flip {} ----", frames_seen));
         return;
     }

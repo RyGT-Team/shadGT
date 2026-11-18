@@ -67,6 +67,12 @@ function(ryty_add_library target output)
     target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}
         ${HOST_SHADERS_INCLUDE} ${IMGUI_RESOURCES_INCLUDE})
     add_dependencies(${target} host_shaders ImGui_Resources)
+    # DIAG-SGT-015: Nsight Systems ranges in the renderer libraries too (common/nvtx.h; builds
+    # without NDEBUG). Only shadps4 got them, so -DSHADGT_NVTX_INCLUDE left the .prx without any.
+    if (SHADGT_NVTX_INCLUDE)
+        target_include_directories(${target} PRIVATE "${SHADGT_NVTX_INCLUDE}")
+        target_compile_definitions(${target} PRIVATE SHADGT_NVTX)
+    endif()
     if (WIN32)
         target_link_libraries(${target} PRIVATE mincore wbemuuid)
         target_link_options(${target} PRIVATE /errorlimit:0)

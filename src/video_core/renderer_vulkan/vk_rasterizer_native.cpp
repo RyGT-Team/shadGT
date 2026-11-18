@@ -19871,6 +19871,25 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobGuestBuffer(VAddr address, u64 size,
                                                                          bool write,
                                                                          PreparedDraw& p) {
+    // FIX-SGT-009: FIX-SGT-004 for draws prepared on the game's job threads. Their reads took any
+    // region over a listed in-place range too, while GT7's GPU culling writes that memory in
+    // place: with SHADGT_NATIVE_PREPARE=1 the scenery drops came back, milder (only prepared draws
+    // took this path). A read there binds the imported view when one holds it; writes already go
+    // to the recorder (below), which keeps FIX-SGT-004's rule. SHADGT_LISTED_IN_PLACE=0: as before.
+    static const bool listed_only = [] {
+        const char* env = std::getenv("SHADGT_LISTED_IN_PLACE");
+        return !(env && env[0] == '0');
+    }();
+    if (listed_only && !write && std::ranges::any_of(InplaceRanges(), [&](const auto& range) {
+            return address < range.second && address + size > range.first;
+        })) {
+        if (auto* direct = r.buffer_cache.GetDirectMemory();
+            direct && direct->EnsureImported(address, size)) {
+            if (const auto found = direct->FindBuffer(address, size)) {
+                return std::pair{found->first->Handle(), found->second};
+            }
+        }
+    }
     {
         std::shared_lock map_lock{buffer_map_mutex};
         if (Region* region = RegionOver(address, size)) {

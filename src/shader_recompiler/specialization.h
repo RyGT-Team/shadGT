@@ -172,6 +172,27 @@ struct StageSpecialization {
                 if (empty_without_addressing && !desc.IsSpecial() && IsBoundEmpty(sharp)) {
                     bound_empty[binding - 1] = true; // ForEachSharp counted it already
                 }
+                // FIX-SGT-008: a V# whose last word has reserved bits or a type set is no buffer (an unused slot holding
+                // leftover floats, e.g. 44441916 00000000 c454de6c 3f800000 in GT7's car shader
+                // 0xc4fac70): its words changed from draw to draw and made a new permutation each
+                // time, so GT7 translated and compiled the same shaders again all session and their
+                // draws were skipped (endless popping). Such a slot is specialized as a default
+                // buffer. SHADGT_BUFFER_JUNK_FILTER=0: as before.
+                static const bool junk_filter = [] {
+                    const char* env = std::getenv("SHADGT_BUFFER_JUNK_FILTER");
+                    return !(env && env[0] == '0');
+                }();
+                // Only the last word's reserved bits and type count: GT7 keeps other data in the
+                // address's upper byte (_padding0) of buffers it really reads (fs 0x7e5778be:
+                // 11288000 00407010 00000001 18027204), which the hardware ignores.
+                if (junk_filter && !desc.IsSpecial() && (sharp._padding1 != 0 || sharp.type != 0)) {
+                    spec.stride = 0;
+                    spec.is_formatted = desc.is_formatted;
+                    spec.swizzle_enable = 0;
+                    spec.add_tid_enable = 0;
+                    spec.coherent = desc.buffer_type == BufferType::SharedMemory;
+                    return;
+                }
                 spec.stride =
                     !usage_known || info->buffer_stride_used[index] ? sharp.GetStride() : 0;
                 if (usage_known) {

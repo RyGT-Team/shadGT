@@ -337,6 +337,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_UPSCALE_RATIO|float|Frame pacing & present|upscale_ratio setting (0 = off)|1.0-4.0 (above 4 is clamped); below 1 = off|Render-resolution ratio for upscaling (e.g. 1.5); overrides the upscale_ratio setting.",
     // Rendering workarounds
     "RYGTSW1|SHADGT_ASPECT|string|Rendering workarounds|GPU.aspect_ratio config (game's 16:9 when unset)|auto, 21:9, 32:9, width:height or a number; overrides the config|Camera aspect ratio for screens wider or narrower than 16:9 (GTS-009). Overrides the launcher's aspect ratio option.",
+    "RYGTSW1|SHADGT_BUFFER_JUNK_FILTER|flag|Rendering workarounds|on|0 = off (as before: each such value makes a new shader permutation)|A buffer setting with reserved bits set is not one (an unused slot holding leftovers): its shader is specialized as for a default buffer instead of compiled again (FIX-SGT-008).",
     "RYGTSW1|SHADGT_BLOCK_NO_STORAGE_FALLBACK|flag|Rendering workarounds|off (fallback on)|1 = keep the old way (no fallback)|Set to 1 to disable the retry of BC6H images without storage use when the driver refuses them (FIX-232; textures went missing).",
     "RYGTSW1|SHADGT_CUBE_SAMPLER_CLAMP|flag|Rendering workarounds|on|0 = off|Cube map samplers clamp at the faces' edges (FIX-215); 0 turns it off.",
     "RYGTSW1|SHADGT_DIAG_GEQUAL_ALWAYS|flag|Rendering workarounds|off|any value = on (presence). Diagnostic builds only.|GREATER_EQUAL depth tests always pass (DIAG-227). Changes rendering; for diagnosis only.",

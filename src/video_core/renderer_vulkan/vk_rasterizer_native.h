@@ -984,19 +984,41 @@ private:
     /// guest memory read in place), valid while no region or mirror was made or dropped and no
     /// memory unmapped since (buffer_generation); a region or mirror with pages to copy in takes
     /// the full lookup.
-    struct BufferMemo {
+    /// PERF-SGT-018: one cache line an entry. The table is far larger than the CPU's caches, so a
+    /// lookup's first read of its entry waits for memory: that one compare was 3.7% of the
+    /// recorder's time in a GT7 race (Nsight Systems, GuestBuffer). The entry was 88 bytes, which
+    /// lay across two lines for most slots. The region and the mirror are never both set and share
+    /// one pointer; the flags, what was bound and which of the two the pointer is sit in the
+    /// offset's unused top bits (an offset into a buffer is far below 2^48).
+    struct alignas(64) BufferMemo {
+        static constexpr u64 OffsetMask = (u64{1} << 48) - 1;
         VAddr address = 0;
         u64 size = 0;
-        u32 flags = 0;
         u64 generation = ~u64{0};
         u64 hard_generation = 0; ///< PERF-GT7-047
         u64 log_seq = 0;
         vk::Buffer buffer{};
-        u64 offset = 0;
-        Region* region = nullptr;
-        Mirror* mirror = nullptr;
-        Bound bound = Bound::InPlace;
+        u64 offset_meta = 0; ///< offset | flags << 48 | bound << 50 | owner kind << 52
+        void* owner = nullptr; ///< the Region or the Mirror, by the owner kind
+
+        u32 Flags() const { return u32(offset_meta >> 48) & 3; }
+        Bound BoundAs() const { return Bound((offset_meta >> 50) & 3); }
+        u64 Offset() const { return offset_meta & OffsetMask; }
+        Region* RegionOf() const {
+            return ((offset_meta >> 52) & 3) == 1 ? static_cast<Region*>(owner) : nullptr;
+        }
+        Mirror* MirrorOf() const {
+            return ((offset_meta >> 52) & 3) == 2 ? static_cast<Mirror*>(owner) : nullptr;
+        }
+        bool Matches(VAddr at, u64 bytes, u32 flags) const {
+            return address == at && size == bytes && Flags() == flags;
+        }
+        static u64 Pack(u64 offset, u32 flags, Bound bound, Region* region, Mirror* mirror) {
+            return offset | u64(flags & 3) << 48 | u64(u8(bound) & 3) << 50 |
+                   u64(region ? 1 : mirror ? 2 : 0) << 52;
+        }
     };
+    static_assert(sizeof(BufferMemo) == 64);
     std::array<BufferMemo, 16384> buffer_memos{}; ///< OPT-006: 2048 thrashed
     u64 buffer_generation = 0;
     u64 buffer_hard_generation = 0; ///< PERF-GT7-047: what the change log doesn't tell
@@ -1915,6 +1937,24 @@ private:
 
     std::mutex views_mutex;
     std::unordered_map<const Native::ImageEntry*, std::vector<ViewRecord>> views;
+    /// PERF-SGT-021: the images of small textures in the game's per-frame memory, kept with
+    /// their views when their texture goes and given to the next texture of the same shape.
+    struct RecycledImage {
+        std::unique_ptr<Native::Rhi::Image> image;
+        std::vector<ViewRecord> records;
+        u32 usage = 0;
+        u64 features = 0;
+    };
+    std::mutex recycle_mutex; ///< taken after views_mutex when both are held
+    std::unordered_map<u64, u64> recycle_keys; ///< image handle -> shape key
+    /// shape key -> its free images, oldest first: taken in the order they came back, so the
+    /// images of a shape go round in a fixed order (and those of several shapes in step).
+    std::unordered_map<u64, std::deque<RecycledImage>> recycle_pool;
+    u32 recycle_free = 0;
+    /// image handle -> the views of an image taken from the pool, until its texture asks for one
+    std::unordered_map<u64, std::vector<ViewRecord>> recycle_views;
+    std::vector<const Native::ImageEntry*> recycle_live; ///< textures with such an image (views_mutex)
+    u64 recycle_taken = 0, recycle_made = 0, recycle_pooled = 0, recycle_early = 0;
     /// NAT-108: views of evicted images, destroyed once the GPU passed the tick.
     std::deque<std::pair<u64, vk::UniqueImageView>> retired_views;
     void EvictImages();
@@ -1998,6 +2038,31 @@ private:
                  reuse_diag_frame = 0, reuse_diag_window = 0;
         uint64_t reuse_diag_serial = ~uint64_t{0}, reuse_diag_frame_number = ~uint64_t{0};
         std::unordered_set<uint64_t> reuse_diag_in_list, reuse_diag_in_frame, reuse_diag_in_window;
+        /// DIAG-SGT-019: graphics sets by how their lookup went (not cacheable, no dynamic
+        /// buffers, kept set found, kept set not found), and for the not found ones which
+        /// kinds of key words differ from the nearest of the layout's last 64 new keys
+        /// (bit 0 buffer, 1 offset, 2 range, 3 write header, 4 sampler, 5 view, 6 layout).
+        std::array<uint64_t, 4> miss_diag_counts{};
+        std::array<uint64_t, 128> miss_diag_by_kinds{};
+        uint64_t miss_diag_first = 0, miss_diag_words = 0, miss_diag_remade = 0;
+        uint64_t miss_diag_new_view_sets = 0, miss_diag_new_buffer_sets = 0;
+        uint64_t miss_diag_new_range_sets = 0;
+        std::string miss_diag_samples;
+        uint32_t miss_diag_sampled = 0;
+        /// Kept sets dropped for a destroyed view, buffer, or other handle.
+        std::array<uint64_t, 3> miss_diag_drops{};
+        /// What each view shows (by handle), and the not found sets by the view that differs.
+        std::unordered_map<uint64_t, std::string> miss_diag_view_names;
+        std::unordered_map<std::string, uint32_t> miss_diag_view_misses;
+        /// Evicted pictures by kind, size and format, and all of them by address.
+        std::unordered_map<std::string, uint32_t> miss_diag_evicted, miss_diag_evicted_at;
+        struct MissDiagRecent {
+            std::vector<std::vector<uint64_t>> keys;
+            size_t next = 0;
+        };
+        std::unordered_map<uint64_t, MissDiagRecent> miss_diag_recent;
+        std::unordered_set<uint64_t> miss_diag_keys, miss_diag_views, miss_diag_buffers_seen,
+            miss_diag_ranges;
         u64 prepared_used = 0, prepared_missing = 0;
         std::array<u64, 5> prepared_rejected{};
         /// DIAG-GTS-401: prepared draws turned down for their pictures (log too short, a

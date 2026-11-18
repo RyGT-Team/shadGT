@@ -275,6 +275,32 @@ static PipelineCleanupWorker& PipelineRetirementWorker() {
     });
     return worker;
 }
+// PERF-SGT-017 (SHADGT_PIPELINE_OWNER_BATCH=0: as before): the recorder gave each spliced list's
+// pipeline keep-alives to the cleanup worker on their own, 1,670 times a second in a GT7 race: a
+// std::function allocation, the queue's lock and a wake system call each time (Nsight Systems:
+// ZwAlertThreadByThreadId under PipelineCleanupWorker::Enqueue), only for the worker to drop the
+// references. They are collected here and handed over 512 at a time or after 100 ms; a keep-alive
+// held a little longer changes nothing. Flushed before the worker is drained at shutdown.
+namespace {
+struct CompletedOwnerBatch {
+    std::mutex mutex;
+    std::vector<std::shared_ptr<const void>> owners;
+    std::chrono::steady_clock::time_point since{};
+};
+CompletedOwnerBatch& CompletedOwners() {
+    static CompletedOwnerBatch batch;
+    return batch;
+}
+void FlushCompletedPipelineOwners() {
+    std::vector<std::shared_ptr<const void>> owners;
+    {
+        auto& batch = CompletedOwners();
+        std::scoped_lock lock{batch.mutex};
+        owners.swap(batch.owners);
+    }
+    if (!owners.empty()) PipelineRetirementWorker().Enqueue([owners = std::move(owners)] {});
+}
+} // namespace
 
 
 namespace {
@@ -2949,6 +2975,7 @@ PipelineCache::~PipelineCache() {
     // Shutdown only: deliver all GPU-complete handoffs and drain before device teardown.
     scheduler.Finish();
     scheduler.PopPendingOperations();
+    FlushCompletedPipelineOwners(); // PERF-SGT-017
     PipelineRetirementWorker().Drain();
     SaveDriverCache(true);
 }
@@ -10071,7 +10098,26 @@ std::optional<std::vector<u32>> PipelineCache::GetShaderPatch(u64 hash, Shader::
 
 namespace Vulkan {
 void PipelineCache::ReleaseCompletedPipelineOwners(std::vector<std::shared_ptr<const void>> owners) {
-    PipelineRetirementWorker().Enqueue([owners = std::move(owners)] {});
+    static const bool batched = [] { // PERF-SGT-017
+        const char* env = std::getenv("SHADGT_PIPELINE_OWNER_BATCH");
+        return !(env && env[0] == '0');
+    }();
+    if (!batched) {
+        PipelineRetirementWorker().Enqueue([owners = std::move(owners)] {});
+        return;
+    }
+    if (owners.empty()) return;
+    bool flush;
+    {
+        auto& batch = CompletedOwners();
+        const auto now = std::chrono::steady_clock::now();
+        std::scoped_lock lock{batch.mutex};
+        if (batch.owners.empty()) batch.since = now;
+        batch.owners.insert(batch.owners.end(), std::make_move_iterator(owners.begin()),
+                            std::make_move_iterator(owners.end()));
+        flush = batch.owners.size() >= 512 || now - batch.since >= std::chrono::milliseconds{100};
+    }
+    if (flush) FlushCompletedPipelineOwners();
 }
 std::shared_ptr<const void> PipelineCache::KeepAlive(const GraphicsPipeline* pipeline) const {
     if (!pipeline) return {};

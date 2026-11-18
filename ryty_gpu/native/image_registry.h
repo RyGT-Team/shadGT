@@ -419,6 +419,10 @@ public:
     /// FIX-157: `keep` may keep one past its idle time (asked with no lock held).
     u32 Evict(u64 before, const std::function<void(ImageEntry&)>& on_evict,
               const std::function<bool(ImageEntry&)>& keep = {}, u32 max_retired = ~u32{0});
+    /// PERF-SGT-021: frees these images, each if last used before frame `before` (recorder
+    /// only, as Evict). The caller names live entries.
+    u32 EvictListed(std::span<const ImageEntry* const> listed, u64 before,
+                    const std::function<void(ImageEntry&)>& on_evict);
     /// FIX-157: whether guest memory under a picture the GPU wrote still holds what it held
     /// when the picture was last uploaded from it (its content hash).
     bool MemoryUnchanged(const ImageEntry& entry);
@@ -486,6 +490,8 @@ private:
     std::shared_mutex granule_mutex;
     std::unordered_map<u64, std::vector<ImageEntry*>> granules;
     void IndexEntry(ImageEntry& entry);
+    u32 RetireTaken(std::vector<std::unique_ptr<ImageEntry>>& taken,
+                    const std::function<void(ImageEntry&)>& on_evict);
     void UnindexEntry(ImageEntry& entry);
     std::unique_ptr<Rhi::Buffer> TilingParamsBuffer(const VideoCore::ImageInfo& info);
 

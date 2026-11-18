@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <numeric>
+#include "ryty_gpu/native/buffer_sizes.h"
 #include "ryty_gpu/native/descriptor_dead_handles.h"
 
 #include "common/alignment.h"
@@ -74,6 +75,7 @@ UniqueBuffer::~UniqueBuffer() {
 void UniqueBuffer::Destroy() {
     if (buffer) {
         Native::DeadHandles::Note(static_cast<VkBuffer>(buffer)); // PERF-GTS-375
+        Native::BufferSizes::Forget(static_cast<VkBuffer>(buffer)); // PERF-SGT-020
     }
     if (allocation) {
         vmaDestroyBuffer(allocator, buffer, allocation);
@@ -125,6 +127,7 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
         buffer = Vulkan::Check(device.createBuffer(buffer_ci));
     }
 
+    Native::BufferSizes::Note(static_cast<VkBuffer>(buffer), buffer_ci.size); // PERF-SGT-020
     if (with_bda) {
         const vk::BufferDeviceAddressInfo bda_info = {
             .buffer = buffer,
@@ -140,6 +143,7 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
     : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, mem_type{MemoryType::HostUncached},
       buffer{instance.GetDevice(), instance.GetAllocator()} {
     buffer.buffer = imported;
+    Native::BufferSizes::Note(static_cast<VkBuffer>(imported), size_bytes); // PERF-SGT-020
     is_coherent = true;
 }
 

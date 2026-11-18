@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <stop_token>
+#include "ryty_gpu/native/buffer_sizes.h"
 #include "ryty_gpu/native/descriptor_dead_handles.h"
 #include <thread>
 #include <condition_variable>
@@ -413,6 +414,7 @@ std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindOrImportSpan(VAdd
         lease.reset();
         if (!wrapper_owns_buffer) {
             Native::DeadHandles::Note(buffer);
+            Native::BufferSizes::Forget(buffer); // PERF-SGT-020
             d.vkDestroyBuffer(device, buffer, nullptr);
         }
         if (!lease_owns_memory) {
@@ -686,6 +688,7 @@ bool DirectMemory::ImportView(VAddr address, VAddr want_end) {
         lease.reset();
         if (!wrapper_owns_buffer) {
             Native::DeadHandles::Note(buffer); // PERF-GTS-375
+            Native::BufferSizes::Forget(buffer); // PERF-SGT-020
             d.vkDestroyBuffer(device, buffer, nullptr);
         }
         if (!lease_owns_memory) {

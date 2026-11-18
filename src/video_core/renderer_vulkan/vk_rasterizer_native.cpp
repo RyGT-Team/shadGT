@@ -17,6 +17,7 @@
 #include "ryty_gpu/native/linear_image_download.h"
 #include "ryty_gpu/native/parallel_direct_capability.h"
 #include "ryty_gpu/native/parallel_gate_histogram.h"
+#include "ryty_gpu/native/buffer_sizes.h"
 #include "ryty_gpu/native/descriptor_dead_handles.h"
 #include "core/emulator_settings.h"
 #include "ryty_gpu/native/parallel_rotate_segment.h"
@@ -2931,7 +2932,24 @@ static bool CubeCompatible(const Instance& instance, u32 width, u32 height, u32 
            layers >= 6 && samples == 1;
 }
 
-Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bool) {
+static bool ListedInPlace(VAddr address, u64 size);
+
+// PERF-SGT-021 (SHADGT_RECYCLE_FRAME_TEXTURES=0: as before): GT7 writes a few small lookup
+// textures (30x17x16 and 4x4x48 R32G32Uint, a 512x256 R32Sfloat with mips) at a new address
+// of its per-frame memory in most frames. Each got a new image and view, so every draw that
+// samples one needed a new descriptor set: 30% of a race's sets, 15,000 a second, and the old
+// ones were dropped when the old texture went two seconds later (DIAG-SGT-019). Such a
+// texture now goes after an idle frame, and its image and views are kept for the next
+// one of the same shape: the view handle is the same and the kept sets are found again.
+static bool RecycleFrameTextures() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_RECYCLE_FRAME_TEXTURES");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bool render_target) {
     constexpr u64 GuestLimit = u64{1} << 40;
     if (FaultAheadEnabled() && info.guest_size && info.guest_address < GuestLimit &&
         info.guest_size <= GuestLimit - info.guest_address) {
@@ -3038,6 +3056,37 @@ Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bo
         .usage = usage,
         .initialLayout = vk::ImageLayout::eUndefined,
     };
+    u64 recycle_key = 0;
+    if (RecycleFrameTextures() && !render_target && info.guest_size != 0 &&
+        info.guest_size <= 1_MB && ListedInPlace(info.guest_address, info.guest_size)) {
+        const std::array<u64, 8> shape{
+            u64(static_cast<VkImageCreateFlags>(flags)),
+            u64(type) | u64(format) << 32,
+            u64(image_ci.extent.width) | u64(image_ci.extent.height) << 32,
+            u64(image_ci.extent.depth) | u64(image_ci.mipLevels) << 32,
+            u64(image_ci.arrayLayers) | u64(image_ci.samples) << 32,
+            u64(static_cast<VkImageUsageFlags>(usage)),
+            u64(static_cast<VkFormatFeatureFlags2>(features)),
+            u64(info.props.is_depth) | u64(info.props.has_stencil) << 1 |
+                u64(info.props.is_volume) << 2 | u64(info.pixel_format) << 32,
+        };
+        recycle_key = XXH3_64bits(shape.data(), sizeof(shape)) | 1;
+        std::scoped_lock lock{recycle_mutex};
+        if (const auto found = recycle_pool.find(recycle_key);
+            found != recycle_pool.end() && !found->second.empty()) {
+            auto& free = found->second.front();
+            made.image = std::move(free.image);
+            made.usage = free.usage;
+            made.features = free.features;
+            if (!free.records.empty()) {
+                recycle_views[made.image->NativeHandle()] = std::move(free.records);
+            }
+            found->second.pop_front();
+            --recycle_free;
+            ++recycle_taken;
+            return made;
+        }
+    }
     Native::Rhi::ImageDesc desc{};
     desc.dim = type == vk::ImageType::e3D ? Native::Rhi::ImageDim::D3 : Native::Rhi::ImageDim::D2;
     desc.format = Native::Rhi::FormatFromVk(static_cast<u32>(format));
@@ -3052,7 +3101,29 @@ Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bo
         *device, static_cast<const VkImageCreateInfo&>(image_ci), desc);
     made.usage = static_cast<u32>(static_cast<VkImageUsageFlags>(usage));
     made.features = static_cast<u64>(static_cast<VkFormatFeatureFlags2>(features));
+    if (recycle_key != 0 && made.image) {
+        std::scoped_lock lock{recycle_mutex};
+        recycle_keys[made.image->NativeHandle()] = recycle_key;
+        ++recycle_made;
+    }
     return made;
+}
+
+// DIAG-SGT-019 (SHADGT_DIAG_DESCRIPTOR_REUSE=1): what a view shows, for the report of the
+// descriptor sets that were not found. Called with views_mutex held.
+template <class Stats>
+static void DiagNameView(Stats& stats, const Native::ImageEntry& entry, vk::ImageView view) {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_DIAG_DESCRIPTOR_REUSE");
+        return env && env[0] == '1';
+    }();
+    if (!on) return;
+    const VAddr at = entry.info.guest_address;
+    stats.miss_diag_view_names[u64(static_cast<VkImageView>(view))] = fmt::format(
+        "{} {}x{} {} mips {} layers {} at {:#x}xxxxxx",
+        !entry.from_cpu ? "target" : "texture", entry.info.size.width, entry.info.size.height,
+        vk::to_string(entry.info.pixel_format), entry.info.resources.levels,
+        entry.info.resources.layers, at >> 24);
 }
 
 vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
@@ -3067,6 +3138,21 @@ vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
         r.FrameDumpEvent(fmt::format("scene-view id={} address={:#x} handle={:#x} use={} cached={} normalized_mip={}+{} normalized_layer={}+{} effective_min_lod={} min_lod_supported={} image_format={} requested_format={}",SceneTrace::Id(),entry.info.guest_address,reinterpret_cast<u64>(static_cast<VkImageView>(handle)),u32(use),cached,first,count,layer,layer_count,min_lod,r.instance.IsImageViewMinLodSupported(),u32(d.format),u32(requested.format)));
     };
     auto& records = views[&entry];
+    if (records.empty() && entry.image && RecycleFrameTextures()) {
+        // PERF-SGT-021: an image from the pool comes with its views
+        std::scoped_lock recycle_lock{recycle_mutex};
+        const u64 image_handle = entry.image->NativeHandle();
+        if (recycle_keys.contains(image_handle)) {
+            if (const auto kept = recycle_views.find(image_handle); kept != recycle_views.end()) {
+                records = std::move(kept->second);
+                recycle_views.erase(kept);
+                for (const auto& record : records) DiagNameView(stats, entry, *record.view);
+            }
+            if (std::ranges::find(recycle_live, &entry) == recycle_live.end()) {
+                recycle_live.push_back(&entry);
+            }
+        }
+    }
     for (const auto& record : records) {
         if (record.use == use && record.info == requested) {
             trace_view(*record.view,true);
@@ -3171,6 +3257,7 @@ vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
     trace_view(handle,false);
     if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-view-created id={} handle={:#x} format={} aspect={} type={}",SceneTrace::Id(),reinterpret_cast<u64>(static_cast<VkImageView>(handle)),u32(format),u32(aspect),u32(view_type)));
     records.push_back({requested, use, std::move(view)});
+    DiagNameView(stats, entry, handle); // DIAG-SGT-019
     return handle;
 }
 
@@ -8317,8 +8404,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
     BufferMemo& memo = buffer_memos[slot & (buffer_memos.size() - 1)];
     // PERF-GT7-047 (Will Scarlett): unrelated region/mirror changes do not
     // invalidate owned-range memos. In-place reads still take the full lookup.
-    if (memo.address == address && memo.size == size && memo.flags == flags &&
-        memo.generation != buffer_generation) {
+    if (memo.Matches(address, size, flags) && memo.generation != buffer_generation) {
         static const bool revalidate = [] {
             const char* env = std::getenv("SHADGT_NATIVE_BUFFER_REVALIDATE");
             return !(env && env[0] == '0');
@@ -8332,7 +8418,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
         // longer updated, and scenery dropped out every other culling run until a restart.
         // SHADGT_NATIVE_BUFFER_REVALIDATE=0 removed it. GT Sport lists no such ranges.
         const bool listed = ListedInPlace(address, size);
-        if (revalidate && !listed && (memo.region || memo.mirror) &&
+        if (revalidate && !listed && (memo.RegionOf() || memo.MirrorOf()) &&
             memo.hard_generation == buffer_hard_generation &&
             buffer_log.Seq() - memo.log_seq <= 64 &&
             buffer_log.Untouched(memo.log_seq, {&range, 1})) {
@@ -8340,28 +8426,29 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
             memo.log_seq = buffer_log.Seq();
         }
     }
-    if (memo.generation == buffer_generation && memo.address == address && memo.size == size &&
-        memo.flags == flags) {
-        if (memo.region || memo.mirror) {
+    if (memo.generation == buffer_generation && memo.Matches(address, size, flags)) {
+        Region* const memo_r = memo.RegionOf(); // PERF-SGT-018
+        Mirror* const memo_m = memo.MirrorOf();
+        if (memo_r || memo_m) {
             SortRegionWrites(); // CPU writes since: pages to copy in (may drop a mirror)
         }
-        const bool mirror_allowed = memo.generation == buffer_generation && (!memo.mirror || [&] {
+        const bool mirror_allowed = memo.generation == buffer_generation && (!memo_m || [&] {
             Native::CpuStackRegistry::Lease lease{Native::CpuStacks()};
-            return lease.Allowed(memo.mirror->begin, memo.mirror->end);
+            return lease.Allowed(memo_m->begin, memo_m->end);
         }());
         const bool fresh =
             mirror_allowed && memo.generation == buffer_generation &&
-            (!memo.region || memo.region->dirty_pages.empty()) &&
-            (!memo.mirror || memo.mirror->dirty_pages.empty());
+            (!memo_r || memo_r->dirty_pages.empty()) &&
+            (!memo_m || memo_m->dirty_pages.empty());
         if (fresh) {
-            if (memo.region) {
+            if (memo_r) {
                 NATIVE_DIAGNOSTIC(++stats.region_binds);
-            } else if (memo.mirror) {
+            } else if (memo_m) {
                 NATIVE_DIAGNOSTIC(++stats.mirror_binds);
-                memo.mirror->used_frame = frame;
+                memo_m->used_frame = frame;
             }
-            last_bound = memo.bound;
-            last_mirror = memo.mirror; // OPT-004
+            last_bound = memo.BoundAs();
+            last_mirror = memo_m; // OPT-004
             NATIVE_DIAGNOSTIC(++stats.buffer_memo_hits);
             if (BindSplitDiagOn() && last_bound != Bound::Mirror) { // DIAG-SGT-003
                 NoteBindSplit(address, size,
@@ -8377,7 +8464,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
                                                              : 4,
                                frame);
             }
-            return std::pair{memo.buffer, memo.offset};
+            return std::pair{memo.buffer, memo.Offset()};
         }
     }
     memo_kind = MemoKind::None;
@@ -8404,19 +8491,22 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
     if (result && memo_kind == MemoKind::Mirror) {
         last_mirror = memo_mirror; // OPT-004
     }
-    if (result && memo_kind != MemoKind::None) {
+    if (result && memo_kind != MemoKind::None && result->second <= BufferMemo::OffsetMask) {
+        // PERF-SGT-018: a mirror's pointer only when the lookup's kind says mirror, a region's only
+        // for a region, as the two separate fields held them.
+        Region* const keep_region = memo_region;
+        Mirror* const keep_mirror = keep_region ? nullptr : memo_mirror;
         memo = BufferMemo{
             .address = address,
             .size = size,
-            .flags = flags,
             .generation = buffer_generation,
             .hard_generation = buffer_hard_generation,
             .log_seq = buffer_log.Seq(),
             .buffer = result->first,
-            .offset = result->second,
-            .region = memo_region,
-            .mirror = memo_mirror,
-            .bound = last_bound,
+            .offset_meta = BufferMemo::Pack(result->second, flags, last_bound, keep_region,
+                                            keep_mirror),
+            .owner = keep_region ? static_cast<void*>(keep_region)
+                                 : static_cast<void*>(keep_mirror),
         };
     }
     return result;
@@ -12578,10 +12668,36 @@ static bool LateBindingsOn() {
     return on;
 }
 
+// PERF-SGT-020: the recorder's last looked-up buffer sizes. Emptied when handles die: the
+// driver may give a new buffer of another size the same handle value.
+namespace {
+struct BufferSizeCache {
+    std::array<std::pair<u64, u64>, 64> entries{};
+    u64 Get(vk::Buffer buffer) {
+        const u64 handle = u64(VkBuffer(buffer));
+        auto& entry = entries[((handle >> 4) ^ (handle >> 11)) & 63];
+        if (entry.first != handle) {
+            entry = {handle, Native::BufferSizes::Find(handle)};
+        }
+        return entry.second;
+    }
+};
+thread_local BufferSizeCache t_buffer_sizes;
+
+/// The range a buffer bound with a dynamic offset is written with: the next power of two
+/// (256 bytes or more) when the buffer still holds it from `offset`, or the range itself.
+u64 BucketRange(vk::Buffer buffer, u64 offset, u64 range) {
+    const u64 bucket = std::bit_ceil(std::max<u64>(range, 256));
+    if (bucket == range || bucket > (u64{1} << 30)) return range;
+    return offset + bucket <= t_buffer_sizes.Get(buffer) ? bucket : range;
+}
+} // namespace
+
 void NativeRenderer::LongSetsUpkeep() {
     if (!LongLivedSetsOn()) return;
     static thread_local std::vector<u64> dead;
     const bool some = Native::DeadHandles::Take(dead);
+    if (some) t_buffer_sizes.entries.fill({}); // PERF-SGT-020
     std::unique_lock<std::mutex> lock{long_sets_mutex, std::defer_lock};
     if (ParallelRecordingRequested()) lock.lock();
     if (some) DropLongSets(dead);
@@ -12839,6 +12955,9 @@ void NativeRenderer::DropLongSets(std::span<const u64> dead_handles) {
                 continue;
             }
             ++long_sets.dropped;
+            // DIAG-SGT-019: by what was destroyed (the sets are empty with the switch off)
+            ++stats.miss_diag_drops[stats.miss_diag_views.contains(handle) ? 0
+                                    : stats.miss_diag_buffers_seen.contains(handle) ? 1 : 2];
             if (layout == handle) {
                 ++long_sets.unused_sets; // its layout goes: no pipeline can use it again
             } else {
@@ -12991,6 +13110,19 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             NATIVE_DIAGNOSTIC(++descriptor_hash_reused);
         }
         u64 key_hash = cacheable ? prepared_key.hash : 0;
+        // PERF-SGT-020 (SHADGT_DYNAMIC_RANGE_BUCKETS=0: as before): a kept set's key held each
+        // buffer's exact range, and GT7's draws bind constant blocks of many sizes (about
+        // 11,000 different ranges in a race). With 13,600 views and 144 buffers that made
+        // 4 million different keys: 30% of a race's sets were new ones, made and written at
+        // 19,000 a second, and the table was emptied every 20 s at its 200,000 limit
+        // (DIAG-SGT-019). The range is rounded up to a power of two when the buffer still
+        // holds it from this draw's offset, in the key and in the written set.
+        static const bool range_buckets_on = [] {
+            const char* env = std::getenv("SHADGT_DYNAMIC_RANGE_BUCKETS");
+            return !(env && env[0] == '0');
+        }();
+        const bool bucket_ranges = range_buckets_on && long_sets_on && !long_sets_shared &&
+                                   !pending && cacheable && dynamic_buffers != 0;
         if (dynamic_buffers != 0) {
             // PERF-GTS-374: the offsets go to the bind; the set is looked up without them.
             auto& offsets = dynamic_offsets[index];
@@ -13013,6 +13145,11 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
                     }
                     offsets[entry.slot] = static_cast<u32>(offset);
                     dynamic_key[entry.word + 1] = 0;
+                    if (bucket_ranges) {
+                        dynamic_key[entry.word + 2] = BucketRange(
+                            vk::Buffer{reinterpret_cast<VkBuffer>(buffer)},
+                            offset, range);
+                    }
                 }
             } else
             for (const auto& write : writes) {
@@ -13062,6 +13199,104 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             stats.reuse_diag_frame += !stats.reuse_diag_in_frame.insert(loose).second;
             stats.reuse_diag_window += !stats.reuse_diag_in_window.insert(loose).second;
             stats.reuse_diag_exact += bool(s.descriptor_sets.Find(key_hash, descriptor_key));
+        }
+        // DIAG-SGT-019 (same switch): how each graphics set's lookup goes, and for a kept set
+        // that is not found: whether the same key was made before, whether it names a view,
+        // buffer or range never seen in a key, and which kinds of key words differ from the
+        // nearest recent new key of the same layout. Counts only.
+        if (reuse_diag && bind_point == vk::PipelineBindPoint::eGraphics && !long_sets_shared) {
+            if (!cacheable) {
+                ++stats.miss_diag_counts[0];
+            } else if (dynamic_buffers == 0 || !long_sets_on) {
+                ++stats.miss_diag_counts[1];
+            } else if (long_sets.entries.Find(key_hash, key_check)) {
+                ++stats.miss_diag_counts[2];
+            } else {
+                ++stats.miss_diag_counts[3];
+                stats.miss_diag_remade += !stats.miss_diag_keys.insert(key_hash).second;
+                static thread_local std::vector<u8> kinds;
+                kinds.assign(descriptor_key.size(), u8{3});
+                {
+                    size_t next = 1;
+                    for (const auto& write : writes) {
+                        next += 4;
+                        for (u32 n = 0; n < write.descriptorCount && next + 2 < kinds.size();
+                             ++n, next += 3) {
+                            const u8 first = write.pBufferInfo ? 0 : 4;
+                            kinds[next] = first;
+                            kinds[next + 1] = first + 1;
+                            kinds[next + 2] = first + 2;
+                        }
+                    }
+                }
+                bool new_view = false, new_buffer = false, new_range = false;
+                for (size_t w = 0; w < kinds.size(); ++w) {
+                    const u64 value = descriptor_key[w];
+                    if (kinds[w] == 5 && value) {
+                        new_view |= stats.miss_diag_views.insert(value).second;
+                    } else if (kinds[w] == 0 && value) {
+                        new_buffer |= stats.miss_diag_buffers_seen.insert(value).second;
+                    } else if (kinds[w] == 2) {
+                        new_range |= stats.miss_diag_ranges.insert(value).second;
+                    }
+                }
+                stats.miss_diag_new_view_sets += new_view;
+                stats.miss_diag_new_buffer_sets += new_buffer;
+                stats.miss_diag_new_range_sets += new_range;
+                auto& recent = stats.miss_diag_recent[u64(VkDescriptorSetLayout(layout))];
+                size_t best = ~size_t{0};
+                const std::vector<u64>* nearest = nullptr;
+                u32 best_kinds = 0;
+                for (const auto& old : recent.keys) {
+                    if (old.size() != descriptor_key.size()) continue;
+                    size_t differ = 0;
+                    u32 mask = 0;
+                    for (size_t w = 0; w < old.size(); ++w) {
+                        if (old[w] == descriptor_key[w]) continue;
+                        ++differ;
+                        mask |= 1u << kinds[w];
+                    }
+                    if (differ < best) {
+                        best = differ;
+                        best_kinds = mask;
+                        nearest = &old;
+                    }
+                }
+                if (!nearest) {
+                    ++stats.miss_diag_first;
+                } else {
+                    ++stats.miss_diag_by_kinds[best_kinds];
+                    stats.miss_diag_words += best;
+                    {
+                        std::scoped_lock names_lock{views_mutex};
+                        for (size_t w = 0; w < kinds.size(); ++w) {
+                            if (kinds[w] != 5 || (*nearest)[w] == descriptor_key[w]) continue;
+                            const auto name = stats.miss_diag_view_names.find(descriptor_key[w]);
+                            ++stats.miss_diag_view_misses[name == stats.miss_diag_view_names.end()
+                                                              ? std::string{"unnamed"}
+                                                              : name->second];
+                        }
+                    }
+                    if ((best_kinds & 4) && stats.miss_diag_sampled < 12 &&
+                        (stats.miss_diag_counts[3] & 0x3ff) == 1) {
+                        ++stats.miss_diag_sampled;
+                        for (size_t w = 2; w < kinds.size(); ++w) {
+                            if (kinds[w] != 2 || (*nearest)[w] == descriptor_key[w]) continue;
+                            stats.miss_diag_samples += fmt::format(
+                                " [{} words, word {}: range {:#x} was {:#x}, offset {:#x}, "
+                                "buffer {:#x} was {:#x}]",
+                                kinds.size(), w, descriptor_key[w], (*nearest)[w], key[w - 1],
+                                descriptor_key[w - 2], (*nearest)[w - 2]);
+                        }
+                    }
+                }
+                if (recent.keys.size() < 64) {
+                    recent.keys.emplace_back(descriptor_key.begin(), descriptor_key.end());
+                } else {
+                    recent.keys[recent.next++ % 64].assign(descriptor_key.begin(),
+                                                           descriptor_key.end());
+                }
+            }
         }
         // PERF-GTS-396: for a draw captured for a parallel pass too. They were left out, so
         // every draw a worker recorded had its sets made and written anew by the recorder (25
@@ -13196,6 +13431,9 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
                 for (u32 n = 0; n < update.descriptorCount; ++n) {
                     auto info = update.pBufferInfo[n];
                     if (update.dstBinding + n < dynamic_buffers && dynamic_offset_fits(info)) {
+                        if (bucket_ranges) { // PERF-SGT-020: as in the key
+                            info.range = BucketRange(info.buffer, info.offset, info.range);
+                        }
                         info.offset = 0;
                     }
                     dynamic_infos.push_back(info);
@@ -23171,7 +23409,7 @@ void NativeRenderer::EvictImages() {
         return true;
     };
     trace.Next(3);
-    registry->Evict(frame - KeepFrames, [&](Native::ImageEntry& entry) {
+    const auto on_evict = [&](Native::ImageEntry& entry) {
         if (kept_textures.erase(&entry) != 0) {
             kept_texture_bytes -= std::min<u64>(kept_texture_bytes,
                                                 std::max<u64>(entry.info.guest_size, 1));
@@ -23180,6 +23418,23 @@ void NativeRenderer::EvictImages() {
             VideoCore::PageManager::GetPageAddr(entry.info.guest_address),
             VideoCore::PageManager::GetNextPageAddr(
                 entry.info.guest_address + std::max<u64>(entry.info.guest_size, 1) - 1));
+        {
+            // DIAG-SGT-019: what is evicted (its kept descriptor sets go with it)
+            static const bool evict_diag = [] {
+                const char* env = std::getenv("SHADGT_DIAG_DESCRIPTOR_REUSE");
+                return env && env[0] == '1';
+            }();
+            if (evict_diag) {
+                ++stats.miss_diag_evicted[fmt::format(
+                    "{} {}x{} {} mips {} layers {}",
+                    !entry.from_cpu ? "target" : entry.sources.empty() ? "texture"
+                                                                       : "texture made of targets",
+                    entry.info.size.width, entry.info.size.height,
+                    vk::to_string(entry.info.pixel_format), entry.info.resources.levels,
+                    entry.info.resources.layers)];
+                ++stats.miss_diag_evicted_at[fmt::format("{:#x}", entry.info.guest_address)];
+            }
+        }
         if (entry.kept.load(std::memory_order_relaxed)) {
             u64& bytes = KeptShadowMapImage(entry.info) ? kept_shadow_bytes : kept_bytes; // FIX-GT7-153
             bytes -= std::min<u64>(bytes, std::max<u64>(entry.info.guest_size, 1));
@@ -23196,7 +23451,39 @@ void NativeRenderer::EvictImages() {
 #endif
         {
             std::scoped_lock lock{views_mutex};
-            if (const auto it = views.find(&entry); it != views.end()) {
+            std::erase(recycle_live, &entry);
+            // PERF-SGT-021: a per-frame texture's image and views are kept for the next one
+            // of its shape (nothing is destroyed: the kept descriptor sets stay good).
+            bool pooled = false;
+            if (entry.image && RecycleFrameTextures()) {
+                std::scoped_lock recycle_lock{recycle_mutex};
+                const u64 image_handle = entry.image->NativeHandle();
+                const auto key = recycle_keys.find(image_handle);
+                std::vector<ViewRecord> waiting;
+                if (const auto kept = recycle_views.find(image_handle); kept != recycle_views.end()) {
+                    waiting = std::move(kept->second); // taken from the pool and never viewed
+                    recycle_views.erase(kept);
+                }
+                if (key != recycle_keys.end() && entry.from_cpu && entry.sources.empty() &&
+                    recycle_free < 96) {
+                    RecycledImage free{std::move(entry.image), std::move(waiting),
+                                       entry.backend_usage, entry.backend_features};
+                    if (const auto it = views.find(&entry); it != views.end()) {
+                        if (!it->second.empty()) free.records = std::move(it->second);
+                        views.erase(it);
+                    }
+                    recycle_pool[key->second].push_back(std::move(free));
+                    ++recycle_free;
+                    ++recycle_pooled;
+                    pooled = true;
+                } else {
+                    if (key != recycle_keys.end()) recycle_keys.erase(key);
+                    for (auto& record : waiting) {
+                        retired_views.emplace_back(tick, std::move(record.view));
+                    }
+                }
+            }
+            if (const auto it = views.find(&entry); !pooled && it != views.end()) {
                 for (auto& record : it->second) {
                     retired_views.emplace_back(tick, std::move(record.view));
                 }
@@ -23214,9 +23501,28 @@ void NativeRenderer::EvictImages() {
             owners.erase(std::remove(owners.begin(), owners.end(), &entry), owners.end());
             it = owners.empty() ? stencil_owners.erase(it) : std::next(it);
         }
-    }, [&](Native::ImageEntry& entry) {
+    };
+    registry->Evict(frame - KeepFrames, on_evict, [&](Native::ImageEntry& entry) {
         return kept_textures.contains(&entry) || keep(entry) || keep_new_texture(entry);
     }, 16);
+    if (RecycleFrameTextures()) {
+        // PERF-SGT-021: per-frame textures go after a few idle frames, so a handful of
+        // images of each shape go round (not one for each of the last 120 frames).
+        constexpr u64 RecycleIdleFrames = 1;
+        static thread_local std::vector<const Native::ImageEntry*> idle;
+        idle.clear();
+        {
+            std::scoped_lock lock{views_mutex};
+            for (const auto* entry : recycle_live) {
+                if (entry->last_use.load(std::memory_order_relaxed) + RecycleIdleFrames < frame) {
+                    idle.push_back(entry);
+                }
+            }
+        }
+        if (!idle.empty()) {
+            recycle_early += registry->EvictListed(idle, frame - RecycleIdleFrames, on_evict);
+        }
+    }
     if (newly_kept != 0) {
         static std::atomic<u32> logged{};
         if (const u32 n = logged++; n < 20 || n % 100 == 0) {
@@ -25353,6 +25659,91 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
     stats.reuse_diag_sets = stats.reuse_diag_exact = stats.reuse_diag_list = 0;
     stats.reuse_diag_frame = stats.reuse_diag_window = 0;
     stats.reuse_diag_in_window.clear();
+    if (const auto& c = stats.miss_diag_counts; c[0] + c[1] + c[2] + c[3] != 0) {
+        static constexpr std::array<const char*, 7> names{"buffer", "offset", "range", "header",
+                                                          "sampler", "view", "layout"};
+        std::string text;
+        for (u32 mask = 0; mask < 128; ++mask) {
+            if (stats.miss_diag_by_kinds[mask] == 0) continue;
+            std::string which;
+            for (u32 bit = 0; bit < 7; ++bit) {
+                if (mask & (1u << bit)) {
+                    which += fmt::format("{}{}", which.empty() ? "" : "+", names[bit]);
+                }
+            }
+            text += fmt::format(" {} {};", which.empty() ? "same words" : which,
+                                stats.miss_diag_by_kinds[mask]);
+        }
+        const uint64_t compared = c[3] - stats.miss_diag_first;
+        LOG_INFO(Render_Vulkan,
+                 "DIAG-SGT-019 (10 s): graphics sets: {} not cacheable, {} without dynamic "
+                 "buffers, {} kept sets found, {} not found. Of the not found: {} had the key "
+                 "of a set made before; {} name a view never in a key before, {} a buffer, {} "
+                 "a range ({} views, {} buffers, {} ranges, {} keys seen in all). Against the "
+                 "nearest of the layout's last 64 new keys: {} had none; differing kinds:{} "
+                 "{:.1f} words differ on average. Range samples:{}",
+                 c[0], c[1], c[2], c[3], stats.miss_diag_remade, stats.miss_diag_new_view_sets,
+                 stats.miss_diag_new_buffer_sets, stats.miss_diag_new_range_sets,
+                 stats.miss_diag_views.size(), stats.miss_diag_buffers_seen.size(),
+                 stats.miss_diag_ranges.size(), stats.miss_diag_keys.size(),
+                 stats.miss_diag_first, text,
+                 compared ? double(stats.miss_diag_words) / double(compared) : 0.0,
+                 stats.miss_diag_samples);
+    }
+    stats.miss_diag_counts = {};
+    stats.miss_diag_by_kinds = {};
+    stats.miss_diag_first = stats.miss_diag_words = stats.miss_diag_remade = 0;
+    stats.miss_diag_new_view_sets = stats.miss_diag_new_buffer_sets = 0;
+    stats.miss_diag_new_range_sets = 0;
+    stats.miss_diag_samples.clear();
+    stats.miss_diag_sampled = 0;
+    if (const auto& d = stats.miss_diag_drops; d[0] + d[1] != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "DIAG-SGT-019 (10 s): kept sets dropped: {} for a destroyed view, {} for a "
+                 "destroyed buffer, {} for another handle",
+                 d[0], d[1], d[2]);
+    }
+    stats.miss_diag_drops = {};
+    if (!stats.miss_diag_view_misses.empty()) {
+        std::vector<std::pair<std::string, uint32_t>> sorted{stats.miss_diag_view_misses.begin(),
+                                                             stats.miss_diag_view_misses.end()};
+        std::ranges::sort(sorted, std::greater{}, &std::pair<std::string, uint32_t>::second);
+        std::string text;
+        for (size_t i = 0; i < sorted.size() && i < 20; ++i) {
+            text += fmt::format(" {} x{};", sorted[i].first, sorted[i].second);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "DIAG-SGT-019 (10 s): sets not found, by the view that differs ({} kinds):{}",
+                 sorted.size(), text);
+        stats.miss_diag_view_misses.clear();
+    }
+    {
+        std::scoped_lock recycle_lock{recycle_mutex};
+        if (recycle_taken + recycle_made + recycle_pooled != 0) {
+            LOG_INFO(Render_Vulkan,
+                     "PERF-SGT-021 (10 s): per-frame texture images: {} taken from the pool, {} "
+                     "made, {} put back ({} after a few idle frames); {} free, {} known",
+                     recycle_taken, recycle_made, recycle_pooled, recycle_early,
+                     recycle_free, recycle_keys.size());
+        }
+        recycle_taken = recycle_made = recycle_pooled = recycle_early = 0;
+    }
+    if (!stats.miss_diag_evicted.empty()) {
+        const auto top = [](std::unordered_map<std::string, uint32_t>& counts) {
+            std::vector<std::pair<std::string, uint32_t>> sorted{counts.begin(), counts.end()};
+            std::ranges::sort(sorted, std::greater{}, &std::pair<std::string, uint32_t>::second);
+            std::string text;
+            for (size_t i = 0; i < sorted.size() && i < 14; ++i) {
+                text += fmt::format(" {} x{};", sorted[i].first, sorted[i].second);
+            }
+            const size_t kinds = counts.size();
+            counts.clear();
+            return fmt::format("{} kinds:{}", kinds, text);
+        };
+        const std::string kinds = top(stats.miss_diag_evicted);
+        LOG_INFO(Render_Vulkan, "DIAG-SGT-019 (10 s): evicted pictures: {}. By address: {}",
+                 kinds, top(stats.miss_diag_evicted_at));
+    }
     if (stats.mirrors_made != 0) {
         LOG_INFO(Render_Vulkan,
                  "DIAG-GTS-387 (10 s): {} mirrors made ({:.1f} MB), {} of them over existing "

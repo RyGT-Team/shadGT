@@ -5407,13 +5407,43 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
     }
     merged.reserve(region_count);
     retired_watch_ranges.reserve(retired_watch_ranges.size() + region_count);
+    // FIX-SGT-012 (SHADGT_REGION_AVOID_LISTED=0: as before): a region never grows or merges into a
+    // listed in-place range the asked range does not reach and no region there holds already.
+    // FIX-SGT-004 sends binds in those ranges to guest memory, but a region could still cover
+    // them: in GT7's rain one grew to 0x101d8d9000-0x102ee1e000 (277 MB, 666 textures) over the
+    // GPU culling block 0x1020000000-0x1020412000. Its watched pages faulted on the compute
+    // queue's read pointer GT7 keeps there (0x1020000440, 0x10202355c0), and reads through the
+    // region met bytes the culling passes wrote in place: the road went dark for single frames,
+    // also while paused (shown by SHADGT_NATIVE_WRITE_REGIONS=0 and a Shift+F8 dump).
+    static const bool avoid_listed = [] {
+        const char* env = std::getenv("SHADGT_REGION_AVOID_LISTED");
+        return !(env && env[0] == '0');
+    }();
+    const auto takes_listed = [&](VAddr from, VAddr to) {
+        if (!avoid_listed) return false;
+        for (const auto& [listed_begin, listed_end] : NativeInplaceRanges()) {
+            if (from >= listed_end || to <= listed_begin) continue;
+            if (address < listed_end && address + size > listed_begin) continue; // asked for
+            bool held = false;
+            for (const auto& [base, other] : regions) {
+                if (other.begin < listed_end && other.end > listed_begin && other.begin < to &&
+                    other.end > from) {
+                    held = true;
+                    break;
+                }
+            }
+            if (!held) return true;
+        }
+        return false;
+    };
     {
         std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
         const auto action = Native::ReplaceOverlappingRegions(
             regions, begin, end, write, size, 1_GB,
             [&](VAddr from, VAddr to) {
                 return direct && to - from <= 1_GB && r.IsMappedStart(from) &&
-                       r.memory->IsValidGpuMapping(from, to - from);
+                       r.memory->IsValidGpuMapping(from, to - from) &&
+                       !takes_listed(from, to); // FIX-SGT-012
             }, [&](VAddr from, VAddr to) {
             region.begin = from;
             region.end = to;

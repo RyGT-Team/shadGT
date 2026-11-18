@@ -2077,6 +2077,121 @@ void InstallGt7CpuOcclusion(u8* base) {
                       "GAME-003 GT7 culls its scenery on the CPU, as GT Sport does"});
 }
 
+// GAME-008: GT7's job thread Job#0 never sleeps. Its idle loop (eboot 0x333cfe0 in version 1.71)
+// checks six job queues and a flag, runs a PAUSE and goes round again: on a PS4 it has its core to
+// itself, here it kept one core at 98-100% in menus and races alike (sampled: 57% of its time in
+// that loop, most of the rest polling a fence label). The loop's back edge (`je` at 0x333d08a,
+// taken when no queue has work) now goes through a stub that calls Gt7JobIdle first: after
+// SHADGT_GT7_JOB_IDLE_US of idling without a break (500), the thread sleeps
+// SHADGT_GT7_JOB_SLEEP_US (250) on a high-resolution timer per pass, until work comes. Any work
+// (a pass more than 50 us after the last) starts the count again. SHADGT_GT7_JOB_IDLE_US=0: off.
+constexpr u64 kGt7JobIdleBackEdge = 0x333d085; // cmp byte [r14+0x1a],0 ; je loop head
+constexpr u8 kGt7JobIdleBackEdgeCode[] = {0x41, 0x80, 0x7e, 0x1a, 0x00, 0x0f, 0x84, 0x50, 0xff,
+                                          0xff, 0xff};
+constexpr u64 kGt7JobIdleResume = 0x333cfe2; // the loop head after its PAUSE
+// push rax..r11 (volatile), pushfq; align; save xmm0-5; mov rax,<hook>; call rax; restore;
+// pause; jmp qword [rip] (the resume address follows the stub).
+constexpr u8 kGt7JobIdleStub[] = {
+    0x50, 0x51, 0x52, 0x56, 0x57, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53, 0x9c, 0x49,
+    0x89, 0xe3, 0x48, 0x83, 0xe4, 0xf0, 0x48, 0x81, 0xec, 0x90, 0x00, 0x00, 0x00, 0x4c, 0x89,
+    0x9c, 0x24, 0x80, 0x00, 0x00, 0x00, 0xf3, 0x0f, 0x7f, 0x44, 0x24, 0x20, 0xf3, 0x0f, 0x7f,
+    0x4c, 0x24, 0x30, 0xf3, 0x0f, 0x7f, 0x54, 0x24, 0x40, 0xf3, 0x0f, 0x7f, 0x5c, 0x24, 0x50,
+    0xf3, 0x0f, 0x7f, 0x64, 0x24, 0x60, 0xf3, 0x0f, 0x7f, 0x6c, 0x24, 0x70, 0x48, 0xb8, 0x88,
+    0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0xff, 0xd0, 0xf3, 0x0f, 0x6f, 0x44, 0x24, 0x20,
+    0xf3, 0x0f, 0x6f, 0x4c, 0x24, 0x30, 0xf3, 0x0f, 0x6f, 0x54, 0x24, 0x40, 0xf3, 0x0f, 0x6f,
+    0x5c, 0x24, 0x50, 0xf3, 0x0f, 0x6f, 0x64, 0x24, 0x60, 0xf3, 0x0f, 0x6f, 0x6c, 0x24, 0x70,
+    0x48, 0x8b, 0xa4, 0x24, 0x80, 0x00, 0x00, 0x00, 0x9d, 0x41, 0x5b, 0x41, 0x5a, 0x41, 0x59,
+    0x41, 0x58, 0x5f, 0x5e, 0x5a, 0x59, 0x58, 0xf3, 0x90, 0xff, 0x25, 0x00, 0x00, 0x00, 0x00};
+constexpr size_t kGt7JobIdleStubHook = 74; // the imm64 of `mov rax, <hook>`
+
+s64 g_job_idle_ticks = 0;  // continuous idling before a sleep, in QueryPerformanceCounter ticks
+s64 g_job_break_ticks = 0; // a pass this long after the last one found work in between
+s64 g_job_sleep_100ns = 0; // one sleep, in 100 ns units (negative: relative)
+
+void Gt7JobIdle() {
+    thread_local s64 last = 0, idle_from = 0;
+    thread_local HANDLE timer = nullptr;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (now.QuadPart - last > g_job_break_ticks) {
+        idle_from = now.QuadPart;
+    }
+    last = now.QuadPart;
+    if (now.QuadPart - idle_from < g_job_idle_ticks) {
+        return;
+    }
+    if (!timer) {
+        timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                       TIMER_ALL_ACCESS);
+    }
+    LARGE_INTEGER due;
+    due.QuadPart = -g_job_sleep_100ns;
+    if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+        WaitForSingleObject(timer, INFINITE);
+    } else {
+        SwitchToThread();
+    }
+    QueryPerformanceCounter(&now);
+    last = now.QuadPart; // still idle: the next pass sleeps again
+}
+
+void InstallGt7JobIdle(u8* base) {
+    u8* const edge = base + kGt7JobIdleBackEdge + kTextRvaShift;
+    if (!ReadableRange(edge, sizeof(kGt7JobIdleBackEdgeCode)) ||
+        std::memcmp(edge, kGt7JobIdleBackEdgeCode, sizeof(kGt7JobIdleBackEdgeCode)) != 0) {
+        return; // GT Sport, or another GT7 version
+    }
+    const auto read_us = [](const char* name, long long fallback) {
+        const char* env = std::getenv(name);
+        if (!env || !*env) return fallback;
+        char* end = nullptr;
+        const long long value = std::strtoll(env, &end, 10);
+        return end != env && value >= 0 ? value : fallback;
+    };
+    const long long idle_us = read_us("SHADGT_GT7_JOB_IDLE_US", 500);
+    const long long sleep_us = std::max(10LL, read_us("SHADGT_GT7_JOB_SLEEP_US", 250));
+    if (idle_us == 0) {
+        std::fprintf(stderr, "[patch] GAME-008: off (SHADGT_GT7_JOB_IDLE_US=0), Job#0 spins\n");
+        return;
+    }
+    LARGE_INTEGER frequency;
+    QueryPerformanceFrequency(&frequency);
+    g_job_idle_ticks = frequency.QuadPart * idle_us / 1000000;
+    g_job_break_ticks = frequency.QuadPart * 50 / 1000000;
+    g_job_sleep_100ns = sleep_us * 10;
+    u8* const stub = AllocNear(base);
+    if (!stub) {
+        std::fprintf(stderr, "[patch] GAME-008: no memory near the game's code, not applied\n");
+        return;
+    }
+    std::memcpy(stub, kGt7JobIdleStub, sizeof(kGt7JobIdleStub));
+    const void* const hook = reinterpret_cast<void*>(&Gt7JobIdle);
+    std::memcpy(stub + kGt7JobIdleStubHook, &hook, 8);
+    const u8* const resume = base + kGt7JobIdleResume + kTextRvaShift;
+    std::memcpy(stub + sizeof(kGt7JobIdleStub), &resume, 8);
+    FlushInstructionCache(GetCurrentProcess(), stub, sizeof(kGt7JobIdleStub) + 8);
+    // Only the je's rel32 changes: the loop's other entries (18 branches to 0x333cfe2) stay as
+    // they are.
+    u8* const rel = edge + 7;
+    const s64 offset = reinterpret_cast<s64>(stub) - reinterpret_cast<s64>(rel + 4);
+    if (offset < INT32_MIN || offset > INT32_MAX) {
+        std::fprintf(stderr, "[patch] GAME-008: stub out of reach, not applied\n");
+        return;
+    }
+    const s32 rel32 = static_cast<s32>(offset);
+    DWORD old_protect = 0;
+    if (!VirtualProtect(rel, 4, PAGE_EXECUTE_READWRITE, &old_protect)) {
+        return;
+    }
+    std::memcpy(rel, &rel32, 4);
+    DWORD ignored = 0;
+    VirtualProtect(rel, 4, old_protect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), edge, sizeof(kGt7JobIdleBackEdgeCode));
+    std::fprintf(stderr,
+                 "[patch] GAME-008: GT7 Job#0's idle loop sleeps %lld us after %lld us idle\n",
+                 sleep_us, idle_us);
+}
+
 void InstallMiscHooks(u8* base) {
 #ifndef NDEBUG
     const char* diag = Common::DiagEnv("SHADGT_ENV_DIAG");
@@ -4130,6 +4245,7 @@ void RytyApplyGamePatches() {
     InstallGt7RaceSignal(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // GAME-002
     InstallGtsRaceStartSignal(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // GAME-006
     InstallGt7CpuOcclusion(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // GAME-003
+    InstallGt7JobIdle(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));      // GAME-008
     Gt7Cipher::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));     // PERF-GT7-113
     Gt7RaceContextGuard::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // FIX-GT7-162
 #ifndef NDEBUG

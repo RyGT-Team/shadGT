@@ -27,6 +27,13 @@ struct TitleDefaults {
     // SHADGT_DRIVER_CACHE_MAX_MB: the driver cache file's size limit. GT Sport: 4096
     // (PERF-GTS-407). GT7: 2048 (FIX-GT7-049: the driver keeps the whole file in memory).
     u32 driver_cache_max_mb;
+    // FIX-SGT-010 (SHADGT_DRIVER_CACHE_ROTATE_MB): a driver cache file over this size is moved to
+    // .old at start and the driver starts an empty one. The driver never drops pipelines, so
+    // every renderer build that changes shader code adds a set the next builds never use, and
+    // the driver keeps the whole file in memory: GT7's had grown to 2.96 GB (15.0 GiB resident
+    // after 16 minutes; 11.8 GiB with a fresh cache, which was 229 MB after that session).
+    // GT Sport: 2048. GT7: 1024.
+    u32 driver_cache_rotate_mb;
     // GT7: the driver cache file also follows the pipeline cache setting.
     bool driver_cache_follows_pipeline_cache;
     // SHADGT_NATIVE_KEEP_TEXTURES_MB unset: idle textures kept up to an eighth of the device
@@ -51,6 +58,7 @@ constexpr TitleDefaults TitleDefaultsOf(Common::GameTitle title) {
             .prepared_draws_refused_with_lds = true,
             .native_chunk_mb = 1,
             .driver_cache_max_mb = 2048,
+            .driver_cache_rotate_mb = 1024,
             .driver_cache_follows_pipeline_cache = true,
             .kept_textures_from_vram_setting = true,
             .so_blend_on_nvidia = false,
@@ -63,6 +71,7 @@ constexpr TitleDefaults TitleDefaultsOf(Common::GameTitle title) {
             .prepared_draws_refused_with_lds = false,
             .native_chunk_mb = 64,
             .driver_cache_max_mb = 4096,
+            .driver_cache_rotate_mb = 2048,
             .driver_cache_follows_pipeline_cache = false,
             .kept_textures_from_vram_setting = false,
             .so_blend_on_nvidia = true,

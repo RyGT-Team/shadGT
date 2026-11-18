@@ -41,6 +41,8 @@ static_assert(!VideoCore::TitleDefaultsOf(GameTitle::Gt7).prepared_draws);
 static_assert(VideoCore::TitleDefaultsOf(GameTitle::Gt7).prepared_draws_refused_with_lds);
 static_assert(VideoCore::TitleDefaultsOf(GameTitle::Gt7).native_chunk_mb == 1);
 static_assert(VideoCore::TitleDefaultsOf(GameTitle::Gt7).driver_cache_max_mb == 2048);
+static_assert(VideoCore::TitleDefaultsOf(GameTitle::Gt7).driver_cache_rotate_mb == 1024); // FIX-SGT-010
+static_assert(VideoCore::TitleDefaultsOf(GameTitle::GtSport).driver_cache_rotate_mb == 2048);
 static_assert(VideoCore::TitleDefaultsOf(GameTitle::Gt7).driver_cache_follows_pipeline_cache);
 static_assert(VideoCore::TitleDefaultsOf(GameTitle::Gt7).kept_textures_from_vram_setting);
 static_assert(!VideoCore::TitleDefaultsOf(GameTitle::Gt7).so_blend_on_nvidia);

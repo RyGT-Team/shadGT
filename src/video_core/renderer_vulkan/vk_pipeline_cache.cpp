@@ -2969,6 +2969,47 @@ static u64 DriverCacheMaxBytes() {
     return limit;
 }
 
+// FIX-SGT-010 (SHADGT_DRIVER_CACHE_ROTATE_MB): a driver cache file over this size is moved to
+// .old at start and the driver begins an empty one (title_defaults.h has why). Unset: 1024 for
+// GT7, 2048 for GT Sport; 0 turns it off. Separate from the limit above, which the launcher sets
+// from the disk budget (up to 100 GB): that one only stops a larger file being loaded.
+static u64 DriverCacheRotateBytes() {
+    static const u64 limit = [] {
+        const char* env = std::getenv("SHADGT_DRIVER_CACHE_ROTATE_MB");
+        if (!env || !*env) {
+            return u64{VideoCore::CurrentTitleDefaults().driver_cache_rotate_mb} << 20;
+        }
+        const long long mb = std::strtoll(env, nullptr, 10);
+        return mb <= 0 ? u64{0} : u64(mb) << 20;
+    }();
+    return limit;
+}
+
+// FIX-SGT-010: moves an oversized driver cache to <file>.old (replacing an earlier .old) before it
+// is opened. Returns true when the file was moved, so the session starts and saves a fresh cache.
+static bool RotateOversizedDriverCache(const std::filesystem::path& path) {
+    const u64 rotate = DriverCacheRotateBytes();
+    if (rotate == 0) return false;
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error || size <= rotate) return false;
+    auto old = path;
+    old += ".old";
+    std::filesystem::remove(old, error);
+    error.clear();
+    std::filesystem::rename(path, old, error);
+    if (error) {
+        LOG_WARNING(Render_Vulkan, "FIX-SGT-010: driver cache {} is {} MB, over {} MB, but could "
+                    "not be moved to .old ({}); loading it as before",
+                    path.filename().string(), size >> 20, rotate >> 20, error.message());
+        return false;
+    }
+    LOG_WARNING(Render_Vulkan, "FIX-SGT-010: driver cache {} was {} MB, over {} MB: moved to {} "
+                "and starting an empty one (pipelines build again this session)",
+                path.filename().string(), size >> 20, rotate >> 20, old.filename().string());
+    return true;
+}
+
 // Bounded persistence is automatic; the environment variable is a diagnostic opt-out.
 static bool DriverCacheFileEnabled() {
 #ifndef NDEBUG
@@ -3075,6 +3116,7 @@ void PipelineCache::CreateDriverCache() {
         driver_cache_path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
             fmt::format("{}-{:04x}-{:04x}-{:08x}-{}.vkpipelinecache", serial,
                         identity.vendorID, identity.deviceID, identity.driverVersion, uuid);
+        RotateOversizedDriverCache(driver_cache_path); // FIX-SGT-010
         std::error_code exists_error;
         const bool existing_cache = std::filesystem::exists(driver_cache_path, exists_error);
         if (exists_error) rejected_driver_cache.store(true);

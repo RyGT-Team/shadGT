@@ -169,6 +169,7 @@ vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type);
 #include "video_core/renderer_vulkan/trace_residency.h"
 #include "video_core/renderer_vulkan/resident_prt_view.h"
 #ifdef _WIN32
+#include <intrin.h> // DIAG-SGT-013: _ReturnAddress
 #include <windows.h>
 #endif
 
@@ -5467,6 +5468,17 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
     }
     ++buffer_generation; // OPT-003: regions are taken in or made
     buffer_log.Note(begin, end); // OPT-010
+    // DIAG-SGT-013: a region that covers part of a listed in-place range, and what asked for it.
+    static std::atomic<u32> listed_regions_logged{0};
+    if (listed_regions_logged.load(std::memory_order_relaxed) < 24 &&
+        std::ranges::any_of(NativeInplaceRanges(), [&](const auto& range) {
+            return begin < range.second && end > range.first;
+        }) && listed_regions_logged.fetch_add(1, std::memory_order_relaxed) < 24) {
+        LOG_WARNING(Render_Vulkan,
+                    "DIAG-SGT-013: region {:#x}-{:#x} over a listed in-place range; asked {:#x}+{:#x} "
+                    "({}), {} regions taken in, frame {}",
+                    begin, end, address, size, write ? "write" : "read", merged.size(), frame);
+    }
     // GPU-only guest allocations need not have CPU-importable backing. They still need
     // storage for shader writes (including the terrain's persistent shadow map).
     // PERF-GT7-131 (SHADGT_REGION_COPY=0 off): a region over small mappings not imported yet (a
@@ -23218,6 +23230,25 @@ void NativeRenderer::WatchPages(VAddr address, u64 size) {
                     begin,end,fresh);
     }
 #endif
+    // DIAG-SGT-013: who write-protects pages in a listed in-place range (GT7's GPU culling block
+    // faulted on its compute queue pointer with FIX-SGT-012 in place). The first 24, with the
+    // caller's offset in libSceVideoOut.prx for symbolizing.
+    static std::atomic<u32> listed_logged{0};
+    if (fresh != 0 && listed_logged.load(std::memory_order_relaxed) < 24 &&
+        std::ranges::any_of(NativeInplaceRanges(), [&](const auto& range) {
+            return begin < range.second && end > range.first;
+        }) && listed_logged.fetch_add(1, std::memory_order_relaxed) < 24) {
+        HMODULE self{};
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&listed_logged), &self);
+        const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress()) -
+                            reinterpret_cast<uintptr_t>(self);
+        LOG_WARNING(Render_Vulkan,
+                    "DIAG-SGT-013: pages {:#x}-{:#x} in a listed in-place range watched ({} newly), "
+                    "caller libSceVideoOut.prx+{:#x}, frame {}",
+                    begin, end, fresh, caller, frame);
+    }
 }
 
 void NativeRenderer::UnwatchPages(VAddr begin, VAddr end) {

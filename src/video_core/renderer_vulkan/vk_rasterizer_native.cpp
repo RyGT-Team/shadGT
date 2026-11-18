@@ -8467,9 +8467,17 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     if (listed_only && std::ranges::any_of(InplaceRanges(), [&](const auto& range) {
             return address < range.second && address + size > range.first;
         })) {
-        if (auto* direct = r.buffer_cache.GetDirectMemory();
-            direct && direct->EnsureImported(address, size)) {
-            if (const auto found = direct->FindBuffer(address, size)) {
+        if (auto* direct = r.buffer_cache.GetDirectMemory()) {
+            std::optional<std::pair<const VideoCore::Buffer*, u64>> found;
+            if (direct->EnsureImported(address, size)) {
+                found = direct->FindBuffer(address, size);
+            }
+            // FIX-SGT-014: no view holds the whole binding (GT7's rain: 77-85 MB from
+            // 0x101d8d9490 through the culling block): one alias over it, not a region.
+            if (!found) {
+                found = direct->FindOrImportSpan(address, size);
+            }
+            if (found) {
                 last_bound = Bound::InPlace;
                 if (write) {
                     DropMirrors(address, size); // NAT-150: the GPU writes guest memory there

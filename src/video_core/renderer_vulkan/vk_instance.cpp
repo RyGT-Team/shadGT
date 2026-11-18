@@ -33,6 +33,9 @@
 #endif
 
 #include <vk_mem_alloc.h>
+#ifdef _WIN32
+#include <windows.h> // FIX-SGT-016: GetModuleHandleW
+#endif
 
 namespace Vulkan {
 
@@ -1647,6 +1650,16 @@ void Instance::CollectToolingInfo() const {
         // Intel: Causes crash on start.
         return;
     }
+    // FIX-SGT-016: Nsight Systems' Vulkan layer (ToolsInjection64.dll) wraps
+    // vkGetPhysicalDeviceToolProperties without a next layer to call: the call jumped to address 0
+    // inside the layer and nsys profile --trace=vulkan crashed GT7 before the title screen. The
+    // list only goes to the log, so it is skipped while that layer is loaded.
+#ifdef _WIN32
+    if (GetModuleHandleW(L"ToolsInjection64.dll") != nullptr) {
+        LOG_INFO(Render_Vulkan, "Attached debugging tool: Nsight Systems (tool list not queried)");
+        return;
+    }
+#endif
     const auto [tools_result, tools] = physical_device.getToolProperties();
     if (tools_result != vk::Result::eSuccess) {
         LOG_ERROR(Render_Vulkan, "Could not get Vulkan tool properties: {}",

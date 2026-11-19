@@ -54,11 +54,18 @@ From FEAT-GTS-415 on, an environment switch is named after where it takes effect
 ## Diagnostics stay out of Release builds (PERF-SGT-025)
 
 Diagnostic code (timers, counters, reports, traces, dumps, extra log lines, the hashes and
-containers that feed them) is built only in diagnostics builds: Debug and RelWithDebInfo, where
-`NDEBUG` is not defined. Release is what players run, and a diagnostic left in it costs every draw,
+containers that feed them) is built only in diagnostics builds, never in Release. Release is what
+players run, and a diagnostic left in it costs every draw,
 packet or job it sits on even when nobody reads it. PERF-SGT-025 removed about fifteen such costs
 from the hot paths: clock reads per dispatch, a lock per draw in Pro mode, a processor-number call
 per recorder job, a log line on every capability query.
+
+Two gates exist, and they differ in RelWithDebInfo:
+
+| Gate | Debug | RelWithDebInfo | Release |
+|---|---|---|---|
+| `SHADGT_DIAGNOSTICS` (CMake's `SHADGT_DIAGNOSTICS=AUTO`) | on | on | off |
+| no `NDEBUG` | on | off with CMake's default flags (`/DNDEBUG`); on when the flags leave it out (`-DCMAKE_CXX_FLAGS_RELWITHDEBINFO="/Zi /O2 /Ob1"`, the measurement build) | off |
 
 - **When you add a diagnostic** to find a bug or build a feature, gate it as you write it, with the
   same check its reader uses:

@@ -120,6 +120,8 @@ struct Totals {
     std::array<std::uint64_t, 8> runs{};
     std::array<std::uint64_t, 8> run_draws{};
     std::uint64_t run = 0;
+    /// OPT-010 prepared draws, by outcome (see PreparedOutcome).
+    std::array<std::uint64_t, 9> prepared{};
     /// Splices by the line that asked for them (the first 32 lines seen).
     std::array<std::pair<std::uint32_t, std::uint64_t>, 32> splice_lines{};
 };
@@ -143,6 +145,22 @@ inline void EndRun(Totals& totals) {
 }
 
 /// A draw's or dispatch's binding phase ended; `recorded`: it recorded resource work.
+/// What became of a direct draw's prepared bindings.
+enum PreparedOutcome : std::uint8_t {
+    PreparedFound,       ///< a prepared draw was taken for it
+    PreparedMissing,     ///< none was there (or one made for another draw)
+    PreparedRejected,    ///< CommitPrepared refused it: + the reason (pipeline, user data, unmap,
+                         ///< images, buffers), 5 entries
+    PreparedUsed = 7,    ///< bound from it
+    PreparedDropped = 8, ///< bound from it, then dropped when the vertices changed its buffers
+};
+
+inline void NotePrepared(std::uint32_t outcome) {
+    if (Enabled() && outcome < Local().prepared.size()) {
+        ++Local().prepared[outcome];
+    }
+}
+
 inline void NoteSplice(std::uint32_t line) {
     if (!Enabled()) {
         return;

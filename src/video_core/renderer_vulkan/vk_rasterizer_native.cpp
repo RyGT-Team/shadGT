@@ -15571,6 +15571,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             prepared = nullptr;
         }
         NATIVE_DIAGNOSTIC(stats.prepared_missing += prepared ? 0 : 1);
+        Native::OrderedTiming::NotePrepared(prepared ? Native::OrderedTiming::PreparedFound
+                                                     : Native::OrderedTiming::PreparedMissing);
     }
     if (!late_bound_done.empty()) { // PERF-GTS-398
         for (PreparedDraw* done : late_bound_done) FreePrepared(done);
@@ -16199,10 +16201,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
            prepared->sampler_drops!=samplers_dropped.load(std::memory_order_acquire) || // FIX-GTS-503
            !PreparedBuffersUntouched(*prepared,prepared->buffer_seq)) {
             from_prepared=false;prepared_vertices_valid=false;buffer_freshness_certified=false;
+            Native::OrderedTiming::NotePrepared(Native::OrderedTiming::PreparedDropped);
         } else {
             buffer_freshness_seq=buffer_log.Seq();
             buffer_freshness_certified=true;
         }
+    }
+    if (from_prepared) {
+        Native::OrderedTiming::NotePrepared(Native::OrderedTiming::PreparedUsed);
     }
     DrawBindings& b = from_prepared ? prepared->bindings : Ctx().bindings;
     // GT7-UW: a HUD draw showing a small picture drawn with depth this frame (the race's maps).
@@ -21026,6 +21032,7 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     }
     const auto reject = [&](u32 why) {
         NATIVE_DIAGNOSTIC(++stats.prepared_rejected[why]);
+        Native::OrderedTiming::NotePrepared(Native::OrderedTiming::PreparedRejected + why);
         return false;
     };
     if (p.pipeline != &pipeline) {
@@ -25306,6 +25313,14 @@ static void ReportOrderedFraction(u64 frame) {
     }
     LOG_INFO(Render_Vulkan, "DIAG-SGT-023 splices a frame by calling line (vk_rasterizer_native.cpp):{}",
              splices);
+    const auto per_frame = [&](u64 n) { return double(n) / frames; };
+    LOG_INFO(Render_Vulkan,
+             "DIAG-SGT-023 prepared draws a frame (OPT-010): found {:.1f}, none {:.1f}, used {:.1f}, "
+             "rejected for pipeline {:.1f}, user data {:.1f}, unmap {:.1f}, images {:.1f}, buffers "
+             "{:.1f}, dropped after the vertices {:.1f}",
+             per_frame(t.prepared[0]), per_frame(t.prepared[1]), per_frame(t.prepared[7]),
+             per_frame(t.prepared[2]), per_frame(t.prepared[3]), per_frame(t.prepared[4]),
+             per_frame(t.prepared[5]), per_frame(t.prepared[6]), per_frame(t.prepared[8]));
     t = {};
     last_frame = frame;
     last_ticks = ticks;

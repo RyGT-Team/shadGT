@@ -205,6 +205,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_NATIVE_STABLE_BINDINGS|flag|Native recorder & sync|on|exactly 0 = off|Re-runs binding when regions change during it, so a draw's bindings are consistent. 0 binds once.",
     "RYGTSW1|SHADGT_NATIVE_SUB_VERSIONS|flag|Native recorder & sync|on|0 = off|Tracks write versions per mip/layer instead of per image (FIX-208). 0 uses one version per image.",
     "RYGTSW1|SHADGT_NATIVE_VERTEX_NEAR|flag|Native recorder & sync|on|0 = off|Binds vertex attributes from the previous attribute's mirror without a lookup (OPT-004). 0 looks up each (FIX-178).",
+    "RYGTSW1|SHADGT_WAIT_DRAIN_ON_LABEL|flag|Native recorder & sync|on|0 = drain on every turn, as before|While a compute queue waits for a label, drains the recorder only after a write of that label is decoded (and every 64th turn), not on every turn (PERF-SGT-028).",
     "RYGTSW1|SHADGT_NATIVE_WAIT_NO_DRAIN|flag|Native recorder & sync|on|0 = drain the recorder at once|A queue waiting on a label yields until the recorder runs dry instead of draining it at once (PERF-GT7-046); 0 drains at once.",
     "RYGTSW1|SHADGT_NATIVE_WRITEBACK_BATCH|flag|Native recorder & sync|on|0 = off|Batches tiled image downloads into one buffer for write-back. 0 does each separately.",
     "RYGTSW1|SHADGT_NATIVE_WRITEBACK_COPY_EACH|flag|Native recorder & sync|off|1 = on|Copies each written-back picture into guest memory at once, as before PERF-GTS-462, instead of once per batch. Slower; for comparison.",

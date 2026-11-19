@@ -3,6 +3,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#if defined(_MSC_VER) || defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h> // PERF-SGT-028: _mm_pause
+#endif
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -1186,6 +1190,14 @@ void Liverpool::SyncRecorder(std::string_view reason) {
 
 void Liverpool::RecordLabelWrite(VAddr address, std::vector<u8> value,
                                  Common::UniqueFunction<void>&& work) {
+    if (waiting_queues != 0) { // PERF-SGT-028: a write over a label a compute queue waits on
+        for (size_t slot = 0; slot < waited_labels.size(); ++slot) {
+            const VAddr waited = waited_labels[slot];
+            if (waited != 0 && address <= waited && waited < address + value.size()) {
+                ++label_writes_over_wait[slot];
+            }
+        }
+    }
     if (!draw_pipe || value.empty() || address == 0) {
         Record(std::move(work));
         return;
@@ -1414,12 +1426,13 @@ void Liverpool::ReportDrawPipe() {
         LOG_WARNING(Render,
                     "DIAG-SGT-027 {} WAIT_REG_MEM drains in {:.1f} s: {} waits drained, ended "
                     "after the first drain by the label {} / by a recorded fence {}, {} looped; "
-                    "{} loop turns ({:.1f} a looping wait), {} with nothing handed to the "
-                    "recorder since the last drain (a recorded fence ended {} of those); a "
-                    "queued label write would have satisfied {} turns",
+                    "{} loop turns ({:.1f} a looping wait), {} of them drained ({} as a 64th-turn "
+                    "recheck); looping waits ended by a recorded fence {} / by the label {}; "
+                    "{:.1f} ms until the recorder ran dry before the first drain",
                     q == 0 ? "gfx" : "asc", seconds, t.packets, t.label_first, t.fence_first,
                     t.loops, t.turns, t.loops ? double(t.turns) / double(t.loops) : 0.0,
-                    t.turns_unchanged, t.fence_on_unchanged, t.pending_label);
+                    t.loop_drains, t.rechecks, t.loop_end_fence, t.loop_end_label,
+                    t.idle_wait_us / 1000.0);
     }
     wait_drains = {};
     waits_moved = 0;
@@ -3103,7 +3116,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
 #ifndef NDEBUG
                 if (waited) ++wait_drains[0].loops; // DIAG-SGT-027
-                u64 diag_pushed_at_drain = draw_pipe ? draw_pipe->PushedJobs() : 0;
 #endif
                 if (rasterizer && !wait_reg_mem->Test(regs.reg_array)) {
                     rasterizer->FlushForDeferredFences();
@@ -3116,15 +3128,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto diag_turn = [&] {
                     auto& tally = wait_drains[0];
                     ++tally.turns;
-                    const bool unchanged =
-                        draw_pipe && draw_pipe->PushedJobs() == diag_pushed_at_drain;
-                    tally.turns_unchanged += unchanged;
-                    tally.pending_label += PendingLabelSatisfies(*wait_reg_mem);
+                    ++tally.loop_drains;
                     SyncRecorder("wait reg mem");
-                    diag_pushed_at_drain = draw_pipe ? draw_pipe->PushedJobs() : 0;
                     const bool fence = !wait_reg_mem->Test(regs.reg_array) &&
                                        SatisfiedByPendingFence(rasterizer, wait_reg_mem);
-                    tally.fence_on_unchanged += unchanged && fence;
+                    tally.loop_end_fence += fence;
                     return !fence;
                 };
                 while (!wait_reg_mem->Test(regs.reg_array) && diag_turn()) {
@@ -3813,56 +3821,89 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 break;
             }
             // PERF-GT7-046: until the recorder has run dry, other queues decode.
+#ifndef NDEBUG
+            const auto diag_idle_from = std::chrono::steady_clock::now(); // DIAG-SGT-027
+#endif
             while (WaitsYieldToRecorder() && !wait_reg_mem->Test(regs.reg_array) &&
                    !draw_pipe->QueueIdle()) {
                 YIELD_ASC(vqid);
             }
+#ifndef NDEBUG
+            auto& tally = wait_drains[1]; // DIAG-SGT-027
+            tally.idle_wait_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - diag_idle_from).count();
+#endif
+            // PERF-SGT-028 (SHADGT_WAIT_DRAIN_ON_LABEL=0: every turn, as before): a looping wait
+            // drained the recorder on every turn, about 4,000 times a second in a GT7 race, and
+            // each drain held this thread until the recorder caught up with what the other
+            // queues had decoded meanwhile. A recorded fence only ends the wait once a write of
+            // the label has been decoded (every deferred fence starts as RecordLabelWrite), and in
+            // 1.1 million turns none ended one without such a write since the last drain
+            // (DIAG-SGT-027). The loop drains on those turns, and on every 64th turn still.
+            static const bool drain_on_label = [] {
+                const char* env = std::getenv("SHADGT_WAIT_DRAIN_ON_LABEL");
+                return !(env && env[0] == '0');
+            }();
+            const size_t slot = std::min<size_t>(vqid + 1, waited_labels.size() - 1);
+            waited_labels[slot] = reinterpret_cast<VAddr>(wait_reg_mem->Address<u32*>());
+            label_writes_over_wait[slot] = 0;
+            ++waiting_queues;
+            u64 label_writes_at_drain = 0;
+            u32 skipped = 0;
             // PERF-031: what is waited on may be written by recorded work; the pending-fence
             // check reads the rasterizer, which only the drained recorder lets the command use.
-#ifndef NDEBUG
-            // DIAG-SGT-027: the first drain and each loop turn, counted.
-            bool diag_in_loop = false;
-            u64 diag_pushed_at_drain = 0;
-#endif
-            const auto unmet = [&] {
+            const auto unmet = [&](bool first) {
                 if (wait_reg_mem->Test(regs.reg_array)) {
                     return false;
                 }
+                if (!first && drain_on_label &&
+                    label_writes_over_wait[slot] == label_writes_at_drain && ++skipped % 64 != 0) {
+                    // Nothing can have changed what the fence check says. The drain held this
+                    // thread while the recorder worked; a skipped turn pauses instead.
+                    if (skipped % 256 == 255) {
+                        std::this_thread::yield();
+                    } else {
+                        _mm_pause();
+                    }
+                    return true;
+                }
 #ifndef NDEBUG
-                auto& tally = wait_drains[1];
-                bool unchanged = false;
-                if (diag_in_loop) {
-                    ++tally.turns;
-                    unchanged = draw_pipe && draw_pipe->PushedJobs() == diag_pushed_at_drain;
-                    tally.turns_unchanged += unchanged;
-                    tally.pending_label += PendingLabelSatisfies(*wait_reg_mem);
-                } else {
+                if (first) {
                     ++tally.packets;
+                } else {
+                    ++tally.loop_drains;
+                    tally.rechecks += label_writes_over_wait[slot] == label_writes_at_drain;
                 }
 #endif
+                label_writes_at_drain = label_writes_over_wait[slot];
                 SyncRecorder("wait reg mem");
-#ifndef NDEBUG
-                diag_pushed_at_drain = draw_pipe ? draw_pipe->PushedJobs() : 0;
                 const bool label = wait_reg_mem->Test(regs.reg_array);
                 const bool fence = !label && SatisfiedByPendingFence(rasterizer, wait_reg_mem);
-                if (!diag_in_loop) {
+#ifndef NDEBUG
+                if (first) {
                     tally.label_first += label;
                     tally.fence_first += fence;
                     tally.loops += !label && !fence;
                 } else {
-                    tally.fence_on_unchanged += unchanged && fence;
+                    tally.loop_end_fence += fence;
                 }
-                diag_in_loop = true;
-                return !label && !fence;
-#else
-                return !wait_reg_mem->Test(regs.reg_array) &&
-                       !SatisfiedByPendingFence(rasterizer, wait_reg_mem);
 #endif
+                return !label && !fence;
             };
-            const bool waited = unmet();
-            while (waited && unmet()) {
+            const bool waited = unmet(true);
+            while (waited && unmet(false)) {
+#ifndef NDEBUG
+                ++tally.turns;
+#endif
                 YIELD_ASC(vqid);
             }
+#ifndef NDEBUG
+            if (waited) {
+                tally.loop_end_label += wait_reg_mem->Test(regs.reg_array);
+            }
+#endif
+            waited_labels[slot] = 0;
+            --waiting_queues;
             if (waited) {
                 RecordFrontendWait(FrontendWait::AscWaitRegMem,
                                    reinterpret_cast<uintptr_t>(wait_reg_mem->Address<u64*>()),

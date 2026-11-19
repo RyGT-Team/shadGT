@@ -476,11 +476,16 @@ private:
     /// the last drain; of those, turns a recorded fence ended (a skipped drain would have
     /// missed them); turns a queued label write would have satisfied.
     struct WaitDrainTally {
-        u64 packets, label_first, fence_first, loops, turns, turns_unchanged,
-            fence_on_unchanged, pending_label;
+        u64 packets, label_first, fence_first, loops, turns, loop_drains, rechecks,
+            loop_end_label, loop_end_fence, idle_wait_us;
     };
     std::array<WaitDrainTally, 2> wait_drains{};
 #endif
+    /// PERF-SGT-028: the label each waiting compute queue waits on (by vqid + 1), and the label
+    /// writes decoded over it since its wait began (RecordLabelWrite, on this thread).
+    std::array<VAddr, 16> waited_labels{};
+    std::array<u64, 16> label_writes_over_wait{};
+    u32 waiting_queues = 0;
     // PERF-035: commands from other threads run on the recorder instead of after a drain.
     u64 commands_recorded{};
     // PERF-048: waits on labels another queue writes, found after letting it decode first.

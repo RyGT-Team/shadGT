@@ -51,6 +51,35 @@ From FEAT-GTS-415 on, an environment switch is named after where it takes effect
   It renames exact switch names only (not macros such as `RYGT_SWITCH_EXPORT`), in code, comments
   and docs. `CHANGES.MD` and `CHANGELOG.md` keep the names of their time.
 
+## Diagnostics stay out of Release builds (PERF-SGT-025)
+
+Diagnostic code (timers, counters, reports, traces, dumps, extra log lines, the hashes and
+containers that feed them) is built only in diagnostics builds: Debug and RelWithDebInfo, where
+`NDEBUG` is not defined. Release is what players run, and a diagnostic left in it costs every draw,
+packet or job it sits on even when nobody reads it. PERF-SGT-025 removed about fifteen such costs
+from the hot paths: clock reads per dispatch, a lock per draw in Pro mode, a processor-number call
+per recorder job, a log line on every capability query.
+
+- **When you add a diagnostic** to find a bug or build a feature, gate it as you write it, with the
+  same check its reader uses:
+  - `#ifndef NDEBUG` / `#if !defined(NDEBUG)` around the code, or `NATIVE_DIAGNOSTIC(...)` in the
+    native renderer (a no-op under `NDEBUG`);
+  - `#ifdef SHADGT_DIAGNOSTICS`, or `Common::DiagEnv("SHADGT_DIAG_...")` for its switch, which is
+    `nullptr` at compile time in Release; `if constexpr (Common::DiagnosticsBuilt)` in code.
+  - A helper that times or counts (a scope object, a `Note...` function) compiles to nothing in
+    Release, as `Native::OrderedTiming` and `PartClock` do; don't rely on a run-time switch alone.
+- **The reader and the writer are gated together.** A counter, ring or timestamp whose only reader
+  is a debug report is dead work in Release; gate the writes, not just the report.
+- **A rate-limited or switch-guarded log still costs** its check, and anything built before the
+  `LOG_*` call (strings, hashes, locks) runs at every log level. Build it inside the gate.
+- **Functional work stays.** If a "diagnostic" also does something the game needs (a stalled
+  wait's fence flush, a sampler upkeep), keep that part in every build and make it cheap.
+- **When the work is done**, check what is left: build Release and look for the diagnostic's log
+  text in `libSceVideoOut.prx` (`grep -ac "<text>"` should find nothing), and say in the commit
+  that it is diagnostics-only.
+- Mark the switch's description line (below) "diagnostics builds only", under
+  `Diagnostics & tracing`.
+
 ## Every switch needs a description line
 
 The RyGT launcher's Advanced page lists the renderer's experimental switches by reading

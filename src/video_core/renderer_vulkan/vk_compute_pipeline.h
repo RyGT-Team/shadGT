@@ -63,8 +63,7 @@ public:
                                const std::filesystem::path& file, std::stop_token stop);
 
     void SetStageInfo(const Shader::Info& info) {
-        stages[int(Shader::SwStage::Compute)] = &info;
-        canonical_stages[int(Shader::SwStage::Compute)] = &info;
+        SetCanonicalStage(u32(Shader::SwStage::Compute), &info);
     }
 
 private:

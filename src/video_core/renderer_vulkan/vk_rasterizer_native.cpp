@@ -15606,7 +15606,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                    };
     const GraphicsPipeline* pipeline = [&]() -> const GraphicsPipeline* {
         PhaseClock clock{stats.phase_ns[0]};
-        if (prepared && !quad_list && r.selected_pipeline == nullptr && prepared->pipeline &&
+        if (prepared && !quad_list && r.Rec().selected_pipeline == nullptr && prepared->pipeline &&
             PipelineOwnerMatches(prepared->pipeline, prepared->pipeline_keepalive)) {
             if (const GraphicsPipeline* installed = InstallPrepared(*prepared)) {
                 pipeline_owner = prepared->pipeline_keepalive;

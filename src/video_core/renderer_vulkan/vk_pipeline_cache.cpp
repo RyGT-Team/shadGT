@@ -10273,7 +10273,8 @@ void PipelineCache::ReleasePrewarmModules() {
     std::unordered_set<const Shader::Info*> in_use;
     const auto add = [&](const auto& pipeline) {
         if (!pipeline) return;
-        for (const auto* stage : pipeline->GetStages()) {
+        // FEAT-SGT-022 step 2: the cache's infos; the draw stages may be a recorder's copies.
+        for (const auto* stage : pipeline->CanonicalStages()) {
             if (stage) in_use.insert(stage);
         }
     };

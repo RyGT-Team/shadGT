@@ -435,8 +435,9 @@ private:
 };
 
 void GraphicsPipeline::SetStageInfos(std::span<const Shader::Info*, MaxShaderStages> infos) {
-    std::ranges::copy(infos, stages.begin());
-    std::ranges::copy(infos, canonical_stages.begin());
+    for (u32 stage = 0; stage < infos.size(); ++stage) {
+        SetCanonicalStage(stage, infos[stage]);
+    }
     // Installed before pipeline publication. Draw-stage copies change user data,
     // not this shader metadata. Unknown legacy metadata keeps the live scan.
     parallel_stage_summary = {};
@@ -480,7 +481,7 @@ GraphicsPipeline::GraphicsPipeline(
     BuildDescSetLayout(preloading);
     const auto debug_str = GetDebugString();
     BuildWatch watch{debug_str, preloading ? "stored pipeline build" : "pipeline build"};
-    const bool tessellated = stages[u32(Shader::SwStage::TessellationControl)] != nullptr;
+    const bool tessellated = canonical_stages[u32(Shader::SwStage::TessellationControl)] != nullptr;
 
     const vk::PushConstantRange push_constants = {
         .stageFlags = AllGraphicsStageBits,
@@ -588,7 +589,7 @@ GraphicsPipeline::GraphicsPipeline(
     const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
     // FIX-220: alpha to coverage needs an alpha at location 0; a pixel shader that writes none
     // draws as without it.
-    const Shader::Info* const fragment_stage = stages[u32(Shader::SwStage::Fragment)];
+    const Shader::Info* const fragment_stage = canonical_stages[u32(Shader::SwStage::Fragment)];
     const bool writes_coverage_alpha =
         fragment_stage && fragment_stage->stores.Get(Shader::IR::Attribute::RenderTarget0, 3);
     sdata.multisampling = {
@@ -2253,7 +2254,7 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
         set_bindings;
     std::array<u32, Shader::Backend::MaxDescriptorSets> set_descriptors{};
 
-    for (const auto* stage : stages) {
+    for (const auto* stage : canonical_stages) {
         if (!stage) {
             continue;
         }

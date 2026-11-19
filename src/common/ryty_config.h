@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <optional>
 #include <string>
+#include "common/game_title.h"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -55,10 +56,16 @@ inline std::string ReadFileW(const std::wstring& path) {
     return result;
 }
 
-/// FIX-230: user\custom_configs\CUSA03220.json next to the exe.
+/// FIX-230: user\custom_configs\<serial>.json next to the exe. GAME-005: the game's serial
+/// (CUSA24769 under GT7, CUSA03220 under GT Sport), or GT7's old CUSA03220.json when it is all
+/// there is (Common::GameSettingsSerial). Read only: nothing writes through this path.
 inline std::wstring RytyGameConfigPathW() {
     const std::wstring& dir = RytyExeDirW();
-    return dir.empty() ? std::wstring{} : dir + L"user\\custom_configs\\CUSA03220.json";
+    if (dir.empty()) {
+        return {};
+    }
+    const std::string_view serial = GameSettingsSerial(); // ASCII
+    return dir + L"user\\custom_configs\\" + std::wstring(serial.begin(), serial.end()) + L".json";
 }
 
 /// FIX-230: the launcher's settings as they are now (not cached).
@@ -68,7 +75,7 @@ inline std::string RytyReadGameConfig() {
 }
 #endif
 
-/// The launcher's game settings (user\custom_configs\CUSA03220.json next to the exe), read once.
+/// The launcher's game settings (user\custom_configs\<serial>.json next to the exe), read once.
 inline const std::string& RytyGameConfigText() {
     static const std::string text = [] {
         std::string result;

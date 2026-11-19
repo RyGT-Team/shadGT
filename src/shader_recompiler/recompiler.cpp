@@ -6,6 +6,7 @@
 #include <magic_enum/magic_enum.hpp>
 #include "common/logging/log.h"
 #include "common/logging/classes.h"
+#include "common/read_capture.h"
 #include "shader_recompiler/frontend/control_flow_graph.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/structured_control_flow.h"
@@ -109,6 +110,40 @@ std::string ListGcnCode(std::span<const u32> code) {
         }
     }
     return out;
+}
+
+NeoCodeUse NeoCodeCensus(std::span<const u32> code) {
+    using namespace Gcn;
+    Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
+    Gcn::GcnDecodeContext decoder;
+    NeoCodeUse use{};
+    const auto sub_dword = [](SdwaSelector sel) {
+        return sel != SdwaSelector::Invalid && sel != SdwaSelector::Dword;
+    };
+    size_t at = 0; // dwords
+    while (!slice.atEnd()) {
+        const GcnInst inst = decoder.decodeInstruction(slice);
+        if (inst.encoding == InstEncoding::VOPC && inst.dst[1].field != OperandField::VccLo) {
+            ++use.sdwa_compares_to_sgpr; // only SDWA gives a VOPC another destination
+        }
+        if (sub_dword(inst.src[0].sdwa_sel) || sub_dword(inst.src[1].sdwa_sel) ||
+            sub_dword(inst.dst[0].sdwa_sel)) {
+            ++use.sdwa_selects;
+        }
+        if (inst.src[0].dpp.has_value()) {
+            ++use.dpp;
+        }
+        if (inst.encoding == InstEncoding::MIMG && at + 1 < code.size()) {
+            use.mimg_g16 += code[at] & 1u;
+            use.mimg_a16 += (code[at + 1] >> 30) & 1u;
+            use.mimg_d16 += (code[at + 1] >> 31) & 1u;
+        }
+        at += inst.length / sizeof(u32);
+        if (inst.opcode == Opcode::S_ENDPGM) {
+            break;
+        }
+    }
+    return use;
 }
 
 bool HasLaneReads(std::span<const u32> code) {
@@ -348,12 +383,33 @@ static void NanTracePass(IR::Program& program, const Info& info) {
 
 #endif
 
-IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Info& info,
-                             RuntimeInfo& runtime_info, const Profile& device_profile) {
+// PERF-GTS-502: what the first half of a translation hands the second. Built in place and never
+// moved: cfg holds a span of program.ins_list and a reference to gcn_block_pool.
+struct FrontendState {
+    FrontendState(Info& info, Pools& pools_, RuntimeInfo& runtime_info_, const Profile& profile_)
+        : pools{pools_}, runtime_info{runtime_info_}, profile{profile_}, program{info} {}
+    FrontendState(const FrontendState&) = delete;
+    FrontendState& operator=(const FrontendState&) = delete;
+
+    Pools& pools;
+    RuntimeInfo& runtime_info;
+    Profile profile; ///< the device's, as this shader adjusts it
+    Common::ObjectPool<Gcn::Block> gcn_block_pool{64};
+    IR::Program program;
+    std::optional<Gcn::CFG> cfg;
+};
+
+void FrontendStateDeleter::operator()(FrontendState* state) const noexcept {
+    delete state;
+}
+
+FrontendHandle TranslateProgramFront(const std::span<const u32>& code, Pools& pools, Info& info,
+                                     RuntimeInfo& runtime_info, const Profile& device_profile) {
 #ifndef NDEBUG
     SrtArenaTrace::FrontendScope arena_trace_scope;
 #endif
-    auto profile = device_profile;
+    FrontendHandle state{new FrontendState(info, pools, runtime_info, device_profile)};
+    auto& profile = state->profile;
     if (runtime_info.sw_stage == SwStage::TessellationControl) { // FIX-227 (diagnosis)
         static int logged = 0;
         if (logged++ < 10) {
@@ -386,7 +442,7 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Gcn::GcnDecodeContext decoder;
 
     // Decode and save instructions
-    IR::Program program{info};
+    IR::Program& program = state->program;
     program.ins_list.reserve(code.size());
     while (!slice.atEnd()) {
         program.ins_list.emplace_back(decoder.decodeInstruction(slice));
@@ -396,8 +452,7 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     pools.ReleaseContents();
 
     // Create control flow graph
-    Common::ObjectPool<Gcn::Block> gcn_block_pool{64};
-    Gcn::CFG cfg{gcn_block_pool, program.ins_list};
+    Gcn::CFG& cfg = state->cfg.emplace(state->gcn_block_pool, program.ins_list);
     EmitControlFlowGraph(program, pools, cfg, runtime_info, profile);
 
     // On NVIDIA GPUs HW interpolation of clip distance values seems broken, and we need to emulate
@@ -429,6 +484,22 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::IR::DumpProgram(program, info, "pre-res-patch.");
 #endif
     Shader::Optimization::ResourcePatchingPass(program.info, resources, profile);
+    return state;
+}
+
+IR::Program TranslateProgramBack(FrontendHandle state) {
+    ASSERT(state && state->cfg);
+#ifdef SHADGT_DIAGNOSTICS
+    // PERF-GTS-502: this half must not read the game's memory (see TranslateProgramFront).
+    Common::ForbidGuestReads forbid{"the second half of a shader translation"};
+#endif
+    IR::Program& program = state->program;
+    Info& info = program.info;
+    Pools& pools = state->pools;
+    RuntimeInfo& runtime_info = state->runtime_info;
+    const Profile& profile = state->profile;
+    Gcn::CFG& cfg = *state->cfg;
+
     Shader::Optimization::LowerBufferFormatToRaw(program);
     Shader::Optimization::SharedMemorySimplifyPass(program, profile);
     Shader::Optimization::SharedMemoryToStoragePass(program, runtime_info, profile);
@@ -469,7 +540,13 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::IR::DumpProgram(program, info);
 #endif
 
-    return program;
+    return std::move(program); // state (and cfg) end after the program is moved out
+}
+
+IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Info& info,
+                             RuntimeInfo& runtime_info, const Profile& device_profile) {
+    return TranslateProgramBack(
+        TranslateProgramFront(code, pools, info, runtime_info, device_profile));
 }
 
 } // namespace Shader

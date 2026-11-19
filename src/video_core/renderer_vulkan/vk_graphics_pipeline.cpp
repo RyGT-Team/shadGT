@@ -3,6 +3,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <atomic>
 #include <map>
 #include <algorithm>
@@ -14,14 +15,17 @@
 #include <mutex>
 #include <optional>
 #include <semaphore>
+#include <span>
 #include <string>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <boost/container/small_vector.hpp>
+#include <fmt/ranges.h>
 
 #include "common/assert.h"
+#include "video_core/title_defaults.h"
 #include "common/elf_info.h"
 #include "common/singleton.h"
 #include "common/logging/log.h"
@@ -590,10 +594,54 @@ GraphicsPipeline::GraphicsPipeline(
     sdata.multisampling = {
         .rasterizationSamples = LiverpoolToVK::NumSamples(
             key.num_samples, instance.GetColorSampleCounts() & instance.GetDepthSampleCounts()),
+        // NEO-GT7-005: a pixel shader translated to run once per pixel (mixed samples) has none.
         .sampleShadingEnable =
-            fs_info.addr_flags.persp_sample_ena || fs_info.addr_flags.linear_sample_ena,
+            (fs_info.addr_flags.persp_sample_ena || fs_info.addr_flags.linear_sample_ena) &&
+            !(fragment_stage && fs_info.PixelRate()),
         .alphaToCoverageEnable = key.alpha_to_coverage && writes_coverage_alpha,
     };
+    // NEO-GTS-508: with VK_EXT_sample_locations on (PS4 Pro mode), a multi-sample pipeline takes
+    // the game's sample positions, set per draw (dynamic state). Not for a count the device can't
+    // take them for (Instance::TakesSampleLocations). Not when the pixel shader may interpolate at
+    // a sample with InterpolateAtSample (per-sample barycentrics without AMD's explicit vertex
+    // parameter, as emit_spirv_context_get_set.cpp emits them), which custom locations forbid
+    // (VUID-VkGraphicsPipelineCreateInfo-sampleLocationsEnable-01524); a shader whose loads are
+    // not known counts as one if it has per-sample inputs. NEO-GTS-511: one translated with the
+    // positions table (SampleTable) reads them with InterpolateAtOffset instead, so its pipeline
+    // takes the game's positions (every 2-sample shader is translated so where the GPU takes
+    // them: vk_pipeline_cache.cpp). The dynamic state list and the fragment library key follow.
+    const u32 raster_samples = static_cast<u32>(sdata.multisampling.rasterizationSamples);
+    const bool interpolates_at_sample =
+        fragment_stage && !fs_info.single_sample_barycentric && !fs_info.PixelRate() &&
+        !fs_info.SampleTable() && !profile.supports_amd_shader_explicit_vertex_parameter &&
+        (fragment_stage->attribute_flags_known
+             ? fragment_stage->loads.GetAny(Shader::IR::Attribute::BaryCoordSmoothSample)
+             : fs_info.addr_flags.persp_sample_ena != 0);
+    const bool sample_locations =
+        instance.TakesSampleLocations(raster_samples) && !interpolates_at_sample;
+    // NEO-GTS-511: for the 2-sample draw counter and the positions table.
+    pipeline_raster_samples = raster_samples;
+    sample_location_exclusion = sample_locations                                  ? 0
+                                : !instance.TakesSampleLocations(raster_samples) ? 1
+                                                                                  : 2;
+    uses_sample_table = fragment_stage && fs_info.SampleTable() && !fs_info.SampleTableInOffsets();
+    // NEO-GTS-513: the same rule as the translation (EmitPrologue).
+    const bool offsets_too_many =
+        fragment_stage && fs_info.SampleTableInOffsets() &&
+        fragment_stage->buffers.size() > Shader::PushData::Sample0OffsetsMaxBuffers;
+    uses_sample0_offsets =
+        fragment_stage && fs_info.SampleTableInOffsets() && !offsets_too_many;
+    per_pixel_fallback = fragment_stage && fs_info.PerPixelFallback();
+    const bool reads_sample =
+        fragment_stage && (fragment_stage->attribute_flags_known
+                               ? fragment_stage->loads.GetAny(
+                                     Shader::IR::Attribute::BaryCoordSmoothSample)
+                               : fs_info.addr_flags.persp_sample_ena != 0);
+    pixel_rate_shading = !fragment_stage || !fs_info.PixelRate() || per_pixel_fallback ? 0
+                         : uses_sample_table || uses_sample0_offsets                ? 1
+                         : offsets_too_many                                         ? 4
+                         : reads_sample                                             ? 3
+                                                                                    : 2;
 
     const vk::PipelineViewportDepthClipControlCreateInfoEXT clip_control = {
         // FIX-GTS-443: 0..1 when the vertex shader converts the depth. A geometry shader's
@@ -635,9 +683,19 @@ GraphicsPipeline::GraphicsPipeline(
     } else if (!sdata.vertex_bindings.empty()) {
         dynamic_states.push_back(vk::DynamicState::eVertexInputBindingStride);
     }
+    // NEO-GTS-508: last in the list, and only in the fragment libraries and the whole pipeline:
+    // the vertex input and pre-rasterization libraries (and their keys) stay as they were.
+    const u32 pre_raster_dynamic_count = static_cast<u32>(dynamic_states.size());
+    if (sample_locations) {
+        dynamic_states.push_back(vk::DynamicState::eSampleLocationsEXT);
+    }
 
     const vk::PipelineDynamicStateCreateInfo dynamic_info = {
         .dynamicStateCount = static_cast<u32>(dynamic_states.size()),
+        .pDynamicStates = dynamic_states.data(),
+    };
+    const vk::PipelineDynamicStateCreateInfo pre_raster_dynamic_info = {
+        .dynamicStateCount = pre_raster_dynamic_count,
         .pDynamicStates = dynamic_states.data(),
     };
 
@@ -915,7 +973,9 @@ GraphicsPipeline::GraphicsPipeline(
     // SO-017 was for. SHADGT_SO_SKIP still overrides.
     static const u32 so_skip = [vendor = instance.GetVendorID()] {
         const char* env = std::getenv("SHADGT_SO_SKIP");
-        u32 bits = env ? u32(std::strtoul(env, nullptr, 0)) : (vendor == 0x10de ? 0u : 1u);
+        // TITLE-001: GT7 keeps blended draws off shader objects on NVIDIA too (SO-017).
+        const bool blend_on = vendor == 0x10de && VideoCore::CurrentTitleDefaults().so_blend_on_nvidia;
+        u32 bits = env ? u32(std::strtoul(env, nullptr, 0)) : (blend_on ? 0u : 1u);
         if (std::FILE* file = std::fopen("so_skip.txt", "r")) {
             char text[32]{};
             if (std::fgets(text, sizeof(text), file)) bits = u32(std::strtoul(text, nullptr, 0));
@@ -1056,6 +1116,7 @@ GraphicsPipeline::GraphicsPipeline(
                                 infos[u32(Shader::SwStage::Fragment)] != nullptr,
                                 independent_sets)) return;
     }
+    sample_location_samples = sample_locations ? raster_samples : 0; // NEO-GTS-508
 
 #ifndef NDEBUG
     if (instance.IsShaderObjectEnabled()) {
@@ -1076,6 +1137,74 @@ GraphicsPipeline::GraphicsPipeline(
     // Protect both library and whole-pipeline tessellation builds from the optimizer.
     const bool amd_policy = AmdPipelinePolicyEnabled(instance.GetVendorID()); // AMD-320
     const bool plain_tessellated = tessellated && !amd_policy;
+
+    // NEO-GT7-016: a colour target with fewer samples than the rasterization (the PS4 Pro mode's
+    // checkerboard on NVIDIA's mixed samples) takes its colour from sample 0, as on the console
+    // and with AMD's mixed samples: TRUNCATE instead of NVIDIA's default MERGE, which wrote a
+    // pixel's colour for every triangle covering either sample and so blended glass twice along
+    // its triangles' shared edges. It is fragment output state: the whole pipeline and the
+    // interface library carry it; sdata.multisampling (stored with the pipeline, and given to the
+    // shader libraries, their keys and PERF-GT7-108's recipes) stays as it was. Shader objects
+    // never draw mixed samples (so_candidate; BindShaderObjects sets MERGE for them). Not with
+    // sample shading: the fragment library's multisample state must then be the interface
+    // library's (VUID-VkGraphicsPipelineCreateInfo-pLibraries-06636/09567) and shared fragment
+    // libraries are not keyed by the mode. With NEO-GT7-005 on, mixed pipelines have none;
+    // SHADGT_NEO_PIXEL_RATE=0 keeps the former MERGE with sample shading.
+    vk::PipelineCoverageReductionStateCreateInfoNV coverage_reduction{
+        .coverageReductionMode = vk::CoverageReductionModeNV::eTruncate,
+    };
+    vk::PipelineMultisampleStateCreateInfo output_multisampling = sdata.multisampling;
+    if (instance.IsCoverageTruncateOn() && !sdata.multisampling.sampleShadingEnable) {
+        std::array<u32, AmdGpu::NUM_COLOR_BUFFERS> colors{};
+        for (u32 i = 0; i < key.num_color_attachments; ++i) {
+            colors[i] = color_formats[i] != vk::Format::eUndefined ? static_cast<u32>(color_samples[i])
+                                                                   : 0u;
+        }
+        const std::span<const u32> attached{colors.data(), key.num_color_attachments};
+        const u32 raster = static_cast<u32>(sdata.multisampling.rasterizationSamples);
+        if (CoverageReduction::HasFewerColourSamples(raster, attached)) {
+            const u32 depth = pipeline_rendering_ci.depthAttachmentFormat != vk::Format::eUndefined ||
+                                      pipeline_rendering_ci.stencilAttachmentFormat !=
+                                          vk::Format::eUndefined
+                                  ? static_cast<u32>(LiverpoolToVK::NumSamples(
+                                        key.depth_samples, instance.GetDepthSampleCounts()))
+                                  : 0u;
+            const bool listed = CoverageReduction::Listed(instance.GetTruncateCombinations(),
+                                                          raster, depth, attached);
+            if (listed) {
+                output_multisampling.pNext = &coverage_reduction;
+            }
+            static std::atomic<u32> noted_truncate{};
+            static std::atomic<u32> noted_merge{};
+            if ((listed ? noted_truncate : noted_merge).fetch_add(1, std::memory_order_relaxed) <
+                3) {
+                LOG_WARNING(Render_Vulkan,
+                            "NEO-GT7-016: pipeline {} ({} raster samples, depth {}, colour {}): {}",
+                            GetDebugString(), raster, depth, fmt::join(attached, "/"),
+                            listed ? "colour coverage from sample 0 (TRUNCATE)"
+                                   : "combination not listed by the driver, MERGE kept");
+            }
+        }
+    }
+    // NEO-GTS-508: custom sample locations, their values dynamic (sampleLocationsInfo ignored).
+    // In the interface library's state (in front of NEO-GT7-016's coverage reduction) and in the
+    // fragment library's, so both keep the same sample-locations state
+    // (VUID-VkGraphicsPipelineCreateInfo-pLibraries-06636/09567). sdata.multisampling, stored
+    // with the pipeline and given to the vertex input and pre-rasterization libraries, never
+    // carries it (nor a pointer).
+    vk::PipelineSampleLocationsStateCreateInfoEXT output_sample_locations{
+        .sampleLocationsEnable = VK_TRUE,
+    };
+    const vk::PipelineSampleLocationsStateCreateInfoEXT fragment_sample_locations{
+        .sampleLocationsEnable = VK_TRUE,
+    };
+    vk::PipelineMultisampleStateCreateInfo fragment_multisampling = sdata.multisampling;
+    if (sample_locations) {
+        output_sample_locations.pNext = output_multisampling.pNext;
+        output_multisampling.pNext = &output_sample_locations;
+        fragment_multisampling.pNext = &fragment_sample_locations;
+    }
+
     const vk::GraphicsPipelineCreateInfo pipeline_info = {
         .pNext = &pipeline_rendering_ci,
         .flags = tessellated && plain_tessellated ? vk::PipelineCreateFlagBits::eDisableOptimization
@@ -1087,7 +1216,7 @@ GraphicsPipeline::GraphicsPipeline(
         .pTessellationState = &tessellation_state,
         .pViewportState = &viewport_info,
         .pRasterizationState = &raster_chain.get(),
-        .pMultisampleState = &sdata.multisampling,
+        .pMultisampleState = &output_multisampling, // NEO-GT7-016
         .pDepthStencilState =
             !instance.IsExtendedDynamicState3Supported() ? &depth_stencil_info : nullptr,
         .pColorBlendState = &color_blending,
@@ -1180,6 +1309,15 @@ GraphicsPipeline::GraphicsPipeline(
             }
             part_info.stageCount = 0;
             part_info.pStages = nullptr;
+            if (i != 3) {
+                // NEO-GT7-016: the coverage reduction is the interface library's alone.
+                // NEO-GTS-508: the sample locations are the fragment libraries' alone.
+                part_info.pMultisampleState =
+                    i == 2 ? &fragment_multisampling : &sdata.multisampling;
+            }
+            if (i < 2) {
+                part_info.pDynamicState = &pre_raster_dynamic_info; // NEO-GTS-508
+            }
             if (i == 1) {
                 part_info.stageCount = static_cast<u32>(pre_raster_stages.size());
                 part_info.pStages = pre_raster_stages.data();
@@ -1315,8 +1453,8 @@ GraphicsPipeline::GraphicsPipeline(
         pre_raster_key.Add(key.provoking_vtx_last);
         pre_raster_key.Add(key.depth_clip_enable);
         pre_raster_key.Add(key.clip_space);
-        for (const auto state : dynamic_states) {
-            pre_raster_key.Add(state);
+        for (const auto state : std::span{dynamic_states}.first(pre_raster_dynamic_count)) {
+            pre_raster_key.Add(state); // NEO-GTS-508: the pre-rasterization library's list
         }
 
         // AMD-320: libraries with and without link-time data are different libraries.
@@ -1331,6 +1469,9 @@ GraphicsPipeline::GraphicsPipeline(
         // Keep FS/fragment-output multisampling identical even without sample
         // shading. The old key could link a cached 1x FS library to 4x output.
         AddFragmentMultisampleKey(fragment_key, sdata.multisampling);
+        // NEO-GTS-508: a fragment library with custom sample locations is another library (also
+        // keyed by its dynamic state list below).
+        fragment_key.Add(sample_locations);
         fragment_key.Add(pipeline_rendering_ci.viewMask);
         // FIX-GT7-030: tessellated pipelines' libraries are not optimized (FIX-057): the others must
         // not draw with them.
@@ -1943,6 +2084,12 @@ void GraphicsPipeline::BindShaderObjects(
         cmd.setRasterizationSamplesEXT(s.samples);
         const vk::SampleMask mask = ~vk::SampleMask{0};
         cmd.setSampleMaskEXT(s.samples, &mask);
+    }
+    if (!p && instance.IsCoverageTruncateOn()) {
+        // NEO-GT7-016: with the coverage reduction feature on, a shader-object draw must have
+        // this state set (VUID-vkCmdDraw-None-07649). Shader objects never draw mixed samples
+        // (so_candidate), where both modes are the same: MERGE, the driver's default.
+        cmd.setCoverageReductionModeNV(vk::CoverageReductionModeNV::eMerge);
     }
     if (!p || p->alpha_to_coverage != s.alpha_to_coverage) {
         cmd.setAlphaToCoverageEnableEXT(s.alpha_to_coverage);

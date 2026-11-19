@@ -1,3 +1,4 @@
+#include "common/game_title.h"
 #include "ryty_gpu/ryty_camera.h"
 #include "ryty_gpu/ryty_camera_validation.h"
 #include <windows.h>
@@ -536,7 +537,7 @@ void InitializeRuntime() {
         std::lock_guard lock(runtime_mutex);
         std::ofstream log;
         try {
-            const auto directory = GamePath().parent_path() / L"logs";
+            const auto directory = GamePath().parent_path() / L"logs" / std::string(Common::CurrentGameSerial()); // logs\<serial>
             std::error_code error;
             std::filesystem::create_directories(directory, error);
             log.open(directory / L"camera-validation.log", std::ios::app);

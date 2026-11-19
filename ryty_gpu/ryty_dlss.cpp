@@ -9,7 +9,9 @@
 #include <string>
 
 #include "common/logging/log.h"
+#include "common/game_title.h"
 #include "core/emulator_settings.h"
+#include "ryty_gpu/ryty_pro_mode.h"
 #include "ryty_gpu/ryty_dlss.h"
 #include "ryty_gpu/ryty_dlssg.h"
 #include "ryty_gpu/rygt_dlss_api.h"
@@ -46,8 +48,21 @@ std::string LastError() {
 
 bool TemporalRequested() {
     static const bool requested = [] {
+        // GT Sport only: the in-frame reconstruction (GtsDlssPass) knows GT Sport's passes.
+        // GT7's temporal DLSS is RytyUpscale::TemporalRequested (DLSS-GT7-001).
+        if (Common::IsGt7()) {
+            return false;
+        }
         const char* value = std::getenv("SHADGT_DLSS_TEMPORAL");
-        return value ? std::strcmp(value, "1") == 0 : EmulatorSettings.IsDlssEnabled();
+        const bool wanted = value ? std::strcmp(value, "1") == 0 : EmulatorSettings.IsDlssEnabled();
+        // NEO-GTS-505: as GT7's (DLSS-GT7-001), off in the PS4 Pro mode on a 4K TV: the game
+        // rebuilds its checkerboard itself, and DLSS's history over it would accumulate twice.
+        if (wanted && Ryty::GetProMode() == Ryty::ProMode::Neo4K) {
+            LOG_WARNING(Render_Vulkan, "NEO-GTS-505: temporal DLSS off in the PS4 Pro mode on a "
+                                       "4K TV (the game rebuilds its checkerboard itself)");
+            return false;
+        }
+        return wanted;
     }();
     return requested;
 }
@@ -300,14 +315,24 @@ void Pass::Create(vk::Device device_, VmaAllocator allocator_, u32 num_images) {
 
 vk::ImageView Pass::Render(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::ImageView input,
                            vk::Format input_format, vk::Extent2D input_size,
-                           vk::Extent2D output_size) {
+                           vk::Extent2D output_size,
+                           const RytyUpscale::TemporalInputs* temporal) {
+    // DLSS-GT7-001: the game's pictures are only changed for DLSS while Streamline's DLSS scales
+    // them and takes the inputs (set again by RytyDlssG::Upscale).
+    auto& temporal_usable = RytyUpscale::TemporalUsable();
+    // GT Sport: with the plugin's temporal interface asked for (TemporalRequested, never on
+    // GT7), the reconstruction is done in the frame (GtsDlssPass) and this pass scales nothing.
     if ((!g_plugin.ready && !g_streamline) || failed || (!g_streamline && TemporalRequested())) {
+        temporal_usable.store(false, std::memory_order_relaxed);
         return input;
     }
     const bool supported =
         g_streamline ? RytyDlssG::UpscaleSupports(input_size, output_size)
                      : g_plugin.supports(input_size.width, input_size.height, output_size.width,
                                          output_size.height) != 0;
+    if (!supported || !g_streamline) {
+        temporal_usable.store(false, std::memory_order_relaxed); // the NGX plugin takes none
+    }
     if (!supported) {
         return input;
     }
@@ -371,13 +396,14 @@ vk::ImageView Pass::Render(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::
         g_streamline
             ? RytyDlssG::Upscale(device, allocator, cmdbuf, input_image, input, input_format,
                                  input_size, img.output_image, img.output_image_view.get(),
-                                 vk::Format::eR16G16B16A16Sfloat, output_size)
+                                 vk::Format::eR16G16B16A16Sfloat, output_size, temporal)
             : g_plugin.evaluate(static_cast<VkCommandBuffer>(cmdbuf), &in, &out, 0.0f) == 0;
     if (!ok) {
         // The output was not written; stop trying and let FSR (or plain scaling) take over.
         LOG_ERROR(Render_Vulkan, "ryGT DLSS: {}; falling back to FSR",
                   g_streamline ? std::string{"Streamline's DLSS failed"} : LastError());
         failed = true;
+        temporal_usable.store(false, std::memory_order_relaxed);
     }
 
     const vk::ImageMemoryBarrier2 return_barrier{

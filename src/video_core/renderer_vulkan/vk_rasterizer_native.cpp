@@ -17,6 +17,7 @@
 #include "ryty_gpu/native/linear_image_download.h"
 #include "ryty_gpu/native/parallel_direct_capability.h"
 #include "ryty_gpu/native/parallel_gate_histogram.h"
+#include "ryty_gpu/native/buffer_sizes.h"
 #include "ryty_gpu/native/descriptor_dead_handles.h"
 #include "core/emulator_settings.h"
 #include "ryty_gpu/native/parallel_rotate_segment.h"
@@ -48,6 +49,7 @@
 #include "video_core/renderer_vulkan/immutable_upload_memo.h"
 #include "ryty_gpu/native/snapshot_backing_protocol.h"
 #include "video_core/renderer_vulkan/snapshot_protection_receipt.h"
+#include "common/mapping_writeback_gate.h"
 #include "common/scope_exit.h"
 #include "video_core/renderer_vulkan/snapshot_source_hints.h"
 #include "video_core/renderer_vulkan/freshness_range_search.h"
@@ -83,6 +85,9 @@
 #include "video_core/renderer_vulkan/native_ring_policy.h"
 #include "common/thread.h"
 #include "common/native_thread_priority.h"
+#include "common/game_title.h"
+#include "video_core/title_defaults.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
 
 #include <fstream>
 #include <algorithm>
@@ -123,14 +128,17 @@
 // (ryty_config.h brings in windows.h, whose `near` and `far` macros would rename variables here.)
 #undef near
 #undef far
+#include "core/libraries/kernel/process.h"
 #include "core/debug_state.h"
 #include "video_core/renderdoc.h"
 #include "core/guest_hash.h"
 #include "core/memory.h"
+#include "ryty_gpu/native/committed_pages.h"
 #include "ryty_gpu/native/image_registry.h"
 #include "ryty_gpu/native/cpu_texture_staging.h"
 #include "ryty_gpu/native/gpu_checkpoints.h"
 #include "ryty_gpu/native/slow_call_trace.h"
+#include "video_core/renderer_vulkan/kept_shadow_map.h"
 #include "ryty_gpu/native/job_walker.h"
 #include "ryty_gpu/native/rhi/rhi_vulkan.h"
 #include "ryty_gpu/ryty_ghost.h"
@@ -162,6 +170,7 @@ vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type);
 #include "video_core/renderer_vulkan/trace_residency.h"
 #include "video_core/renderer_vulkan/resident_prt_view.h"
 #ifdef _WIN32
+#include <intrin.h> // DIAG-SGT-013: _ReturnAddress
 #include <windows.h>
 #endif
 
@@ -427,6 +436,7 @@ struct ParallelRuntime {
     std::array<ProofPhaseStats,9> proof_phases{};
     std::array<ProofPhaseStats,8> whole_phases{};
     Native::Parallel::PositiveHandleCache<vk::Sampler> sampler_proof;
+    u64 sampler_proof_drops{}; ///< FIX-GTS-503: samplers dropped when it was last cleared
     u64 sampler_proof_hits{},sampler_proof_misses{},sampler_scan_steps{},sampler_scan_positives{};
     u64 natural_preclosed{},natural_captured{},natural_serial_fallback{},natural_binding_skip{};
     u64 absent_mode0_attempts{},absent_mode0_accepted{},absent_mode0_rejected{};
@@ -570,6 +580,7 @@ static std::unique_ptr<Native::Rhi::Buffer> scene_indirect_buffer;
 static std::vector<SceneIndirectArgs> scene_indirect_args;
 
 bool RytyGtsInRace();
+bool RytyRaceRunning(); // GAME-006, ryty_game_patch.cpp
 static bool PrepareScope(); // PERF-GTS-450: races, or menus with SHADGT_NATIVE_PREPARE_MENUS=1
 bool RytyGtsRaceSession(); // WIDE-015
 int RytyGtsMenuScreen();   // WIDE-020
@@ -1662,7 +1673,8 @@ struct PartClock {
 };
 
 u64 ChunkSize() {
-    static const u64 size = NativeChunkBytes(std::getenv("SHADGT_NATIVE_CHUNK_MB"));
+    static const u64 size = NativeChunkBytes(std::getenv("SHADGT_NATIVE_CHUNK_MB"),
+                                             VideoCore::CurrentTitleDefaults().native_chunk_mb);
     return size;
 }
 constexpr u32 SpliceAfter = 512; ///< commands per list before it is run and submitted
@@ -1733,11 +1745,13 @@ bool NativeModeRequested() {
         }
 #endif
         const bool on = value && *value == "true";
-        LOG_WARNING(Render_Vulkan, "FIX-230: native renderer {} ({})", on ? "on" : "off",
-                    value ? "native_renderer in user\\custom_configs\\CUSA03220.json"
+        // GAME-005: the settings file is the game's own (Common::GameSettingsSerial).
+        LOG_WARNING(Render_Vulkan, "FIX-230: native renderer {} ({}{})", on ? "on" : "off",
+                    value ? "native_renderer in user\\custom_configs\\"
                     : Common::RytyGameConfigText().empty()
                         ? "the launcher's settings file could not be read: default off"
-                        : "no native_renderer setting: default off");
+                        : "no native_renderer setting: default off",
+                    value ? std::string{Common::GameSettingsSerial()} + ".json" : std::string{});
         return on;
     }();
     return requested;
@@ -1855,8 +1869,10 @@ void NativeRenderer::ForgetBindings(Stream& s) {
 }
 
 u64 NativeRenderer::ReuseGeneration() const {
+    // FIX-GTS-503: a dropped sampler's handle may come back for another sampler (no caller in
+    // the merged renderer; the binding commands' generation carries the same count).
     return registry->Generation() + unmap_generation.load(std::memory_order_relaxed) +
-           buffer_generation;
+           buffer_generation + samplers_dropped.load(std::memory_order_relaxed);
 }
 
 std::pair<vk::Buffer, u64> NativeRenderer::UploadBytes(u32 slot, const void* data, u32 size,
@@ -1929,7 +1945,8 @@ GtsSceneImage NativeRenderer::TemporalImage(const Native::ImageEntry& entry) {
 
 void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Targets& targets,
                                      const DrawBindings& bindings) {
-    if (!r.temporalDlss.Enabled()) return;
+    // Merge (shadGT): GT Sport's temporal pass; GT7 has its own (NoteTemporalDraw).
+    if (Common::IsGt7() || !r.temporalDlss.Enabled()) return;
     const auto& regs = r.liverpool->DrawRegs();
     const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
     if (!fs || regs.num_indices > 6 ||
@@ -1993,7 +2010,7 @@ void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Ta
 
 bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& targets,
                                    const DrawBindings& bindings) {
-    if (!r.temporalDlss.Enabled()) return false;
+    if (Common::IsGt7() || !r.temporalDlss.Enabled()) return false; // (as CaptureNativeFsr)
     const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
     const auto& regs = r.liverpool->DrawRegs();
     if (!fs || !IsSceneCompositionShader(fs->pgm_hash) || regs.num_indices > 6 ||
@@ -2254,9 +2271,17 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
             trace.Next(1);
             RefreshRegion(*region, address, size);
             // RefreshRegion may record transfer writes after FlushUploads' initial barrier.
-            // The upload or untiling dispatch must read those refreshed bytes.
-            list.Barrier(Native::Rhi::ScopeTransfer,
-                         Native::Rhi::ScopeTransfer | Native::Rhi::ScopeCompute);
+            // The upload or untiling dispatch must read those refreshed bytes (FIX-196).
+            // SHADGT_NATIVE_UPLOAD_BARRIER=0: no barrier, as before FIX-196 (diagnosis only:
+            // textures the CPU writes in a region can upload stale).
+            static const bool upload_barrier = [] {
+                const char* env = std::getenv("SHADGT_NATIVE_UPLOAD_BARRIER");
+                return !(env && env[0] == '0');
+            }();
+            if (upload_barrier) {
+                list.Barrier(Native::Rhi::ScopeTransfer,
+                             Native::Rhi::ScopeTransfer | Native::Rhi::ScopeCompute);
+            }
             trace.Next(2);
             auto wrapped = device->WrapBuffer(region->buffer->NativeHandle(), region->buffer->Size());
             source.buffer = wrapped.get();
@@ -2544,7 +2569,13 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
 }
 
 static bool ParallelRingOn(); // PERF-GTS-399, below
+/// PERF-GT7-133: moves on when a region or mirror goes in or out of its map, and when a renderer
+/// goes, so that no thread keeps a stale set of the handles the renderer owns.
+static std::atomic<u64> g_lds_owned_epoch{1};
+static void NoteOwnedMapChange() { g_lds_owned_epoch.fetch_add(1, std::memory_order_acq_rel); }
+
 NativeRenderer::~NativeRenderer() {
+    g_lds_owned_epoch.fetch_add(1, std::memory_order_acq_rel); // PERF-GT7-133
     auto expected_observer = one_off_observer;
     g_one_off_observer.compare_exchange_strong(expected_observer, {}, std::memory_order_acq_rel);
     if(PreparedSampledProofRequested())prepared_proof_contexts.Close(this);
@@ -2620,7 +2651,11 @@ NativeRenderer::~NativeRenderer() {
         vk_device.destroyQueryPool(timing->pool);
     }
     views.clear();
+    sampler_lookup.clear(); // FIX-GTS-503: it points into the table
+    sampler_stand_in_lines.clear();
     samplers.clear();
+    retired_samplers.clear();
+    spare_samplers = {};
 }
 
 static bool FaultAheadEnabled() {
@@ -2634,13 +2669,19 @@ static bool FaultAheadEnabled() {
 // GT7-UW: the display buffers' addresses (the presenter notes them as the game registers them).
 namespace {
 std::array<std::atomic<VAddr>, 16> g_display_addresses{};
+/// DLSS-GT7-001: the size each was registered with (width << 32 | height; 0 unknown).
+std::array<std::atomic<u64>, 16> g_display_sizes{};
 } // namespace
 
-void NoteDisplayAddress(VAddr address) {
-    for (auto& slot : g_display_addresses) {
+void NoteDisplayAddress(VAddr address, u32 width, u32 height) {
+    for (std::size_t i = 0; i < g_display_addresses.size(); ++i) {
+        auto& slot = g_display_addresses[i];
         VAddr expected = 0;
         if (slot.load(std::memory_order_relaxed) == address ||
             slot.compare_exchange_strong(expected, address)) {
+            if (width != 0 && height != 0) {
+                g_display_sizes[i].store((u64{width} << 32) | height, std::memory_order_relaxed);
+            }
             return;
         }
     }
@@ -2661,22 +2702,48 @@ static bool IsDisplayAddress(VAddr address) {
 
 float RytyDisplayAspect(); // ryty_game_patch.cpp (GTS-009)
 
-// Merge (shadGT): GT7-UW splits GT7's HUD only; GT Sport keeps its own WIDE HUD handling.
-static bool IsGt7Title() {
-    static const bool gt7 = [] {
-        const auto& elf = Common::ElfInfo::Instance();
-        const std::string_view id = elf.GameSerial();
-        const std::string_view name = elf.Title();
-        return id == "CUSA24767" || id == "CUSA24769" ||
-               (name.starts_with("Gran Turismo") && name.ends_with(" 7"));
-    }();
-    return gt7;
+// Merge (shadGT): GT7's temporal DLSS (DLSS-GT7-001: NoteTemporalDraw and what hangs on it) is
+// GT7's only; GT Sport's is GtsDlssPass (CaptureNativeFsr), which GT7 does not take.
+static bool Gt7TemporalRequested() {
+    return Common::IsGt7() && RytyUpscale::TemporalRequested();
+}
+static bool Gt7TemporalActive() {
+    return Common::IsGt7() && RytyUpscale::TemporalActive();
+}
+
+// DLSS-GT7-001: the part of a picture drawn at a display buffer's address that the screen shows:
+// the size the buffer was registered with, from the top left corner. In the PS4 Pro mode GT7
+// draws into a 3840x2160 surface and shows its 1920x1080 or 3200x1800 corner (NEO-GT7-006); the
+// prototype's pictures standing for the display (HUD pictures, the scene drawn beside, the scene
+// before a menu's interface) are made that size, so they match what FindDisplay shows. Elsewhere
+// the picture's own size.
+static vk::Extent2D ShownPart(const Native::ImageEntry& picture) {
+    vk::Extent2D size{picture.info.size.width, picture.info.size.height};
+    for (std::size_t i = 0; i < g_display_addresses.size(); ++i) {
+        const VAddr value = g_display_addresses[i].load(std::memory_order_relaxed);
+        if (value == 0) {
+            break;
+        }
+        if (value == picture.info.guest_address) {
+            const u64 shown = g_display_sizes[i].load(std::memory_order_relaxed);
+            if (shown != 0) {
+                size.width = std::min(size.width, static_cast<u32>(shown >> 32));
+                size.height = std::min(size.height, static_cast<u32>(shown & 0xffffffffu));
+            }
+            break;
+        }
+    }
+    return size;
 }
 
 bool NativeRenderer::HudSplitOn() {
     static const bool on = [] {
         const char* env = std::getenv("SHADGT_HUD_SPLIT");
-        return IsGt7Title() && RytyDisplayAspect() > 0.0f && !(env && env[0] == '0');
+        // Merge (shadGT): GT7-UW splits GT7's HUD only; GT Sport keeps its own WIDE HUD handling.
+        // DLSS-GT7-001: the temporal prototype wants the HUD out of the picture DLSS scales (its
+        // pixels would take the scene's motion vectors); it is laid over the result as here.
+        return Common::IsGt7() && (RytyDisplayAspect() > 0.0f || Gt7TemporalRequested()) &&
+               !(env && env[0] == '0');
     }();
     return on;
 }
@@ -2719,7 +2786,35 @@ void NativeRenderer::BeginHudStream() {
 
 // Runs the HUD list after the main one (in the same command buffer, at the same tick).
 void NativeRenderer::SpliceHudStream(u64 tick) {
-    Stream& s = hud_stream;
+    SpliceStream(hud_stream, tick);
+    SpliceStream(hud_black_stream, tick); // DLSS-GT7-001
+    temporal.hud_batch_open = false;
+}
+
+bool NativeRenderer::HudBatchOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_DLSS_TEMPORAL_HUD_BATCH");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+void NativeRenderer::CloseHudBatch() {
+    temporal.hud_batch_open = false;
+    if (++temporal.batches == 1 || temporal.batches % 6000 == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "DLSS-GT7-001: HUD draws batched in their own lists: {} draws in {} batches",
+                    temporal.batched_draws, temporal.batches);
+    }
+    if (stream.list) {
+        Splice(); // the main list, then the HUD lists
+        return;
+    }
+    r.scheduler.EndRendering();
+    SpliceHudStream(r.scheduler.CurrentTick());
+}
+
+void NativeRenderer::SpliceStream(Stream& s, u64 tick) {
     if (!s.list) {
         return;
     }
@@ -2756,9 +2851,43 @@ void NativeRenderer::SpliceHudStream(u64 tick) {
     ForgetBindings(s); // OPT-014
 }
 
-Native::ImageEntry* NativeRenderer::MakeHudPicture(const Native::ImageEntry& like) {
+// DLSS-GT7-001: with the temporal prototype the HUD is only split in a frame that had the game's
+// temporal pass (a race). Menus keep their pictures as they are drawn: split, their 2D pages
+// came out wrong (seen by the user on 2026-11-11).
+bool NativeRenderer::HudSplitNow() const {
+    // DLSS-GT7-001: not in a menu frame whose interface goes through DLSS (NoteTemporalDraw).
+    return HudSplitOn() && (RytyDisplayAspect() > 0.0f ||
+                            (temporal.frame == frame && temporal.through_frame != frame));
+}
+
+// DLSS-GT7-001: the prototype's HUD pictures are twice the display's size, and the HUD's draws
+// get their viewports and scissors doubled, so a 1920x1080 HUD is drawn at 3840x2160 instead of
+// being stretched (the user saw it "left in low resolution" beside the DLSS picture). The draws
+// that give screen positions use a 16384-wide viewport: doubled, it needs 32768 (NVIDIA has it;
+// without it the HUD stays at the display's size).
+u32 NativeRenderer::HudScale() const {
+    static const bool wanted = [] {
+        const char* env = std::getenv("SHADGT_DLSS_TEMPORAL_HUD_SCALE");
+        return !(env && env[0] == '1');
+    }();
+    if (!wanted || !Gt7TemporalRequested() || RytyDisplayAspect() > 0.0f) {
+        return 1;
+    }
+    return r.instance.GetMaxViewportWidth() >= 32768 && r.instance.GetMaxViewportHeight() >= 32768
+               ? 2
+               : 1;
+}
+
+Native::ImageEntry* NativeRenderer::MakeHudPicture(const Native::ImageEntry& like, u32 scale,
+                                                   vk::Extent2D size) {
     auto* entry = new Native::ImageEntry{};
     entry->info = like.info;
+    if (size.width != 0 && size.height != 0) {
+        entry->info.size.width = size.width;
+        entry->info.size.height = size.height;
+    }
+    entry->info.size.width *= scale;
+    entry->info.size.height *= scale;
     Native::MadeImage made = MakeImage(entry->info, true);
     if (!made.image) {
         delete entry;
@@ -2788,8 +2917,9 @@ Native::ImageEntry* NativeRenderer::MakeHudPicture(const Native::ImageEntry& lik
     };
     s.cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
                                               .pImageMemoryBarriers = &barrier});
-    LOG_INFO(Render_Vulkan, "GT7-UW: HUD picture for the display {:#x} ({}x{})",
-             like.info.guest_address, like.info.size.width, like.info.size.height);
+    LOG_INFO(Render_Vulkan, "GT7-UW: HUD picture for the display {:#x} ({}x{}), {}x{}",
+             like.info.guest_address, like.info.size.width, like.info.size.height,
+             entry->info.size.width, entry->info.size.height);
     return entry;
 }
 
@@ -2802,7 +2932,24 @@ static bool CubeCompatible(const Instance& instance, u32 width, u32 height, u32 
            layers >= 6 && samples == 1;
 }
 
-Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bool) {
+static bool ListedInPlace(VAddr address, u64 size);
+
+// PERF-SGT-021 (SHADGT_RECYCLE_FRAME_TEXTURES=0: as before): GT7 writes a few small lookup
+// textures (30x17x16 and 4x4x48 R32G32Uint, a 512x256 R32Sfloat with mips) at a new address
+// of its per-frame memory in most frames. Each got a new image and view, so every draw that
+// samples one needed a new descriptor set: 30% of a race's sets, 15,000 a second, and the old
+// ones were dropped when the old texture went two seconds later (DIAG-SGT-019). Such a
+// texture now goes after an idle frame, and its image and views are kept for the next
+// one of the same shape: the view handle is the same and the kept sets are found again.
+static bool RecycleFrameTextures() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_RECYCLE_FRAME_TEXTURES");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bool render_target) {
     constexpr u64 GuestLimit = u64{1} << 40;
     if (FaultAheadEnabled() && info.guest_size && info.guest_address < GuestLimit &&
         info.guest_size <= GuestLimit - info.guest_address) {
@@ -2836,6 +2983,10 @@ Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bo
     vk::FormatFeatureFlags2 features = FeaturesOf(usage);
     vk::Format format = instance.GetSupportedFormat(info.pixel_format, features);
     const vk::ImageType type = TypeOf(info.type);
+    if (info.props.is_depth) {
+        // NEO-GTS-508: depth attachments of pipelines with the game's sample positions.
+        flags |= instance.SampleLocationsDepthFlag(format, type, usage, flags);
+    }
     auto properties =
         instance.GetPhysicalDevice().getImageFormatProperties2(vk::PhysicalDeviceImageFormatInfo2{
             .format = format,
@@ -2905,6 +3056,37 @@ Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bo
         .usage = usage,
         .initialLayout = vk::ImageLayout::eUndefined,
     };
+    u64 recycle_key = 0;
+    if (RecycleFrameTextures() && !render_target && info.guest_size != 0 &&
+        info.guest_size <= 1_MB && ListedInPlace(info.guest_address, info.guest_size)) {
+        const std::array<u64, 8> shape{
+            u64(static_cast<VkImageCreateFlags>(flags)),
+            u64(type) | u64(format) << 32,
+            u64(image_ci.extent.width) | u64(image_ci.extent.height) << 32,
+            u64(image_ci.extent.depth) | u64(image_ci.mipLevels) << 32,
+            u64(image_ci.arrayLayers) | u64(image_ci.samples) << 32,
+            u64(static_cast<VkImageUsageFlags>(usage)),
+            u64(static_cast<VkFormatFeatureFlags2>(features)),
+            u64(info.props.is_depth) | u64(info.props.has_stencil) << 1 |
+                u64(info.props.is_volume) << 2 | u64(info.pixel_format) << 32,
+        };
+        recycle_key = XXH3_64bits(shape.data(), sizeof(shape)) | 1;
+        std::scoped_lock lock{recycle_mutex};
+        if (const auto found = recycle_pool.find(recycle_key);
+            found != recycle_pool.end() && !found->second.empty()) {
+            auto& free = found->second.front();
+            made.image = std::move(free.image);
+            made.usage = free.usage;
+            made.features = free.features;
+            if (!free.records.empty()) {
+                recycle_views[made.image->NativeHandle()] = std::move(free.records);
+            }
+            found->second.pop_front();
+            --recycle_free;
+            ++recycle_taken;
+            return made;
+        }
+    }
     Native::Rhi::ImageDesc desc{};
     desc.dim = type == vk::ImageType::e3D ? Native::Rhi::ImageDim::D3 : Native::Rhi::ImageDim::D2;
     desc.format = Native::Rhi::FormatFromVk(static_cast<u32>(format));
@@ -2919,7 +3101,29 @@ Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bo
         *device, static_cast<const VkImageCreateInfo&>(image_ci), desc);
     made.usage = static_cast<u32>(static_cast<VkImageUsageFlags>(usage));
     made.features = static_cast<u64>(static_cast<VkFormatFeatureFlags2>(features));
+    if (recycle_key != 0 && made.image) {
+        std::scoped_lock lock{recycle_mutex};
+        recycle_keys[made.image->NativeHandle()] = recycle_key;
+        ++recycle_made;
+    }
     return made;
+}
+
+// DIAG-SGT-019 (SHADGT_DIAG_DESCRIPTOR_REUSE=1): what a view shows, for the report of the
+// descriptor sets that were not found. Called with views_mutex held.
+template <class Stats>
+static void DiagNameView(Stats& stats, const Native::ImageEntry& entry, vk::ImageView view) {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_DIAG_DESCRIPTOR_REUSE");
+        return env && env[0] == '1';
+    }();
+    if (!on) return;
+    const VAddr at = entry.info.guest_address;
+    stats.miss_diag_view_names[u64(static_cast<VkImageView>(view))] = fmt::format(
+        "{} {}x{} {} mips {} layers {} at {:#x}xxxxxx",
+        !entry.from_cpu ? "target" : "texture", entry.info.size.width, entry.info.size.height,
+        vk::to_string(entry.info.pixel_format), entry.info.resources.levels,
+        entry.info.resources.layers, at >> 24);
 }
 
 vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
@@ -2934,6 +3138,21 @@ vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
         r.FrameDumpEvent(fmt::format("scene-view id={} address={:#x} handle={:#x} use={} cached={} normalized_mip={}+{} normalized_layer={}+{} effective_min_lod={} min_lod_supported={} image_format={} requested_format={}",SceneTrace::Id(),entry.info.guest_address,reinterpret_cast<u64>(static_cast<VkImageView>(handle)),u32(use),cached,first,count,layer,layer_count,min_lod,r.instance.IsImageViewMinLodSupported(),u32(d.format),u32(requested.format)));
     };
     auto& records = views[&entry];
+    if (records.empty() && entry.image && RecycleFrameTextures()) {
+        // PERF-SGT-021: an image from the pool comes with its views
+        std::scoped_lock recycle_lock{recycle_mutex};
+        const u64 image_handle = entry.image->NativeHandle();
+        if (recycle_keys.contains(image_handle)) {
+            if (const auto kept = recycle_views.find(image_handle); kept != recycle_views.end()) {
+                records = std::move(kept->second);
+                recycle_views.erase(kept);
+                for (const auto& record : records) DiagNameView(stats, entry, *record.view);
+            }
+            if (std::ranges::find(recycle_live, &entry) == recycle_live.end()) {
+                recycle_live.push_back(&entry);
+            }
+        }
+    }
     for (const auto& record : records) {
         if (record.use == use && record.info == requested) {
             trace_view(*record.view,true);
@@ -3038,6 +3257,7 @@ vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
     trace_view(handle,false);
     if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-view-created id={} handle={:#x} format={} aspect={} type={}",SceneTrace::Id(),reinterpret_cast<u64>(static_cast<VkImageView>(handle)),u32(format),u32(aspect),u32(view_type)));
     records.push_back({requested, use, std::move(view)});
+    DiagNameView(stats, entry, handle); // DIAG-SGT-019
     return handle;
 }
 
@@ -3060,56 +3280,305 @@ u64 MemoHash(const u64* words, size_t count, u64 seed) {
 }
 } // namespace
 
+// DLSS-GT7-002: the bias temporal DLSS adds to a guest sampler (ryty_upscale.h), zero for those
+// it does not apply to. As in RyGT-Team/shadgt7 PR 42, it goes to the samplers of material
+// textures: filtered linearly over a mip chain. Shadow compares, point samplers and single-level
+// samplers keep the game's bias.
+// FIX-GT7-182: so does a sampler some instruction reads at an explicit level. Vulkan adds a
+// sampler's mipLodBias to explicit levels too ("LOD Operation"), and a level the shader computed
+// (GT7's roughness-to-mip reflection lookups) is not the screen-space footprint the bias
+// corrects: biased, dry roads looked wet. SHADGT_DLSS_BIAS_EXPLICIT_LOD=1 biases those too.
+static float TemporalSamplerBias(const AmdGpu::Sampler& sampler, bool is_depth,
+                                 bool explicit_lod) {
+    if (!Common::IsGt7()) {
+        return 0.0f; // Merge (shadGT): GT7's temporal path only
+    }
+    const float bias = RytyUpscale::TemporalMipBias().load(std::memory_order_relaxed);
+    if (bias == 0.0f || is_depth) {
+        return 0.0f;
+    }
+    static const bool bias_explicit = [] {
+        const char* env = std::getenv("SHADGT_DLSS_BIAS_EXPLICIT_LOD");
+        return env && env[0] == '1';
+    }();
+    if (explicit_lod && !bias_explicit) {
+        return 0.0f;
+    }
+    const auto linear = [](AmdGpu::Filter f) {
+        return f == AmdGpu::Filter::Bilinear || f == AmdGpu::Filter::AnisoLinear;
+    };
+    const bool material = sampler.mip_filter != AmdGpu::MipFilter::None &&
+                          sampler.MaxLod() > sampler.MinLod() && linear(sampler.xy_min_filter) &&
+                          linear(sampler.xy_mag_filter) &&
+                          sampler.filter_mode == AmdGpu::FilterMode::Blend;
+    return material ? bias : 0.0f;
+}
+
+// FIX-GTS-503: SHADGT_SAMPLER_JUNK_FILTER=0: an S# with reserved bits set gets a sampler of its
+// own, as before.
+static bool SamplerJunkFilterOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_SAMPLER_JUNK_FILTER");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
 vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& original,
-                                       AmdGpu::BorderColorBuffer border, bool is_depth) {
+                                       AmdGpu::BorderColorBuffer border, bool is_depth,
+                                       bool explicit_lod) {
     auto sharp = original;
+    // FIX-GTS-503 (shadgt7's FIX-GT7-178): an S# with reserved bits set is not a sampler, and
+    // gets the default one. A shader's sampler slots are all bound before the draw, the ones it
+    // will not read too: GT7's depth-to-distance pass (ps 0x2a265dff) samples only in a branch
+    // that races leave off, the game writes nothing to that slot, and what the memory held
+    // before (floats, counts, addresses) came through here as some ten new sampler states a
+    // second: 2,778 of the 2,839 samplers made in 6 minutes on 11-13, against 61 for everything
+    // the game really reads. Reserved bits tell 64% of that junk and none of the game's 72 S#s;
+    // the rest is dropped once unused (RecycleSamplers).
+    if (sharp.HasReservedBits() && SamplerJunkFilterOn()) {
+        sharp = AmdGpu::Sampler{};
+        samplers_refused.fetch_add(1, std::memory_order_relaxed);
+    }
     if (is_depth && (DiagnosticPassOptions(frame).first & 1)) {
         sharp.depth_compare_func.Assign(AmdGpu::DepthCompare::Always);
     }
     // PERF-GT7-015 (C): the samplers this thread looked up last, by raw S#, without the lock and
-    // the hash map (a draw binds ~4; samplers live as long as the renderer).
+    // the hash map (a draw binds ~4). FIX-GTS-503: for the sampler epoch they were looked up in
+    // only: the first use in a new epoch goes through MakeSampler, which marks the sampler used.
     struct CachedSampler {
         std::array<u64, 2> sharp;
         u64 extra;
         vk::Sampler sampler;
         const NativeRenderer* owner = nullptr;
         u64 epoch = 0;
+        float resolution_bias{};
+        u64 recycle_epoch = 0;
     };
+    const float resolution_bias = TemporalSamplerBias(sharp, is_depth, explicit_lod);
     static thread_local std::array<CachedSampler, 256> cached{};
     static_assert(sizeof(AmdGpu::Sampler) == sizeof(std::array<u64, 2>));
     CachedSampler* cache = nullptr;
     std::array<u64, 2> raw;
     std::memcpy(raw.data(), &sharp, sizeof(raw));
     const bool custom = sharp.border_color_type == AmdGpu::BorderColor::Custom;
-    const u64 extra = (is_depth ? 1u : 0u) | (custom ? u64(border.Address()) << 1 : 0);
+    // (explicit_lod in the key: one S# read both ways would else evict itself from its slot)
+    const u64 extra = (is_depth ? 1u : 0u) | (custom ? u64(border.Address()) << 1 : 0) |
+                      (explicit_lod ? u64{1} << 63 : 0);
+    const u64 recycle_epoch = sampler_epoch.load(std::memory_order_acquire);
     if (NextMemoEnabled()) {
         cache = &cached[MemoHash(raw.data(), raw.size(), extra) & (cached.size() - 1)];
         if (cache->sampler && cache->owner == this &&
             cache->epoch == sampler_cache_epoch.load(std::memory_order_acquire) &&
-            cache->sharp == raw && cache->extra == extra) {
+            cache->recycle_epoch == recycle_epoch && cache->sharp == raw &&
+            cache->extra == extra && cache->resolution_bias == resolution_bias) {
             return cache->sampler;
         }
     }
-    const vk::Sampler sampler = MakeSampler(sharp, border, is_depth);
+    // FIX-GTS-503: the cache epoch read before the lookup: a drop during it moves the epoch on,
+    // and the entry stored here then never matches.
+    const u64 cache_epoch = sampler_cache_epoch.load(std::memory_order_acquire);
+    const vk::Sampler sampler = MakeSampler(sharp, border, is_depth, resolution_bias);
     if (cache) {
-        *cache = {raw, extra, sampler, this, sampler_cache_epoch.load(std::memory_order_acquire)};
+        *cache = {raw, extra, sampler, this, cache_epoch, resolution_bias, recycle_epoch};
     }
     return sampler;
 }
 
+// FIX-GTS-503: SHADGT_SAMPLER_RECYCLE=0: no sampler is ever destroyed, and past the limit a
+// sampler already made stands in for every new state.
+static bool SamplerRecycleOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_SAMPLER_RECYCLE");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+// FIX-GTS-503: the sampler budget: the device's limit, 4000 at most with the recycling on (that
+// is NVIDIA's limit; AMD's and Intel's drivers allow many more, and with their own limit the
+// table would grow by the thousands of junk states an hour of racing brings and the recycling
+// would never run there: one budget, so every GPU takes the path the others were checked on).
+// SHADGT_TEST_SAMPLER_LIMIT=<n> (256 at least): a lower one for a test, reached within minutes.
+u32 NativeRenderer::SamplerLimit() const {
+    static const u32 limit = [this] {
+        constexpr u32 Budget = 4000;
+        const u32 reported = r.instance.GetMaxSamplerAllocationCount();
+        const u32 device = SamplerRecycleOn() ? std::min(reported, Budget) : reported;
+        const char* env = std::getenv("SHADGT_TEST_SAMPLER_LIMIT");
+        const u32 test = env && *env ? u32(std::strtoul(env, nullptr, 10)) : 0;
+        if (test == 0 || test >= device) {
+            return device;
+        }
+        const u32 lowered = std::max<u32>(test, 256);
+        LOG_WARNING(Render_Vulkan, "FIX-GTS-503: sampler limit {} for a test (the device's is {})",
+                    lowered, device);
+        return lowered;
+    }();
+    return limit;
+}
+
+// FIX-GTS-503: samplers dropped by one recycling pass, and destroyed by one call, at most. Junk
+// states come some ten a second and a pass at most every two seconds: 128 a second is ample.
+constexpr size_t SamplersAPass = 256;
+
+void NativeRenderer::RecycleSamplers() {
+    // FIX-GTS-503 (sampler_mutex held; shadgt7's FIX-GT7-174/177, never pushed there). A sampler
+    // per state, never destroyed, reached NVIDIA's 4000 within a long session, and FIX-GT7-002's
+    // stand-in, the last sampler made, then served every new state to the end: Spa's trees as
+    // opaque crowns (11-13), colours everywhere and a blue sky on the merge (11-17). Here the
+    // samplers not handed out since the current epoch began are dropped, at most every two
+    // seconds; the epoch then moves on. Each is destroyed once the GPU passed the tick.
+    DestroyRetiredSamplers();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - sampler_epoch_start < std::chrono::seconds{2}) {
+        return;
+    }
+    const u64 epoch = sampler_epoch.load(std::memory_order_relaxed);
+    const u64 tick = r.scheduler.CurrentTick() + 1;
+    // SamplersAPass at most: the first pass of a session finds everything the table took to fill,
+    // and this runs under the lock every sampler lookup takes. What is left keeps its old epoch
+    // and goes with the next passes.
+    std::vector<const SamplerEntry*> gone;
+    gone.reserve(SamplersAPass);
+    for (auto it = samplers.begin(); it != samplers.end() && gone.size() < SamplersAPass;) {
+        if (it->second.epoch < epoch) {
+            // Kept descriptor sets written with it go before anything can bind them again
+            // (PERF-GTS-375: the recorder takes the note before its next lookup).
+            Native::DeadHandles::Note(static_cast<VkSampler>(it->second.sampler->Handle()));
+            gone.push_back(&it->second);
+            retired_samplers.emplace_back(tick, std::move(it->second.sampler));
+            it = samplers.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    sampler_epoch.store(epoch + 1, std::memory_order_release);
+    sampler_epoch_start = now;
+    sampler_stand_in_lines.clear(); // each was for the epoch that ends here
+    if (!gone.empty()) {
+        samplers_dropped.fetch_add(gone.size(), std::memory_order_acq_rel);
+        // Every memo holding a sampler handle (the thread caches, the job draws' proofs and
+        // sealed image batches) is keyed by this epoch: none outlives the drop.
+        sampler_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
+        // The raw S#s of the dropped states go with them: their lines point at entries that no
+        // longer exist. A junk S# is never asked for again, so nothing else would take its line
+        // out, some ten a second in a race.
+        std::ranges::sort(gone);
+        std::erase_if(sampler_lookup, [&gone](const auto& raw) {
+            return std::ranges::binary_search(gone, static_cast<const SamplerEntry*>(raw.second));
+        });
+    }
+}
+
+void NativeRenderer::DestroyRetiredSamplers() {
+    // sampler_mutex held. SamplersAPass at most a call, as the drops.
+    const u64 done = r.scheduler.GetWorkSemaphore()->KnownGpuTick();
+    for (u32 n = 0; n < SamplersAPass && !retired_samplers.empty() &&
+                    retired_samplers.front().first <= done;
+         ++n) {
+        retired_samplers.pop_front();
+    }
+}
+
+vk::Sampler NativeRenderer::StandInSampler(const AmdGpu::Sampler& state,
+                                           AmdGpu::BorderColorBuffer border, bool is_depth) {
+    // FIX-GTS-503. Only a sampler of the same kind will do: a plain one for a compare read, or
+    // one with another comparison, is not a worse picture but an undefined or an inverted one.
+    // Among those, what a wrong sampler costs, worst first: the levels of detail it may read
+    // (11-13: leaves read from mip 6 on were opaque hulls), the border it answers with outside a
+    // shadow map, its filters (11-09: blocks), then how it wraps and its anisotropy.
+    const auto likeness = [&](const AmdGpu::Sampler& made) {
+        int score = 0;
+        if (made.min_lod.Value() == state.min_lod.Value() &&
+            made.max_lod.Value() == state.max_lod.Value()) {
+            score += 32;
+        }
+        score += made.border_color_type.Value() == state.border_color_type.Value() ? 16 : 0;
+        score += made.lod_bias.Value() == state.lod_bias.Value() ? 8 : 0;
+        score += made.xy_mag_filter.Value() == state.xy_mag_filter.Value() ? 4 : 0;
+        score += made.xy_min_filter.Value() == state.xy_min_filter.Value() ? 4 : 0;
+        score += made.mip_filter.Value() == state.mip_filter.Value() ? 4 : 0;
+        score += made.clamp_x.Value() == state.clamp_x.Value() ? 1 : 0;
+        score += made.clamp_y.Value() == state.clamp_y.Value() ? 1 : 0;
+        score += made.clamp_z.Value() == state.clamp_z.Value() ? 1 : 0;
+        score += made.max_aniso.Value() == state.max_aniso.Value() ? 1 : 0;
+        return score;
+    };
+    SamplerEntry* best = nullptr;
+    int best_score = -1;
+    u64 best_key = 0;
+    for (auto& [key, entry] : samplers) {
+        if (entry.depth != is_depth) {
+            continue;
+        }
+        AmdGpu::Sampler made{};
+        std::memcpy(&made, entry.state.data(), sizeof(made));
+        if (is_depth && made.depth_compare_func.Value() != state.depth_compare_func.Value()) {
+            continue;
+        }
+        // The lowest key among equals: the same answer whatever order the table is walked in.
+        const int score = likeness(made);
+        if (score > best_score || (score == best_score && key < best_key)) {
+            best = &entry;
+            best_score = score;
+            best_key = key;
+        }
+    }
+    if (best) {
+        best->epoch = sampler_epoch.load(std::memory_order_relaxed);
+        return best->sampler->Handle();
+    }
+    // None of its kind in the table: one made from the state itself, outside the table (which
+    // is full), one for plain reads and one a comparison at most, within the 64 the limit
+    // leaves for the samplers the table doesn't count.
+    auto& spare = spare_samplers[is_depth ? 1 + u32(state.depth_compare_func.Value()) : 0];
+    if (!spare) {
+        spare = std::make_unique<VideoCore::Sampler>(r.instance, state, border, is_depth);
+    }
+    return spare->Handle();
+}
+
 vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
-                                        AmdGpu::BorderColorBuffer border, bool is_depth) {
+                                        AmdGpu::BorderColorBuffer border, bool is_depth,
+                                        float resolution_bias) {
     const bool custom = sharp.border_color_type == AmdGpu::BorderColor::Custom;
     const u64 hash = XXH3_64bits(&sharp, sizeof(sharp)) ^
+                     (u64(std::bit_cast<u32>(resolution_bias)) << 16) ^
                      (is_depth ? 0x9E3779B97F4A7C15ULL : 0) ^
                      (custom ? u64(border.Address()) << 1 : 0);
     static thread_local Native::EpochValueMemo<vk::Sampler> memo;
-    const auto epoch = sampler_cache_epoch.load(std::memory_order_acquire);
+    // FIX-GTS-503: the memo holds for one cache epoch (a drop moves it) and one recycling epoch
+    // (its first use in a new one goes through the table and marks the sampler used). A sampler
+    // is dropped only after a whole epoch (2 s or more) nobody asked for it: a thread stopped
+    // longer than that between these loads and its use could still get a dropped handle.
+    const auto epoch = (sampler_cache_epoch.load(std::memory_order_acquire) << 32) +
+                       sampler_epoch.load(std::memory_order_acquire);
     if (const auto found = memo.Find(this, epoch, hash)) return *found;
     std::scoped_lock lock{sampler_mutex};
     if (const auto it = sampler_lookup.find(hash); it != sampler_lookup.end()) {
-        memo.Store(this, epoch, hash, it->second);
-        return it->second;
+        // FIX-GTS-503: handed out in this epoch; the entry is written only when the epoch
+        // changed (this runs for many samplers of many draws).
+        SamplerEntry& entry = *it->second;
+        if (const u64 recycle = sampler_epoch.load(std::memory_order_relaxed);
+            entry.epoch != recycle) {
+            entry.epoch = recycle;
+        }
+        const vk::Sampler handle = entry.sampler->Handle();
+        memo.Store(this, epoch, hash, handle);
+        return handle;
+    }
+    if (const auto it = sampler_stand_in_lines.find(hash); it != sampler_stand_in_lines.end()) {
+        // FIX-GTS-503: the stand-in this S# got, without walking the table again. With the
+        // recycling on it holds for two seconds at most, then the S# is looked at afresh (a pass
+        // may have made room); with it off, to the end, as the stand-in always did.
+        if (it->second.epoch == sampler_epoch.load(std::memory_order_relaxed) &&
+            (!SamplerRecycleOn() ||
+             std::chrono::steady_clock::now() - sampler_epoch_start < std::chrono::seconds{2})) {
+            ++sampler_stand_ins;
+            return it->second.sampler;
+        }
+        sampler_stand_in_lines.erase(it);
     }
     // FIX-GT7-002: one Vulkan sampler per state the device sees. GT7's S#s differ in bits the
     // sampler doesn't use (performance hints, unused bits, the border colour table when the
@@ -3136,18 +3605,16 @@ vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
             custom_color = border.Address<std::array<float, 4>*>()[sharp.border_color_ptr.Value()];
         }
     }
-    const u32 limit = r.instance.GetMaxSamplerAllocationCount();
-    if (samplers.size() >= limit / 4 * 3) {
-        // Close to the limit: levels of detail in quarter steps.
-        const auto quarter = [](float lod) { return std::round(lod * 4.0f) * 64.0f; };
-        state.min_lod.Assign(u64(quarter(sharp.MinLod())));
-        state.max_lod.Assign(u64(quarter(sharp.MaxLod())));
-        state.lod_bias.Assign(u64(s64(quarter(sharp.LodBias()))) & 0x3fff);
-    } else {
-        state.min_lod.Assign(sharp.min_lod.Value());
-        state.max_lod.Assign(sharp.max_lod.Value());
-        state.lod_bias.Assign(sharp.lod_bias.Value());
-    }
+    // FIX-GTS-503 (shadgt7's FIX-GT7-177): the levels of detail as given, whatever the table
+    // holds. Past three quarters of the limit they used to go in quarter steps, and the usual top
+    // level, 0xFFF (15.996), rounded to 16 and wrapped to 0 in its 12 bits: such a sampler read
+    // mip 0 alone, and a state made before no longer matched its own S#s (11-13: 70 of the 72
+    // S#s GT7 really uses have that top level). The states never were the trouble: junk S#s are,
+    // and those are dropped.
+    state.min_lod.Assign(sharp.min_lod.Value());
+    state.max_lod.Assign(sharp.max_lod.Value());
+    state.lod_bias.Assign(sharp.lod_bias.Value());
+    const u32 limit = SamplerLimit();
     // GFX-GT7-001 (the launcher's Texture sharpness, SHADGT_TEXTURE_LOD_BIAS=<levels>): added to every
     // sampler's bias, negative for sharper textures. Compare samplers keep theirs: a bias sharpens
     // nothing in a shadow test.
@@ -3167,6 +3634,12 @@ vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
         const float bias = std::clamp(state.LodBias() + texture_lod_bias, -max_bias, max_bias);
         state.lod_bias.Assign(u64(s64(std::round(bias * 256.0f))) & 0x3fff);
     }
+    if (resolution_bias != 0.0f) {
+        // DLSS-GT7-002: the sampler's own state carries the bias, so the pool keys on it.
+        const float max_bias = r.instance.MaxSamplerLodBias();
+        const float bias = std::clamp(state.LodBias() + resolution_bias, -max_bias, max_bias);
+        state.lod_bias.Assign(u64(s64(std::round(bias * 256.0f))) & 0x3fff);
+    }
     struct Key {
         AmdGpu::Sampler state;
         std::array<float, 4> color;
@@ -3174,28 +3647,49 @@ vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
     };
     const Key key{state, custom_color, is_depth ? 1u : 0u};
     const u64 state_hash = XXH3_64bits(&key, sizeof(key));
-    auto& slot = samplers[state_hash];
-    if (!slot) {
-        if (samplers.size() + 64 > limit && !samplers.empty()) {
-            // At the limit: the last sampler made stands in (logged), rather than a failure.
+    auto it = samplers.find(state_hash);
+    if (it == samplers.end()) {
+        // FIX-GTS-503: past three quarters of the limit, the samplers no longer used go first.
+        const auto allocated = [&] { return samplers.size() + retired_samplers.size(); };
+        if (SamplerRecycleOn() && allocated() >= limit / 4 * 3) {
+            RecycleSamplers();
+        }
+        if (allocated() + 64 > limit && !samplers.empty()) {
+            // At the limit (FIX-GTS-503: every sampler in use for two seconds or still on the
+            // GPU): a sampler already made stands in (logged), rather than a failure: the one of
+            // its kind that reads most like the state asked for, not the last one made (which was
+            // whatever junk an unused slot held when the table filled). Not memoized: its line
+            // holds for this epoch only.
+            ++sampler_stand_ins;
             static std::atomic<u32> logged{};
             if (Sample(logged)) {
                 LOG_ERROR(Render_Vulkan, "FIX-GT7-002: {} samplers, the device's limit is {}",
-                          samplers.size(), limit);
+                          allocated(), limit);
             }
-            samplers.erase(state_hash);
-              memo.Store(this, epoch, hash, last_sampler);
-            return last_sampler;
+            const vk::Sampler stand_in = StandInSampler(state, border, is_depth);
+            if (sampler_stand_in_lines.size() > (1u << 16)) {
+                sampler_stand_in_lines.clear();
+            }
+            sampler_stand_in_lines.insert_or_assign(
+                hash, StandInLine{stand_in, sampler_epoch.load(std::memory_order_relaxed)});
+            return stand_in;
         }
-        slot = std::make_unique<VideoCore::Sampler>(r.instance, state, border, is_depth);
-        last_sampler = slot->Handle();
+        it = samplers
+                 .emplace(state_hash,
+                          SamplerEntry{std::make_unique<VideoCore::Sampler>(r.instance, state,
+                                                                            border, is_depth),
+                                       0, {state.raw0, state.raw1}, is_depth})
+                 .first;
+        ++samplers_made;
     }
+    it->second.epoch = sampler_epoch.load(std::memory_order_relaxed); // FIX-GTS-503
     if (sampler_lookup.size() > (1u << 20)) {
         sampler_lookup.clear();
     }
-    sampler_lookup.emplace(hash, slot->Handle());
-    memo.Store(this, epoch, hash, slot->Handle());
-    return slot->Handle();
+    sampler_lookup.insert_or_assign(hash, &it->second);
+    const vk::Sampler handle = it->second.sampler->Handle();
+    memo.Store(this, epoch, hash, handle);
+    return handle;
 }
 
 
@@ -3328,11 +3822,16 @@ void NativeRenderer::BeginAhead() {
 CmdBuf NativeRenderer::CmdOf(Native::Rhi::CommandList& list) const {
     if (stream.list == &list) return stream.cmd;
     if (hud_stream.list == &list) return hud_stream.cmd; // GT7-UW
+    if (hud_black_stream.list == &list) return hud_black_stream.cmd; // DLSS-GT7-001
     ASSERT_MSG(list.NativeHandleSlot() == nullptr, "Deferred list is not the active stream");
     return CmdBuf{vk::CommandBuffer{Handle<VkCommandBuffer_T>(list.NativeHandle())}};
 }
 
 NativeRenderer::Stream& NativeRenderer::Begin() {
+    // DLSS-GT7-001: work other than a HUD draw of the open batch runs after the batch.
+    if (temporal.hud_batch_open && !temporal.display_draw_now) {
+        CloseHudBatch();
+    }
     Stream& s = stream;
     if (s.list) {
         return s;
@@ -3641,6 +4140,9 @@ void NativeRenderer::BindGraphics(Stream& s, const GraphicsPipeline& pipeline,
         s.so_known = false;
         s.pipelines.Graphics(pipeline.Handle(), [&] {
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.Handle());
+            if (pipeline.SampleLocationSamples() != 0) {
+                s.dynamic.ResendSampleLocations(cmdbuf); // NEO-GTS-508
+            }
         });
     }
 }
@@ -3690,8 +4192,9 @@ void NativeRenderer::FlushLdsReaders(u32) {
             so018_pipeline = pipeline.Handle(); so018_kind = 1;
         }
 #endif
-        BindGraphics(s, pipeline, reader.pipeline_owner);
+        // NEO-GTS-508: the reader's state first, so the bind resends its sample positions.
         s.dynamic = reader.dynamic;
+        BindGraphics(s, pipeline, reader.pipeline_owner);
         s.dynamic.Invalidate();
         s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
         RecordVertexIndex(reader.vertices);
@@ -4293,8 +4796,31 @@ void NativeRenderer::FlushWritebacks() {
                 return;
             }
             if (!chunked && (!direct || !direct->EnsureImported(address, size))) {
-                UNREACHABLE_MSG("native image download import failed");
-                return;
+                // FIX-GTS-499: the game may unmap a picture's memory while its write-back is
+                // pending (GT7 11-16, cold start: DIAG-132 dropped the views of 0x103f000000+
+                // 0x6400000 on the unmap, then the import of a picture inside it failed and this
+                // stopped the renderer). When the range is no longer mapped, or an unmap of it has
+                // begun (the mapping gate holds it unavailable until the host unmap is done),
+                // nothing is left to write back to: the picture's write-back is skipped, with a
+                // line. A failure on mapped memory (a driver refusing the import, a limit) still
+                // stops here.
+                auto& gate = Common::GuestMappingWritebackGate();
+                const auto token = gate.ProtocolAvailable()
+                                       ? gate.Capture(address, size)
+                                       : Common::MappingWritebackGate::Token{};
+                const bool unmapping = token && !gate.Complete(token, [] {});
+                if (!unmapping && Core::RytyMemory::IsValidMapping(address, size)) {
+                    UNREACHABLE_MSG("native image download import failed");
+                    return;
+                }
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-GTS-499: write-back of the picture at {:#x}+{:#x} skipped: "
+                                "the game unmapped its memory",
+                                address, size);
+                }
+                continue;
             }
             if (!chunked) parts = direct->PlanLeasedParts(address, size, alignment, 1);
             const bool direct_output = !chunked && parts && parts->size() == 1;
@@ -4706,6 +5232,17 @@ void NativeRenderer::TrimIdleChunks() {
     // Release completed buffers outside the pool mutex.
 }
 
+// DIAG-171 (port of shadgt7's switch; diagnosis, SHADGT_NATIVE_NO_REUSE): 1 = descriptor pools
+// are never used again, 2 = upload chunks neither, 3 = chunks reused 16 GPU ticks later than
+// they could be. They pile up: to see whether reuse races the GPU. 0 or unset: off.
+static char NativeNoReuse() {
+    static const char mode = [] {
+        const char* env = std::getenv("SHADGT_NATIVE_NO_REUSE");
+        return env && env[0] >= '1' && env[0] <= '3' ? env[0] : '0';
+    }();
+    return mode;
+}
+
 NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     Native::SlowCallTrace<6> trace{t_timed, "take-upload-chunk",
         {"mutex", "timeline-query", "trim-free", "reclaim-retired", "take-free", "create-buffer"}};
@@ -4726,7 +5263,12 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     // reserve once their GPU work finishes instead of retaining that peak forever.
     trace.Next(2);
     trace.Next(3);
-    CacheCompletedUploadChunks(free_chunks, retiring_chunks, known);
+    // DIAG-171 (port): =2 keeps retired chunks out of reuse, =3 reuses them 16 ticks late.
+    if (const char no_reuse = NativeNoReuse(); no_reuse != '2') {
+        const u64 margin = no_reuse == '3' ? u64{16} : u64{0};
+        CacheCompletedUploadChunks(free_chunks, retiring_chunks,
+                                   known > margin ? known - margin : u64{0});
+    }
     free_chunks_low = std::min(free_chunks_low, free_chunks.size());
     trace.Next(4);
     auto fit = free_chunks.end();
@@ -4849,7 +5391,8 @@ vk::DescriptorPool NativeRenderer::TakeDescriptorPool() {
     const vk::Device vk_device = r.instance.GetDevice();
     vk::DescriptorPool ready;
     bool reset = false;
-    {
+    // DIAG-171 (port): SHADGT_NATIVE_NO_REUSE=1 or 2: a new pool each time (diagnosis).
+    if (const char no_reuse = NativeNoReuse(); no_reuse != '1' && no_reuse != '2') {
         std::scoped_lock lock{chunk_mutex};
         std::tie(ready, reset) = Native::TakeReadyDescriptorPool(free_pools, retiring_pools,
             r.scheduler.GetWorkSemaphore()->KnownGpuTick());
@@ -4895,6 +5438,22 @@ bool NativeRenderer::HasImageBacking(VAddr address, u64 size) {
     return Core::RytyMemory::IsValidMapping(address, size);
 }
 
+// FIX-GT7-184: whether nothing can be read for a texture of this layout that has no image yet:
+// no page of its guest range is committed (its copy would be zeros), the GPU wrote no region there
+// (NAT-107 uploads from those) and drew no picture there (NAT-104 copies those in: the shadow maps
+// at 0x2900000000 are textures over memory the CPU never maps, so never committed).
+bool NativeRenderer::NothingToRead(const VideoCore::ImageInfo& info) {
+    const VAddr begin = info.guest_address;
+    const u64 size = info.guest_size;
+    if (Native::AnyCommittedPage(begin, size) || RegionOver(begin, size)) {
+        return false;
+    }
+    bool drawn = false;
+    registry->ForEachOverlapping(begin, begin + size,
+                                 [&](Native::ImageEntry& other) { drawn |= !other.from_cpu; });
+    return !drawn;
+}
+
 NativeRenderer::Region* NativeRenderer::RegionOver(VAddr address, u64 size) {
     auto it = regions.upper_bound(address);
     if (it != regions.begin()) {
@@ -4936,13 +5495,43 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
     }
     merged.reserve(region_count);
     retired_watch_ranges.reserve(retired_watch_ranges.size() + region_count);
+    // FIX-SGT-012 (SHADGT_REGION_AVOID_LISTED=0: as before): a region never grows or merges into a
+    // listed in-place range the asked range does not reach and no region there holds already.
+    // FIX-SGT-004 sends binds in those ranges to guest memory, but a region could still cover
+    // them: in GT7's rain one grew to 0x101d8d9000-0x102ee1e000 (277 MB, 666 textures) over the
+    // GPU culling block 0x1020000000-0x1020412000. Its watched pages faulted on the compute
+    // queue's read pointer GT7 keeps there (0x1020000440, 0x10202355c0), and reads through the
+    // region met bytes the culling passes wrote in place: the road went dark for single frames,
+    // also while paused (shown by SHADGT_NATIVE_WRITE_REGIONS=0 and a Shift+F8 dump).
+    static const bool avoid_listed = [] {
+        const char* env = std::getenv("SHADGT_REGION_AVOID_LISTED");
+        return !(env && env[0] == '0');
+    }();
+    const auto takes_listed = [&](VAddr from, VAddr to) {
+        if (!avoid_listed) return false;
+        for (const auto& [listed_begin, listed_end] : NativeInplaceRanges()) {
+            if (from >= listed_end || to <= listed_begin) continue;
+            if (address < listed_end && address + size > listed_begin) continue; // asked for
+            bool held = false;
+            for (const auto& [base, other] : regions) {
+                if (other.begin < listed_end && other.end > listed_begin && other.begin < to &&
+                    other.end > from) {
+                    held = true;
+                    break;
+                }
+            }
+            if (!held) return true;
+        }
+        return false;
+    };
     {
         std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
         const auto action = Native::ReplaceOverlappingRegions(
             regions, begin, end, write, size, 1_GB,
             [&](VAddr from, VAddr to) {
                 return direct && to - from <= 1_GB && r.IsMappedStart(from) &&
-                       r.memory->IsValidGpuMapping(from, to - from);
+                       r.memory->IsValidGpuMapping(from, to - from) &&
+                       !takes_listed(from, to); // FIX-SGT-012
             }, [&](VAddr from, VAddr to) {
             region.begin = from;
             region.end = to;
@@ -4961,10 +5550,22 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
                 merged.push_back(std::move(old));
                 ++regions_taken_in;
         }, RegionGrowSlack());
+        NoteOwnedMapChange(); // PERF-GT7-133: regions may have been taken out
         if (action == Native::RegionMergeDisposition::Preserve) return nullptr;
     }
     ++buffer_generation; // OPT-003: regions are taken in or made
     buffer_log.Note(begin, end); // OPT-010
+    // DIAG-SGT-013: a region that covers part of a listed in-place range, and what asked for it.
+    static std::atomic<u32> listed_regions_logged{0};
+    if (listed_regions_logged.load(std::memory_order_relaxed) < 24 &&
+        std::ranges::any_of(NativeInplaceRanges(), [&](const auto& range) {
+            return begin < range.second && end > range.first;
+        }) && listed_regions_logged.fetch_add(1, std::memory_order_relaxed) < 24) {
+        LOG_WARNING(Render_Vulkan,
+                    "DIAG-SGT-013: region {:#x}-{:#x} over a listed in-place range; asked {:#x}+{:#x} "
+                    "({}), {} regions taken in, frame {}",
+                    begin, end, address, size, write ? "write" : "read", merged.size(), frame);
+    }
     // GPU-only guest allocations need not have CPU-importable backing. They still need
     // storage for shader writes (including the terrain's persistent shadow map).
     // PERF-GT7-131 (SHADGT_REGION_COPY=0 off): a region over small mappings not imported yet (a
@@ -5046,6 +5647,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
 #endif
     NoteHistory(begin, end - begin, 10, merged.size()); // DIAG-187 (diagnosis)
     std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
+    NoteOwnedMapChange(); // PERF-GT7-133
     auto [it, inserted] = regions.emplace(begin, std::move(region));
     return &it->second;
 }
@@ -5055,7 +5657,21 @@ void NativeRenderer::SortRegionWrites() {
         return;
     }
     const bool mirror_diag=MirrorDiagnosticEnabled();
-    std::vector<std::pair<VAddr, VAddr>> writes, stack_retirements;
+    // PERF-GT7-134: the lists taken are this thread's, kept from one call to the next, and the
+    // pending ones get their emptied storage back: local lists freed both at every call (and the
+    // pending ones grew again from nothing), ~0.4 ms a frame of the recorder in a GT7 race. A
+    // nested call (none is known) takes lists of its own.
+    static thread_local std::vector<std::pair<VAddr, VAddr>> kept_writes, kept_retirements;
+    static thread_local u32 sort_depth = 0;
+    std::vector<std::pair<VAddr, VAddr>> nested_writes, nested_retirements;
+    auto& writes = sort_depth == 0 ? kept_writes : nested_writes;
+    auto& stack_retirements = sort_depth == 0 ? kept_retirements : nested_retirements;
+    ++sort_depth;
+    SCOPE_EXIT {
+        --sort_depth;
+    };
+    writes.clear();
+    stack_retirements.clear();
     {
         std::scoped_lock lock{region_dirty_mutex};
         writes.swap(pending_region_writes);
@@ -5127,6 +5743,7 @@ void NativeRenderer::SortRegionWrites() {
                 buffer_log.Note(mirror.begin, mirror.end, true); // OPT-010
                 retired_watch_ranges.emplace_back(mirror.begin, mirror.end);
                 std::unique_lock map_lock{buffer_map_mutex};
+                NoteOwnedMapChange(); // PERF-GT7-133
                 it = mirrors.erase(it); // freed once the GPU is done with it
                 continue;
             }
@@ -5210,12 +5827,18 @@ bool NativeRenderer::IsDynamic(VAddr begin, VAddr end, u64* blocked_granule, u64
     return false;
 }
 
+// DIAG-GTS-524: why the last MirrorBuffer call gave no mirror (1 off or over 64 MB, 2 refresh
+// refused, 3 first sighting, 4 seen this frame already, 5 rewritten memory, 6 queued).
+static thread_local u8 g_mirror_miss = 0;
+
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr address, u64 size) {
+    g_mirror_miss = 0;
     static const bool enabled = [] {
         const char* env = std::getenv("SHADGT_NATIVE_MIRRORS");
         return !(env && env[0] == '0');
     }();
     if (!enabled || size == 0 || size > 64_MB) {
+        g_mirror_miss = 1;
         return std::nullopt;
     }
     SortRegionWrites();
@@ -5225,7 +5848,10 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr add
         mirror = MirrorHolding(address, size);
     }
     if (mirror) {
-        if (!RefreshMirror(*mirror)) return std::nullopt;
+        if (!RefreshMirror(*mirror)) {
+            g_mirror_miss = 2;
+            return std::nullopt;
+        }
         mirror->used_frame = frame;
         NATIVE_DIAGNOSTIC(++stats.mirror_binds);
         memo_kind = MemoKind::Mirror; // OPT-003
@@ -5258,22 +5884,26 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr add
     const bool mirror_diag=MirrorDiagnosticEnabled();
     if (inserted) {
         if(mirror_diag)NoteMirrorDiagnostic(MirrorCandidateNew,address,address+size,begin,end,unmap_generation.load());
+        g_mirror_miss = 3;
         return std::nullopt;
     }
     candidate.end = std::max(candidate.end, end);
     if (candidate.frame == frame) {
         if(mirror_diag)NoteMirrorDiagnostic(MirrorCandidateSameFrame,address,address+size,begin,candidate.end,unmap_generation.load());
+        g_mirror_miss = 4;
         return std::nullopt;
     }
     candidate.frame = frame; // looked at again next frame at the earliest
     u64 blocked_granule=~u64{0},blocked_age=~u64{0};
     if (IsDynamic(begin, candidate.end,mirror_diag?&blocked_granule:nullptr,mirror_diag?&blocked_age:nullptr)) {
         if(mirror_diag)NoteMirrorDiagnostic(MirrorCandidateDynamic,address,address+size,begin,candidate.end,unmap_generation.load(),blocked_granule,blocked_age);
+        g_mirror_miss = 5;
         return std::nullopt;
     }
     pending_mirrors.emplace_back(begin, candidate.end);
     if(mirror_diag)NoteMirrorDiagnostic(MirrorCandidateQueued,address,address+size,begin,candidate.end,unmap_generation.load());
     mirror_candidates.erase(it);
+    g_mirror_miss = 6;
     return std::nullopt;
 }
 
@@ -5513,6 +6143,7 @@ void NativeRenderer::MakePendingMirrors() {
                     ++buffer_generation;
                     buffer_log.Note(it->second.begin, it->second.end, true);
                     retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
+                    NoteOwnedMapChange(); // PERF-GT7-133
                     it = mirrors.erase(it);
                 } else {
                     ++it;
@@ -5586,6 +6217,7 @@ void NativeRenderer::MakePendingMirrors() {
             for (auto it = FirstMirror(begin); it != mirrors.end() && it->second.begin < end;) {
                 mirror_bytes -= it->second.end - it->second.begin;
                 retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
+                NoteOwnedMapChange(); // PERF-GT7-133
                 it = mirrors.erase(it); // freed once the GPU is done with it
             }
         }
@@ -5604,6 +6236,7 @@ void NativeRenderer::MakePendingMirrors() {
         NATIVE_DIAGNOSTIC(stats.mirror_retaken_bytes += taken);
         NATIVE_DIAGNOSTIC(stats.mirror_largest = std::max<u64>(stats.mirror_largest, end - begin));
         promotion_trace.Next(6);
+        NoteOwnedMapChange(); // PERF-GT7-133
         mirrors.emplace(begin, Mirror{.begin = begin,
                                       .end = end,
                                       .buffer = std::move(buffer),
@@ -5625,6 +6258,7 @@ void NativeRenderer::DropMirrors(VAddr address, u64 size, u32 diagnostic_reason)
         buffer_log.Note(it->second.begin, it->second.end, true); // OPT-010
         retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
         std::unique_lock map_lock{buffer_map_mutex};
+        NoteOwnedMapChange(); // PERF-GT7-133
         it = mirrors.erase(it); // freed once the GPU is done with it
     }
 }
@@ -5634,6 +6268,13 @@ static const std::vector<std::pair<VAddr, VAddr>>& NativeInplaceRanges() {
         std::vector<std::pair<VAddr, VAddr>> result;
         const char* configured = std::getenv("SHADGT_NATIVE_INPLACE_RANGES");
         const char* extra = std::getenv("SHADGT_NATIVE_INPLACE_EXTRA");
+        // FIX-GT7-034 (port): the listed ranges whose GPU writes go back under a region include
+        // FIX-GT7-029's per-frame tail, as InplaceRanges() does (shadgt7 used one list for both).
+        // Without it a neighbour's region grown over the tail kept the GPU's writes there from
+        // the CPU. Only with a list (GT7's launcher sets one; GT Sport has none).
+        if (!extra && configured) {
+            extra = "208000000+800000";
+        }
         for (const char* source : {configured, extra}) {
             for (const char* at = source; at && *at;) {
                 char* end = nullptr;
@@ -6078,9 +6719,15 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         }
     }
     dirty.erase(first, last);
+    // PERF-104 (port of shadgt7's switch): consecutive pages are watched again in one call.
+    // SHADGT_NATIVE_REFRESH_BATCH=0: each page on its own (diagnosis).
+    static const bool watch_batch = [] {
+        const char* env = std::getenv("SHADGT_NATIVE_REFRESH_BATCH");
+        return !(env && env[0] == '0');
+    }();
     for (size_t first = 0; first < pages.size();) {
         size_t last = first + 1;
-        while (last < pages.size() && pages[last] == pages[last - 1] + 4096) ++last;
+        while (watch_batch && last < pages.size() && pages[last] == pages[last - 1] + 4096) ++last;
         const VAddr watched_end = std::min(region.end, pages[last - 1] + 4096);
         WatchPages(pages[first], watched_end - pages[first]);
         first = last;
@@ -6261,12 +6908,97 @@ constexpr u32 OneOffSafeCount = 8;
 // At one address, 4 (the per-frame targets there come back at the same address run after run).
 constexpr u32 OneOffPlaceSafeCount = 4;
 
+// FIX-GT7-149 (SHADGT_ONE_OFF_KEPT_RULE=0: as before): which pictures FIX-GT7-121 waits for without
+// a deadline. "Sampled in a later frame before any redraw" counted as harmful at once, and one
+// such sighting made a kind wait for ever. A picture sampled the frame after its draw and drawn
+// again the frame after that fell in it: skipped, it is wrong for a frame or two, as any skipped
+// draw. On the PC measured, 115 of 306 kinds were marked, full-screen colour targets among them
+// (1920x1088: safe 2,914 times, harmful twice), and on a cold Nurburgring race start 27.0 of
+// the 27.2 s of waits without a deadline were for pictures drawn again within 4 frames (RTX
+// 4070, 16 threads, one run); the pictures really kept (shadow maps) cost next to nothing.
+// Now a picture is harmful when sampled and not drawn again within OneOffRedrawGrace frames,
+// and a kind waits without a deadline when seen harmful more often than safe; a place (its
+// address) still does after one sighting. The rule learns in a file of its own (the old rule's
+// is left as it is, and SHADGT_ONE_OFF_KEPT_RULE=0 goes on with it), started from the old one:
+// kinds as they are (the old sightings outnumbered no longer count), places seen safe at
+// least as often as harmful without their harmful count, and one safe sighting short of
+// PERF-GT7-023's exemption, so that none is skipped outright on the old rule's word.
+bool OneOffKeptRule() {
+    static const bool on = [] {
+        // GT7 only (FIX-GT7-149): GT Sport keeps its rule and its learned file.
+        const char* env = std::getenv("SHADGT_ONE_OFF_KEPT_RULE");
+        return Common::IsGt7() && !(env && env[0] == '0');
+    }();
+    return on;
+}
+// Frames after its draw in which a redraw still makes a sampled picture harmless: skipped, it
+// would have been wrong that long at most.
+constexpr u64 OneOffRedrawGrace = 4;
+
 bool OneOffKindExempt(u32 safe, u32 harmful) {
     return harmful == 0 && safe >= OneOffSafeCount;
 }
 
 bool OneOffPlaceExempt(u32 safe, u32 harmful) {
     return harmful == 0 && safe >= OneOffPlaceSafeCount;
+}
+
+// FIX-GT7-153 (SHADGT_KEPT_SHADOW_MAPS=0: as before): GT7 draws one shadow map of the whole circuit
+// per track (see kept_shadow_map.h), at one of a few addresses, and keeps it: the scene samples it
+// beyond the real-time cascades. Two things lost it on a cold first race, for the whole visit (no
+// shadow past ~100 m in a hood view, shadows "appearing" as they enter the cascades, until the
+// track was entered again):
+//  - PERF-GT7-023 learns kept pictures by their exact kind (size included) or by their address, and
+//    only after one was skipped and sampled; until then the map's draws waited only the frame's
+//    budget (FIX-GT7-102/109) and were skipped while their new pipelines built. A draw into it now
+//    waits whatever was learned: without a deadline at its first drawing (the map not drawn within
+//    the last frames: the whole map at a load, ~2,000 draws in one frame at Le Mans) and out of
+//    play; a redraw in play keeps the frame's budget (FIX-GT7-109). Measured on an RTX 4070 only:
+//    10-12 ms per new depth-only pipeline, ~40 ms in one loading frame at Le Mans.
+//  - Drawn during a load that then went on for hundreds of frames of compiles, nothing sampled it
+//    for 120 frames and NAT-108 dropped it; see EvictImages.
+// A draw whose colour target was not drawn lately takes the general rule first (the map passes are
+// depth-only).
+bool KeptShadowMapsOn() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_KEPT_SHADOW_MAPS");
+        // Merge (shadGT): GT7's maps only. GT Sport's terrain shadow map has the same shape and
+        // is kept by its own rule (EvictImages, tracked_depth).
+        return Common::IsGt7() && !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+
+// FIX-GTS-497: the first part of FIX-GT7-153 (a draw into a circuit's shadow map waits for its
+// pipeline, without a deadline at its first drawing) for both games. GT Sport's terrain shadow
+// map has the same shape (square 16-bit depth, 16384x16384 at 0x2900000000 at Northern Isle) and
+// was skipped there while its pipeline built on a cold first race, then never drawn again: no
+// shadow past the cascades for the whole race (seen 11-16 morning; end-of-race report of 18:12).
+// Keeping the drawn map in memory stays each game's own rule (EvictImages). SHADGT_KEPT_SHADOW_MAPS=0
+// turns both parts off.
+bool KeptShadowMapWaitOn() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_KEPT_SHADOW_MAPS");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+
+bool KeptShadowMapTarget(const AmdGpu::Regs& regs) {
+    const auto& db = regs.depth_buffer;
+    return KeptShadowMapWaitOn() &&
+           IsKeptShadowMapShape(db.z_info.format == AmdGpu::DepthBuffer::ZFormat::Z16, db.Pitch(),
+                                db.Height(), regs.depth_view.NumSlices(), db.NumSamples());
+}
+
+// The same pictures once drawn, from their memory layout (not the draw's extent), with or without
+// stencil, as KeptShadowMapTarget reads the registers.
+bool KeptShadowMapImage(const VideoCore::ImageInfo& info) {
+    const bool z16 = info.props.is_depth && (info.pixel_format == vk::Format::eD16Unorm ||
+                                             info.pixel_format == vk::Format::eD16UnormS8Uint);
+    return KeptShadowMapsOn() &&
+           IsKeptShadowMapShape(z16, info.pitch, info.mips_layout[0].height, info.resources.layers,
+                                info.num_samples);
 }
 
 // The family of a kind: its format and tiling, whatever its size.
@@ -6276,10 +7008,11 @@ Kind FamilyOf(Kind kind) {
     return kind;
 }
 
-std::filesystem::path OneOffKindsPath() {
+std::filesystem::path OneOffKindsPath(bool kept_rule) {
     const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
+    // FIX-GT7-149: the kept rule's file is another one.
     return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
-           fmt::format("{}.one_off_kinds.txt", serial);
+           fmt::format("{}.one_off_kinds{}.txt", serial, kept_rule ? "2" : "");
 }
 } // namespace
 
@@ -6341,7 +7074,9 @@ bool NativeRenderer::OneOffKnownHarmful() const {
     for (const OneOffHit& hit : one_off_hits) {
         const OneOffKind kind = KindOf(hit);
         if (const auto it = one_off_kinds.find(kind);
-            it != one_off_kinds.end() && it->second.harmful != 0) {
+            it != one_off_kinds.end() &&
+            (OneOffKeptRule() ? it->second.harmful > it->second.safe // FIX-GT7-149
+                              : it->second.harmful != 0)) {
             return true;
         }
         if (const auto it = one_off_places.find({hit.address, kind});
@@ -6360,10 +7095,15 @@ void NativeRenderer::LoadOneOffKinds() {
     if (!OneOffLearnOn()) {
         return;
     }
-    std::ifstream file{OneOffKindsPath()};
+    // FIX-GT7-149: the kept rule's own file, or at its first start the old rule's, taken over.
+    std::error_code exists_ec;
+    const bool take_over = OneOffKeptRule() &&
+                           !std::filesystem::exists(OneOffKindsPath(true), exists_ec);
+    std::ifstream file{OneOffKindsPath(OneOffKeptRule() && !take_over)};
     std::string line;
     u32 exempt = 0;
     u32 places_exempt = 0;
+    u32 cleared = 0;
     while (std::getline(file, line)) {
         if (line.empty() || line[0] == '#') {
             continue;
@@ -6388,6 +7128,14 @@ void NativeRenderer::LoadOneOffKinds() {
             continue;
         }
         kind.depth = what == "depth";
+        one_off_kinds_changed |= take_over; // written to the kept rule's file
+        if (take_over && address != 0 && seen.harmful != 0 && seen.harmful <= seen.safe) {
+            // The old rule's sightings, outnumbered: waits with the frame's budget again,
+            // until the kept rule has seen it for itself.
+            seen.harmful = 0;
+            seen.safe = std::min(seen.safe, OneOffPlaceSafeCount - 1);
+            ++cleared;
+        }
         if (address != 0) {
             one_off_places[{address, kind}] = seen;
             places_exempt += OneOffPlaceExempt(seen.safe, seen.harmful) ? 1 : 0;
@@ -6400,6 +7148,12 @@ void NativeRenderer::LoadOneOffKinds() {
              "PERF-GT7-023: {} kinds of one-off pictures known, {} of them no longer waited for; "
              "{} places, {} of them no longer waited for",
              one_off_kinds.size(), exempt, one_off_places.size(), places_exempt);
+    if (cleared != 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-GT7-149: the old rule's file taken over; the harmful counts of {} places "
+                    "are dropped (seen safe at least as often)",
+                    cleared);
+    }
 }
 
 void NativeRenderer::SaveOneOffKinds(bool wait) {
@@ -6421,7 +7175,7 @@ void NativeRenderer::SaveOneOffKinds(bool wait) {
     for (const auto& [place, seen] : one_off_places) {
         text += fmt::format("at {:#x} ", place.address) + kind_text(place.kind, seen);
     }
-    auto write = [path = OneOffKindsPath(), text = std::move(text)] {
+    auto write = [path = OneOffKindsPath(OneOffKeptRule()), text = std::move(text)] {
         static std::mutex write_mutex;
         std::scoped_lock lk{write_mutex};
         auto temp = path;
@@ -6475,6 +7229,355 @@ void NativeRenderer::WatchOneOffs(const AmdGpu::Regs& regs, bool skipped) {
     one_off_hits.clear();
 }
 
+// PERF-GTS-493: a one-off picture skipped in a race (its pipeline was not built yet), kept until a
+// draw writes it. What is left when the race stops running (or every 60 s in a race) is written to
+// the log: pictures the game drew only while their pipeline was missing, so missing for the race.
+// DIAG-GTS-507 (PS4 Pro mode only, SHADGT_SAMPLE_LOCS_DIAG=0 turns it off): the sample positions
+// a multi-sample draw asks for (PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0..X1Y1, 0xA2FE, 4 registers a pixel
+// of the 2x2 quad, 4 samples a register, each a signed 4-bit x then y in 1/16 pixel from the pixel's
+// centre), with PA_SC_AA_CONFIG and PA_SC_CENTROID_PRIORITY. The renderer does not give them to
+// Vulkan yet (RECHERCHE-POSITIONS-ECHANTILLONS-PRO.md); a GPU with a 1x1 sample-location grid
+// (NVIDIA) can only take them if the four pixels of the quad ask for the same ones. One line for
+// each distinct setting (64 at most), with the pixel shader of its first draw.
+static void NoteSampleLocations(const AmdGpu::Regs& regs) {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_SAMPLE_LOCS_DIAG");
+        return Libraries::Kernel::sceKernelIsNeoMode() != 0 && !(env && env[0] == '0');
+    }();
+    if (!on || regs.aa_config.msaa_num_samples == 0) {
+        return;
+    }
+    constexpr u32 kLocs = 0xA2FE;
+    constexpr u32 kCentroid = 0xA2F5;
+    std::array<u32, 19> key{};
+    std::memcpy(&key[0], &regs.aa_config, sizeof(u32));
+    for (u32 i = 0; i < 16; ++i) {
+        key[1 + i] = regs.reg_array[kLocs + i];
+    }
+    key[17] = regs.reg_array[kCentroid];
+    key[18] = regs.reg_array[kCentroid + 1];
+    static std::mutex mutex;
+    static std::vector<std::array<u32, 19>> seen;
+    {
+        std::scoped_lock lock{mutex};
+        if (seen.size() >= 64 || std::ranges::find(seen, key) != seen.end()) {
+            return;
+        }
+        seen.push_back(key);
+    }
+    const u32 samples = regs.aa_config.NumSamples();
+    const auto position = [&](u32 pixel, u32 sample) {
+        const u32 word = regs.reg_array[kLocs + pixel * 4 + sample / 4];
+        const u32 byte = (word >> ((sample % 4) * 8)) & 0xff;
+        const int x = static_cast<int>(byte & 0xf) - ((byte & 0x8) ? 16 : 0);
+        const int y = static_cast<int>(byte >> 4) - ((byte & 0x80) ? 16 : 0);
+        return std::pair{x, y};
+    };
+    std::string text;
+    bool same = true;
+    for (u32 pixel = 0; pixel < 4; ++pixel) {
+        text += fmt::format(" {}:", pixel == 0 ? "X0Y0" : pixel == 1 ? "X1Y0" : pixel == 2 ? "X0Y1" : "X1Y1");
+        for (u32 sample = 0; sample < std::min<u32>(samples, 16); ++sample) {
+            const auto [x, y] = position(pixel, sample);
+            text += fmt::format(" ({},{})", x, y);
+            same = same && position(0, sample) == position(pixel, sample);
+        }
+    }
+    u64 ps_hash = 0;
+    if (regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Fragment))) {
+        if (const auto* pgm = regs.ProgramForStage(u32(Shader::HwStage::Fragment));
+            pgm && pgm->Address<u32*>()) {
+            ps_hash = AmdGpu::GetParams(*pgm).hash;
+        }
+    }
+    LOG_WARNING(Render_Vulkan,
+                "DIAG-GTS-507: {} samples (aa_config {:#010x}, max dist {}, exposed {}), quad "
+                "pixels {}: positions in 1/16 pixel from the centre{}; centroid priority "
+                "{:#010x} {:#010x}; ps {:#x}",
+                samples, key[0], u32(regs.aa_config.max_sample_dst),
+                1u << regs.aa_config.msaa_exposed_samples, same ? "alike" : "DIFFER", text, key[17],
+                key[18], ps_hash);
+}
+
+// DIAG-GTS-509 (PS4 Pro mode only, with DIAG-GTS-507's switch): what the checkerboard needs to be
+// rebuilt right on a GPU with a 1x1 sample-location grid (RECHERCHE-DAMIER-PRO.md section 6). A
+// checkerboard draw is a 2-sample draw whose quad pixels ask for different positions. For each
+// distinct one (64 lines at most): its shaders, the pixel-shader input and control registers,
+// DB_EQAA and the AA masks, its colour and depth targets, whether a hull shader runs. For the first
+// 60 frames that have such draws: the frame and its pattern (A: sample 0 left on even rows). And
+// every shader that binds as a texture an image a checkerboard draw wrote (64 at most).
+namespace CheckerboardDiag {
+inline std::mutex mutex;
+inline std::vector<std::array<u64, 16>> seen;
+inline std::unordered_set<VAddr> targets;
+inline std::vector<std::pair<VAddr, u64>> readers;
+inline u64 last_frame = ~u64{0};
+inline u32 frames = 0;
+} // namespace CheckerboardDiag
+
+static bool CheckerboardDiagOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_SAMPLE_LOCS_DIAG");
+        return Libraries::Kernel::sceKernelIsNeoMode() != 0 && !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+// DIAG-GTS-510 (replaces DIAG-GTS-509's draw lines): every draw into a 2-sample depth (the PS4 Pro
+// checkerboard's depth and whatever else draws there), one line for each distinct one (128 at
+// most; DB_ALPHA_TO_MASK, whose dither changes every frame, and the A/B pattern are left out of the
+// key): its shaders and what decides how its samples would be treated with the game's positions
+// (per-sample inputs, kill, Z or mask export, coverage to mask, alpha to mask), its colour targets
+// and their sample counts, the kind of positions it asks for (standard, alike, differ) and whether
+// the race runs. Its targets join the images whose readers are logged below.
+static void NoteCheckerboardDraw(const AmdGpu::Regs& regs, u64 frame) {
+    if (!CheckerboardDiagOn()) {
+        return;
+    }
+    const auto& db = regs.depth_buffer;
+    if (db.DepthAddress() == 0 || db.NumSamples() != 2) {
+        return;
+    }
+    constexpr u32 kLocs = 0xA2FE;
+    const u32 samples = regs.aa_config.NumSamples();
+    const u32 even = regs.reg_array[kLocs] & 0xff;
+    const u32 odd = regs.reg_array[kLocs + 8] & 0xff;
+    const char* positions = samples != 2 ? "aa_config not 2 samples"
+                            : even != odd ? "differ (checkerboard)"
+                                          : "alike";
+    const int even_x = static_cast<int>(even & 0xf) - ((even & 0x8) ? 16 : 0);
+    const auto raw = [](const auto& field) {
+        u32 value = 0;
+        std::memcpy(&value, &field, sizeof(value));
+        return value;
+    };
+    const auto stage_hash = [&](Shader::HwStage stage) -> u64 {
+        if (!regs.stage_enable.IsStageEnabled(u32(stage))) {
+            return 0;
+        }
+        const auto* pgm = regs.ProgramForStage(u32(stage));
+        return pgm && pgm->Address<u32*>() ? AmdGpu::GetParams(*pgm).hash : 0;
+    };
+    const u64 ps = stage_hash(Shader::HwStage::Fragment);
+    const u64 vs = stage_hash(Shader::HwStage::Vertex);
+    const u64 hs = stage_hash(Shader::HwStage::Hull);
+    const u32 input = raw(regs.ps_input_ena);
+    const u32 control = raw(regs.depth_shader_control);
+    std::array<u64, 18> key{ps, vs, hs, input, raw(regs.ps_input_addr), raw(regs.barycentric_control),
+                            control, regs.reg_array[0xA201] /* DB_EQAA */,
+                            regs.reg_array[0xA30E], regs.reg_array[0xA30F] /* PA_SC_AA_MASK */,
+                            db.DepthAddress(), regs.color_target_mask.raw, samples,
+                            even != odd ? 1u : 0u, 0, 0, 0, 0};
+    std::string colours;
+    u32 slot = 14;
+    for (u32 i = 0; i < AmdGpu::NUM_COLOR_BUFFERS; ++i) {
+        const auto& cb = regs.color_buffers[i];
+        if (((regs.color_target_mask.raw >> (i * 4)) & 0xf) == 0 || cb.Address() == 0) {
+            continue;
+        }
+        colours += fmt::format(" cb{} {:#x} {}x{} samples {} fmt {}", i, cb.Address(), cb.Pitch(),
+                               cb.Height(), cb.NumSamples(), u32(cb.GetDataFmt()));
+        if (slot < key.size()) {
+            key[slot++] = cb.Address();
+        }
+    }
+    bool new_draw = false;
+    bool log_frame = false;
+    {
+        std::scoped_lock lock{CheckerboardDiag::mutex};
+        CheckerboardDiag::targets.insert(db.DepthAddress());
+        for (u32 i = 0; i < AmdGpu::NUM_COLOR_BUFFERS; ++i) {
+            const auto& cb = regs.color_buffers[i];
+            if (((regs.color_target_mask.raw >> (i * 4)) & 0xf) != 0 && cb.Address() != 0) {
+                CheckerboardDiag::targets.insert(cb.Address());
+            }
+        }
+        if (even != odd && frame != CheckerboardDiag::last_frame && CheckerboardDiag::frames < 12) {
+            CheckerboardDiag::last_frame = frame;
+            ++CheckerboardDiag::frames;
+            log_frame = true;
+        }
+        static std::vector<std::array<u64, 18>> seen;
+        if (seen.size() < 128 && std::ranges::find(seen, key) == seen.end()) {
+            seen.push_back(key);
+            new_draw = true;
+        }
+    }
+    if (log_frame) {
+        LOG_WARNING(Render_Vulkan, "DIAG-GTS-510: frame {} checkerboard pattern {} (sample 0 on even "
+                                   "rows at x {})",
+                    frame, even_x < 0 ? "A" : "B", even_x);
+    }
+    if (new_draw) {
+        LOG_WARNING(
+            Render_Vulkan,
+            "DIAG-GTS-510: draw into the 2-sample depth {:#x} ({}x{}), race {}: ps {:#x} vs {:#x} hs "
+            "{:#x}; positions {}; ps inputs {:#x} (persp_sample {}, linear_sample {}, coverage {}); "
+            "db_shader_control {:#x} (kill {}, z export {}, mask export {}, coverage to mask {}); "
+            "alpha to mask {:#x}; baryc_cntl {:#x}; db_eqaa {:#x}; aa_mask {:#010x} {:#010x};{}",
+            db.DepthAddress(), db.Pitch(), db.Height(), RytyRaceRunning() ? "on" : "off", ps, vs, hs,
+            positions, input, input & 1, (input >> 4) & 1, (input >> 14) & 1, control,
+            (control >> 6) & 1, control & 1, (control >> 8) & 1, (control >> 7) & 1,
+            regs.db_alpha_to_mask, key[5], key[7], key[8], key[9],
+            colours.empty() ? std::string{" no colour target"} : colours);
+    }
+}
+
+// NEO-GTS-511 (PS4 Pro mode): every 30 s while a race runs, how the 2-sample draws (the
+// checkerboard, its depth passes) got their sample positions: the game's (and how many of those
+// run once per pixel because they could not have the positions table), or the standard ones and
+// why. On a GPU with a 2x2 grid for 2 samples the standard count should stay 0: a depth written
+// at some positions and tested at others is undefined (black blocks in GT7's trees).
+namespace TwoSampleCount {
+enum Kind : u32 {
+    Game, PerPixel, Device, Shader, Count, OnePoint, Quad,
+    Sample0, CentreNormal, CentreNoTable, CentreBuffers, Kinds
+};
+inline std::array<std::atomic<u64>, Kinds> counts{};
+inline std::atomic<s64> last_ms{0};
+} // namespace TwoSampleCount
+
+static void CountTwoSampleDraw(const GraphicsPipeline& pipeline, SampleLocations::Why why) {
+    static const bool pro = Libraries::Kernel::sceKernelIsNeoMode() != 0;
+    if (!pro || pipeline.RasterSamples() != 2 || !RytyRaceRunning()) {
+        return;
+    }
+    using namespace TwoSampleCount;
+    Kind kind = Game;
+    if (pipeline.SampleLocationSamples() == 0) {
+        kind = pipeline.SampleLocationExclusion() == 2 ? Shader : Device;
+    } else if (why != SampleLocations::Why::Game) {
+        kind = why == SampleLocations::Why::CountDiffers ? Count
+               : why == SampleLocations::Why::OnePoint   ? OnePoint
+                                                         : Quad;
+    }
+    counts[kind].fetch_add(1, std::memory_order_relaxed);
+    if (kind == Game && pipeline.PerPixelFallback()) {
+        counts[PerPixel].fetch_add(1, std::memory_order_relaxed);
+    }
+    // NEO-GTS-512: the colour draws run once per pixel, shaded at sample 0 or at the centre.
+    if (const u32 shading = pipeline.PixelRateShading(); shading != 0) {
+        counts[shading == 1   ? Sample0
+               : shading == 2 ? CentreNormal
+               : shading == 3 ? CentreNoTable
+                              : CentreBuffers]
+            .fetch_add(1, std::memory_order_relaxed);
+    }
+    const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    s64 last = last_ms.load(std::memory_order_relaxed);
+    if (last == 0) {
+        last_ms.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 30000 || !last_ms.compare_exchange_strong(last, now)) {
+        return;
+    }
+    std::array<u64, Kinds> n{};
+    for (u32 i = 0; i < Kinds; ++i) {
+        n[i] = counts[i].exchange(0, std::memory_order_relaxed);
+    }
+    LOG_WARNING(Render_Vulkan,
+                "NEO-GTS-511: 2-sample draws in the last {} s of race: {} at the game's positions "
+                "({} of them once per pixel, no positions table); at the standard positions: {} "
+                "(device or switch {}, shader interpolates at a sample {}, PA_SC_AA_CONFIG count "
+                "differs {}, registers on one point {}, quad pixels differ on a 1x1 grid {}); "
+                "colour once per pixel: shaded at the game's sample 0 {}, at the centre {} (as "
+                "on the console {}, no table {}, too many buffers {}) (NEO-GTS-512/513)",
+                (now - last) / 1000, n[Game], n[PerPixel],
+                n[Device] + n[Shader] + n[Count] + n[OnePoint] + n[Quad], n[Device], n[Shader],
+                n[Count], n[OnePoint], n[Quad], n[Sample0],
+                n[CentreNormal] + n[CentreNoTable] + n[CentreBuffers], n[CentreNormal],
+                n[CentreNoTable], n[CentreBuffers]);
+}
+
+// DIAG-GTS-509: a shader binding as a texture an image a checkerboard draw wrote.
+static void NoteCheckerboardRead(VAddr address, u64 program, bool storage) {
+    if (!CheckerboardDiagOn()) {
+        return;
+    }
+    {
+        std::scoped_lock lock{CheckerboardDiag::mutex};
+        if (!CheckerboardDiag::targets.contains(address) || CheckerboardDiag::readers.size() >= 128 ||
+            std::ranges::find(CheckerboardDiag::readers, std::pair{address, program}) !=
+                CheckerboardDiag::readers.end()) {
+            return;
+        }
+        CheckerboardDiag::readers.emplace_back(address, program);
+    }
+    LOG_WARNING(Render_Vulkan, "DIAG-GTS-510: shader {:#x} binds as a texture the image {:#x} a "
+                               "2-sample-depth draw wrote{}",
+                program, address, storage ? " as storage" : "");
+}
+
+void NativeRenderer::NoteRaceMissing(const AmdGpu::Regs& regs) {
+    u64 ps_hash = 0;
+    if (regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Fragment))) {
+        if (const auto* pgm = regs.ProgramForStage(u32(Shader::HwStage::Fragment));
+            pgm && pgm->Address<u32*>()) {
+            ps_hash = AmdGpu::GetParams(*pgm).hash;
+        }
+    }
+    for (const OneOffHit& hit : one_off_hits) {
+        if (race_missing.size() >= 4096 && !race_missing.contains(hit.address)) {
+            continue;
+        }
+        auto [it, first] = race_missing.try_emplace(hit.address);
+        if (first) {
+            it->second.hit = hit;
+            it->second.frame = frame;
+            it->second.ps_hash = ps_hash;
+        }
+        ++it->second.skips;
+    }
+}
+
+void NativeRenderer::CheckRaceMissing() {
+    std::erase_if(race_missing, [&](const auto& item) {
+        const Native::ImageEntry* entry = registry->FindExisting(
+            item.first, [](const Native::ImageEntry& e) { return !e.from_cpu && e.image != nullptr; });
+        return entry && entry->written_frame.load(std::memory_order_relaxed) > item.second.frame;
+    });
+    const bool in_race = RytyGtsInRace();
+    const bool running = RytyRaceRunning();
+    const auto now = std::chrono::steady_clock::now();
+    const bool session_ended = race_missing_state.in_race && !in_race;
+    const bool ended = session_ended || (race_missing_state.running && !running);
+    const bool periodic = in_race && !race_missing.empty() &&
+                          now - race_missing_state.last >= std::chrono::seconds{60};
+    race_missing_state.in_race = in_race;
+    race_missing_state.running = running;
+    if ((!ended && !periodic) || race_missing.empty()) { // nothing missing: no line
+        return;
+    }
+    race_missing_state.last = now;
+    std::string list;
+    u32 shown = 0;
+    for (const auto& [address, missing] : race_missing) {
+        if (shown++ == 24) {
+            list += " ...";
+            break;
+        }
+        const auto& h = missing.hit;
+        list += fmt::format(" {:#x} {} {}x{} format {}/{} ps {:#x}, skipped {} times since frame "
+                            "{};",
+                            address, h.depth ? std::string{"depth"} : fmt::format("color{}", h.cb), h.pitch,
+                            h.height, h.format, h.number_format, missing.ps_hash, missing.skips,
+                            missing.frame);
+    }
+    LOG_WARNING(Render_Vulkan,
+                "PERF-GTS-493 {}: {} one-off pictures skipped in the race and not drawn since{}{}",
+                session_ended ? "end of the race session"
+                : ended       ? "race stopped (pause, retry or finish)"
+                              : "race report (60 s)",
+                race_missing.size(),
+                list.empty() ? "" : ":", list);
+    if (ended && !in_race) {
+        race_missing.clear(); // a new session's pictures are its own
+    }
+}
+
 void NativeRenderer::CheckOneOffs() {
     if (!OneOffTrackOn() || one_off_watch.empty()) {
         return;
@@ -6490,6 +7593,9 @@ void NativeRenderer::CheckOneOffs() {
             const u64 after = written - watch.frame;
             outcome = after <= 1 ? 0 : after <= 4 ? 1 : after <= 16 ? 2 : after <= 64 ? 3 : 4;
         } else if (sampled > watch.frame) {
+            if (OneOffKeptRule() && frame - watch.frame <= OneOffRedrawGrace) {
+                return false; // FIX-GT7-149: still watched, a redraw within the grace clears it
+            }
             outcome = 5;
         } else if (frame - watch.frame > 300) {
             outcome = 6;
@@ -6703,6 +7809,9 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
     };
     one_off_hits.clear(); // DIAG-GT7-008
     one_off_texture_level = false; // FIX-GT7-135
+    one_off_kept_shadow = false;   // FIX-GT7-153
+    one_off_kept_shadow_first = false;
+    bool target_recent = false; // FIX-GT7-153: the frame window as drawn_lately read it, last call
     OneOffHit described{};
     // FIX-GT7-131: a colour target counts as drawn lately only through a picture of its own memory
     // layout (pitch, texel size, tiling, samples). Another layout at the same address (GT7's scratch
@@ -6740,6 +7849,7 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
     }();
     s32 target_cb = -1; // FIX-GT7-135: the colour buffer drawn_lately looks at (-1: depth)
     const auto drawn_lately = [&](VAddr address) {
+        target_recent = false; // FIX-GT7-153
         const Native::ImageEntry* entry = registry->FindExisting(
             address, [&](const Native::ImageEntry& e) {
                 return !e.from_cpu && e.image != nullptr &&
@@ -6826,6 +7936,7 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
             return env && *env ? std::strtoull(env, nullptr, 10) : u64{64};
         }();
         const bool lately = earlier != 0 && frame - earlier <= window;
+        target_recent = lately; // FIX-GT7-153
         if (!lately) {
             note(earlier == 0 ? 0 : frame - earlier);
             if (OneOffTrackOn()) {
@@ -6877,8 +7988,17 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
                      .tile = u32(db.GetTileMode())};
     }
     if (regs.depth_control.depth_enable && regs.depth_control.depth_write_enable &&
-        regs.depth_buffer.DepthValid() && !drawn_lately(regs.depth_buffer.DepthAddress())) {
-        return true;
+        regs.depth_buffer.DepthValid()) {
+        const bool lately = drawn_lately(regs.depth_buffer.DepthAddress());
+        if (KeptShadowMapTarget(regs)) {
+            // FIX-GT7-153: waits whatever its kind; without a deadline at its first drawing.
+            one_off_kept_shadow = true;
+            one_off_kept_shadow_first = !target_recent;
+            return true;
+        }
+        if (!lately) {
+            return true;
+        }
     }
     return false;
 }
@@ -7109,6 +8229,164 @@ u64 NativeRenderer::SnapshotBelow() {
     return RytyGtsMenuSnapshotsAllowed() ? below : 0;
 }
 
+// DIAG-GTS-524 (SHADGT_DIAG_INPLACE_BYTES=1): every 5 s, the bytes GuestBuffer bound per frame by
+// kind (guest memory read or written in place over PCIe, copied to upload memory, a video-memory
+// region, a vertex mirror) and the in-place ranges that took the most, by 1 MiB. GT7's GPU sat at
+// 95% busy at 32 W while reading 6-9 GB/s over PCIe. These are bound sizes, not bytes the shaders
+// read: a range bound once a frame and read in part still counts whole.
+namespace {
+thread_local bool g_inplace_diag_snapshot = false;
+bool InPlaceDiagOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_DIAG_INPLACE_BYTES");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+} // namespace
+
+// DIAG-SGT-003 (SHADGT_DIAG_BIND_SPLIT=1): guest memory bound two ways within two frames, through a
+// video-memory region by some work and in place (imported view or the D3 page-table path) by
+// other work, at least one of them writing. GT7's GPU culling lost its depth pyramid that way
+// (FIX-GTS-520): its writer and reader saw different copies, and scenery dropped out until a
+// restart. Logged once per 64 KiB granule a minute, with the shader that bound it (0 when not a
+// shader buffer), and counted every 5 s.
+namespace {
+enum BindKind : u8 {
+    BindRegionRead = 1, BindRegionWrite = 2, BindInPlaceRead = 4, BindInPlaceWrite = 8,
+    BindDirectRead = 16, BindDirectWrite = 32,
+};
+thread_local u64 g_bind_hash = 0;
+bool BindSplitDiagOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_DIAG_BIND_SPLIT");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+std::string BindKinds(u8 m) {
+    std::string out;
+    const auto add = [&](u8 bit, const char* name) {
+        if (m & bit) out += out.empty() ? std::string{name} : std::string{","} + name;
+    };
+    add(BindRegionRead, "region read");
+    add(BindRegionWrite, "region write");
+    add(BindInPlaceRead, "in place read");
+    add(BindInPlaceWrite, "in place write");
+    add(BindDirectRead, "direct read");
+    add(BindDirectWrite, "direct write");
+    return out.empty() ? std::string{"none"} : out;
+}
+} // namespace
+
+static void NoteBindSplit(VAddr address, u64 size, u8 kind, u64 frame, u64 hash) {
+    struct Granule {
+        u64 frame = 0;
+        u8 now = 0, before = 0;
+        u64 hash_region = 0, hash_other = 0;
+        u64 logged_frame = 0;
+    };
+    static std::mutex mutex;
+    static std::unordered_map<u64, Granule> granules;
+    static u64 splits = 0, logged = 0;
+    static auto since = std::chrono::steady_clock::now();
+    if (size == 0) return;
+    std::scoped_lock lock{mutex};
+    const u64 first = address >> 16, last = (address + size - 1) >> 16;
+    for (u64 g = first; g <= last && g - first < 4096; ++g) {
+        Granule& e = granules[g];
+        if (e.frame != frame) {
+            e.before = e.frame + 1 == frame ? e.now : 0;
+            e.now = 0;
+            e.frame = frame;
+        }
+        e.now |= kind;
+        if (kind & (BindRegionRead | BindRegionWrite)) {
+            e.hash_region = hash;
+        } else {
+            e.hash_other = hash;
+        }
+        const u8 m = e.now | e.before;
+        const bool region = (m & (BindRegionRead | BindRegionWrite)) != 0;
+        const bool other =
+            (m & (BindInPlaceRead | BindInPlaceWrite | BindDirectRead | BindDirectWrite)) != 0;
+        const bool written = (m & (BindRegionWrite | BindInPlaceWrite | BindDirectWrite)) != 0;
+        if (!(region && other && written)) continue;
+        ++splits;
+        if (e.logged_frame != 0 && frame - e.logged_frame < 3600) continue;
+        e.logged_frame = frame;
+        if (logged++ < 400) {
+            LOG_INFO(Render_Vulkan,
+                     "DIAG-SGT-003: {:#x} (64 KiB) bound two ways in frames {}-{}: this frame {}; "
+                     "frame before {}; region by shader {:#x}, other by shader {:#x}; this bind "
+                     "{:#x}+{:#x}",
+                     g << 16, frame - 1, frame, BindKinds(e.now), BindKinds(e.before),
+                     e.hash_region, e.hash_other, address, size);
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - since >= std::chrono::seconds{5}) {
+        if (splits) {
+            LOG_INFO(Render_Vulkan, "DIAG-SGT-003: {} split binds of 64 KiB granules in 5 s",
+                     splits);
+        }
+        splits = 0;
+        since = now;
+        if (granules.size() > (1u << 20)) granules.clear();
+    }
+}
+
+static void NoteBoundBytes(VAddr address, u64 size, bool write, int kind, u64 frame, int miss = 0) {
+    // kind: 0 read in place, 1 written in place, 2 upload copy, 3 region, 4 mirror
+    static std::mutex mutex;
+    static u64 bytes[5]{}, calls[5]{};
+    static u64 miss_bytes[7]{}; // in-place reads of vertex/index ranges, by g_mirror_miss
+    static std::unordered_map<u64, std::array<u64, 3>> ranges; // MiB -> bytes, calls, writes
+    static u64 first_frame = ~u64{0};
+    static auto since = std::chrono::steady_clock::now();
+    std::scoped_lock lock{mutex};
+    if (first_frame == ~u64{0}) first_frame = frame;
+    bytes[kind] += size;
+    ++calls[kind];
+    if (kind == 0 && miss > 0 && miss < 7) miss_bytes[miss] += size;
+    if (kind <= 1) {
+        auto& range = ranges[address >> 20];
+        range[0] += size;
+        ++range[1];
+        range[2] += write;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - since < std::chrono::seconds{5}) return;
+    const double frames = double(std::max<u64>(1, frame - first_frame));
+    std::vector<std::pair<u64, std::array<u64, 3>>> top(ranges.begin(), ranges.end());
+    std::ranges::sort(top, [](const auto& a, const auto& b) { return a.second[0] > b.second[0]; });
+    std::string list;
+    for (size_t i = 0; i < std::min<size_t>(top.size(), 8); ++i) {
+        const auto& [mib, v] = top[i];
+        list += fmt::format(" {:#x}: {:.1f} MB/frame in {:.0f} binds{}{};", mib << 20,
+                            double(v[0]) / frames / 1e6, double(v[1]) / frames,
+                            v[2] ? " (written)" : "", ListedInPlace(mib << 20, 1_MB) ? " (listed)" : "");
+    }
+    LOG_INFO(Render_Vulkan,
+             "DIAG-GTS-524: {:.0f} frames; MB bound per frame: in place read {:.1f} written {:.1f}, "
+             "upload copy {:.1f}, region {:.1f}, mirror {:.1f}; in-place binds per frame {:.0f}; "
+             "vertex/index in place, MB per frame: off or over 64 MB {:.1f}, refresh refused {:.1f}, "
+             "first sighting {:.1f}, seen this frame {:.1f}, rewritten memory {:.1f}, queued {:.1f}; "
+             "top in-place ranges:{}",
+             frames, double(bytes[0]) / frames / 1e6, double(bytes[1]) / frames / 1e6,
+             double(bytes[2]) / frames / 1e6, double(bytes[3]) / frames / 1e6,
+             double(bytes[4]) / frames / 1e6, double(calls[0] + calls[1]) / frames,
+             double(miss_bytes[1]) / frames / 1e6, double(miss_bytes[2]) / frames / 1e6,
+             double(miss_bytes[3]) / frames / 1e6, double(miss_bytes[4]) / frames / 1e6,
+             double(miss_bytes[5]) / frames / 1e6, double(miss_bytes[6]) / frames / 1e6, list);
+    std::fill(std::begin(miss_bytes), std::end(miss_bytes), 0);
+    std::fill(std::begin(bytes), std::end(bytes), 0);
+    std::fill(std::begin(calls), std::end(calls), 0);
+    ranges.clear();
+    first_frame = frame;
+    since = now;
+}
+
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr address, u64 size,
                                                                       bool write, bool mirror) {
     if (size == 0) {
@@ -7126,14 +8404,21 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
     BufferMemo& memo = buffer_memos[slot & (buffer_memos.size() - 1)];
     // PERF-GT7-047 (Will Scarlett): unrelated region/mirror changes do not
     // invalidate owned-range memos. In-place reads still take the full lookup.
-    if (memo.address == address && memo.size == size && memo.flags == flags &&
-        memo.generation != buffer_generation) {
+    if (memo.Matches(address, size, flags) && memo.generation != buffer_generation) {
         static const bool revalidate = [] {
             const char* env = std::getenv("SHADGT_NATIVE_BUFFER_REVALIDATE");
             return !(env && env[0] == '0');
         }();
         const std::pair<VAddr, VAddr> range{address, address + size};
-        if (revalidate && (memo.region || memo.mirror) &&
+        // FIX-GTS-520: never for a range in the listed in-place ranges or GT7's per-frame memory.
+        // There the same addresses are bound in place for some work and through a region for
+        // other work, and regions come and go every frame (FIX-GT7-122). A revalidated memo kept
+        // one binding while the range had moved to the other: GT7's GPU culling then read its
+        // depth pyramid (cs 0xebdbf166 -> 0xaca0d43e, 0x1020000f00) from a copy that its writer no
+        // longer updated, and scenery dropped out every other culling run until a restart.
+        // SHADGT_NATIVE_BUFFER_REVALIDATE=0 removed it. GT Sport lists no such ranges.
+        const bool listed = ListedInPlace(address, size);
+        if (revalidate && !listed && (memo.RegionOf() || memo.MirrorOf()) &&
             memo.hard_generation == buffer_hard_generation &&
             buffer_log.Seq() - memo.log_seq <= 64 &&
             buffer_log.Untouched(memo.log_seq, {&range, 1})) {
@@ -7141,52 +8426,87 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
             memo.log_seq = buffer_log.Seq();
         }
     }
-    if (memo.generation == buffer_generation && memo.address == address && memo.size == size &&
-        memo.flags == flags) {
-        if (memo.region || memo.mirror) {
+    if (memo.generation == buffer_generation && memo.Matches(address, size, flags)) {
+        Region* const memo_r = memo.RegionOf(); // PERF-SGT-018
+        Mirror* const memo_m = memo.MirrorOf();
+        if (memo_r || memo_m) {
             SortRegionWrites(); // CPU writes since: pages to copy in (may drop a mirror)
         }
-        const bool mirror_allowed = memo.generation == buffer_generation && (!memo.mirror || [&] {
+        const bool mirror_allowed = memo.generation == buffer_generation && (!memo_m || [&] {
             Native::CpuStackRegistry::Lease lease{Native::CpuStacks()};
-            return lease.Allowed(memo.mirror->begin, memo.mirror->end);
+            return lease.Allowed(memo_m->begin, memo_m->end);
         }());
         const bool fresh =
             mirror_allowed && memo.generation == buffer_generation &&
-            (!memo.region || memo.region->dirty_pages.empty()) &&
-            (!memo.mirror || memo.mirror->dirty_pages.empty());
+            (!memo_r || memo_r->dirty_pages.empty()) &&
+            (!memo_m || memo_m->dirty_pages.empty());
         if (fresh) {
-            if (memo.region) {
+            if (memo_r) {
                 NATIVE_DIAGNOSTIC(++stats.region_binds);
-            } else if (memo.mirror) {
+            } else if (memo_m) {
                 NATIVE_DIAGNOSTIC(++stats.mirror_binds);
-                memo.mirror->used_frame = frame;
+                memo_m->used_frame = frame;
             }
-            last_bound = memo.bound;
-            last_mirror = memo.mirror; // OPT-004
+            last_bound = memo.BoundAs();
+            last_mirror = memo_m; // OPT-004
             NATIVE_DIAGNOSTIC(++stats.buffer_memo_hits);
-            return std::pair{memo.buffer, memo.offset};
+            if (BindSplitDiagOn() && last_bound != Bound::Mirror) { // DIAG-SGT-003
+                NoteBindSplit(address, size,
+                              last_bound == Bound::Region ? (write ? BindRegionWrite : BindRegionRead)
+                              : write                     ? BindInPlaceWrite
+                                                          : BindInPlaceRead,
+                              frame, g_bind_hash);
+            }
+            if (InPlaceDiagOn()) { // DIAG-GTS-524
+                NoteBoundBytes(address, size, write,
+                               last_bound == Bound::InPlace  ? (write ? 1 : 0)
+                               : last_bound == Bound::Region ? 3
+                                                             : 4,
+                               frame);
+            }
+            return std::pair{memo.buffer, memo.Offset()};
         }
     }
     memo_kind = MemoKind::None;
     memo_region = nullptr;
     memo_mirror = nullptr;
+    g_inplace_diag_snapshot = false; // DIAG-GTS-524
+    g_mirror_miss = 0;
     const auto result = GuestBufferLookup(address, size, write, mirror);
+    if (result && BindSplitDiagOn() && last_bound != Bound::Mirror &&
+        !(last_bound == Bound::InPlace && g_inplace_diag_snapshot)) { // DIAG-SGT-003
+        NoteBindSplit(address, size,
+                      last_bound == Bound::Region ? (write ? BindRegionWrite : BindRegionRead)
+                      : write                     ? BindInPlaceWrite
+                                                  : BindInPlaceRead,
+                      frame, g_bind_hash);
+    }
+    if (result && InPlaceDiagOn()) {
+        NoteBoundBytes(address, size, write,
+                       last_bound == Bound::InPlace  ? (g_inplace_diag_snapshot ? 2 : write ? 1 : 0)
+                       : last_bound == Bound::Region ? 3
+                                                     : 4,
+                       frame, mirror ? g_mirror_miss : 0);
+    }
     if (result && memo_kind == MemoKind::Mirror) {
         last_mirror = memo_mirror; // OPT-004
     }
-    if (result && memo_kind != MemoKind::None) {
+    if (result && memo_kind != MemoKind::None && result->second <= BufferMemo::OffsetMask) {
+        // PERF-SGT-018: a mirror's pointer only when the lookup's kind says mirror, a region's only
+        // for a region, as the two separate fields held them.
+        Region* const keep_region = memo_region;
+        Mirror* const keep_mirror = keep_region ? nullptr : memo_mirror;
         memo = BufferMemo{
             .address = address,
             .size = size,
-            .flags = flags,
             .generation = buffer_generation,
             .hard_generation = buffer_hard_generation,
             .log_seq = buffer_log.Seq(),
             .buffer = result->first,
-            .offset = result->second,
-            .region = memo_region,
-            .mirror = memo_mirror,
-            .bound = last_bound,
+            .offset_meta = BufferMemo::Pack(result->second, flags, last_bound, keep_region,
+                                            keep_mirror),
+            .owner = keep_region ? static_cast<void*>(keep_region)
+                                 : static_cast<void*>(keep_mirror),
         };
     }
     return result;
@@ -7221,6 +8541,44 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     }
     last_bound = Bound::Region;
     NotePerFrameRange(address, size); // FIX-GT7-122
+    // FIX-SGT-004 (SHADGT_LISTED_IN_PLACE=0: as before): a range in the listed in-place ranges is
+    // bound in guest memory even when a region reaches over it. Writes there never made a region,
+    // but reads took any region over them: a neighbour's region grown over the list (PERF-GTS-369's
+    // room past the end, or a read reaching into a small region) left GT7's GPU culling writing its
+    // depth pyramid and visibility states in place (cs 0xebdbf166, 0xc959ee53 at 0x1020235600 and
+    // 0x1020407f00) while its visibility test (cs 0xaca0d43e) read a region copy the writers no
+    // longer updated. Scenery, the ground or the shadows went missing for single frames, every few
+    // frames, until a restart (DIAG-SGT-003). GT7's moving per-frame memory keeps FIX-GT7-122's
+    // handling; GT Sport lists no ranges.
+    static const bool listed_only = [] {
+        const char* env = std::getenv("SHADGT_LISTED_IN_PLACE");
+        return !(env && env[0] == '0');
+    }();
+    if (listed_only && std::ranges::any_of(InplaceRanges(), [&](const auto& range) {
+            return address < range.second && address + size > range.first;
+        })) {
+        if (auto* direct = r.buffer_cache.GetDirectMemory()) {
+            std::optional<std::pair<const VideoCore::Buffer*, u64>> found;
+            if (direct->EnsureImported(address, size)) {
+                found = direct->FindBuffer(address, size);
+            }
+            // FIX-SGT-014: no view holds the whole binding (GT7's rain: 77-85 MB from
+            // 0x101d8d9490 through the culling block): one alias over it, not a region.
+            if (!found) {
+                found = direct->FindOrImportSpan(address, size);
+            }
+            if (found) {
+                last_bound = Bound::InPlace;
+                if (write) {
+                    DropMirrors(address, size); // NAT-150: the GPU writes guest memory there
+                } else if (!mirror) {
+                    memo_kind = MemoKind::InPlace; // OPT-003
+                }
+                if (write) memo_kind = MemoKind::InPlace;
+                return std::pair{found->first->Handle(), found->second};
+            }
+        }
+    }
     // NAT-114: ranges in (or reaching into) a region use it.
     if (Region* region = RegionOver(address, size)) {
         NotePerFrameRegion(*region); // FIX-GT7-122: dropped before the next work binds
@@ -7274,6 +8632,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     // (constants) are copied when the draw is recorded instead of read in place by the GPU later.
     if (!mirror && !write && size <= SnapshotBelow()) {
         last_bound = Bound::InPlace;
+        g_inplace_diag_snapshot = true; // DIAG-GTS-524
         return SnapshotRange(address, size);
     }
     if (mirror && !write) {
@@ -7339,6 +8698,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
         }
         return std::nullopt;
     }
+    g_inplace_diag_snapshot = true; // DIAG-GTS-524
     return SnapshotRange(address, size);
 }
 
@@ -10209,6 +11569,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                 return !(env && env[0] == '0');
             }();
             auto* readable_direct = r.buffer_cache.GetDirectMemory();
+            g_bind_hash = stage.pgm_hash; // DIAG-SGT-003
             if (bindable) size = Native::ReadableBindingSize(base, size, desc.is_written,
                 readable_cut, readable_direct != nullptr,
                 [&](u64 a, u64 n) { std::shared_lock lock{buffer_map_mutex}; return RegionOver(a, n) != nullptr; },
@@ -10307,12 +11668,24 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                         if (const auto view = direct->FindBuffer(base, size)) {
                             in_view = std::pair{view->first->Handle(), view->second};
                             last_bound = Bound::InPlace;
+                            if (BindSplitDiagOn()) { // DIAG-SGT-003
+                                NoteBindSplit(base, size, BindInPlaceRead, frame, stage.pgm_hash);
+                            }
                         }
                     }
                 }
 #if !defined(NDEBUG)
                 if (mirror_bound) note_path(2); // DIAG-GTS-456: bound from the mirror
 #endif
+                // PERF-GTS-479: a slot learned off that would read in place here is learned back.
+                // Not gated on RegionOver: the region over such a buffer is the one its copy made
+                // (and it kept the other shaders' direct reads off the range too).
+                if (desc.IsDirectCandidate() && desc.NoDirect() && !freeze_fill_args &&
+                    !mirror_bound && !in_view && direct &&
+                    !(descriptor_postprocess && !desc.is_written) && size < (u64{1} << 32) &&
+                    (desc.is_written || size > SnapshotBelow())) {
+                    Shader::DirectLearning::NoteWouldReadInPlace(stage.pgm_hash, buffer_index);
+                }
                 if (!freeze_fill_args && !mirror_bound && !in_view && direct &&
                     !(descriptor_postprocess && !desc.is_written) &&
                     desc.IsDirectEligible() && size < (u64{1} << 32) &&
@@ -10320,6 +11693,10 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                     !RegionOver(base, size) && direct->EnsureImported(base, size)) {
                     // D3: read in place through the page table; nothing bound.
                     direct_entries[buffer_index] = {u32(base), u32(base >> 32), u32(size), 1u};
+                    if (BindSplitDiagOn()) { // DIAG-SGT-003
+                        NoteBindSplit(base, size, desc.is_written ? BindDirectWrite : BindDirectRead,
+                                      frame, stage.pgm_hash);
+                    }
                     if (SnapshotBelow() >= 4_KB && stage.hw_stage == Shader::HwStage::Compute &&
                         size >= 4_KB &&
                         desc.post_op == Shader::SharpFetchPostOp::ReadConstPointer) {
@@ -10737,6 +12114,8 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                 if (Native::WatchedTexture(entry->info.guest_address,
                                            entry->info.guest_address + 1)) {
                     WatchBind(*entry, tsharp, storage, true, stage.pgm_hash); // FIX-157
+                    NoteCheckerboardRead(entry->info.guest_address, stage.pgm_hash,
+                                         storage); // DIAG-GTS-509
                 }
 #endif
                 SeqBind(*entry, tsharp, storage, stage.pgm_hash); // DIAG-208 (diagnosis)
@@ -10891,7 +12270,54 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             bind_null(5);
             continue;
         }
-        Native::ImageEntry* entry = registry->Find(desc.info, storage, frame);
+        // FIX-GT7-184: a texture that would be made now over memory with no committed page, no
+        // region the GPU wrote and no picture the GPU drew is bound empty, as FIX-GT7-068 does
+        // for buffers. Nothing can be read for it: its upload copied zeros for its whole size
+        // (NAT-042). IsMappedStart only tells that the start is in the guest arena, and the
+        // geometry check allows up to 4 GiB. GT7's pixel shader 0x2a265dff (a 720x540
+        // depth-to-distance pass) declares two textures it reads in a branch that is off in
+        // races; the game leaves their slots as they were, and they hold whatever was there,
+        // floats among them: a T# at 0x3f80000000 (1.0f) of 1x129 with 6 mips and 0x2ac00000
+        // bytes, or of 1x385 with 5 or 6 mips and 0xaa000000 or 0xaa800000 bytes, with or
+        // without the PS4 Pro mode. Each time the renderer made one of those and uploaded its
+        // 0.7 or 2.7 GiB of zeros, the GPU device was lost right after (RyGT-Team/rygt7 issue
+        // 54, on an RTX 3070 Ti; VK_EXT_device_fault: a write to an invalid address). Which
+        // write faults is not known. Smaller ones pass at a price: a 1.3 GiB one was followed
+        // by a 757 ms frame on an RTX 4070. An empty slot is not a zero-filled texture in every
+        // respect (alpha 0 where a format without alpha gave 1, no swizzle, sizes of 0, the
+        // depth stand-in for a depth compare): that only shows to a shader that reads it. From
+        // 4 MB, as FIX-GT7-068: below, the zero-filled texture costs little and stays. The test
+        // runs at each bind, so a texture whose memory is mapped later, or whose range a target
+        // is drawn into later, is made then. SHADGT_NATIVE_UNREADABLE_TEXTURES=0: as before.
+        static const bool unreadable_textures = [] {
+            const char* env = std::getenv("SHADGT_NATIVE_UNREADABLE_TEXTURES");
+            return !(env && env[0] == '0');
+        }();
+        Native::ImageEntry* entry = nullptr;
+        if (unreadable_textures && !storage && desc.info.guest_size >= 4_MB) {
+            entry = registry->Find(desc.info, false, frame, false);
+            if (!entry && NothingToRead(desc.info)) {
+                static std::atomic<u32> logged{};
+                if (Sample(logged)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-GT7-184: texture {:#x}+{:#x} ({}x{}, pitch {}, {} mips, {} "
+                                "layers, tile {}, {}) of shader {:#x} has no mapped page and "
+                                "nothing the GPU wrote; bound empty; T# {:016x} {:016x} {:016x} "
+                                "{:016x}",
+                                desc.info.guest_address, desc.info.guest_size,
+                                desc.info.size.width, desc.info.size.height, desc.info.pitch,
+                                desc.info.resources.levels, desc.info.resources.layers,
+                                u32(desc.info.tile_mode), vk::to_string(desc.info.pixel_format),
+                                stage.pgm_hash, raw_sharp[0], raw_sharp[1], raw_sharp[2],
+                                raw_sharp[3]);
+                }
+                bind_null(7);
+                continue;
+            }
+        }
+        if (!entry) {
+            entry = registry->Find(desc.info, storage, frame);
+        }
         if (!entry) {
             bind_null(6);
             continue;
@@ -10905,6 +12331,8 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
 #if !defined(NDEBUG)
         if (Native::WatchedTexture(desc.info.guest_address, desc.info.guest_address + 1)) {
             WatchBind(*entry, tsharp, storage, false, stage.pgm_hash); // FIX-157 (diagnosis)
+            NoteCheckerboardRead(entry->info.guest_address, stage.pgm_hash,
+                                 storage); // DIAG-GTS-509
         }
 #endif
         SeqBind(*entry, tsharp, storage, stage.pgm_hash); // DIAG-208 (diagnosis)
@@ -11017,7 +12445,9 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                         u32(ssharp.xy_mag_filter.Value()), ssharp.MinLod(), ssharp.MaxLod(),
                         u32(ssharp.lod_bias.Value()));
         }
-        b.images.push_back({SamplerFor(ssharp, regs.ta_bc_base, sampler.is_depth), VK_NULL_HANDLE,
+        b.images.push_back({SamplerFor(ssharp, regs.ta_bc_base, sampler.is_depth,
+                                       sampler.explicit_lod),
+                            VK_NULL_HANDLE,
                             vk::ImageLayout::eGeneral});
         b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
         b.writes.push_back(vk::WriteDescriptorSet{
@@ -11238,10 +12668,36 @@ static bool LateBindingsOn() {
     return on;
 }
 
+// PERF-SGT-020: the recorder's last looked-up buffer sizes. Emptied when handles die: the
+// driver may give a new buffer of another size the same handle value.
+namespace {
+struct BufferSizeCache {
+    std::array<std::pair<u64, u64>, 64> entries{};
+    u64 Get(vk::Buffer buffer) {
+        const u64 handle = u64(VkBuffer(buffer));
+        auto& entry = entries[((handle >> 4) ^ (handle >> 11)) & 63];
+        if (entry.first != handle) {
+            entry = {handle, Native::BufferSizes::Find(handle)};
+        }
+        return entry.second;
+    }
+};
+thread_local BufferSizeCache t_buffer_sizes;
+
+/// The range a buffer bound with a dynamic offset is written with: the next power of two
+/// (256 bytes or more) when the buffer still holds it from `offset`, or the range itself.
+u64 BucketRange(vk::Buffer buffer, u64 offset, u64 range) {
+    const u64 bucket = std::bit_ceil(std::max<u64>(range, 256));
+    if (bucket == range || bucket > (u64{1} << 30)) return range;
+    return offset + bucket <= t_buffer_sizes.Get(buffer) ? bucket : range;
+}
+} // namespace
+
 void NativeRenderer::LongSetsUpkeep() {
     if (!LongLivedSetsOn()) return;
     static thread_local std::vector<u64> dead;
     const bool some = Native::DeadHandles::Take(dead);
+    if (some) t_buffer_sizes.entries.fill({}); // PERF-SGT-020
     std::unique_lock<std::mutex> lock{long_sets_mutex, std::defer_lock};
     if (ParallelRecordingRequested()) lock.lock();
     if (some) DropLongSets(dead);
@@ -11371,11 +12827,10 @@ void NativeRenderer::BindLate(PreparedDraw& p,
             const u64 dead = long_sets.dead_ring[n % long_sets.dead_ring.size()];
             died = std::ranges::find(handles, dead) != handles.end();
         }
-        if (died) {
+        if (died || !StoreLongSet(wide.low64, wide.high64, layout, set, handles)) {
             long_sets.retired.push_back({p.late_retire_tick, layout_key, set});
             ++long_sets.late_not_kept;
         } else {
-            StoreLongSet(wide.low64, wide.high64, layout, set, handles);
             ++long_sets.late_made;
         }
         sets[index] = set;
@@ -11444,8 +12899,14 @@ bool NativeRenderer::AheadRetained(const PreparedDraw& p, size_t info_index,
     return false;
 }
 
-void NativeRenderer::StoreLongSet(u64 hash, u64 check, vk::DescriptorSetLayout layout,
+bool NativeRenderer::StoreLongSet(u64 hash, u64 check, vk::DescriptorSetLayout layout,
                                   vk::DescriptorSet set, std::span<const u64> handles) {
+    // FIX-GTS-503: a sampler dropped between the draw's lookups and here (its note possibly taken
+    // before this set existed) would leave the set kept for good, found again by a new sampler
+    // given the same handle value. Used for this draw only, as a set whose handle died.
+    if (HoldsDroppedSampler(handles)) {
+        return false;
+    }
     long_sets.entries.Insert(hash, check, u64(VkDescriptorSetLayout(layout)), set);
     // PERF-GTS-378: a list per handle. In a multimap every set's entry for a handle they all
     // hold (the ahead upload arena, a sampler) was inserted after a walk over that handle's
@@ -11463,6 +12924,21 @@ void NativeRenderer::StoreLongSet(u64 hash, u64 check, vk::DescriptorSetLayout l
         list.emplace_back(hash, check);
     }
     ++long_sets.made;
+    return true;
+}
+
+bool NativeRenderer::HoldsDroppedSampler(std::span<const u64> handles) {
+    if (samplers_dropped.load(std::memory_order_acquire) == 0) {
+        return false; // none ever dropped (the usual case: the table far from its budget)
+    }
+    std::scoped_lock lock{sampler_mutex};
+    for (const auto& [tick, sampler] : retired_samplers) {
+        const u64 dropped = u64(VkSampler(sampler->Handle()));
+        if (std::ranges::find(handles, dropped) != handles.end()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void NativeRenderer::DropLongSets(std::span<const u64> dead_handles) {
@@ -11479,6 +12955,9 @@ void NativeRenderer::DropLongSets(std::span<const u64> dead_handles) {
                 continue;
             }
             ++long_sets.dropped;
+            // DIAG-SGT-019: by what was destroyed (the sets are empty with the switch off)
+            ++stats.miss_diag_drops[stats.miss_diag_views.contains(handle) ? 0
+                                    : stats.miss_diag_buffers_seen.contains(handle) ? 1 : 2];
             if (layout == handle) {
                 ++long_sets.unused_sets; // its layout goes: no pipeline can use it again
             } else {
@@ -11536,7 +13015,7 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     if (reuse) {
         s.binding_commands.Prepare(pipeline.GetLayout(), u32(bind_point),
             registry->Generation() + unmap_generation.load(std::memory_order_acquire) +
-                buffer_generation,
+                buffer_generation + samplers_dropped.load(std::memory_order_acquire), // FIX-GTS-503
             s.pipelines.InvalidationEpoch());
     }
     const auto stage_flags =
@@ -11631,6 +13110,19 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             NATIVE_DIAGNOSTIC(++descriptor_hash_reused);
         }
         u64 key_hash = cacheable ? prepared_key.hash : 0;
+        // PERF-SGT-020 (SHADGT_DYNAMIC_RANGE_BUCKETS=0: as before): a kept set's key held each
+        // buffer's exact range, and GT7's draws bind constant blocks of many sizes (about
+        // 11,000 different ranges in a race). With 13,600 views and 144 buffers that made
+        // 4 million different keys: 30% of a race's sets were new ones, made and written at
+        // 19,000 a second, and the table was emptied every 20 s at its 200,000 limit
+        // (DIAG-SGT-019). The range is rounded up to a power of two when the buffer still
+        // holds it from this draw's offset, in the key and in the written set.
+        static const bool range_buckets_on = [] {
+            const char* env = std::getenv("SHADGT_DYNAMIC_RANGE_BUCKETS");
+            return !(env && env[0] == '0');
+        }();
+        const bool bucket_ranges = range_buckets_on && long_sets_on && !long_sets_shared &&
+                                   !pending && cacheable && dynamic_buffers != 0;
         if (dynamic_buffers != 0) {
             // PERF-GTS-374: the offsets go to the bind; the set is looked up without them.
             auto& offsets = dynamic_offsets[index];
@@ -11653,6 +13145,11 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
                     }
                     offsets[entry.slot] = static_cast<u32>(offset);
                     dynamic_key[entry.word + 1] = 0;
+                    if (bucket_ranges) {
+                        dynamic_key[entry.word + 2] = BucketRange(
+                            vk::Buffer{reinterpret_cast<VkBuffer>(buffer)},
+                            offset, range);
+                    }
                 }
             } else
             for (const auto& write : writes) {
@@ -11702,6 +13199,104 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             stats.reuse_diag_frame += !stats.reuse_diag_in_frame.insert(loose).second;
             stats.reuse_diag_window += !stats.reuse_diag_in_window.insert(loose).second;
             stats.reuse_diag_exact += bool(s.descriptor_sets.Find(key_hash, descriptor_key));
+        }
+        // DIAG-SGT-019 (same switch): how each graphics set's lookup goes, and for a kept set
+        // that is not found: whether the same key was made before, whether it names a view,
+        // buffer or range never seen in a key, and which kinds of key words differ from the
+        // nearest recent new key of the same layout. Counts only.
+        if (reuse_diag && bind_point == vk::PipelineBindPoint::eGraphics && !long_sets_shared) {
+            if (!cacheable) {
+                ++stats.miss_diag_counts[0];
+            } else if (dynamic_buffers == 0 || !long_sets_on) {
+                ++stats.miss_diag_counts[1];
+            } else if (long_sets.entries.Find(key_hash, key_check)) {
+                ++stats.miss_diag_counts[2];
+            } else {
+                ++stats.miss_diag_counts[3];
+                stats.miss_diag_remade += !stats.miss_diag_keys.insert(key_hash).second;
+                static thread_local std::vector<u8> kinds;
+                kinds.assign(descriptor_key.size(), u8{3});
+                {
+                    size_t next = 1;
+                    for (const auto& write : writes) {
+                        next += 4;
+                        for (u32 n = 0; n < write.descriptorCount && next + 2 < kinds.size();
+                             ++n, next += 3) {
+                            const u8 first = write.pBufferInfo ? 0 : 4;
+                            kinds[next] = first;
+                            kinds[next + 1] = first + 1;
+                            kinds[next + 2] = first + 2;
+                        }
+                    }
+                }
+                bool new_view = false, new_buffer = false, new_range = false;
+                for (size_t w = 0; w < kinds.size(); ++w) {
+                    const u64 value = descriptor_key[w];
+                    if (kinds[w] == 5 && value) {
+                        new_view |= stats.miss_diag_views.insert(value).second;
+                    } else if (kinds[w] == 0 && value) {
+                        new_buffer |= stats.miss_diag_buffers_seen.insert(value).second;
+                    } else if (kinds[w] == 2) {
+                        new_range |= stats.miss_diag_ranges.insert(value).second;
+                    }
+                }
+                stats.miss_diag_new_view_sets += new_view;
+                stats.miss_diag_new_buffer_sets += new_buffer;
+                stats.miss_diag_new_range_sets += new_range;
+                auto& recent = stats.miss_diag_recent[u64(VkDescriptorSetLayout(layout))];
+                size_t best = ~size_t{0};
+                const std::vector<u64>* nearest = nullptr;
+                u32 best_kinds = 0;
+                for (const auto& old : recent.keys) {
+                    if (old.size() != descriptor_key.size()) continue;
+                    size_t differ = 0;
+                    u32 mask = 0;
+                    for (size_t w = 0; w < old.size(); ++w) {
+                        if (old[w] == descriptor_key[w]) continue;
+                        ++differ;
+                        mask |= 1u << kinds[w];
+                    }
+                    if (differ < best) {
+                        best = differ;
+                        best_kinds = mask;
+                        nearest = &old;
+                    }
+                }
+                if (!nearest) {
+                    ++stats.miss_diag_first;
+                } else {
+                    ++stats.miss_diag_by_kinds[best_kinds];
+                    stats.miss_diag_words += best;
+                    {
+                        std::scoped_lock names_lock{views_mutex};
+                        for (size_t w = 0; w < kinds.size(); ++w) {
+                            if (kinds[w] != 5 || (*nearest)[w] == descriptor_key[w]) continue;
+                            const auto name = stats.miss_diag_view_names.find(descriptor_key[w]);
+                            ++stats.miss_diag_view_misses[name == stats.miss_diag_view_names.end()
+                                                              ? std::string{"unnamed"}
+                                                              : name->second];
+                        }
+                    }
+                    if ((best_kinds & 4) && stats.miss_diag_sampled < 12 &&
+                        (stats.miss_diag_counts[3] & 0x3ff) == 1) {
+                        ++stats.miss_diag_sampled;
+                        for (size_t w = 2; w < kinds.size(); ++w) {
+                            if (kinds[w] != 2 || (*nearest)[w] == descriptor_key[w]) continue;
+                            stats.miss_diag_samples += fmt::format(
+                                " [{} words, word {}: range {:#x} was {:#x}, offset {:#x}, "
+                                "buffer {:#x} was {:#x}]",
+                                kinds.size(), w, descriptor_key[w], (*nearest)[w], key[w - 1],
+                                descriptor_key[w - 2], (*nearest)[w - 2]);
+                        }
+                    }
+                }
+                if (recent.keys.size() < 64) {
+                    recent.keys.emplace_back(descriptor_key.begin(), descriptor_key.end());
+                } else {
+                    recent.keys[recent.next++ % 64].assign(descriptor_key.begin(),
+                                                           descriptor_key.end());
+                }
+            }
         }
         // PERF-GTS-396: for a draw captured for a parallel pass too. They were left out, so
         // every draw a worker recorded had its sets made and written anew by the recorder (25
@@ -11836,6 +13431,9 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
                 for (u32 n = 0; n < update.descriptorCount; ++n) {
                     auto info = update.pBufferInfo[n];
                     if (update.dstBinding + n < dynamic_buffers && dynamic_offset_fits(info)) {
+                        if (bucket_ranges) { // PERF-SGT-020: as in the key
+                            info.range = BucketRange(info.buffer, info.offset, info.range);
+                        }
                         info.offset = 0;
                     }
                     dynamic_infos.push_back(info);
@@ -11865,7 +13463,10 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
                     }
                 }
             }
-            StoreLongSet(key_hash, key_check, layout, set, handles);
+            if (!StoreLongSet(key_hash, key_check, layout, set, handles)) {
+                // FIX-GTS-503: written again once the GPU ran this list.
+                long_sets.retired.push_back({r.scheduler.CurrentTick() + 1, layout_key, set});
+            }
         } else if (cacheable) s.descriptor_sets.Store(key_hash, descriptor_key, set);
         sets[index] = set;
     }} catch(...) {
@@ -12421,8 +14022,19 @@ void NativeRenderer::RecordVertexIndex(const VertexIndexState& v) {
 // the barriers it takes 3.8 times less GPU time. A listed program must store into its images
 // without loading from them, and must not store the same texels twice in a run: their order is no
 // longer defined. SHADGT_NATIVE_OVERLAP_PROGRAMS=<hex>[,...] sets the list (empty: none).
-bool NativeRenderer::RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64 program,
+// PERF-GT7-136 (SHADGT_NATIVE_INDEPENDENT_RUNS=0: listed programs only, as before): any other
+// program's run goes on the same way when its shader writes no buffer and reads no memory raw
+// (uses_dma), the dispatch stores pictures, and none of them meets a picture an earlier dispatch of
+// the run stored or read, nor does a picture it reads meet one the run stored. GT Sport's two
+// reflection-probe filters, cs 0x5e8f5cf7 (54 dispatches a frame) and cs 0xd0af5a54 (48), are runs
+// like that: each dispatch reads one shared source and stores a picture of its own, and with a
+// barrier between every two of them they took 40% of the GPU's time at Northern Isle; without
+// them the GPU worked ~35% less a frame and the race held 60 fps (Nsight GPU trace and one race of
+// 2026-11-16, RTX 4070 only). Listed programs keep the rule above: GT7's 0x490b6362 may store
+// other parts of the same picture in a run, which the check of stored pictures would stop.
+bool NativeRenderer::RunNeedsBarrier(const Stream& s, const DrawBindings& b, const Shader::Info& cs,
                                      bool recorded, std::optional<u64> texel) const {
+    const u64 program = cs.pgm_hash;
     static const std::vector<u64> listed = [] {
         std::vector<u64> list;
         const char* env = std::getenv("SHADGT_NATIVE_OVERLAP_PROGRAMS");
@@ -12454,7 +14066,14 @@ bool NativeRenderer::RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64
         ++g_run_barrier_reasons[7]; // listed dispatches seen
     }
 #endif
-    if ((std::ranges::find(listed, program) == listed.end() && !texel) ||
+    static const bool independent_runs = [] {
+        const char* env = std::getenv("SHADGT_NATIVE_INDEPENDENT_RUNS");
+        return !(env && env[0] == '0');
+    }();
+    const bool is_listed = std::ranges::find(listed, program) != listed.end();
+    const bool independent = independent_runs && !is_listed && !texel && !cs.uses_dma &&
+                             !b.stored.empty(); // PERF-GT7-136
+    if ((!is_listed && !texel && !independent) ||
         s.run_program != program || s.run_commands != s.commands || s.buffers_written.foreign ||
         recorded || !writebacks.empty() || b.writes_buffers || !s.attach_dirty.empty()) {
         return true;
@@ -12467,6 +14086,15 @@ bool NativeRenderer::RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64
                    picture->info.guest_address < entry->info.guest_address + entry->info.guest_size;
         });
     };
+    if (independent) {
+        // PERF-GT7-136: an unlisted program's dispatches may not store over each other: their
+        // order would no longer be defined.
+        for (const auto* entry : b.stored) {
+            if (entry && meets(s.written, entry)) {
+                return true; // writes what the run wrote
+            }
+        }
+    }
     // PERF-GT7-057: a same-texel program (SameTexelKey) may read the picture it stores where the
     // run wrote it, if the run hasn't stored that mip and layer since its last barrier: each of
     // its dispatches reads only the texels it then stores. FIX-GT7-080: the key says no other of
@@ -12862,7 +14490,9 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
             u64 version;
         };
         boost::container::small_vector<LayerPick, 64> best;
-        std::vector<u64> source_subs;
+        // PERF-GT7-135: kept by the thread, as `sources` above (the nested refreshes of FIX-207 are
+        // over by now): each source's copy had a list allocated and freed at every refresh.
+        static thread_local std::vector<u64> source_subs;
         for (const auto& [source, place] : sources) {
             if (WholeVersion(*source) == 0 || !source->image ||
                 source->reused.load(std::memory_order_relaxed)) {
@@ -13734,6 +15364,17 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             parallel_sidecars_generation.fetch_add(1,std::memory_order_release);
         } catch(const std::exception&) {parallel_sidecar_init_failed.store(true,std::memory_order_relaxed);LOG_WARNING(Render_Vulkan,"PARALLEL-RECORD: initialization failed, using serial recorder");}
     }
+    // DLSS-GT7-001: a draw into a display buffer may join the open batch of HUD draws (Begin).
+    struct DisplayDraw {
+        bool& flag;
+        ~DisplayDraw() {
+            flag = false;
+        }
+    } display_draw{temporal.display_draw_now};
+    if (Gt7TemporalRequested()) { // (a static: nothing a draw without the prototype)
+        const auto& cb0 = r.liverpool->DrawRegs().color_buffers[0];
+        temporal.display_draw_now = cb0 && IsDisplayAddress(cb0.Address());
+    }
     AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Draws}; // DIAG-GT7-005
 #if !defined(NDEBUG)
     const auto start = std::chrono::steady_clock::now();
@@ -13945,12 +15586,20 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
         return r.AcquireGraphicsPipeline(params, !indirect && !quad_list, &pipeline_owner);
     }();
-    const bool must_wait = !pipeline && DrawMustNotSkip(regs);
+    NoteSampleLocations(regs); // DIAG-GTS-507
+    NoteCheckerboardDraw(regs, frame); // DIAG-GTS-509
+    // PERF-GTS-493: in a race (from its countdown with GAME-006) no one-off draw waits (FIX-198,
+    // FIX-GT7-121/135/153): looked up again without waiting, skipped if not ready, and watched.
+    const bool one_off = !pipeline && DrawMustNotSkip(regs);
+    const bool must_wait = one_off && !PipelineCache::RaceNeverWaits();
     // FIX-GT7-121: a picture known to be sampled before any redraw waits whatever the budget.
     // FIX-GT7-135: so does a never-drawn level of a texture, out of play.
+    // FIX-GT7-153: and a draw into a circuit's shadow map at its first drawing, or out of play.
+    const bool in_play = g_game_in_play.load(std::memory_order_relaxed);
+    const bool kept_shadow_wait =
+        must_wait && one_off_kept_shadow && (one_off_kept_shadow_first || !in_play);
     const bool harmful_wait =
-        must_wait && (OneOffKnownHarmful() ||
-                      (one_off_texture_level && !g_game_in_play.load(std::memory_order_relaxed)));
+        must_wait && (OneOffKnownHarmful() || kept_shadow_wait || (one_off_texture_level && !in_play));
     if (must_wait && (harmful_wait || OneOffBudgetLeft())) {
         // FIX-198: drawn once its pipeline is built (see DrawMustNotSkip).
         PhaseClock clock{stats.phase_ns[0]};
@@ -13964,17 +15613,54 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                                          .count()); // FIX-GT7-102
         if (pipeline) {
             ++stats.one_off_waits;
-            stats.one_off_harmful_waits += harmful_wait ? 1 : 0;
+            stats.one_off_harmful_waits += harmful_wait && !one_off_kept_shadow ? 1 : 0;
+            if (one_off_kept_shadow) {
+                // FIX-GT7-153: its own count; a line for the first waits of 1 ms or more.
+                const u64 waited_ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - wait_start)
+                                              .count());
+                ++stats.kept_shadow_waits;
+                stats.kept_shadow_wait_ns += waited_ns;
+                stats.kept_shadow_wait_max_ns = std::max(stats.kept_shadow_wait_max_ns, waited_ns);
+                static std::atomic<u32> kept_logged{};
+                if (waited_ns >= 1000000) {
+                    if (const u32 n = kept_logged++; n < 64 || n % 500 == 0) {
+                        const auto& db = regs.depth_buffer;
+                        LOG_WARNING(Render_Vulkan,
+                                    "FIX-GT7-153: a draw into the shadow map at {:#x} ({}x{}, "
+                                    "16-bit) waited {:.1f} ms for its pipeline ({}, frame {})",
+                                    db.DepthAddress(), db.Pitch(), db.Height(), waited_ns / 1e6,
+                                    kept_shadow_wait ? "no deadline" : "the frame's budget", frame);
+                    }
+                }
+            }
             WatchOneOffs(regs, false); // DIAG-GT7-008, PERF-GT7-023
         } else {
             ++stats.one_off_budget_skips; // FIX-GT7-109: not ready within the play budget
+            stats.kept_shadow_skips += one_off_kept_shadow ? 1 : 0; // FIX-GT7-153: a redraw in play
             WatchOneOffs(regs, true);
         }
     } else if (must_wait) {
         // FIX-GT7-102: this frame already waited its budget for one-off pipelines: skipped as
         // other draws are, and watched as a skip (it never makes its kind safe).
         ++stats.one_off_budget_skips;
+        stats.kept_shadow_skips += one_off_kept_shadow ? 1 : 0; // FIX-GT7-153: a redraw in play
         WatchOneOffs(regs, true);
+    } else if (one_off) {
+        // PERF-GTS-493: the recorder's own lookup, not the command thread's selection (which said
+        // "no pipeline"): it starts the pipeline's build, or installs it once built, and skips
+        // otherwise, as for any draw in a race. Left to the selection only, some of GT7's one-off
+        // pictures were never looked up again and stayed missing for the whole race (their skips
+        // kept growing with the compile queue empty).
+        pipeline = r.AcquireGraphicsPipeline(params, false, &pipeline_owner);
+        if (pipeline) {
+            WatchOneOffs(regs, false);
+        } else {
+            ++stats.one_off_race_skips;
+            stats.kept_shadow_skips += one_off_kept_shadow ? 1 : 0;
+            NoteRaceMissing(regs); // for the end-of-race report
+            WatchOneOffs(regs, true);
+        }
     } else if (!pipeline && !one_off_hits.empty()) {
         // PERF-GT7-023: one-off pictures of kinds that no longer wait only: skipped as other
         // draws are, and still watched (one sampled before its redraw makes its kind wait again).
@@ -14171,11 +15857,144 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
     }
 
+    // DLSS-GT7-001: the temporal pass's result is replaced before the first draw into it or
+    // into a display buffer.
+    // In a frame left as the game draws it (temporal.mirror), the result is only lent: it holds
+    // the un-resolved colour from here until the tone mapping, which is drawn first into the
+    // prototype's own display picture (what DLSS will see), then, with the game's result back,
+    // into the game's. A draw into the result in between (the flares) is drawn into the kept
+    // result too.
+    std::optional<RenderState> raw_scene_state;
+    std::optional<RenderState> kept_result_state;
+    if (temporal.pending_out) {
+        const bool to_display =
+            targets.colors[0] && IsDisplayAddress(targets.colors[0]->info.guest_address);
+        bool to_out = false;
+        for (const auto* color : targets.colors) {
+            to_out |= color == temporal.pending_out;
+        }
+        // DLSS-GT7-003: a draw into the result before the tone mapping (GT7's motion blur in a
+        // pre-race, a replay or a TV camera; its light glows in a race). The result used to be
+        // replaced right here, so whatever the game read from it afterwards was the un-resolved
+        // colour: the bloom, when it comes after the motion blur, and its halos then blinked
+        // with the jitter (RECHERCHE-SCINTILLEMENT-LUMIERES-GT7.md, C1). Now the game's result
+        // stays resolved until the tone mapping, and the draw is recorded twice: into the result
+        // as the game draws it, and into a copy of the un-resolved colour, which is what replaces
+        // the result at the tone mapping. SHADGT_DLSS_TEMPORAL_BLOOM=1: as before.
+        bool beside = false;
+        if (to_out && !to_display && TemporalKeepsResolved() &&
+            targets.state.num_color_attachments == 1 &&
+            targets.colors[0] == temporal.pending_out) {
+            if (temporal.raw_result_frame != frame) {
+                if (Native::ImageEntry* raw =
+                        TemporalPicture(temporal.raw_result, *temporal.pending_out)) {
+                    CopyPicture(*temporal.pending_color, *raw);
+                    temporal.pending_color = raw;
+                    temporal.raw_result_frame = frame;
+                }
+            }
+            if (temporal.raw_result_frame == frame) {
+                const VideoCore::TextureCache::ImageDesc desc{regs.color_buffers[0],
+                                                              r.liverpool->DrawCbExtent(0)};
+                if (const vk::ImageView view =
+                        View(*temporal.raw_result, desc.view_info, ViewUse::Attachment)) {
+                    kept_result_state = targets.state;
+                    kept_result_state->color_attachments[0].image_view = view;
+                    beside = true;
+                    if (temporal.beside_logged < 8) {
+                        ++temporal.beside_logged;
+                        const Shader::Info* fs =
+                            pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+                        LOG_WARNING(Render_Vulkan,
+                                    "DLSS-GT7-003: frame {}: a draw into the anti-aliased picture "
+                                    "before the tone mapping (ps {:#x}, {} vertices): the game "
+                                    "keeps its resolved picture, DLSS's copy gets the draw too",
+                                    frame, fs ? fs->pgm_hash : 0, regs.num_indices);
+                    }
+                }
+            }
+        }
+        if (beside) {
+            // (the result is replaced, or lent, at the tone mapping)
+        } else if ((to_display || to_out) && !temporal.mirror) {
+            ApplyTemporalReplace();
+        } else if (to_display || to_out) {
+            const bool single = targets.state.num_color_attachments == 1;
+            if (TemporalSwapIn()) {
+                const VideoCore::TextureCache::ImageDesc desc{regs.color_buffers[0],
+                                                              r.liverpool->DrawCbExtent(0)};
+                if (to_display) {
+                    Native::ImageEntry* raw =
+                        single ? TemporalPicture(temporal.raw_display, *targets.colors[0],
+                                                 ShownPart(*targets.colors[0]))
+                               : nullptr;
+                    const vk::ImageView view =
+                        raw ? View(*raw, desc.view_info, ViewUse::Attachment) : vk::ImageView{};
+                    if (view) {
+                        raw_scene_state = targets.state;
+                        raw_scene_state->color_attachments[0].image_view = view;
+                        // (the shown part only: a PS4 Pro surface is larger, NEO-GT7-006)
+                        raw_scene_state->width = static_cast<u16>(
+                            std::min<u32>(raw_scene_state->width, raw->info.size.width));
+                        raw_scene_state->height = static_cast<u16>(
+                            std::min<u32>(raw_scene_state->height, raw->info.size.height));
+                    } else {
+                        TemporalSwapOut(); // nothing for DLSS in this frame
+                    }
+                    temporal.pending_color = nullptr;
+                    temporal.pending_out = nullptr;
+                } else if (single && targets.colors[0] == temporal.pending_out) {
+                    const vk::ImageView view =
+                        View(*temporal.kept, desc.view_info, ViewUse::Attachment);
+                    if (view) {
+                        kept_result_state = targets.state;
+                        kept_result_state->color_attachments[0].image_view = view;
+                    }
+                }
+            } else {
+                temporal.pending_color = nullptr;
+                temporal.pending_out = nullptr;
+            }
+        }
+    }
+    // DLSS-GT7-001: set below for a menu's interface, drawn shifted by the frame's jitter.
+    bool jitter_shift = false;
+    // DLSS-GT7-001: in a menu frame whose interface goes through DLSS, the interface (the draws
+    // into the display after the frame's first, the scene) is drawn shifted by the frame's jitter
+    // like the scene, so DLSS gathers it as it gathers the scene (Home switches it).
+    if (temporal.through_frame == frame && temporal.frame == frame && targets.colors[0] &&
+        targets.state.num_color_attachments == 1 &&
+        IsDisplayAddress(targets.colors[0]->info.guest_address)) {
+        if (temporal.scene_draw_frame != frame) {
+            temporal.scene_draw_frame = frame;
+        } else {
+            // The interface's first draw: the display as it is now (the scene alone) is kept,
+            // so DLSS's motion pass finds where the interface drew and gives it no motion where
+            // it stays put on the screen (End switches it; dlss_motion.comp). One copy and two
+            // barriers a frame.
+            if (temporal.ui_scene_frame != frame &&
+                RytyUpscale::TemporalUiMask().load(std::memory_order_relaxed)) {
+                const u32 slot = static_cast<u32>(frame & 1);
+                if (Native::ImageEntry* scene =
+                        TemporalPicture(temporal.ui_scene[slot], *targets.colors[0],
+                                        ShownPart(*targets.colors[0]))) {
+                    CopyPicture(*targets.colors[0], *scene);
+                    temporal.ui_scene_frame = frame;
+                    temporal.ui_scene_slot = slot;
+                    temporal.ui_scene_address = targets.colors[0]->info.guest_address;
+                }
+            }
+            if (RytyUpscale::TemporalUiJitter().load(std::memory_order_relaxed)) {
+                jitter_shift = true;
+            }
+        }
+    }
     // GT7-UW: the frame's first draw into a display buffer is the scene; later ones the HUD,
     // drawn into the display's black and white HUD pictures instead.
     std::optional<RenderState> hud_black_state;
     std::optional<RenderState> hud_white_state;
     HudLayer* hud_layer = nullptr;
+    u32 hud_scale = 1; // DLSS-GT7-001
     // (Multisampled, as a race's track and course maps are; a menu's small pictures drawn with
     // depth, like the World Map's 256x256 probe, are not.)
     if (HudSplitOn() && targets.colors[0] && targets.depth &&
@@ -14183,15 +16002,30 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         targets.colors[0]->info.size.width <= 1024 && targets.colors[0]->info.size.height <= 600) {
         hud_depth_drawn[targets.colors[0]->info.guest_address] = frame;
     }
-    if (HudSplitOn() && targets.colors[0] && targets.state.num_color_attachments == 1 &&
+    if (HudSplitNow() && targets.colors[0] &&
+        targets.state.num_color_attachments == 1 &&
         IsDisplayAddress(targets.colors[0]->info.guest_address)) {
         HudLayer& layer = hud_layers[targets.colors[0]->info.guest_address];
         if (layer.composite_frame != frame) {
             layer.composite_frame = frame;
             layer.clear_pending = true;
-            if (!layer.black) {
-                layer.black = MakeHudPicture(*targets.colors[0]);
-                layer.white = MakeHudPicture(*targets.colors[0]);
+            // DLSS-GT7-001: the shown part of the display (ShownPart), times the HUD's scale.
+            const vk::Extent2D shown = ShownPart(*targets.colors[0]);
+            const u32 scale = HudScale();
+            if (!layer.black || layer.scale != scale ||
+                layer.black->info.size.width != shown.width * scale ||
+                layer.black->info.size.height != shown.height * scale) {
+                // DLSS-GT7-001: made again when End changes their size (the old ones are kept:
+                // recorded commands may still name them).
+                if (layer.black) {
+                    temporal.retired.push_back(layer.black);
+                }
+                if (layer.white) {
+                    temporal.retired.push_back(layer.white);
+                }
+                layer.scale = scale;
+                layer.black = MakeHudPicture(*targets.colors[0], layer.scale, shown);
+                layer.white = MakeHudPicture(*targets.colors[0], layer.scale, shown);
             }
         } else if (layer.black && layer.white) {
             const VideoCore::TextureCache::ImageDesc desc{regs.color_buffers[0],
@@ -14213,8 +16047,41 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 layer.clear_pending = false;
                 layer.hud_frame = frame;
                 hud_layer = &layer;
+                // DLSS-GT7-001: larger pictures, larger render area; never past the pictures
+                // (made the shown part's size: a PS4 Pro surface is larger, NEO-GT7-006).
+                if (layer.scale > 1) {
+                    hud_scale = layer.scale;
+                }
+                for (auto* state : {&*hud_black_state, &*hud_white_state}) {
+                    state->width = static_cast<u16>(std::min<u32>(
+                        u32{state->width} * layer.scale, layer.black->info.size.width));
+                    state->height = static_cast<u16>(std::min<u32>(
+                        u32{state->height} * layer.scale, layer.black->info.size.height));
+                }
             }
         }
+    }
+    // DLSS-GT7-001: the two records above go the way a HUD draw's do: first into the first
+    // state, then again into the second. A HUD draw of a frame left as the game draws it is
+    // recorded a third time, into the display itself, at its own size.
+    bool second_inline = false;
+    bool hud_unscaled = false;
+    const bool hud_mirrored =
+        hud_black_state && hud_layer && temporal.mirror && temporal.frame == frame;
+    if (raw_scene_state) {
+        hud_black_state = raw_scene_state;
+    }
+    if (kept_result_state) {
+        hud_white_state = kept_result_state;
+        second_inline = true;
+    }
+    if (hud_mirrored || (hud_black_state && hud_layer && temporal.frame == frame &&
+                         temporal.white_inline)) {
+        // A menu's interface draws its pieces through one scratch picture, written again for
+        // each piece: the record over white must run where it stands, not later in the HUD's
+        // own list, or it samples the scratch as a later piece left it (colours off in menus,
+        // seen by the user on 2026-11-12; my reading of the cause, not measured).
+        second_inline = true;
     }
     if (r.FrameDumpActive() || Rasterizer::ExposureLogOn()) {
         if (r.FrameDumpCollecting()) {
@@ -14294,6 +16161,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         // MirrorBuffer may process CPU writes after CommitPrepared. A changed
         // range invalidates both prepared bindings and vertices, not only vi.
         if(prepared->unmap_gen!=unmap_generation.load(std::memory_order_acquire) ||
+           prepared->sampler_drops!=samplers_dropped.load(std::memory_order_acquire) || // FIX-GTS-503
            !PreparedBuffersUntouched(*prepared,prepared->buffer_seq)) {
             from_prepared=false;prepared_vertices_valid=false;buffer_freshness_certified=false;
         } else {
@@ -14303,14 +16171,27 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     }
     DrawBindings& b = from_prepared ? prepared->bindings : bindings;
     // GT7-UW: a HUD draw showing a small picture drawn with depth this frame (the race's maps).
+    // DLSS-GT7-001: the same sign, without a HUD layer, tells the prototype a race is on.
     const auto note_race_hud = [&] {
-        if (!hud_layer || hud_layer->race_frame == frame) {
+        const bool for_layer = hud_layer && hud_layer->race_frame != frame;
+        const bool for_temporal =
+            Gt7TemporalRequested() && temporal.race_hud_frame != frame &&
+            targets.colors[0] && IsDisplayAddress(targets.colors[0]->info.guest_address);
+        if (!for_layer && !for_temporal) {
             return;
         }
         for (const auto* sampled : b.sampled) {
+            if (!sampled) {
+                continue;
+            }
             const auto it = hud_depth_drawn.find(sampled->info.guest_address);
             if (it != hud_depth_drawn.end() && it->second == frame) {
-                hud_layer->race_frame = frame;
+                if (for_layer) {
+                    hud_layer->race_frame = frame;
+                }
+                if (for_temporal) {
+                    temporal.race_hud_frame = frame;
+                }
                 return;
             }
         }
@@ -14365,6 +16246,34 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             }
         }
     }
+    // DLSS-GT7-001: in a frame left as the game draws it, a HUD draw goes into the display in the
+    // main list as the game draws it, and into the HUD pictures in two lists of their own that
+    // run after the main one: consecutive HUD draws then stay in one pass each, instead of
+    // switching between three pictures at every draw (2026-11-12, the main menu: 1,450 passes
+    // and 360 pass barriers a frame instead of 350 and 24, 45 frames a second instead of 60).
+    // A draw that reads a display picture, and any other work, runs after the batch (Begin).
+    // Decided before the draw's barrier and its pictures' preparation: with the HUD pictures as
+    // its target the main list saw a change of pass at every draw and put a barrier there
+    // (the first try on 2026-11-12 halved the passes, but kept 365 barriers a frame).
+    // SHADGT_DLSS_TEMPORAL_HUD_BATCH=0: every HUD draw switches pictures as before.
+    bool hud_batched = false;
+    std::optional<RenderState> batched_black;
+    std::optional<RenderState> batched_white;
+    if (hud_mirrored && HudBatchOn() && hud_black_state && hud_white_state && !regs.stage_enable.hs_en) {
+        bool reads_display = false;
+        for (const auto* sampled : b.sampled) {
+            reads_display |= sampled && IsDisplayAddress(sampled->info.guest_address);
+        }
+        hud_batched = !reads_display;
+    }
+    if (temporal.hud_batch_open && !hud_batched) {
+        CloseHudBatch();
+        Begin();
+    }
+    if (hud_batched) {
+        batched_black = std::exchange(hud_black_state, std::nullopt);
+        batched_white = std::exchange(hud_white_state, std::nullopt);
+    }
     {
         PhaseClock clock{stats.phase_ns[6]};
         PrepareImages(b); // PERF-109
@@ -14396,6 +16305,24 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         (db_feedback.has_stencil && regs.depth_control.stencil_enable);
     const auto depth_feedback = Native::DecideDepthFeedback(
         sampled_depth, depth_writes, r.instance.IsAttachmentFeedbackLoopLayoutSupported());
+    // NEO-GTS-511: the pixel shader's positions table (the draw's own positions, as given to
+    // Vulkan) replaces PA_SC_AA_MASK in the push constants: such a pipeline has no AA mask and
+    // no hull shader (vk_pipeline_cache.cpp). Before any push of the bindings below.
+    if (pipeline->UsesSampleTable() || pipeline->UsesSample0Offsets() ||
+        pipeline->RasterSamples() == 2) {
+        SampleLocations::Why why = SampleLocations::Why::Game;
+        const SampleLocations::Pattern locations = r.SampleLocationPattern(pipeline, &why);
+        if (pipeline->UsesSampleTable()) {
+            b.push.quad_sample_mask = SampleLocations::QuadTable(locations);
+        }
+        if (pipeline->UsesSample0Offsets()) {
+            // NEO-GTS-513: past the pixel shader's own offsets (12 buffers at most).
+            const u32 word = SampleLocations::Sample0Word(locations);
+            std::memcpy(&b.push.buf_offsets[Shader::PushData::Sample0OffsetsByte], &word,
+                        sizeof(word));
+        }
+        CountTwoSampleDraw(*pipeline, why);
+    }
     struct DepthSnapshot {
         std::unique_ptr<Native::Rhi::Image> image;
         std::vector<vk::UniqueImageView> views;
@@ -14536,6 +16463,35 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                     .layerCount = VK_REMAINING_ARRAY_LAYERS,
                 },
             });
+        }
+        // NEO-GTS-508: a multi-sample depth target written with the game's sample positions
+        // keeps them through its layout change (VkSampleLocationsInfoEXT in its barrier).
+        // Recorded with the structure built when the command runs (the ring copies no chained
+        // structures). NEO-GTS-511: the positions of the depth's last write (written_locations,
+        // set before each draw that writes it), on both sides of the change. These feedback-loop
+        // changes are the only layout changes a game depth image goes through with its content
+        // kept: the native renderer keeps images in GENERAL, the others start from UNDEFINED, and
+        // DLSS and FSR copy the depth into their own images. On a 1x1-grid GPU only 4-sample and
+        // larger draws whose quad pixels ask for the same positions take the game's; 2-sample
+        // draws stay standard (TakesSampleLocations).
+        for (size_t i = 0; i < feedback.size(); ++i) {
+            const auto* entry = feedback[i];
+            const SampleLocations::Pattern locations = entry->written_locations;
+            if (entry != targets.depth || !entry->info.props.is_depth || locations.samples == 0 ||
+                entry->image->Desc().samples != locations.samples) {
+                continue;
+            }
+            s.cmd.Run([barriers, locations, i](vk::CommandBuffer cmd) mutable {
+                std::array<vk::SampleLocationEXT, 64> storage;
+                const vk::SampleLocationsInfoEXT info =
+                    SampleLocations::ToVulkan(locations, storage);
+                barriers[i].pNext = &info;
+                cmd.pipelineBarrier2(vk::DependencyInfo{
+                    .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
+                    .pImageMemoryBarriers = barriers.data(),
+                });
+            });
+            return;
         }
         s.cmd.pipelineBarrier2(vk::DependencyInfo{
             .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
@@ -14793,6 +16749,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         // The recorder owns log writes. Reuse only a successful check from this
         // Draw while its sequence is unchanged; otherwise scan the original ranges.
         if(!fast_reject && (prepared->unmap_gen!=unmap_generation.load(std::memory_order_acquire) ||
+           prepared->sampler_drops!=samplers_dropped.load(std::memory_order_acquire) || // FIX-GTS-503
            !(from_prepared && buffer_freshness_certified && buffer_log.Seq()==buffer_freshness_seq) &&
            !PreparedBuffersUntouched(*prepared,prepared->buffer_seq))) fast_reject=true;
         if(fast_reject) {
@@ -15412,16 +17369,18 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                             if(sampler_cache_enabled) {
                                 const auto handle_key=reinterpret_cast<u64>(static_cast<VkSampler>(info.sampler));
                                 const bool diag=ParallelGateDiagEnabled();
+                                // FIX-GTS-503: what it vouched for may have been destroyed.
+                                if(const u64 drops=samplers_dropped.load(std::memory_order_acquire);drops!=parallel->sampler_proof_drops) {parallel->sampler_proof.Clear();parallel->sampler_proof_drops=drops;}
                                 known=parallel->sampler_proof.Contains(info.sampler,handle_key);
                                 if(known) {if(diag)NATIVE_DIAGNOSTIC(++parallel->sampler_proof_hits);}
                                 else {
                                     if(diag)NATIVE_DIAGNOSTIC(++parallel->sampler_proof_misses);
                                     std::scoped_lock sampler_lock{sampler_mutex};
-                                    for(const auto& [key,value]:samplers) {if(diag)NATIVE_DIAGNOSTIC(++parallel->sampler_scan_steps);if(value && value->Handle()==info.sampler) {known=true;break;}}
+                                    for(const auto& [key,value]:samplers) {if(diag)NATIVE_DIAGNOSTIC(++parallel->sampler_scan_steps);if(value.sampler && value.sampler->Handle()==info.sampler) {known=true;break;}}
                                     if(known){parallel->sampler_proof.Insert(info.sampler,handle_key);if(diag)NATIVE_DIAGNOSTIC(++parallel->sampler_scan_positives);}
                                 }
                             } else {std::scoped_lock sampler_lock{sampler_mutex};
-                                for(const auto& [key,value]:samplers) if(value && value->Handle()==info.sampler) {known=true;break;}}
+                                for(const auto& [key,value]:samplers) if(value.sampler && value.sampler->Handle()==info.sampler) {known=true;break;}}
                             if(!known){descriptor_fail_reason=6;descriptor_safe=false;break;}
                         } else {
                             SampledProofTimer phase{parallel->proof_phases[2],phase_sample};
@@ -15743,13 +17702,55 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             !stage->has_storage_images && !stage->uses_shader_clock &&
             std::ranges::none_of(stage->buffers, [](const auto& buffer) { return buffer.is_written; }));
     });
+    // PERF-GT7-133 (SHADGT_LDS_OWNED_MEMO=0: as before): the handles of the regions and mirrors,
+    // sorted, kept while neither map changes. Each tessellated draw walked both maps for each of
+    // its buffers, with a NativeHandle() call per entry, and a buffer that is in neither (a
+    // wrapper over imported guest memory, the usual case) walked them whole: ~0.6 ms a frame of the
+    // recorder in a GT7 race (~145 such draws a frame, a few hundred regions). Every place that
+    // puts a region or mirror in or takes one out moves g_lds_owned_epoch (NoteOwnedMapChange), as
+    // does a renderer going; both maps' sizes are checked too. buffer_generation is not used: it
+    // also moves for dirty pages, and the set would then be made again for nearly every draw. The
+    // chunks are the list's own and few: still walked.
+    static const bool owned_memo_on = [] {
+        const char* env = std::getenv("SHADGT_LDS_OWNED_MEMO");
+        return !(env && env[0] == '0');
+    }();
+    struct OwnedHandles {
+        const NativeRenderer* owner = nullptr;
+        u64 epoch = 0;
+        size_t regions = 0;
+        size_t mirrors = 0;
+        std::vector<VkBuffer> handles;
+    };
+    static thread_local OwnedHandles owned_handles;
+    const auto handle_of = [](const auto& buffer) {
+        return vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())};
+    };
+    const u64 owned_epoch = g_lds_owned_epoch.load(std::memory_order_acquire);
+    if (owned_memo_on && pipeline->LdsEmulation() &&
+        (owned_handles.owner != this || owned_handles.epoch != owned_epoch ||
+         owned_handles.regions != regions.size() || owned_handles.mirrors != mirrors.size())) {
+        owned_handles.owner = this;
+        owned_handles.epoch = owned_epoch;
+        owned_handles.regions = regions.size();
+        owned_handles.mirrors = mirrors.size();
+        owned_handles.handles.clear();
+        for (const auto& [_, region] : regions) {
+            if (region.buffer) owned_handles.handles.push_back(static_cast<VkBuffer>(handle_of(region.buffer)));
+        }
+        for (const auto& [_, mirror] : mirrors) {
+            if (mirror.buffer) owned_handles.handles.push_back(static_cast<VkBuffer>(handle_of(mirror.buffer)));
+        }
+        std::ranges::sort(owned_handles.handles);
+    }
     const auto lds_owned_buffer = [&](vk::Buffer handle) {
         if (!handle) return true;
-        const auto matches = [handle](const auto& buffer) {
-            return buffer && vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())} == handle;
-        };
+        const auto matches = [&](const auto& buffer) { return buffer && handle_of(buffer) == handle; };
         // s.keep can also contain non-owning wrappers over imported guest memory.
         if (std::ranges::any_of(s.chunks, [&](const auto& chunk) { return matches(chunk.buffer); })) return true;
+        if (owned_memo_on) {
+            return std::ranges::binary_search(owned_handles.handles, static_cast<VkBuffer>(handle));
+        }
         for (const auto& [_, region] : regions) if (matches(region.buffer)) return true;
         for (const auto& [_, mirror] : mirrors) if (matches(mirror.buffer)) return true;
         return false;
@@ -15879,6 +17880,47 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         if(!parallel_draw) BeginRendering(hud_black_state ? *hud_black_state : targets.state); // GT7-UW
     }
 
+    // DLSS-GT7-001 (GT7's temporal path; nothing elsewhere: the scale stays 1 and no shift is
+    // asked for): the viewports and scissors of a record into the HUD's larger pictures, and of a
+    // menu's interface drawn shifted by the frame's jitter. After UpdateViewportScissorState.
+    const auto hud_view_state = [&] {
+        if (hud_scale > 1 && hud_black_state && !hud_unscaled) {
+            // The HUD's pictures are hud_scale times the display's size.
+            const float k = static_cast<float>(hud_scale);
+            auto viewports = s.dynamic.viewports;
+            for (auto& viewport : viewports) {
+                viewport.x *= k;
+                viewport.y *= k;
+                viewport.width *= k;
+                viewport.height *= k;
+            }
+            s.dynamic.SetViewports(viewports);
+            auto scissors = s.dynamic.scissors;
+            for (auto& scissor : scissors) {
+                scissor.offset.x *= static_cast<s32>(hud_scale);
+                scissor.offset.y *= static_cast<s32>(hud_scale);
+                scissor.extent.width *= hud_scale;
+                scissor.extent.height *= hud_scale;
+            }
+            s.dynamic.SetScissors(scissors);
+        }
+        if (jitter_shift) {
+            // Drawn where the jittered scene under it is (temporal.jitter: the scene's shift in
+            // pixels, x right, y down).
+            auto viewports = s.dynamic.viewports;
+            for (auto& viewport : viewports) {
+                viewport.x += temporal.jitter[0];
+                viewport.y += temporal.jitter[1];
+            }
+            s.dynamic.SetViewports(viewports);
+        }
+    };
+
+    // NEO-GTS-511: the positions a multi-sample depth is written with, for its layout changes.
+    if (targets.depth && depth_writes && !depth_feedback.read_only &&
+        targets.depth->image->Desc().samples > 1) {
+        targets.depth->written_locations = r.SampleLocationPattern(pipeline);
+    }
     // The renderer's dynamic state code, filling this list's state.
     {
         PhaseClock part{stats.record_ns[2]};
@@ -15897,9 +17939,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
         r.ctx->attachment_feedback_loop = feedback_aspects;
         r.UpdateViewportScissorState();
+        hud_view_state(); // DLSS-GT7-001
         r.UpdateDepthStencilState();
         r.UpdatePrimitiveState(is_indexed, quad_triangles);
-        r.UpdateRasterizationState();
+        r.UpdateRasterizationState(pipeline);
         r.UpdateColorBlendingState(pipeline);
         if (scale_composition) {
             auto viewports = s.dynamic.viewports;
@@ -16051,6 +18094,16 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
     }
     note_race_hud(); // GT7-UW
+    // DLSS-GT7-001: a draw that reads a display picture back (GT7's interface copies what is
+    // under a panel or a page into its scratch picture, for frosted panels and whole pages).
+    if (Gt7TemporalRequested() && temporal.display_read_frame != frame) {
+        for (const auto* sampled : b.sampled) {
+            if (sampled && IsDisplayAddress(sampled->info.guest_address)) {
+                temporal.display_read_frame = frame;
+                break;
+            }
+        }
+    }
     {
         PhaseClock part{stats.record_ns[6]};
         const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
@@ -16143,11 +18196,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             });
         }
         // DIAG-243: the draws recorded last, for the report of a lost device.
-        static const bool note_draws = [] {
-            const char* env = std::getenv("SHADGT_DEVICE_FAULT");
-            return env && env[0] == '1';
-        }();
-        if (note_draws) {
+        if (r.instance.NotesDrawsForFault()) {
             const auto& key = pipeline->GetGraphicsKey();
             NoteDrawForFault(XXH3_64bits(&key, sizeof(key)),
                              (pipeline->LdsEmulation() & 0xff) |
@@ -16185,6 +18234,23 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         const auto record_draw = [&] {
             prepare_draw();
             issue();
+        };
+        // GT7-UW / DLSS-GT7-001: the draw's state again, for a record of it into another target
+        // or another list (the HUD pictures, the display itself, DLSS's own pictures).
+        const auto bind_state = [&] {
+            DynamicState* const saved = Rasterizer::t_dynamic_state;
+            Rasterizer::t_dynamic_state = &s.dynamic;
+            r.UpdateViewportScissorState();
+            hud_view_state();
+            r.UpdateDepthStencilState();
+            r.UpdatePrimitiveState(is_indexed, quad_triangles);
+            r.UpdateRasterizationState(pipeline);
+            r.UpdateColorBlendingState(pipeline);
+            s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
+            Rasterizer::t_dynamic_state = saved;
+            RecordVertexIndex(*vi);
+            BindGraphics(s, *pipeline, pipeline_owner);
+            PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
         };
         const auto record_wide_draw = [&] {
             prepare_draw();
@@ -16551,32 +18617,59 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             s.cmd.pushConstants(pipeline->GetLayout(), AllGraphicsStageBits,
                 u32(offsetof(Shader::PushData, quad_sample_mask)), 8u, b.push.quad_sample_mask.data());
         }
-        if (hud_white_state && HudStreamOn() && !stream.wrapped_list) {
+        if (hud_white_state && HudStreamOn() && !stream.wrapped_list && !second_inline) {
             // GT7-UW: the same draw over white, in the HUD list (its state recorded there too).
             std::swap(stream, hud_stream);
             BeginHudStream();
             BeginRendering(*hud_white_state);
-            {
-                DynamicState* const saved = Rasterizer::t_dynamic_state;
-                Rasterizer::t_dynamic_state = &s.dynamic;
-                r.UpdateViewportScissorState();
-                r.UpdateDepthStencilState();
-                r.UpdatePrimitiveState(is_indexed, quad_triangles);
-                r.UpdateRasterizationState();
-                r.UpdateColorBlendingState(pipeline);
-                s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
-                Rasterizer::t_dynamic_state = saved;
-            }
-            RecordVertexIndex(*vi);
-            BindGraphics(s, *pipeline, pipeline_owner);
-            PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
+            bind_state();
             issue();
             std::swap(stream, hud_stream);
         } else if (hud_white_state) {
             // GT7-UW: the same draw again over white (the pipeline, bindings and dynamic state
             // stay bound across the change of attachment).
             BeginRendering(*hud_white_state);
+            if (jitter_shift) {
+                jitter_shift = false; // DLSS-GT7-001: the game's own copy, unshifted
+                bind_state();
+            }
             issue();
+        }
+        // (Merge, shadGT: GT7's records below stay in the serial branch, where the draw's
+        // lambdas are; a worker's captured draw has no HUD or temporal record.)
+        if (raw_scene_state) {
+            // DLSS-GT7-001: the tone mapping is drawn for DLSS; now for the game, with its own
+            // result back.
+            EndRendering();
+            TemporalSwapOut();
+            temporal.raw_frame = frame;
+            temporal.raw_address = targets.colors[0]->info.guest_address;
+            ++temporal.mirrored;
+            BeginRendering(targets.state);
+            bind_state();
+            record_draw();
+        } else if (hud_mirrored && !hud_batched) {
+            // DLSS-GT7-001: the HUD draw into the display itself, as the game expects to read it.
+            hud_unscaled = true;
+            BeginRendering(targets.state);
+            bind_state();
+            record_draw();
+            hud_unscaled = false;
+        }
+        if (hud_batched) {
+            // DLSS-GT7-001: the same draw over black and over white, in the HUD lists.
+            hud_black_state = batched_black; // bind_state sizes it for the HUD pictures
+            for (const bool white : {false, true}) {
+                Stream& side = white ? hud_stream : hud_black_stream;
+                std::swap(stream, side);
+                BeginHudStream();
+                BeginRendering(white ? *batched_white : *batched_black);
+                bind_state();
+                record_draw();
+                std::swap(stream, side);
+            }
+            temporal.hud_batch_open = true;
+            ++temporal.batched_draws;
         }
         SceneTrace::GpuEnd(s.cmd);
         }
@@ -16779,9 +18872,357 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         ++stats.indirect_draws;
     }
     ++s.commands;
+    if (Gt7TemporalActive()) {
+        NoteTemporalDraw(*pipeline, targets, b); // DLSS-GT7-001
+    }
     tail_partition.Finish();
     {RecordPartitionClock chunk_partition{parallel?&parallel->record_partition[partition_mode][2]:nullptr};ChunkFlushCheck();}
     {RecordPartitionClock report_partition{parallel?&parallel->record_partition[partition_mode][3]:nullptr};Report();}
+}
+
+// DLSS-GT7-001 (temporal DLSS; see ryty_upscale.h): GT7's temporal
+// anti-aliasing pass in a race. Its pixel shader 0xcfa125dd reads the depth, the motion vectors
+// (RG16F, written by every scene draw as a second target), the frame's colour and the history,
+// and writes the new history (target 0) and the resolved picture (target 1). Its constants hold
+// the frame's jitter: the shader samples at position - c14*c20, - c15*c21 (c14/c15 turn motion
+// units into pixels: 960, -540 at 1920x1080; c20/c21 follow a 49-frame sequence within +-0.25
+// pixel), and reads the history at position - motion * (c14, c15). Measured in two of the user's
+// races on 2026-11-11 (dry and rain, chase and cockpit views); the frame of a camera cut has no
+// such pass, which is the history reset. The pictures are noted for the presenter's DLSS pass,
+// and the resolved picture is replaced with the un-resolved colour, so that what reaches DLSS
+// still carries the jitter. Only while DLSS can take the inputs (TemporalActive).
+void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Targets& targets,
+                                      const DrawBindings& b) {
+    constexpr u64 Gt7TemporalAa = 0xcfa125dd;
+    const Shader::Info* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
+    if (!fs || fs->pgm_hash != Gt7TemporalAa) {
+        return;
+    }
+    // Set again below once the result's replacement is scheduled: a pass left to the game must
+    // not inherit the last frame's way.
+    temporal.mirror = false;
+    if (temporal.size_refused) {
+        return; // the result's size is not the display's (FindDisplay): left to the game
+    }
+    // Only in a race, and only while the interface does not read the display back. The game
+    // runs the same pass behind menus that have a 3D scene (the title screen over the world
+    // map, the layout cards over the globe, the pre-race page; seen by the user on 2026-11-12),
+    // and their pages and frosted panels copy the display picture while they draw: with the
+    // interface kept in the HUD pictures they copied the bare scene (the title's artwork lost
+    // to the map, cards showing the globe, panels shimmering with the un-resolved frames).
+    // There the pass is left alone and DLSS runs as without the prototype. A race is told as
+    // GT7-UW tells it, by its HUD's track and course maps, seen in one of the last two frames
+    // (menus that draw a course map pass for one, hence the second rule); a read of the display
+    // keeps the prototype off for half a second. SHADGT_DLSS_TEMPORAL_MENUS=1: every frame with
+    // the pass.
+    // Since the same day those frames are taken another way (temporal.mirror): the game's
+    // pictures are left as it draws them, so what it reads back is its own, and the tone mapping
+    // and the HUD are drawn a second time beside them for DLSS (Draw). That costs a record more
+    // a HUD draw, which is why a race keeps the first way. SHADGT_DLSS_TEMPORAL_MIRROR=0: such
+    // frames are left to the game as before; =2: every frame goes this way, races too.
+    static const bool menus_too = [] {
+        const char* env = std::getenv("SHADGT_DLSS_TEMPORAL_MENUS");
+        return env && env[0] == '1';
+    }();
+    const bool race_hud =
+        temporal.race_hud_frame != ~u64{0} && frame - temporal.race_hud_frame <= 2;
+    const bool read_back =
+        temporal.display_read_frame != ~u64{0} && frame - temporal.display_read_frame <= 30;
+    const bool race = race_hud && !read_back;
+    if (race != temporal.race && temporal.race_changes++ < 32) {
+        LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: frame {}: {}", frame,
+                    race ? "a race's HUD and no read of the display, the temporal pass is taken"
+                    : read_back ? "the interface reads the display back, the temporal pass is "
+                                  "left to the game"
+                                : "no race's HUD, the temporal pass is left to the game");
+    }
+    temporal.race = race;
+    static const int mirror_mode = [] {
+        const char* env = std::getenv("SHADGT_DLSS_TEMPORAL_MIRROR");
+        return env && env[0] >= '0' && env[0] <= '2' ? env[0] - '0' : 0;
+    }();
+    // 2026-11-12: three records a HUD draw took the main menu from 60 to 57 frames a second,
+    // which a G-SYNC screen shows as flicker. Only where it is needed, then: while the interface
+    // reads the display back, and in a scene's first half second (a page that keeps a copy of
+    // the display, as the title screen's artwork, must find it whole in its first frame).
+    // Elsewhere the HUD stays out of the display, its record over white run in place outside a
+    // race (a menu's pieces share one scratch picture). Page Down forces one way (ryty_upscale.h).
+    //
+    // Measured the same day on the title screen: even so, drawing the interface beside the game's
+    // costs the GPU about 3.4 ms a frame there (it alternates ~50 times a frame between a scratch
+    // picture and the display, and each time the GPU must drain before the scratch is drawn
+    // again): 46 frames a second instead of 60. The quick way chosen by the user: outside a race,
+    // where the interface reads the display back or a scene has just started, the pass is left to
+    // the game (classic DLSS there; the title screen's 3D map is hidden behind its artwork
+    // anyway). A race keeps the frames left as drawn while its HUD reads the display back (a
+    // race is held by the game's own pace, the cost does not show there). SHADGT_DLSS_TEMPORAL_
+    // MIRROR=1: such menu frames left as drawn and drawn beside (the way before), =2 every frame.
+    if (temporal.seen_frame == ~u64{0} || temporal.seen_frame + 1 < frame) {
+        temporal.run_start = frame;
+    }
+    temporal.seen_frame = frame;
+    const bool fresh = frame - temporal.run_start < 30;
+    const u32 hud_mode = RytyUpscale::TemporalHudMode().load(std::memory_order_relaxed);
+    const bool mirror =
+        hud_mode == 1 ||
+        (hud_mode == 0 && !menus_too &&
+         (mirror_mode == 2 || (mirror_mode == 1 && (read_back || fresh)) ||
+          (mirror_mode == 0 && race_hud && read_back)));
+    // Menus (no race HUD), since the same day: the interface is not split off; it stays in the
+    // display DLSS gets, drawn shifted by the frame's jitter like the scene (Draw; Home switches
+    // it). The game's pages read their display as the game drew it, and no record is added: the
+    // menus cost what the classic DLSS costs (the title screen held 60 frames a second only that
+    // way; with the interface drawn apart it fell to 45, whatever the way). Animated interface
+    // pieces may leave trails, since they carry the scene's motion.
+    // SHADGT_DLSS_TEMPORAL_MENU_CLASSIC=1: classic DLSS where a menu reads its display back (the
+    // quick way of earlier the same day).
+    static const bool menu_classic = [] {
+        const char* env = std::getenv("SHADGT_DLSS_TEMPORAL_MENU_CLASSIC");
+        return env && env[0] == '1';
+    }();
+    // Not with GT7-UW's wide screen (RytyDisplayAspect): there the menus' interface is split off
+    // in the black and white HUD pictures and laid over DLSS's picture, where a jitter shift
+    // would only make it shake (and its record over white is not shifted).
+    const bool through = !menu_classic && hud_mode == 0 && !menus_too &&
+                         mirror_mode == 0 && !race_hud && RytyDisplayAspect() <= 0.0f;
+    if (through) {
+        temporal.through_frame = frame;
+    }
+    if (through != temporal.through && temporal.through_changes++ < 64) {
+        LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: frame {}: {}", frame,
+                    through ? "a menu: its interface goes through DLSS"
+                            : "a race's HUD: drawn apart at twice the size");
+    }
+    temporal.through = through;
+    const bool left = menu_classic && hud_mode == 0 && !menus_too &&
+                      mirror_mode == 0 && !race_hud && (read_back || fresh);
+    if (left != temporal.left && temporal.left_changes++ < 64) {
+        LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: frame {}: {}", frame,
+                    !left ? "the temporal pass is taken"
+                    : read_back
+                        ? "the interface reads the display back: classic DLSS for this frame"
+                        : "a scene has just started: classic DLSS for this frame");
+    }
+    temporal.left = left;
+    temporal.white_inline = hud_mode == 2 || (hud_mode == 0 && !race_hud);
+    static bool mirror_logged = false;
+    static u32 mirror_changes = 0;
+    if (mirror != mirror_logged && mirror_changes++ < 32) {
+        LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: frame {}: {} ({} frames drawn beside so far)",
+                    frame,
+                    mirror ? "the frame is left as the game draws it and drawn beside for DLSS"
+                           : "the pass's result is replaced in place",
+                    temporal.mirrored);
+    }
+    mirror_logged = mirror;
+    if (left) {
+        return;
+    }
+    const auto refuse = [&](const char* why) {
+        if (temporal.refused++ < 8) {
+            LOG_WARNING(Render_Vulkan, "DLSS-GT7-001: frame {}: the temporal pass is not used: {}",
+                        frame, why);
+        }
+    };
+    const Native::ImageEntry* out = targets.colors[1];
+    if (!out) {
+        refuse("no second colour target");
+        return;
+    }
+    const Native::ImageEntry* depth = nullptr;
+    const Native::ImageEntry* motion = nullptr;
+    const Native::ImageEntry* color = nullptr;
+    for (const auto* entry : b.sampled) {
+        // (Single-sample only: DLSS takes a 2D view; the PS4 Pro mode's depth has 2 samples.)
+        if (!entry || entry->info.num_samples != 1 ||
+            entry->info.size.width != out->info.size.width ||
+            entry->info.size.height != out->info.size.height) {
+            continue;
+        }
+        if (entry->info.props.is_depth) {
+            depth = entry;
+        } else if (entry->info.pixel_format == vk::Format::eR16G16Sfloat) {
+            motion = entry;
+        } else if (entry != out && entry != targets.colors[0] &&
+                   entry->image->Desc().format == out->image->Desc().format) {
+            color = entry;
+        }
+    }
+    if (!depth || !motion) {
+        refuse("no depth or no RG16F motion picture of the result's size among its textures");
+        return;
+    }
+    // The constants: the stage's first guest buffer (128 bytes of floats).
+    std::array<float, 24> c{};
+    bool read = false;
+    for (const auto& desc : fs->buffers) {
+        if (desc.IsSpecial()) {
+            continue;
+        }
+        const auto vsharp = desc.GetSharp(*fs);
+        const u64 base = vsharp.base_address;
+        read = base != 0 && vsharp.GetSize() >= sizeof(c) &&
+               Core::RytyMemory::GuardedCopy(c.data(), reinterpret_cast<const void*>(base),
+                                             sizeof(c));
+        break;
+    }
+    const float width = static_cast<float>(out->info.size.width);
+    const float height = static_cast<float>(out->info.size.height);
+    const float jitter_x = -c[14] * c[20];
+    const float jitter_y = -c[15] * c[21];
+    if (!read || !std::isfinite(jitter_x) || !std::isfinite(jitter_y) ||
+        std::abs(jitter_x) > 1.0f || std::abs(jitter_y) > 1.0f || c[14] == 0.0f || c[15] == 0.0f ||
+        std::abs(c[14]) > width || std::abs(c[15]) > height) {
+        refuse("its constants are unreadable or not the ones measured");
+        return;
+    }
+    if (!color) {
+        refuse("no colour picture of the result's format to replace it with");
+        return;
+    }
+    // From here the result is replaced: only then are the frame's jitter and pictures handed to
+    // DLSS (a resolved picture given with a jitter would be shifted back and forth by DLSS).
+    if (temporal.frame != frame) {
+        temporal.reset = temporal.frame + 1 != frame;
+    }
+    temporal.depth = depth;
+    temporal.result = out;
+    temporal.motion = motion;
+    temporal.frame = frame;
+    temporal.jitter[0] = jitter_x;
+    temporal.jitter[1] = jitter_y;
+    // motion * (c14, c15) = current - previous position in pixels; DLSS wants the opposite.
+    temporal.mvec_scale[0] = -c[14] / width;
+    temporal.mvec_scale[1] = -c[15] / height;
+    if (temporal.seen++ < 4) {
+        LOG_WARNING(Render_Vulkan,
+                    "DLSS-GT7-001: frame {}: temporal pass, depth {:#x} motion {:#x} colour {:#x} "
+                    "-> {:#x} {}x{}, c14 {} c15 {}, jitter {:.4f},{:.4f} px{}",
+                    frame, depth->info.guest_address, motion->info.guest_address,
+                    color->info.guest_address, out->info.guest_address, out->info.size.width,
+                    out->info.size.height, c[14], c[15], jitter_x, jitter_y,
+                    temporal.reset ? ", after a frame without one" : "");
+    }
+    // The game's bloom and exposure passes read the pass's result right after it, at a quarter
+    // of its size and less: they keep the game's resolved picture (steady from frame to frame;
+    // on the un-resolved one the highlights of car bodies flickered, seen by the user on
+    // 2026-11-11), and the result is replaced before the first draw into a display buffer, which
+    // is the tone mapping (DLSS-GT7-003, Draw). SHADGT_DLSS_TEMPORAL_BLOOM=1: before the next draw
+    // into the result too, as until 2026-11-13; =0: replaced at once.
+    static const bool late = [] {
+        const char* env = std::getenv("SHADGT_DLSS_TEMPORAL_BLOOM");
+        return !(env && env[0] == '0');
+    }();
+    temporal.mirror = mirror;
+    if (mirror) {
+        temporal.mirror_frame = frame;
+    }
+    temporal.pending_color = color;
+    temporal.pending_out = out;
+    temporal.raw_result_frame = ~u64{0}; // DLSS-GT7-003: a new pass, a new copy (two in a frame)
+    if (!late && !mirror) {
+        ApplyTemporalReplace();
+    }
+}
+
+bool NativeRenderer::TemporalKeepsResolved() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_DLSS_TEMPORAL_BLOOM");
+        return !(env && (env[0] == '0' || env[0] == '1'));
+    }();
+    return on;
+}
+
+void NativeRenderer::CopyPicture(const Native::ImageEntry& from, const Native::ImageEntry& to) {
+    Stream& s = Begin();
+    GlobalBarrier();
+    const vk::ImageSubresourceLayers layers{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                            .mipLevel = 0,
+                                            .baseArrayLayer = 0,
+                                            .layerCount = 1};
+    const vk::ImageCopy copy{
+        .srcSubresource = layers,
+        .dstSubresource = layers,
+        .extent{to.info.size.width, to.info.size.height, 1},
+    };
+    CmdBuf{s.cmd}.copyImage(vk::Image{Handle<VkImage_T>(from.image->NativeHandle())},
+                            vk::ImageLayout::eGeneral,
+                            vk::Image{Handle<VkImage_T>(to.image->NativeHandle())},
+                            vk::ImageLayout::eGeneral, copy);
+    s.buffers_written = true;
+    ++s.commands;
+}
+
+Native::ImageEntry* NativeRenderer::TemporalPicture(Native::ImageEntry*& slot,
+                                                    const Native::ImageEntry& like,
+                                                    vk::Extent2D size) {
+    if (size.width == 0 || size.height == 0) {
+        size = vk::Extent2D{like.info.size.width, like.info.size.height};
+    }
+    if (slot && (slot->info.size.width != size.width || slot->info.size.height != size.height ||
+                 slot->image->Desc().format != like.image->Desc().format)) {
+        temporal.retired.push_back(slot); // commands recorded may still name it
+        slot = nullptr;
+    }
+    if (!slot) {
+        slot = MakeHudPicture(like, 1, size);
+    }
+    return slot;
+}
+
+bool NativeRenderer::TemporalSwapIn() {
+    if (temporal.swapped_out) {
+        return true;
+    }
+    const Native::ImageEntry* color = temporal.pending_color;
+    const Native::ImageEntry* out = temporal.pending_out;
+    if (!color || !out || !TemporalPicture(temporal.kept, *out)) {
+        return false;
+    }
+    CopyPicture(*out, *temporal.kept);
+    CopyPicture(*color, *out);
+    temporal.swapped_out = out;
+    return true;
+}
+
+void NativeRenderer::TemporalSwapOut() {
+    const Native::ImageEntry* out = std::exchange(temporal.swapped_out, nullptr);
+    if (!out || !temporal.kept) {
+        return;
+    }
+    CopyPicture(*temporal.kept, *out);
+    Written(out);
+    // The tone mapping drawn again for the game (Draw, a frame left as the game draws it) reads
+    // the result right after this copy, past the draw's own barrier decision.
+    GlobalBarrier();
+}
+
+void NativeRenderer::ApplyTemporalReplace() {
+    const Native::ImageEntry* color = std::exchange(temporal.pending_color, nullptr);
+    const Native::ImageEntry* out = std::exchange(temporal.pending_out, nullptr);
+    if (!color || !out) {
+        return;
+    }
+    Stream& s = Begin();
+    GlobalBarrier();
+    const vk::ImageSubresourceLayers layers{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                            .mipLevel = 0,
+                                            .baseArrayLayer = 0,
+                                            .layerCount = 1};
+    const vk::ImageCopy copy{
+        .srcSubresource = layers,
+        .dstSubresource = layers,
+        .extent{out->info.size.width, out->info.size.height, 1},
+    };
+    const vk::Image src_image{Handle<VkImage_T>(color->image->NativeHandle())};
+    const vk::Image dst_image{Handle<VkImage_T>(out->image->NativeHandle())};
+    CmdBuf{s.cmd}.copyImage(src_image, vk::ImageLayout::eGeneral, dst_image,
+                            vk::ImageLayout::eGeneral, copy);
+    Written(out);
+    s.buffers_written = true;
+    ++s.commands;
+    ++temporal.replaced;
+    temporal.replaced_frame = frame;
 }
 
 std::optional<NativeRenderer::IndirectBuffers> NativeRenderer::ResolveIndirect(
@@ -16919,11 +19360,27 @@ bool NativeRenderer::PrepareEnabled() {
     // PERF-316: on with the native renderer (+12% fps in a Time Attack on a Ryzen 5 5500 and
     // RX 7600: the recorder records draws game job threads worked out). SHADGT_NATIVE_PREPARE=0 or
     // =1 overrides it.
+    // TITLE-001: GT7 keeps them off unless asked for, and refuses them while the hull-shader LDS
+    // emulation is on (FIX-229), as shadgt7 did.
     static const bool enabled = [] {
-        if (const char* env = std::getenv("SHADGT_NATIVE_PREPARE"); env && *env) {
-            return env[0] == '1' && NativeModeRequested();
+        const auto& title = VideoCore::CurrentTitleDefaults();
+        const char* env = std::getenv("SHADGT_NATIVE_PREPARE");
+        const bool wanted = env && *env ? env[0] == '1' : title.prepared_draws;
+        if (!wanted || !NativeModeRequested()) {
+            return false;
         }
-        return NativeModeRequested();
+        if (title.prepared_draws_refused_with_lds) {
+            const char* lds = std::getenv("SHADGT_TESS_LDS_EMULATION");
+            const char* force = std::getenv("SHADGT_NATIVE_PREPARE_FORCE");
+            if (!(lds && lds[0] == '0') && !(force && force[0] == '1')) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-229: SHADGT_NATIVE_PREPARE=1 is ignored: prepared draws are not "
+                            "safe with the race-start car fix (FIX-227); "
+                            "SHADGT_NATIVE_PREPARE_FORCE=1 uses them anyway");
+                return false;
+            }
+        }
+        return true;
     }();
     return enabled;
 }
@@ -16943,6 +19400,7 @@ void NativeRenderer::PreparedDraw::Reset() {
     pipeline_keepalive.reset();
     stage_hashes = {};
     bindings.Clear();
+    NoteOwnedMapChange(); // PERF-GT7-133
     regions.clear();
     image_ranges.clear();
     picture_ranges.clear(); // PERF-GTS-404
@@ -16958,6 +19416,7 @@ void NativeRenderer::PreparedDraw::Reset() {
     indexed = false;
     index_offset = 0;
     index_address = 0;
+    NoteOwnedMapChange(); // PERF-GT7-133
     mirrors.clear();
     in_place.clear();
     missing_pictures.clear(); // PERF-GTS-403
@@ -17285,6 +19744,7 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
     p->image_generation = registry->Generation();
     p->buffer_seq = buffer_log.Seq();
     p->unmap_gen = unmap_generation.load(std::memory_order_acquire);
+    p->sampler_drops = samplers_dropped.load(std::memory_order_acquire); // FIX-GTS-503
     p->bindings.push = UserData(regs);
     const u32 count = std::min<u32>(static_cast<u32>(stages.size()), Shader::MaxStageTypes - 1);
     std::array<StageResourceBindings, Shader::MaxStageTypes> plans{};
@@ -17699,6 +20159,25 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobGuestBuffer(VAddr address, u64 size,
                                                                          bool write,
                                                                          PreparedDraw& p) {
+    // FIX-SGT-009: FIX-SGT-004 for draws prepared on the game's job threads. Their reads took any
+    // region over a listed in-place range too, while GT7's GPU culling writes that memory in
+    // place: with SHADGT_NATIVE_PREPARE=1 the scenery drops came back, milder (only prepared draws
+    // took this path). A read there binds the imported view when one holds it; writes already go
+    // to the recorder (below), which keeps FIX-SGT-004's rule. SHADGT_LISTED_IN_PLACE=0: as before.
+    static const bool listed_only = [] {
+        const char* env = std::getenv("SHADGT_LISTED_IN_PLACE");
+        return !(env && env[0] == '0');
+    }();
+    if (listed_only && !write && std::ranges::any_of(InplaceRanges(), [&](const auto& range) {
+            return address < range.second && address + size > range.first;
+        })) {
+        if (auto* direct = r.buffer_cache.GetDirectMemory();
+            direct && direct->EnsureImported(address, size)) {
+            if (const auto found = direct->FindBuffer(address, size)) {
+                return std::pair{found->first->Handle(), found->second};
+            }
+        }
+    }
     {
         std::shared_lock map_lock{buffer_map_mutex};
         if (Region* region = RegionOver(address, size)) {
@@ -17896,6 +20375,7 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                 return !(env && env[0] == '0');
             }();
             auto* readable_direct = r.buffer_cache.GetDirectMemory();
+            g_bind_hash = stage.pgm_hash; // DIAG-SGT-003
             if (bindable) size = Native::ReadableBindingSize(base, size, desc.is_written,
                 readable_cut, readable_direct != nullptr,
                 [&](u64 a, u64 n) { std::shared_lock lock{buffer_map_mutex}; return RegionOver(a, n) != nullptr; },
@@ -17915,6 +20395,11 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                     region_over = RegionOver(base, size) != nullptr;
                 }
                 p.buffer_ranges.emplace_back(base, base + size);
+                // PERF-GTS-479: as in BindBuffers, a slot learned off is learned back.
+                if (direct && !(descriptor_postprocess && !desc.is_written) &&
+                    desc.IsDirectCandidate() && desc.NoDirect() && size < (u64{1} << 32)) {
+                    Shader::DirectLearning::NoteWouldReadInPlace(stage.pgm_hash, buffer_index);
+                }
                 if (direct && !(descriptor_postprocess && !desc.is_written) &&
                     desc.IsDirectEligible() && size < (u64{1} << 32) && !region_over &&
                     direct->EnsureImported(base, size)) {
@@ -18245,7 +20730,8 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
             ssharp = AmdGpu::Sampler{};
         }
         const auto origin_epoch=p.proof_context ? sampler_cache_epoch.load(std::memory_order_acquire) : 0;
-        const auto sampler_handle=SamplerFor(ssharp, regs.ta_bc_base, sampler.is_depth);
+        const auto sampler_handle=SamplerFor(ssharp, regs.ta_bc_base, sampler.is_depth,
+                                             sampler.explicit_lod); // FIX-GT7-182
         if(p.proof_context) {
             if(!sampler_handle || p.sampler_origins.size()==p.sampler_origins.capacity() ||
                (!p.sampler_origins.empty() && p.sampler_origins_epoch!=origin_epoch) ||
@@ -18518,7 +21004,9 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
             }
         }
     }
-    if (p.unmap_gen != unmap_generation.load(std::memory_order_acquire)) {
+    // FIX-GTS-503: nor bound with a sampler dropped since (counted as an unmap).
+    if (p.unmap_gen != unmap_generation.load(std::memory_order_acquire) ||
+        p.sampler_drops != samplers_dropped.load(std::memory_order_acquire)) {
         return reject(2);
     }
     trace.Next(1);
@@ -18670,7 +21158,8 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     // then reject the whole prepared draw before selecting its bindings or
     // dereferencing its vertex mirrors if any prepared range changed.
     Begin();
-    if (p.unmap_gen != unmap_generation.load(std::memory_order_acquire)) return reject(2);
+    if (p.unmap_gen != unmap_generation.load(std::memory_order_acquire) ||
+        p.sampler_drops != samplers_dropped.load(std::memory_order_acquire)) return reject(2); // FIX-GTS-503
     if (!PreparedBuffersUntouched(p, recheck_from)) return reject(4);
     // The viewport transform the shaders get, from the registers as recorded.
     trace.Next(7);
@@ -18866,7 +21355,16 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
     const u32 depth = desc.dim == Native::Rhi::ImageDim::D3 ? std::max(desc.depth, 1u) : 1u;
     const u32 mips = rows ? 1u : std::max(desc.mips, 1u);
     const u32 height0 = rows ? std::min(rows, desc.height) : desc.height;
-    const u32 row_layers = std::clamp(first_layers, 1u, layers);
+    // FIX-GT7-187: a partial fill (`rows`) of a 3D picture counted one layer in `bytes` and
+    // copied the picture's whole depth: GT7's 120x67x128 volume read 4,116,480 bytes from a
+    // pattern buffer of 1 MB (32,160 bytes counted, times 128 slices). Reading past the buffer
+    // is harmless while what follows it in video memory is alive, and loses the device (device
+    // fault, write invalid, on GT7's title screen and in races while pipelines build) once it
+    // was freed; the slices past the buffer got whatever memory held. Found with the Vulkan
+    // validation layers (VUID-vkCmdCopyBufferToImage-pRegions-00171). A 3D picture's partial
+    // fill now covers `first_layers` slices, as a layered picture's covers its first layers.
+    const bool volume = desc.dim == Native::Rhi::ImageDim::D3;
+    const u32 row_layers = std::clamp(first_layers, 1u, volume ? depth : layers);
     const u64 bytes = u64(desc.width) * height0 * texel * (rows ? row_layers : layers * depth);
     if (info.props.is_bgr_packed_float) {
         lo = VideoCore::PackedFloatToVulkan(lo);
@@ -18883,7 +21381,8 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
     for (u32 m = 0; m < mips; ++m) {
         const u32 w = std::max(desc.width >> m, 1u);
         const u32 h = rows ? height0 : std::max(desc.height >> m, 1u);
-        const u32 d = std::max(depth >> m, 1u);
+        // FIX-GT7-187: the slices counted in `bytes`, not the whole depth.
+        const u32 d = rows && volume ? row_layers : std::max(depth >> m, 1u);
         copies.push_back(vk::BufferImageCopy{
             .bufferOffset = 0,
             .bufferRowLength = w,
@@ -18892,7 +21391,7 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
                                                                 : vk::ImageAspectFlagBits::eColor,
                               .mipLevel = m,
                               .baseArrayLayer = 0,
-                              .layerCount = rows ? row_layers : layers},
+                              .layerCount = rows && !volume ? row_layers : layers},
             .imageOffset = {0, 0, 0},
             .imageExtent = {w, h, d},
         });
@@ -18990,7 +21489,14 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
             info.props.is_volume, Native::WholeLayerPatternSafe(lo, hi, image_texel, layer_stride)) : 0;
         const bool filled_layers = whole_layers && FillImage(entry, lo, hi, image->Desc().height,
                                                               whole_layers);
-        if (filled_layers || (rows != 0 && FillImage(entry, lo, hi, rows))) {
+        // FIX-GT7-187: a 3D picture: the whole slices the fill covers (at least one).
+        u32 slices = 1;
+        if (image && image->Desc().dim == Native::Rhi::ImageDim::D3 && rows == info.size.height) {
+            const u64 slice_bytes = row_bytes * info.size.height;
+            slices = u32(std::clamp<u64>(slice_bytes ? entry.rewrite_bytes / slice_bytes : 1, 1,
+                                         std::max(image->Desc().depth, 1u)));
+        }
+        if (filled_layers || (rows != 0 && FillImage(entry, lo, hi, rows, slices))) {
             NATIVE_DIAGNOSTIC(++stats.rewrite_partial);
         }
     } else if (rewrite == Rewrite::Clear && !depth_value && !color_zero) {
@@ -19212,7 +21718,7 @@ void NativeRenderer::DispatchDirect() {
     const std::optional<u64> texel = b.stored.size() == 1
         ? SameTexelKey(pipeline->GetStage(Shader::SwStage::Compute), b.image_entries)
         : std::nullopt;
-    if (RunNeedsBarrier(s, b, program, recorded, texel)) {
+    if (RunNeedsBarrier(s, b, pipeline->GetStage(Shader::SwStage::Compute), recorded, texel)) {
         GlobalBarrier();
     } else {
         EndRendering();
@@ -20162,6 +22668,7 @@ u32 NativeRenderer::DropRegionsOver(VAddr address, u64 size, u32 mirror_reason) 
                 retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
                 NoteHistory(it->second.begin, it->second.end - it->second.begin, 11,
                             0); // DIAG-187 (diagnosis)
+                NoteOwnedMapChange(); // PERF-GT7-133
                 it = regions.erase(it);
                 ++dropped;
             } else {
@@ -20657,6 +23164,11 @@ void NativeRenderer::EvictImages() {
         if (entry.kept.load(std::memory_order_relaxed)) {
             return true;
         }
+        // Merge (shadGT): the two games keep their own rule. GT Sport's: any picture whose memory is
+        // unchanged, and a depth map without a hash while its backing is watched. GT7's: FIX-157's
+        // rule with its 60 frames of use, its circuit shadow maps on a budget of their own
+        // (FIX-GT7-153) and the volumes of the PS4 Pro mode (NEO-GT7-010).
+        if (!Common::IsGt7()) {
         // A persistent depth map may live in GPU-only guest memory: there is no complete CPU
         // hash, and the region still holds its initial clear rather than the rendered depth.
         // Keep that authoritative image only when its backing has been watched since the first
@@ -20673,6 +23185,100 @@ void NativeRenderer::EvictImages() {
         if (tracked_depth && entry.guest_modified.load(std::memory_order_seq_cst)) {
             entry.kept.store(false, std::memory_order_relaxed);
             return false;
+        }
+        } else {
+        // NEO-GT7-010: a volume (a 3D picture) the GPU baked stays whatever its time in use: GT7
+        // bakes its 64x64x64 colour-grading LUT once (cs 0x5da04de1, at 0x1009c00000) in the
+        // menus, samples it for under a second, then draws no 3D scene for two seconds; it was
+        // dropped, the tonemap read the guest memory's bytes instead and the PS4 Pro mode's scene
+        // stayed black for the rest of the session. Scratch-pool pictures are 2D. In the PS4 Pro
+        // mode only, so the base PS4 mode keeps its behaviour: SHADGT_NATIVE_KEEP_VOLUMES=1 keeps
+        // them in every mode, =0 in none (as before).
+        static const bool keep_volumes = [] {
+            const char* env = std::getenv("SHADGT_NATIVE_KEEP_VOLUMES");
+            if (env && env[0] == '0') {
+                return false;
+            }
+            return (env && env[0] == '1') || Libraries::Kernel::sceKernelIsNeoMode() != 0;
+        }();
+        const bool volume = keep_volumes && entry.info.type == AmdGpu::ImageType::Color3D;
+        // FIX-GT7-153, second part: a circuit's shadow map stays whatever its time in use. On a cold
+        // first race at Le Mans GT7 drew it (frame 6071) while the load went on for a few hundred
+        // more frames of compiles; nothing sampled it for 120 frames, it was dropped, and the race
+        // uploaded its guest memory instead (the clear value: no shadow past the cascades) for the
+        // whole visit. FIX-157 could not keep it: no hash of its memory exists (the map is born from
+        // a fill, FIX-GT7-036, and its memory is GPU-only), so MemoryUnchanged never vouches for it.
+        // It is kept while no snapshot of its memory says otherwise. The NAT-114 region's own page
+        // watch turns a CPU write into a release; an unmap, a newer picture over it, or GPU work
+        // into part of its memory (ForeignWrite) let it go; a whole fill or copy at its address
+        // becomes a pending clear or upload, as for any target. A budget of its own, an eighth of
+        // the video memory setting between 256 and 512 MB, so FIX-157's pictures keep theirs; over
+        // it, the least recently used kept map goes first (only the current track's matters).
+        if (KeptShadowMapImage(entry.info)) {
+            static const u64 shadow_budget = [] {
+                const u64 vram = Instance::VideoMemorySettingBytes();
+                return vram != 0 ? std::clamp<u64>(vram / 8, u64{256} << 20, u64{512} << 20)
+                                 : u64{512} << 20;
+            }();
+            if (entry.content_hash != 0 && !registry->MemoryUnchanged(entry)) {
+                return false;
+            }
+            while (kept_shadow_bytes + size > shadow_budget) {
+                Native::ImageEntry* oldest = nullptr;
+                registry->ForEachOverlapping(0, ~VAddr{0}, [&](Native::ImageEntry& other) {
+                    if (&other != &entry && other.kept.load(std::memory_order_relaxed) &&
+                        KeptShadowMapImage(other.info) &&
+                        (!oldest || other.last_use.load(std::memory_order_relaxed) <
+                                        oldest->last_use.load(std::memory_order_relaxed))) {
+                        oldest = &other;
+                    }
+                });
+                if (!oldest) {
+                    break;
+                }
+                oldest->kept.store(false, std::memory_order_relaxed);
+                kept_shadow_bytes -=
+                    std::min<u64>(kept_shadow_bytes, std::max<u64>(oldest->info.guest_size, 1));
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-GT7-153: the shadow map at {:#x} ({}x{}, last used at frame {}) is "
+                            "no longer kept, to keep the one at {:#x}",
+                            oldest->info.guest_address, oldest->info.size.width,
+                            oldest->info.size.height,
+                            oldest->last_use.load(std::memory_order_relaxed), address);
+            }
+            if (kept_shadow_bytes + size > shadow_budget) {
+                static std::atomic<u32> refused{};
+                if (const u32 n = refused++; n < 20 || n % 100 == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-GT7-153: the shadow map at {:#x} ({}x{}, {:.1f} MB) can't be "
+                                "kept: {:.1f} MB kept of {:.1f} MB",
+                                address, entry.info.size.width, entry.info.size.height,
+                                size / 1048576.0, kept_shadow_bytes / 1048576.0,
+                                shadow_budget / 1048576.0);
+                }
+                return false;
+            }
+            entry.kept.store(true, std::memory_order_relaxed);
+            kept_shadow_bytes += size;
+            if (entry.content_hash != 0) {
+                WatchPages(address, size);
+            }
+            static std::atomic<u32> shadow_logged{};
+            if (const u32 n = shadow_logged++; n < 20 || n % 100 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-GT7-153: the shadow map at {:#x} ({}x{}) stays past its idle time "
+                            "(drawn at frame {}, last used at frame {}, frame {})",
+                            address, entry.info.size.width, entry.info.size.height,
+                            entry.made_frame, entry.last_use.load(std::memory_order_relaxed),
+                            frame);
+            }
+            return true;
+        }
+        if ((!volume && entry.last_use.load(std::memory_order_relaxed) < entry.made_frame + 60) ||
+            kept_bytes + size > KeptBudget || !registry->MemoryUnchanged(entry)) {
+            return false;
+        }
+        entry.kept.store(true, std::memory_order_relaxed);
         }
         kept_bytes += size;
         WatchPages(address, size);
@@ -20699,6 +23305,13 @@ void NativeRenderer::EvictImages() {
         const char* env = std::getenv("SHADGT_NATIVE_KEEP_TEXTURES_MB");
         if (env && *env) {
             return std::strtoull(env, nullptr, 10) << 20;
+        }
+        if (VideoCore::CurrentTitleDefaults().kept_textures_from_vram_setting) {
+            // FIX-GT7-030 (NAT-VRAM-001), GT7: what the video memory setting can free here: idle
+            // textures take at most half of it (not below the budget's 1 GB floor).
+            const u64 vram = Instance::VideoMemorySettingBytes();
+            return vram != 0 ? std::min(u64{2048} << 20, std::max<u64>(vram, u64{1} << 30) / 2)
+                             : u64{2048} << 20;
         }
         const u64 scaled = r.instance.GetTotalMemoryBudget() / 8;
         const u64 budget = std::min<u64>(u64{2048} << 20, scaled ? scaled : u64{2048} << 20);
@@ -20796,7 +23409,7 @@ void NativeRenderer::EvictImages() {
         return true;
     };
     trace.Next(3);
-    registry->Evict(frame - KeepFrames, [&](Native::ImageEntry& entry) {
+    const auto on_evict = [&](Native::ImageEntry& entry) {
         if (kept_textures.erase(&entry) != 0) {
             kept_texture_bytes -= std::min<u64>(kept_texture_bytes,
                                                 std::max<u64>(entry.info.guest_size, 1));
@@ -20805,8 +23418,26 @@ void NativeRenderer::EvictImages() {
             VideoCore::PageManager::GetPageAddr(entry.info.guest_address),
             VideoCore::PageManager::GetNextPageAddr(
                 entry.info.guest_address + std::max<u64>(entry.info.guest_size, 1) - 1));
+        {
+            // DIAG-SGT-019: what is evicted (its kept descriptor sets go with it)
+            static const bool evict_diag = [] {
+                const char* env = std::getenv("SHADGT_DIAG_DESCRIPTOR_REUSE");
+                return env && env[0] == '1';
+            }();
+            if (evict_diag) {
+                ++stats.miss_diag_evicted[fmt::format(
+                    "{} {}x{} {} mips {} layers {}",
+                    !entry.from_cpu ? "target" : entry.sources.empty() ? "texture"
+                                                                       : "texture made of targets",
+                    entry.info.size.width, entry.info.size.height,
+                    vk::to_string(entry.info.pixel_format), entry.info.resources.levels,
+                    entry.info.resources.layers)];
+                ++stats.miss_diag_evicted_at[fmt::format("{:#x}", entry.info.guest_address)];
+            }
+        }
         if (entry.kept.load(std::memory_order_relaxed)) {
-            kept_bytes -= std::min<u64>(kept_bytes, std::max<u64>(entry.info.guest_size, 1));
+            u64& bytes = KeptShadowMapImage(entry.info) ? kept_shadow_bytes : kept_bytes; // FIX-GT7-153
+            bytes -= std::min<u64>(bytes, std::max<u64>(entry.info.guest_size, 1));
         }
 #if !defined(NDEBUG)
         if (Native::WatchedTexture(entry.info.guest_address, entry.info.guest_address + 1)) {
@@ -20820,7 +23451,39 @@ void NativeRenderer::EvictImages() {
 #endif
         {
             std::scoped_lock lock{views_mutex};
-            if (const auto it = views.find(&entry); it != views.end()) {
+            std::erase(recycle_live, &entry);
+            // PERF-SGT-021: a per-frame texture's image and views are kept for the next one
+            // of its shape (nothing is destroyed: the kept descriptor sets stay good).
+            bool pooled = false;
+            if (entry.image && RecycleFrameTextures()) {
+                std::scoped_lock recycle_lock{recycle_mutex};
+                const u64 image_handle = entry.image->NativeHandle();
+                const auto key = recycle_keys.find(image_handle);
+                std::vector<ViewRecord> waiting;
+                if (const auto kept = recycle_views.find(image_handle); kept != recycle_views.end()) {
+                    waiting = std::move(kept->second); // taken from the pool and never viewed
+                    recycle_views.erase(kept);
+                }
+                if (key != recycle_keys.end() && entry.from_cpu && entry.sources.empty() &&
+                    recycle_free < 96) {
+                    RecycledImage free{std::move(entry.image), std::move(waiting),
+                                       entry.backend_usage, entry.backend_features};
+                    if (const auto it = views.find(&entry); it != views.end()) {
+                        if (!it->second.empty()) free.records = std::move(it->second);
+                        views.erase(it);
+                    }
+                    recycle_pool[key->second].push_back(std::move(free));
+                    ++recycle_free;
+                    ++recycle_pooled;
+                    pooled = true;
+                } else {
+                    if (key != recycle_keys.end()) recycle_keys.erase(key);
+                    for (auto& record : waiting) {
+                        retired_views.emplace_back(tick, std::move(record.view));
+                    }
+                }
+            }
+            if (const auto it = views.find(&entry); !pooled && it != views.end()) {
                 for (auto& record : it->second) {
                     retired_views.emplace_back(tick, std::move(record.view));
                 }
@@ -20838,9 +23501,28 @@ void NativeRenderer::EvictImages() {
             owners.erase(std::remove(owners.begin(), owners.end(), &entry), owners.end());
             it = owners.empty() ? stencil_owners.erase(it) : std::next(it);
         }
-    }, [&](Native::ImageEntry& entry) {
+    };
+    registry->Evict(frame - KeepFrames, on_evict, [&](Native::ImageEntry& entry) {
         return kept_textures.contains(&entry) || keep(entry) || keep_new_texture(entry);
     }, 16);
+    if (RecycleFrameTextures()) {
+        // PERF-SGT-021: per-frame textures go after a few idle frames, so a handful of
+        // images of each shape go round (not one for each of the last 120 frames).
+        constexpr u64 RecycleIdleFrames = 1;
+        static thread_local std::vector<const Native::ImageEntry*> idle;
+        idle.clear();
+        {
+            std::scoped_lock lock{views_mutex};
+            for (const auto* entry : recycle_live) {
+                if (entry->last_use.load(std::memory_order_relaxed) + RecycleIdleFrames < frame) {
+                    idle.push_back(entry);
+                }
+            }
+        }
+        if (!idle.empty()) {
+            recycle_early += registry->EvictListed(idle, frame - RecycleIdleFrames, on_evict);
+        }
+    }
     if (newly_kept != 0) {
         static std::atomic<u32> logged{};
         if (const u32 n = logged++; n < 20 || n % 100 == 0) {
@@ -20862,6 +23544,25 @@ void NativeRenderer::WatchPages(VAddr address, u64 size) {
                     begin,end,fresh);
     }
 #endif
+    // DIAG-SGT-013: who write-protects pages in a listed in-place range (GT7's GPU culling block
+    // faulted on its compute queue pointer with FIX-SGT-012 in place). The first 24, with the
+    // caller's offset in libSceVideoOut.prx for symbolizing.
+    static std::atomic<u32> listed_logged{0};
+    if (fresh != 0 && listed_logged.load(std::memory_order_relaxed) < 24 &&
+        std::ranges::any_of(NativeInplaceRanges(), [&](const auto& range) {
+            return begin < range.second && end > range.first;
+        }) && listed_logged.fetch_add(1, std::memory_order_relaxed) < 24) {
+        HMODULE self{};
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&listed_logged), &self);
+        const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress()) -
+                            reinterpret_cast<uintptr_t>(self);
+        LOG_WARNING(Render_Vulkan,
+                    "DIAG-SGT-013: pages {:#x}-{:#x} in a listed in-place range watched ({} newly), "
+                    "caller libSceVideoOut.prx+{:#x}, frame {}",
+                    begin, end, fresh, caller, frame);
+    }
 }
 
 void NativeRenderer::UnwatchPages(VAddr begin, VAddr end) {
@@ -21520,10 +24221,21 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         RyDiag::SetProfileTag(drawn > 3300 ? 2 : 0);
     }
     CheckOneOffs(); // DIAG-GT7-008
+    CheckRaceMissing(); // PERF-GTS-493
     // The game's render target there (its layout from the CB registers may differ in details
     // from the video out description), else an image of the display layout.
+    // Merge (shadGT): GT7 looks its display up by its exact size, and shows the corner of a larger
+    // PS4 Pro surface its own way (NEO-GT7-006/009 below); GT Sport takes a larger picture of the
+    // same pitch and crops it (CropDisplay).
+    const bool gt7_display = Common::IsGt7();
     Native::ImageEntry* entry =
         registry->FindExisting(info.guest_address, [&](const Native::ImageEntry& candidate) {
+            if (gt7_display) {
+                return !candidate.from_cpu && !candidate.info.props.is_depth &&
+                       candidate.info.size.width == info.size.width &&
+                       candidate.info.size.height == info.size.height &&
+                       candidate.info.num_bits == info.num_bits;
+            }
             return !candidate.from_cpu && !candidate.info.props.is_depth &&
                    candidate.info.size.width >= info.size.width &&
                    candidate.info.size.height >= info.size.height &&
@@ -21531,9 +24243,42 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
                    candidate.info.num_samples == 1 && candidate.info.resources.levels == 1 &&
                    candidate.info.resources.layers == 1;
         });
+    // NEO-GT7-006: in the PS4 Pro mode GT7 draws its 3200x1800 picture into the top left corner of
+    // a 3840x2160 surface, registered as 3200x1800 with a pitch of 3840: the display shows that
+    // corner, copied below into an image of the display's size each frame. A lookup by the
+    // registered size found nothing and showed guest memory the GPU never wrote: a black screen.
+    // SHADGT_NEO_DISPLAY_CROP=0: as before.
+    static const bool neo_display_crop = [] {
+        const char* env = std::getenv("SHADGT_NEO_DISPLAY_CROP");
+        return Common::IsGt7() && Libraries::Kernel::sceKernelIsNeoMode() != 0 &&
+               !(env && env[0] == '0');
+    }();
+    Native::ImageEntry* corner_of = nullptr;
+    if (neo_display_crop) {
+        corner_of =
+            registry->FindExisting(info.guest_address, [&](const Native::ImageEntry& candidate) {
+                return !candidate.from_cpu && !candidate.info.props.is_depth && candidate.image &&
+                       candidate.info.num_bits == info.num_bits &&
+                       candidate.info.num_samples == 1 &&
+                       candidate.info.size.width >= info.size.width &&
+                       candidate.info.size.height >= info.size.height &&
+                       (candidate.info.size.width > info.size.width ||
+                        candidate.info.size.height > info.size.height);
+            });
+        // NEO-GT7-009: an image of the display's size at the address (the copy's destination
+        // below, a render target since the first copy) is shown as it is only when it holds a
+        // newer picture than the larger one. Looked up only when none existed, the corner was
+        // copied until that destination was in use again; then the last copied frame stayed on
+        // screen: the race ran behind the frozen loading screen. Write versions share one clock.
+        if (corner_of && entry &&
+            entry->write_version.load(std::memory_order_relaxed) >=
+                corner_of->write_version.load(std::memory_order_relaxed)) {
+            corner_of = nullptr;
+        }
+    }
     if (!entry) {
         static std::atomic<u32> logged{};
-        if (Sample(logged)) {
+        if (!corner_of && Sample(logged)) {
             LOG_WARNING(Render_Vulkan,
                         "NAT-103: nothing drew the display buffer {:#x} ({}x{}, {} bits) yet",
                         info.guest_address, info.size.width, info.size.height, info.num_bits);
@@ -21542,6 +24287,9 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     }
     if (!entry || !entry->image) {
         return std::nullopt;
+    }
+    if (entry == corner_of) {
+        corner_of = nullptr;
     }
     // An uncropped display returns the original entry without the crop path's
     // admission step. Refresh a dirty CPU-backed display before presentation too.
@@ -21561,6 +24309,34 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     if (device->PendingImageInit() || registry->HasPendingUploads()) {
         Begin();
         PrepareImages();
+    }
+    if (corner_of) { // NEO-GT7-006 (GT7 only: source is entry there)
+        Begin();
+        GlobalBarrier();
+        const vk::ImageSubresourceLayers layer{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        };
+        stream.cmd.copyImage(vk::Image{Handle<VkImage_T>(corner_of->image->NativeHandle())},
+                             vk::ImageLayout::eGeneral,
+                             vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},
+                             vk::ImageLayout::eGeneral,
+                             vk::ImageCopy{.srcSubresource = layer,
+                                           .dstSubresource = layer,
+                                           .extent = {info.size.width, info.size.height, 1}});
+        GlobalBarrier();
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 3) {
+            LOG_WARNING(Render_Vulkan,
+                        "NEO-GT7-006: display {:#x} shows the {}x{} corner of the {}x{} picture "
+                        "drawn there ({} into {})",
+                        info.guest_address, info.size.width, info.size.height,
+                        corner_of->info.size.width, corner_of->info.size.height,
+                        vk::to_string(corner_of->info.pixel_format),
+                        vk::to_string(entry->info.pixel_format));
+        }
     }
     ProbeDisplay(*source); // FIX-175 (diagnosis)
     if (capture_frame != ~u64{0} && capture_frame + 1 == frame) {
@@ -21643,6 +24419,90 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
             display.hud_black = View(*it->second.black, hud_view, ViewUse::Sampled);
             display.hud_white = View(*it->second.white, hud_view, ViewUse::Sampled);
             display.hud_race = it->second.race_frame + 1 == frame;
+        }
+    }
+    // DLSS-GT7-001: a result no draw came to replace stays the game's.
+    temporal.pending_color = nullptr;
+    temporal.pending_out = nullptr;
+    if (temporal.swapped_out) {
+        TemporalSwapOut(); // no tone mapping came: the result goes back as it was
+    }
+    // DLSS-GT7-001: a frame left as the game drew it is shown from the prototype's own display
+    // picture (the tone-mapped un-resolved scene), with the HUD pictures laid over it as in a
+    // race. Without that picture the game's display is shown as it is, HUD and all.
+    const bool mirror_frame =
+        temporal.mirror_frame != ~u64{0} && temporal.mirror_frame + 1 == frame;
+    bool raw_shown = false;
+    if (mirror_frame && temporal.raw_display && temporal.raw_frame + 1 == frame &&
+        temporal.raw_address == entry->info.guest_address &&
+        temporal.raw_display->info.size.width == entry->info.size.width &&
+        temporal.raw_display->info.size.height == entry->info.size.height) {
+        if (const vk::ImageView raw = View(*temporal.raw_display, view_info, ViewUse::Sampled)) {
+            display.image =
+                vk::Image{Handle<VkImage_T>(temporal.raw_display->image->NativeHandle())};
+            display.view = raw;
+            raw_shown = true;
+        }
+    }
+    if (mirror_frame && !raw_shown) {
+        display.hud_black = vk::ImageView{};
+        display.hud_white = vk::ImageView{};
+    }
+    // DLSS-GT7-001: a pass whose result is not the display's size (a picture cropped or scaled
+    // before it is shown, as NEO-GT7-006 crops the PS4 Pro's) cannot give DLSS its inputs, and
+    // its replaced result would reach DLSS un-resolved as a single frame: after a few such frames
+    // in a row the pass is left to the game for the run.
+    if (temporal.frame + 1 == frame && temporal.result && !temporal.size_refused) {
+        const bool same_size = temporal.result->info.size.width == entry->info.size.width &&
+                               temporal.result->info.size.height == entry->info.size.height;
+        temporal.size_mismatches = same_size ? 0 : temporal.size_mismatches + 1;
+        if (temporal.size_mismatches >= 8) {
+            temporal.size_refused = true;
+            LOG_WARNING(Render_Vulkan,
+                        "DLSS-GT7-001: the temporal pass's result is {}x{}, the display {}x{}: "
+                        "left to the game for this run (classic DLSS)",
+                        temporal.result->info.size.width, temporal.result->info.size.height,
+                        entry->info.size.width, entry->info.size.height);
+        }
+    }
+    // DLSS-GT7-001: the depth and motion vectors of the frame just finished, when it had the
+    // game's temporal pass, its result was replaced (or drawn beside) and they are the display's
+    // size.
+    const bool replaced =
+        temporal.replaced_frame != ~u64{0} && temporal.replaced_frame + 1 == frame;
+    if (Gt7TemporalActive() && (!mirror_frame || raw_shown) &&
+        (replaced || raw_shown) && temporal.frame + 1 == frame && temporal.depth &&
+        temporal.motion && temporal.depth->info.size.width == entry->info.size.width &&
+        temporal.depth->info.size.height == entry->info.size.height) {
+        VideoCore::ImageViewInfo depth_info{};
+        depth_info.format = vk::Format::eR32Sfloat;
+        VideoCore::ImageViewInfo motion_info{};
+        motion_info.format = vk::Format::eR16G16Sfloat;
+        RytyUpscale::TemporalInputs inputs{};
+        inputs.depth = vk::Image{Handle<VkImage_T>(temporal.depth->image->NativeHandle())};
+        inputs.depth_view = View(*temporal.depth, depth_info, ViewUse::Sampled);
+        inputs.depth_format = static_cast<vk::Format>(temporal.depth->image->Desc().format);
+        inputs.motion = vk::Image{Handle<VkImage_T>(temporal.motion->image->NativeHandle())};
+        inputs.motion_view = View(*temporal.motion, motion_info, ViewUse::Sampled);
+        inputs.motion_format = static_cast<vk::Format>(temporal.motion->image->Desc().format);
+        inputs.size = vk::Extent2D{entry->info.size.width, entry->info.size.height};
+        inputs.jitter[0] = temporal.jitter[0];
+        inputs.jitter[1] = temporal.jitter[1];
+        inputs.mvec_scale[0] = temporal.mvec_scale[0];
+        inputs.mvec_scale[1] = temporal.mvec_scale[1];
+        inputs.reset = temporal.reset;
+        // A menu frame whose interface went through DLSS: the display before its interface,
+        // seen through the display's own view (same channel order as what DLSS gets).
+        const Native::ImageEntry* ui_scene = temporal.ui_scene[temporal.ui_scene_slot];
+        if (ui_scene && temporal.ui_scene_frame + 1 == frame &&
+            temporal.ui_scene_address == entry->info.guest_address &&
+            ui_scene->info.size.width == entry->info.size.width &&
+            ui_scene->info.size.height == entry->info.size.height &&
+            RytyUpscale::TemporalUiMask().load(std::memory_order_relaxed)) {
+            inputs.ui_scene_view = View(*ui_scene, view_info, ViewUse::Sampled);
+        }
+        if (inputs.depth_view && inputs.motion_view) {
+            display.temporal = inputs;
         }
     }
     VerifyMirrors(); // FIX-176 (diagnosis)
@@ -22315,6 +25175,27 @@ void NativeRenderer::Report() {
                         text.empty() ? std::string{" none"} : text);
         }
     }
+    static std::chrono::steady_clock::time_point sampler_last{};
+    if (std::chrono::steady_clock::now() - sampler_last >= std::chrono::seconds{10}) {
+        // FIX-GTS-503: dropped samplers the GPU is done with go; the counts when they moved (every
+        // 10 s, in every build).
+        sampler_last = std::chrono::steady_clock::now();
+        std::scoped_lock lock{sampler_mutex};
+        DestroyRetiredSamplers();
+        const std::array<u64, 4> counts{samplers_made,
+                                        samplers_dropped.load(std::memory_order_relaxed),
+                                        sampler_stand_ins,
+                                        samplers_refused.load(std::memory_order_relaxed)};
+        if (counts != sampler_report) {
+            LOG_INFO(Render_Vulkan,
+                     "FIX-GTS-503: {} samplers ({} more waiting for the GPU), limit {}; in all {} "
+                     "made, {} dropped, {} lookups served by a stand-in, {} lookups of an S# with "
+                     "reserved bits got the default sampler",
+                     samplers.size(), retired_samplers.size(), SamplerLimit(), counts[0],
+                     counts[1], counts[2], counts[3]);
+            sampler_report = counts;
+        }
+    }
 #if !defined(NDEBUG)
     const auto now = std::chrono::steady_clock::now();
     if (now - last_report < std::chrono::seconds{10}) {
@@ -22422,7 +25303,8 @@ void NativeRenderer::Report() {
              "on the GPU ({:.1f} MB), uploads from guest memory on the GPU/CPU {}/{}; images so far: "
              "{} lookups, {} textures and {} targets made, {} uploads ({:.1f} MB); {:.0f} draws/s, "
              "{:.2f} us a draw, {:.2f} us a dispatch on the recorder; images bound empty by "
-             "reason (none/unmapped/format/geometry/outside/FIX-081/no image) {}; us per draw in "
+             "reason (none/unmapped/format/geometry/outside/FIX-081/no image/nothing to read) {}; "
+             "us per draw in "
              "pipeline/targets/buffers/textures(sources)/vertices/prepare/record {}",
              stats.draws, stats.dispatches, stats.skipped, stats.no_pipeline,
              stats.indirect_draws, stats.indirect_skipped, stats.passes,
@@ -22777,6 +25659,91 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
     stats.reuse_diag_sets = stats.reuse_diag_exact = stats.reuse_diag_list = 0;
     stats.reuse_diag_frame = stats.reuse_diag_window = 0;
     stats.reuse_diag_in_window.clear();
+    if (const auto& c = stats.miss_diag_counts; c[0] + c[1] + c[2] + c[3] != 0) {
+        static constexpr std::array<const char*, 7> names{"buffer", "offset", "range", "header",
+                                                          "sampler", "view", "layout"};
+        std::string text;
+        for (u32 mask = 0; mask < 128; ++mask) {
+            if (stats.miss_diag_by_kinds[mask] == 0) continue;
+            std::string which;
+            for (u32 bit = 0; bit < 7; ++bit) {
+                if (mask & (1u << bit)) {
+                    which += fmt::format("{}{}", which.empty() ? "" : "+", names[bit]);
+                }
+            }
+            text += fmt::format(" {} {};", which.empty() ? "same words" : which,
+                                stats.miss_diag_by_kinds[mask]);
+        }
+        const uint64_t compared = c[3] - stats.miss_diag_first;
+        LOG_INFO(Render_Vulkan,
+                 "DIAG-SGT-019 (10 s): graphics sets: {} not cacheable, {} without dynamic "
+                 "buffers, {} kept sets found, {} not found. Of the not found: {} had the key "
+                 "of a set made before; {} name a view never in a key before, {} a buffer, {} "
+                 "a range ({} views, {} buffers, {} ranges, {} keys seen in all). Against the "
+                 "nearest of the layout's last 64 new keys: {} had none; differing kinds:{} "
+                 "{:.1f} words differ on average. Range samples:{}",
+                 c[0], c[1], c[2], c[3], stats.miss_diag_remade, stats.miss_diag_new_view_sets,
+                 stats.miss_diag_new_buffer_sets, stats.miss_diag_new_range_sets,
+                 stats.miss_diag_views.size(), stats.miss_diag_buffers_seen.size(),
+                 stats.miss_diag_ranges.size(), stats.miss_diag_keys.size(),
+                 stats.miss_diag_first, text,
+                 compared ? double(stats.miss_diag_words) / double(compared) : 0.0,
+                 stats.miss_diag_samples);
+    }
+    stats.miss_diag_counts = {};
+    stats.miss_diag_by_kinds = {};
+    stats.miss_diag_first = stats.miss_diag_words = stats.miss_diag_remade = 0;
+    stats.miss_diag_new_view_sets = stats.miss_diag_new_buffer_sets = 0;
+    stats.miss_diag_new_range_sets = 0;
+    stats.miss_diag_samples.clear();
+    stats.miss_diag_sampled = 0;
+    if (const auto& d = stats.miss_diag_drops; d[0] + d[1] != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "DIAG-SGT-019 (10 s): kept sets dropped: {} for a destroyed view, {} for a "
+                 "destroyed buffer, {} for another handle",
+                 d[0], d[1], d[2]);
+    }
+    stats.miss_diag_drops = {};
+    if (!stats.miss_diag_view_misses.empty()) {
+        std::vector<std::pair<std::string, uint32_t>> sorted{stats.miss_diag_view_misses.begin(),
+                                                             stats.miss_diag_view_misses.end()};
+        std::ranges::sort(sorted, std::greater{}, &std::pair<std::string, uint32_t>::second);
+        std::string text;
+        for (size_t i = 0; i < sorted.size() && i < 20; ++i) {
+            text += fmt::format(" {} x{};", sorted[i].first, sorted[i].second);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "DIAG-SGT-019 (10 s): sets not found, by the view that differs ({} kinds):{}",
+                 sorted.size(), text);
+        stats.miss_diag_view_misses.clear();
+    }
+    {
+        std::scoped_lock recycle_lock{recycle_mutex};
+        if (recycle_taken + recycle_made + recycle_pooled != 0) {
+            LOG_INFO(Render_Vulkan,
+                     "PERF-SGT-021 (10 s): per-frame texture images: {} taken from the pool, {} "
+                     "made, {} put back ({} after a few idle frames); {} free, {} known",
+                     recycle_taken, recycle_made, recycle_pooled, recycle_early,
+                     recycle_free, recycle_keys.size());
+        }
+        recycle_taken = recycle_made = recycle_pooled = recycle_early = 0;
+    }
+    if (!stats.miss_diag_evicted.empty()) {
+        const auto top = [](std::unordered_map<std::string, uint32_t>& counts) {
+            std::vector<std::pair<std::string, uint32_t>> sorted{counts.begin(), counts.end()};
+            std::ranges::sort(sorted, std::greater{}, &std::pair<std::string, uint32_t>::second);
+            std::string text;
+            for (size_t i = 0; i < sorted.size() && i < 14; ++i) {
+                text += fmt::format(" {} x{};", sorted[i].first, sorted[i].second);
+            }
+            const size_t kinds = counts.size();
+            counts.clear();
+            return fmt::format("{} kinds:{}", kinds, text);
+        };
+        const std::string kinds = top(stats.miss_diag_evicted);
+        LOG_INFO(Render_Vulkan, "DIAG-SGT-019 (10 s): evicted pictures: {}. By address: {}",
+                 kinds, top(stats.miss_diag_evicted_at));
+    }
     if (stats.mirrors_made != 0) {
         LOG_INFO(Render_Vulkan,
                  "DIAG-GTS-387 (10 s): {} mirrors made ({:.1f} MB), {} of them over existing "
@@ -22868,6 +25835,10 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
         LOG_INFO(Render_Vulkan, "PERF-GT7-023: {} draws into one-off pictures of kinds always "
                  "redrawn skipped instead of waiting", std::exchange(stats.one_off_exempt, 0));
     }
+    if (stats.one_off_race_skips != 0) {
+        LOG_INFO(Render_Vulkan, "PERF-GTS-493: {} one-off draws skipped in a race instead of "
+                 "waiting for their pipeline", std::exchange(stats.one_off_race_skips, 0));
+    }
     if (stats.one_off_budget_skips != 0) {
         LOG_INFO(Render_Vulkan, "FIX-GT7-102: {} draws into pictures not drawn lately skipped "
                  "once their frame had waited its budget for one-off pipelines",
@@ -22877,6 +25848,15 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
         LOG_INFO(Render_Vulkan, "FIX-GT7-121: {} draws into pictures of kinds seen sampled before "
                  "their redraw waited for their pipeline whatever the budget",
                  std::exchange(stats.one_off_harmful_waits, 0));
+    }
+    if (stats.kept_shadow_waits != 0 || stats.kept_shadow_skips != 0) {
+        LOG_INFO(Render_Vulkan, "FIX-GT7-153: {} draws into whole-circuit shadow maps waited for "
+                 "their pipeline ({:.1f} ms in all, {:.1f} ms at most); {} redraws in play skipped at "
+                 "their frame's deadline",
+                 std::exchange(stats.kept_shadow_waits, 0),
+                 std::exchange(stats.kept_shadow_wait_ns, 0) / 1e6,
+                 std::exchange(stats.kept_shadow_wait_max_ns, 0) / 1e6,
+                 std::exchange(stats.kept_shadow_skips, 0));
     }
     SaveOneOffKinds(false); // PERF-GT7-023
     if (OneOffDiagOn()) {

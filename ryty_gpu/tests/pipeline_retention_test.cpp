@@ -1,4 +1,5 @@
 #include "video_core/renderer_vulkan/pipeline_retention_budget.h"
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -8,7 +9,9 @@ int main() {
     std::uint64_t cases = 0;
     for (std::uint64_t mib = 0; mib <= 32768; ++mib) {
         const auto budget = mib << 20;
-        const auto threshold = budget > 2 * GiB ? budget - 2 * GiB : 0;
+        // FIX-GTS-521: the reserve is an eighth of the budget, between 512 MiB and 2 GiB.
+        const auto reserve = std::clamp<std::uint64_t>(budget / 8, GiB / 2, 2 * GiB);
+        const auto threshold = budget > reserve ? budget - reserve : 0;
         assert(!PipelineRetentionUnderPressure(0, budget));
         assert(!PipelineRetentionUnderPressure(threshold, budget));
         assert(PipelineRetentionUnderPressure(threshold + 1, budget) == (budget != 0));

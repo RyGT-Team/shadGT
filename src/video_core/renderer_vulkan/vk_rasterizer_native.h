@@ -40,6 +40,7 @@
 #include "ryty_gpu/native/same_texel.h"
 #include "ryty_gpu/native/retired_snapshot_pool.h"
 #include "ryty_gpu/native/writeback_plan.h"
+#include "ryty_gpu/ryty_upscale.h"
 #include "video_core/renderer_vulkan/pipeline_binding_state.h"
 #include "video_core/renderer_vulkan/descriptor_set_memo.h"
 #include "shader_recompiler/backend/bindings.h"
@@ -164,6 +165,9 @@ public:
         vk::ImageView hud_white{};
         /// GT7-UW: the frame's HUD is a race's (its moved pieces apply; not to menus).
         bool hud_race = false;
+        /// DLSS-GT7-001: the frame's depth, motion vectors and jitter, when the game's temporal
+        /// anti-aliasing pass was seen in it (RYGT_DLSS_TEMPORAL=1).
+        std::optional<RytyUpscale::TemporalInputs> temporal;
     };
     std::optional<Display> FindDisplay(const VideoCore::ImageInfo& info, vk::Format view_format,
                                        vk::Extent2D output_size);
@@ -424,20 +428,115 @@ private:
         u64 hud_frame = ~u64{0};       ///< the frame HUD draws went to the layer in
         bool clear_pending = false;    ///< the next HUD draw clears both pictures first
         u64 race_frame = ~u64{0};      ///< the frame its HUD showed a race's maps
+        u32 scale = 1;                 ///< DLSS-GT7-001: the pictures' size over the display's
     };
     /// GT7-UW: small pictures drawn with a depth buffer, and the frame (a race HUD's track
     /// and course maps are drawn so every frame; menus' HUDs take none).
     std::unordered_map<VAddr, u64> hud_depth_drawn; ///< by address
     std::unordered_map<VAddr, HudLayer> hud_layers;
     static bool HudSplitOn();
-    Native::ImageEntry* MakeHudPicture(const Native::ImageEntry& like);
+
+    /// DLSS-GT7-001 (temporal DLSS): what GT7's temporal anti-aliasing pass
+    /// read in the frame being drawn, for the presenter's DLSS pass (ryty_upscale.h).
+    struct TemporalCapture {
+        const Native::ImageEntry* depth = nullptr;
+        const Native::ImageEntry* motion = nullptr;
+        u64 frame = ~u64{0}; ///< the frame the pass was last seen in
+        bool reset = true;   ///< the frame before that one had none
+        float jitter[2]{};
+        float mvec_scale[2]{};
+        /// The pass's result is replaced with this colour before the next draw into it or into
+        /// a display buffer (after the game's bloom and exposure passes read it).
+        const Native::ImageEntry* pending_color = nullptr;
+        const Native::ImageEntry* pending_out = nullptr;
+        u64 seen = 0;     ///< passes noted
+        u64 replaced = 0; ///< results replaced with the un-resolved colour
+        u64 refused = 0;  ///< passes whose inputs or constants did not fit
+        /// The frame a draw into a display buffer last showed a race's HUD maps; the pass is
+        /// only taken in a race (NoteTemporalDraw).
+        u64 race_hud_frame = ~u64{0};
+        /// The frame a draw last sampled a display picture (the interface reading it back).
+        u64 display_read_frame = ~u64{0};
+        /// Outside a race the game's pictures are left as it draws them, and the tone-mapped
+        /// un-resolved scene DLSS needs is drawn beside them (NoteTemporalDraw).
+        bool mirror = false;        ///< the frame being drawn is such a frame
+        bool white_inline = false;  ///< else: the HUD's record over white runs in place
+        u64 run_start = 0;          ///< the frame the pass came back in after frames without it
+        u64 seen_frame = ~u64{0};   ///< the last frame the pass was seen in, taken or not
+        bool left = false;          ///< the last pass seen was left to the game (logged)
+        u32 left_changes = 0;       ///< logged
+        const Native::ImageEntry* result = nullptr; ///< the pass's result picture
+        u64 replaced_frame = ~u64{0}; ///< the frame the result was last replaced in place
+        u64 through_frame = ~u64{0};  ///< the last menu frame whose interface goes through DLSS
+        u64 scene_draw_frame = ~u64{0}; ///< the frame the first draw into a display was seen in
+        bool through = false;         ///< logged
+        u32 through_changes = 0;      ///< logged
+        /// The display as it was before its interface, in such frames (two, by frame parity:
+        /// the presenter may still read the last one while the next frame draws).
+        std::array<Native::ImageEntry*, 2> ui_scene{};
+        u64 ui_scene_frame = ~u64{0}; ///< the frame the last one was taken in
+        u32 ui_scene_slot = 0;        ///< which
+        VAddr ui_scene_address = 0;   ///< the display buffer it was taken from
+        bool hud_batch_open = false;  ///< HUD records wait in the HUD lists
+        bool display_draw_now = false; ///< the draw being recorded goes into a display buffer
+        u64 batches = 0;              ///< batches closed
+        u64 batched_draws = 0;        ///< HUD draws recorded so
+        u64 mirror_frame = ~u64{0}; ///< the last such frame
+        Native::ImageEntry* kept = nullptr;        ///< the pass's own result, while swapped
+        Native::ImageEntry* raw_display = nullptr; ///< the display as DLSS is to see it
+        /// DLSS-GT7-003: the un-resolved colour with the game's draws into the result since the
+        /// pass (motion blur, glows), while the result itself stays resolved for the game.
+        Native::ImageEntry* raw_result = nullptr;
+        u64 raw_result_frame = ~u64{0}; ///< the frame it was last started in
+        u32 beside_logged = 0;          ///< logged
+        /// The result picture, while it holds the un-resolved colour.
+        const Native::ImageEntry* swapped_out = nullptr;
+        u64 raw_frame = ~u64{0}; ///< the frame raw_display was last drawn in
+        VAddr raw_address = 0;   ///< the display buffer it stands for
+        u64 mirrored = 0;        ///< frames drawn so
+        std::vector<Native::ImageEntry*> retired; ///< pictures of another size, kept alive
+        bool race = false;    ///< as of the last pass seen
+        u32 race_changes = 0; ///< logged
+        /// The pass's result was replaced but its size is not the display's (a picture cropped
+        /// or scaled before it is shown): DLSS could not take the inputs, so the pass is left
+        /// to the game for the rest of the run (FindDisplay).
+        bool size_refused = false;
+        u32 size_mismatches = 0; ///< frames in a row so, before it is refused
+    };
+    TemporalCapture temporal;
+    /// Called at the end of a draw: notes the pass's inputs and replaces its result.
+    void NoteTemporalDraw(const GraphicsPipeline& pipeline, const Targets& targets,
+                          const DrawBindings& b);
+    void ApplyTemporalReplace();
+    /// DLSS-GT7-001, frames left as the game draws them: the pass's result is put aside and
+    /// holds the un-resolved colour until the tone mapping has been drawn for DLSS; then back.
+    bool TemporalSwapIn();
+    void TemporalSwapOut();
+    /// DLSS-GT7-003: the result stays resolved until the tone mapping (default; off with
+    /// SHADGT_DLSS_TEMPORAL_BLOOM=0 or 1).
+    static bool TemporalKeepsResolved();
+    void CopyPicture(const Native::ImageEntry& from, const Native::ImageEntry& to);
+    /// A picture of the prototype's own like another, made again when the size changes.
+    /// size: the picture's size, when not like's.
+    Native::ImageEntry* TemporalPicture(Native::ImageEntry*& slot, const Native::ImageEntry& like,
+                                        vk::Extent2D size = {});
+    /// DLSS-GT7-001: the HUD split for this frame: a wide screen's, or a frame with the pass.
+    bool HudSplitNow() const;
+    /// DLSS-GT7-001: how many times the display's size the prototype's HUD pictures are.
+    u32 HudScale() const;
+    /// size: the picture's size before scale, when not like's.
+    Native::ImageEntry* MakeHudPicture(const Native::ImageEntry& like, u32 scale = 1,
+                                       vk::Extent2D size = {});
     vk::ImageView View(const Native::ImageEntry& entry, const VideoCore::ImageViewInfo& info,
                        ViewUse use);
+    /// explicit_lod (FIX-GT7-182): the shader reads this S# at a level it chose, which must not
+    /// get the DLSS texture bias (DLSS-GT7-002).
     vk::Sampler SamplerFor(const AmdGpu::Sampler& sharp, AmdGpu::BorderColorBuffer border,
-                           bool is_depth);
-    /// The sampler for an S# as SamplerFor adjusted it (FIX-GT7-002's lookup and pool).
+                           bool is_depth, bool explicit_lod);
+    /// The sampler for an S# as SamplerFor adjusted it (FIX-GT7-002's lookup and pool), with the
+    /// DLSS texture bias SamplerFor chose for it.
     vk::Sampler MakeSampler(const AmdGpu::Sampler& sharp, AmdGpu::BorderColorBuffer border,
-                            bool is_depth);
+                            bool is_depth, float resolution_bias);
 
     void AcquireList(Stream& s);
     bool RingEnabled();
@@ -538,7 +637,9 @@ private:
     /// the list being recorded. False when they were written over.
     bool AheadCommit(u64 position, u32 size, vk::DescriptorBufferInfo& info);
     vk::DescriptorSet MakeLongSet(vk::DescriptorSetLayout layout);
-    void StoreLongSet(u64 hash, u64 check, vk::DescriptorSetLayout layout, vk::DescriptorSet set,
+    /// FIX-GTS-503: false (the set not kept) when it holds a sampler dropped since its handles
+    /// were looked up: the drop's note may already have been taken, and nothing would drop it.
+    bool StoreLongSet(u64 hash, u64 check, vk::DescriptorSetLayout layout, vk::DescriptorSet set,
                       std::span<const u64> handles);
     void DropLongSets(std::span<const u64> dead_handles);
     void FlushLongSets();
@@ -631,6 +732,9 @@ private:
     std::mutex polled_mutex;
     std::vector<std::pair<VAddr, u64>> polled_textures;
     Region* RegionOver(VAddr address, u64 size);
+    /// FIX-GT7-184: no committed page, no region and no picture of the GPU's in the texture's
+    /// guest range.
+    bool NothingToRead(const VideoCore::ImageInfo& info);
     Region* MakeRegion(VAddr address, u64 size, bool write);
     void RefreshRegion(Region& region, VAddr address, u64 size);
     /// FIX-198: whether a draw whose pipeline is still building must wait for it: it draws
@@ -646,6 +750,9 @@ private:
     /// After a FIX-198 wait (or a draw PERF-GT7-023 skipped instead): from one_off_hits.
     void WatchOneOffs(const AmdGpu::Regs& regs, bool skipped);
     void CheckOneOffs();     ///< each frame
+    /// PERF-GTS-493: one-off pictures skipped in a race and not drawn since (end-of-race report).
+    void NoteRaceMissing(const AmdGpu::Regs& regs);
+    void CheckRaceMissing(); ///< each frame
     std::string OneOffText(); ///< the window's counts, then cleared
     /// What the draw that first waited for a picture says of it: is it a colour target (and
     /// which) or the depth buffer, its pitch, height, slices, samples, format and tiling.
@@ -668,6 +775,11 @@ private:
     std::vector<OneOffHit> one_off_hits; ///< of the last DrawMustNotSkip
     /// FIX-GT7-135: the last DrawMustNotSkip waits for a never-drawn level of a texture.
     bool one_off_texture_level = false;
+    /// FIX-GT7-153: the last DrawMustNotSkip's depth target is a circuit's shadow map (see
+    /// kept_shadow_map.h): its draw waits, without a deadline when `first` (the map not drawn
+    /// within the last frames) or out of play.
+    bool one_off_kept_shadow = false;
+    bool one_off_kept_shadow_first = false;
     /// FIX-GT7-135: the texture (address, level >= 1) whose level `target` is; {0, -1}: none.
     std::pair<VAddr, s32> TextureLevelOf(const VideoCore::ImageInfo& target);
     /// FIX-GT7-102: time the current frame's draws waited for one-off pipelines; past the
@@ -685,6 +797,18 @@ private:
     u64 one_off_budget_frame = ~u64{0};
     u64 one_off_wait_ns_frame = 0;
     std::unordered_map<VAddr, OneOffWatch> one_off_watch;
+    struct RaceMissing {
+        OneOffHit hit{};
+        u64 frame = 0;
+        u64 ps_hash = 0;
+        u64 skips = 0;
+    };
+    std::unordered_map<VAddr, RaceMissing> race_missing; ///< PERF-GTS-493
+    struct {
+        bool in_race = false;
+        bool running = false;
+        std::chrono::steady_clock::time_point last{};
+    } race_missing_state; ///< PERF-GTS-493
     struct {
         /// [never drawn, not lately][redrawn after 1, 2-4, 5-16, 17-64, 65-300 frames; sampled
         /// in a later frame first; neither in 300 frames]: pictures, and the draws that waited.
@@ -822,7 +946,8 @@ private:
     std::unordered_map<VAddr, MirrorCandidate> mirror_candidates; ///< by page of the range start
     std::vector<std::pair<VAddr, VAddr>> pending_mirrors;          ///< made at a list's start
     VAddr mirror_promotion_resume = 0; ///< fairness hint for merged pending ranges
-    OptionalMirrorBudget mirror_promotion_budget; ///< shared across lists of this frame
+    OptionalMirrorBudget mirror_promotion_budget{
+        OptionalMirrorBudget::FromEnvironment()}; ///< shared across lists of this frame (PERF-GTS-525)
     std::unordered_map<u64, u64> mirror_writes;    ///< granule -> frame the CPU wrote a mirror there
     std::unordered_map<u64, u64> dynamic_granules; ///< granule -> frame it was found CPU-written
     /// PERF-GTS-386: granule -> how often a mirror over it was dropped as CPU-written.
@@ -859,19 +984,41 @@ private:
     /// guest memory read in place), valid while no region or mirror was made or dropped and no
     /// memory unmapped since (buffer_generation); a region or mirror with pages to copy in takes
     /// the full lookup.
-    struct BufferMemo {
+    /// PERF-SGT-018: one cache line an entry. The table is far larger than the CPU's caches, so a
+    /// lookup's first read of its entry waits for memory: that one compare was 3.7% of the
+    /// recorder's time in a GT7 race (Nsight Systems, GuestBuffer). The entry was 88 bytes, which
+    /// lay across two lines for most slots. The region and the mirror are never both set and share
+    /// one pointer; the flags, what was bound and which of the two the pointer is sit in the
+    /// offset's unused top bits (an offset into a buffer is far below 2^48).
+    struct alignas(64) BufferMemo {
+        static constexpr u64 OffsetMask = (u64{1} << 48) - 1;
         VAddr address = 0;
         u64 size = 0;
-        u32 flags = 0;
         u64 generation = ~u64{0};
         u64 hard_generation = 0; ///< PERF-GT7-047
         u64 log_seq = 0;
         vk::Buffer buffer{};
-        u64 offset = 0;
-        Region* region = nullptr;
-        Mirror* mirror = nullptr;
-        Bound bound = Bound::InPlace;
+        u64 offset_meta = 0; ///< offset | flags << 48 | bound << 50 | owner kind << 52
+        void* owner = nullptr; ///< the Region or the Mirror, by the owner kind
+
+        u32 Flags() const { return u32(offset_meta >> 48) & 3; }
+        Bound BoundAs() const { return Bound((offset_meta >> 50) & 3); }
+        u64 Offset() const { return offset_meta & OffsetMask; }
+        Region* RegionOf() const {
+            return ((offset_meta >> 52) & 3) == 1 ? static_cast<Region*>(owner) : nullptr;
+        }
+        Mirror* MirrorOf() const {
+            return ((offset_meta >> 52) & 3) == 2 ? static_cast<Mirror*>(owner) : nullptr;
+        }
+        bool Matches(VAddr at, u64 bytes, u32 flags) const {
+            return address == at && size == bytes && Flags() == flags;
+        }
+        static u64 Pack(u64 offset, u32 flags, Bound bound, Region* region, Mirror* mirror) {
+            return offset | u64(flags & 3) << 48 | u64(u8(bound) & 3) << 50 |
+                   u64(region ? 1 : mirror ? 2 : 0) << 52;
+        }
     };
+    static_assert(sizeof(BufferMemo) == 64);
     std::array<BufferMemo, 16384> buffer_memos{}; ///< OPT-006: 2048 thrashed
     u64 buffer_generation = 0;
     u64 buffer_hard_generation = 0; ///< PERF-GT7-047: what the change log doesn't tell
@@ -1087,8 +1234,9 @@ private:
     void RecordIndirect(const IndirectDraw& indirect, const IndirectBuffers& buffers,
                         bool is_indexed);
     bool NeedsBarrierFor(const DrawBindings& b) const;
-    // PERF-GT7-043
-    bool RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64 program, bool recorded,
+    // PERF-GT7-043; PERF-136: `cs` decides whether an unlisted program's run may go on too.
+    bool RunNeedsBarrier(const Stream& s, const DrawBindings& b, const Shader::Info& cs,
+                         bool recorded,
                          std::optional<u64> texel = std::nullopt) const; // PERF-GT7-057: texel
     void NoteWrites(const Targets* targets, const DrawBindings& b);
     /// NAT-105: CPU writes to the pages of a range fault (once) from now on.
@@ -1310,6 +1458,8 @@ private:
     std::vector<KeptTextureCandidate> kept_texture_scan;
     u32 kept_texture_shard = 0;
     u64 kept_texture_bytes = 0;
+    /// FIX-GT7-153: bytes of circuit shadow maps kept past their idle time (a budget of their own).
+    u64 kept_shadow_bytes = 0;
     std::vector<Native::ImageEntry*> writebacks;
     struct PendingLinearDownload;
     std::unordered_map<const Native::ImageEntry*, std::shared_ptr<PendingLinearDownload>> pending_linear_downloads;
@@ -1431,6 +1581,7 @@ private:
         u64 image_generation = 0;
         u64 buffer_seq = 0;
         u64 unmap_gen = 0;
+        u64 sampler_drops = 0; ///< FIX-GTS-503
         DrawBindings bindings;
         // Private heap packet metadata; no NativeRenderer layout change.
         std::vector<Native::Parallel::SampledViewProof<vk::ImageView>> sampled_view_proofs;
@@ -1682,9 +1833,16 @@ private:
     /// the main one (which draws them over black): neither list switches between the two
     /// pictures, so consecutive HUD draws stay in one pass without barriers between them.
     Stream hud_stream;
+    /// DLSS-GT7-001: in a frame left as the game draws it, the HUD draws over black, in a list of
+    /// their own too (the main list then draws them into the display as the game does).
+    Stream hud_black_stream;
     static bool HudStreamOn();
     void BeginHudStream();
     void SpliceHudStream(u64 tick);
+    void SpliceStream(Stream& s, u64 tick);
+    /// DLSS-GT7-001: the open batch of HUD draws runs (main list first, then the HUD lists).
+    void CloseHudBatch();
+    static bool HudBatchOn();
     DrawBindings bindings;
     u64 frame = 0;
     u64 timing_tick = 0; ///< OPT-001
@@ -1733,13 +1891,70 @@ private:
     std::deque<std::pair<u64, vk::DescriptorPool>> retiring_pools;
 
     std::mutex sampler_mutex;
-    /// FIX-GT7-002: by the state the device sees; sampler_lookup by the raw S#.
-    std::unordered_map<u64, std::unique_ptr<VideoCore::Sampler>> samplers;
-    std::unordered_map<u64, vk::Sampler> sampler_lookup;
-    vk::Sampler last_sampler{};
+    /// FIX-GT7-002: by the state the device sees; sampler_lookup by the raw S# (to that state).
+    /// FIX-GTS-503: each with the sampler epoch it was last handed out in.
+    struct SamplerEntry {
+        std::unique_ptr<VideoCore::Sampler> sampler;
+        u64 epoch = 0;
+        std::array<u64, 2> state{}; ///< the state it was made from (for a stand-in)
+        bool depth = false;
+    };
+    std::unordered_map<u64, SamplerEntry> samplers;
+    /// FIX-GTS-503: straight to the entry (a table's elements stay where they are); the lines
+    /// of a dropped entry go with it, in the same pass.
+    std::unordered_map<u64, SamplerEntry*> sampler_lookup;
+    /// FIX-GTS-503: with the table full of samplers in use, the sampler of the same kind (plain
+    /// or compare, and then the same comparison) that reads most like the state asked for; with
+    /// none of its kind, one made for it and kept apart, one a kind at most (sampler_mutex held).
+    vk::Sampler StandInSampler(const AmdGpu::Sampler& state, AmdGpu::BorderColorBuffer border,
+                               bool is_depth);
+    std::array<std::unique_ptr<VideoCore::Sampler>, 9> spare_samplers;
+    /// The stand-in a raw S# got, for the epoch it was chosen in (with the recycling on, two
+    /// seconds at most: the state gets a sampler of its own as soon as there is room).
+    struct StandInLine {
+        vk::Sampler sampler;
+        u64 epoch = 0;
+    };
+    std::unordered_map<u64, StandInLine> sampler_stand_in_lines;
+    /// FIX-GTS-503: near the limit, the samplers not handed out for a whole epoch (two seconds
+    /// or more) are dropped, and destroyed once the GPU passed the tick. The thread caches and
+    /// MakeSampler's memo count for the epoch they were filled in only.
+    std::atomic<u64> sampler_epoch{1};
+    std::chrono::steady_clock::time_point sampler_epoch_start{};
+    std::deque<std::pair<u64, std::unique_ptr<VideoCore::Sampler>>> retired_samplers;
+    /// Samplers dropped in all: binding memos and prepared draws made before a drop are not
+    /// used after it.
+    std::atomic<u64> samplers_dropped{0};
+    u64 samplers_made = 0;
+    u64 sampler_stand_ins = 0;
+    std::atomic<u64> samplers_refused{0}; ///< lookups of an S# with reserved bits
+    std::array<u64, 4> sampler_report{}; ///< made, dropped, stand-ins, refused at the last report
+    u32 SamplerLimit() const;
+    void RecycleSamplers();
+    void DestroyRetiredSamplers();
+    /// FIX-GTS-503: one of these handles is a dropped sampler not yet destroyed.
+    bool HoldsDroppedSampler(std::span<const u64> handles);
 
     std::mutex views_mutex;
     std::unordered_map<const Native::ImageEntry*, std::vector<ViewRecord>> views;
+    /// PERF-SGT-021: the images of small textures in the game's per-frame memory, kept with
+    /// their views when their texture goes and given to the next texture of the same shape.
+    struct RecycledImage {
+        std::unique_ptr<Native::Rhi::Image> image;
+        std::vector<ViewRecord> records;
+        u32 usage = 0;
+        u64 features = 0;
+    };
+    std::mutex recycle_mutex; ///< taken after views_mutex when both are held
+    std::unordered_map<u64, u64> recycle_keys; ///< image handle -> shape key
+    /// shape key -> its free images, oldest first: taken in the order they came back, so the
+    /// images of a shape go round in a fixed order (and those of several shapes in step).
+    std::unordered_map<u64, std::deque<RecycledImage>> recycle_pool;
+    u32 recycle_free = 0;
+    /// image handle -> the views of an image taken from the pool, until its texture asks for one
+    std::unordered_map<u64, std::vector<ViewRecord>> recycle_views;
+    std::vector<const Native::ImageEntry*> recycle_live; ///< textures with such an image (views_mutex)
+    u64 recycle_taken = 0, recycle_made = 0, recycle_pooled = 0, recycle_early = 0;
     /// NAT-108: views of evicted images, destroyed once the GPU passed the tick.
     std::deque<std::pair<u64, vk::UniqueImageView>> retired_views;
     void EvictImages();
@@ -1823,6 +2038,31 @@ private:
                  reuse_diag_frame = 0, reuse_diag_window = 0;
         uint64_t reuse_diag_serial = ~uint64_t{0}, reuse_diag_frame_number = ~uint64_t{0};
         std::unordered_set<uint64_t> reuse_diag_in_list, reuse_diag_in_frame, reuse_diag_in_window;
+        /// DIAG-SGT-019: graphics sets by how their lookup went (not cacheable, no dynamic
+        /// buffers, kept set found, kept set not found), and for the not found ones which
+        /// kinds of key words differ from the nearest of the layout's last 64 new keys
+        /// (bit 0 buffer, 1 offset, 2 range, 3 write header, 4 sampler, 5 view, 6 layout).
+        std::array<uint64_t, 4> miss_diag_counts{};
+        std::array<uint64_t, 128> miss_diag_by_kinds{};
+        uint64_t miss_diag_first = 0, miss_diag_words = 0, miss_diag_remade = 0;
+        uint64_t miss_diag_new_view_sets = 0, miss_diag_new_buffer_sets = 0;
+        uint64_t miss_diag_new_range_sets = 0;
+        std::string miss_diag_samples;
+        uint32_t miss_diag_sampled = 0;
+        /// Kept sets dropped for a destroyed view, buffer, or other handle.
+        std::array<uint64_t, 3> miss_diag_drops{};
+        /// What each view shows (by handle), and the not found sets by the view that differs.
+        std::unordered_map<uint64_t, std::string> miss_diag_view_names;
+        std::unordered_map<std::string, uint32_t> miss_diag_view_misses;
+        /// Evicted pictures by kind, size and format, and all of them by address.
+        std::unordered_map<std::string, uint32_t> miss_diag_evicted, miss_diag_evicted_at;
+        struct MissDiagRecent {
+            std::vector<std::vector<uint64_t>> keys;
+            size_t next = 0;
+        };
+        std::unordered_map<uint64_t, MissDiagRecent> miss_diag_recent;
+        std::unordered_set<uint64_t> miss_diag_keys, miss_diag_views, miss_diag_buffers_seen,
+            miss_diag_ranges;
         u64 prepared_used = 0, prepared_missing = 0;
         std::array<u64, 5> prepared_rejected{};
         /// DIAG-GTS-401: prepared draws turned down for their pictures (log too short, a
@@ -1848,7 +2088,10 @@ private:
         u64 one_off_waits = 0; ///< FIX-198: draws that waited for their new pipeline
         u64 one_off_exempt = 0; ///< PERF-GT7-023: draws into exempt pictures, skipped
         u64 one_off_budget_skips = 0; ///< FIX-GT7-102: skipped once the frame's budget was spent
+        u64 one_off_race_skips = 0; ///< PERF-GTS-493: skipped in a race, never waited for
         u64 one_off_harmful_waits = 0; ///< FIX-GT7-121: waited whatever the budget
+        u64 kept_shadow_waits = 0, kept_shadow_wait_ns = 0, kept_shadow_wait_max_ns = 0,
+            kept_shadow_skips = 0; ///< FIX-GT7-153
         u64 writeback_befores = 0, precise_writebacks = 0; ///< FIX-203
         /// DIAG-188: a direct dispatch's recorder time by part (pipeline, bindings, images,
         /// barrier with write-backs, recording, notes), and the write-backs' share.
@@ -1885,8 +2128,9 @@ private:
             draw_ns = 0, dispatch_ns = 0, gathers = 0, gathered_bytes = 0, writebacks = 0,
             region_binds = 0, regions_made = 0, region_refreshes = 0;
         /// Images bound empty: no address or format, not mapped for the GPU, format the
-        /// device lacks, bad geometry, outside guest memory, FIX-081, no image made.
-        std::array<u64, 7> null_reasons{};
+        /// device lacks, bad geometry, outside guest memory, FIX-081, no image made, nothing
+        /// to read (FIX-GT7-184).
+        std::array<u64, 8> null_reasons{};
         /// NAT-110: time in the draw's phases: pipeline, targets, buffers, textures, sources,
         /// vertices, prepare (inits and uploads), record.
         std::array<u64, 8> phase_ns{};

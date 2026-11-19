@@ -3,10 +3,14 @@
 
 #pragma once
 
+#include <array>
+#include <bit>
 #include <mutex>
 #include <span>
 #include <unordered_map>
+#include <vector>
 
+#include "video_core/renderer_vulkan/coverage_reduction.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/shared_build_map.h"
 
@@ -362,6 +366,66 @@ public:
         return amd_mixed_attachment_samples;
     }
 
+    /// NEO-GT7-016: VK_NV_coverage_reduction_mode is on (PS4 Pro mode, NVIDIA's mixed samples).
+    bool IsCoverageTruncateOn() const {
+        return nv_coverage_reduction;
+    }
+
+    /// NEO-GT7-016: the combinations the driver lists for VK_COVERAGE_REDUCTION_MODE_TRUNCATE_NV.
+    std::span<const CoverageReduction::Combination> GetTruncateCombinations() const {
+        return truncate_combinations;
+    }
+
+    /// NEO-GTS-508: VK_EXT_sample_locations is on: multi-sample pipelines take the game's sample
+    /// positions (PS4 Pro mode, SHADGT_SAMPLE_LOCATIONS not 0, the device able to).
+    bool IsSampleLocationsOn() const {
+        return sample_locations;
+    }
+
+    /// NEO-GTS-508: the device's VK_EXT_sample_locations properties (zeros when it is off).
+    const vk::PhysicalDeviceSampleLocationsPropertiesEXT& GetSampleLocationsProperties() const {
+        return sample_locations_properties;
+    }
+
+    /// NEO-GTS-508: the largest sample-location grid for a sample count (1, 2, 4, 8 or 16;
+    /// 0x0 when the count takes no custom positions or the feature is off).
+    vk::Extent2D GetSampleLocationGrid(u32 samples) const {
+        const u32 index = static_cast<u32>(std::countr_zero(samples));
+        return sample_locations && std::has_single_bit(samples) && index < sample_location_grids.size()
+                   ? sample_location_grids[index]
+                   : vk::Extent2D{};
+    }
+
+    /// NEO-GTS-508: the device takes one pattern for each pixel of a 2x2 quad at this count.
+    bool HasSampleLocationQuadGrid(u32 samples) const {
+        const vk::Extent2D grid = GetSampleLocationGrid(samples);
+        return grid.width >= 2 && grid.height >= 2 && grid.width % 2 == 0 && grid.height % 2 == 0;
+    }
+
+    /// NEO-GTS-508: pipelines with this sample count take the game's positions. 2 samples only
+    /// on a GPU with a 2x2 grid for them (NEO-GTS-511: then every 2-sample draw takes them) and
+    /// with SHADGT_SAMPLE_LOCATIONS_2X not 0. On a 1x1 grid the checkerboard's pattern (rows
+    /// swapped in the quad) can't be given, and other 2-sample draws with the game's positions
+    /// on its depth would test it at other positions than it was written with (undefined).
+    bool TakesSampleLocations(u32 samples) const {
+        return samples > 1 && GetSampleLocationGrid(samples).width != 0 &&
+               (samples != 2 || (two_sample_locations && HasSampleLocationQuadGrid(samples)));
+    }
+
+    /// NEO-GTS-511: InterpolateAtOffset reaches every offset the positions table can hold
+    /// (-0.5..0.4375 pixel in 1/16).
+    bool TakesSampleTable() const {
+        return properties.limits.minInterpolationOffset <= -0.5f &&
+               properties.limits.maxInterpolationOffset >= 0.4375f &&
+               properties.limits.subPixelInterpolationOffsetBits >= 4;
+    }
+
+    /// NEO-GTS-508: VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT for a depth image
+    /// when the feature is on and the device takes it with this format, usage and flags; else none.
+    vk::ImageCreateFlags SampleLocationsDepthFlag(vk::Format format, vk::ImageType type,
+                                                  vk::ImageUsageFlags usage,
+                                                  vk::ImageCreateFlags flags) const;
+
     /// Returns true when geometry shaders are supported by the device
     bool IsGeometryStageSupported() const {
         return features.geometryShader;
@@ -393,8 +457,8 @@ public:
         return shader_clock && shader_clock_features.shaderSubgroupClock;
     }
 
-    /// FIX-GTS-364: a GCN Radeon (R7/R9, three-digit RX 400/500/600 models, Vega, Radeon VII)
-    /// on AMD's driver. Four-digit RX models (RX 5300 and up) are RDNA.
+    /// FIX-GTS-364 (shadgt7 FIX-GT7-151): a GCN Radeon (R7/R9, three-digit RX 400/500/600 models,
+    /// Vega, Radeon VII) on AMD's driver. Four-digit RX models (RX 5300 and up) are RDNA.
     bool IsAmdGcn() const;
 
     /// AMD-306/307: AMD's driver compiling with its older proprietary shader compiler
@@ -402,6 +466,12 @@ public:
     bool IsAmdLegacyShaderCompiler() const {
         return driver_id == vk::DriverId::eAmdProprietary &&
                driver_info.find("LLPC") == std::string::npos;
+    }
+
+    /// DIAG-243: SHADGT_DEVICE_FAULT=1: the device fault extension is asked for and the renderer
+    /// notes its last draws.
+    bool NotesDrawsForFault() const {
+        return note_fault_draws;
     }
 
     /// AMD-313: a Radeon RX 7000 on AMD's driver.
@@ -734,6 +804,15 @@ private:
     bool amd_shader_trinary_minmax{};
     bool nv_framebuffer_mixed_samples{};
     bool amd_mixed_attachment_samples{};
+    bool nv_coverage_reduction{}; ///< NEO-GT7-016
+    std::vector<CoverageReduction::Combination> truncate_combinations; ///< NEO-GT7-016
+    bool sample_locations{}; ///< NEO-GTS-508
+    bool two_sample_locations{}; ///< NEO-GTS-511: SHADGT_SAMPLE_LOCATIONS_2X not 0
+    vk::PhysicalDeviceSampleLocationsPropertiesEXT sample_locations_properties{}; ///< NEO-GTS-508
+    std::array<vk::Extent2D, 5> sample_location_grids{}; ///< NEO-GTS-508: 1, 2, 4, 8, 16 samples
+    vk::ImageUsageFlags depth_flag_usage{}; ///< NEO-GTS-508: the depth usage CreateDevice checked
+    mutable std::mutex depth_flag_mutex; ///< NEO-GTS-508
+    mutable std::unordered_map<u64, bool> depth_flag_answers; ///< NEO-GTS-508
     bool shader_atomic_float{};
     bool shader_atomic_float2{};
     bool workgroup_memory_explicit_layout{};
@@ -751,6 +830,7 @@ private:
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
     bool shader_clock{};
+    bool note_fault_draws{}; ///< DIAG-243: SHADGT_DEVICE_FAULT=1
     bool quad_control{};       ///< AMD-306
     bool vertex_order_check{}; ///< AMD-307
     bool supports_memory_budget{};

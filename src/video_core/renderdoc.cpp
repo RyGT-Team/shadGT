@@ -31,9 +31,19 @@ static CaptureState capture_state{CaptureState::Idle};
 enum class DebugFrameDumpState { Idle, Pending, Active };
 static std::atomic<DebugFrameDumpState> debug_frame_dump{DebugFrameDumpState::Idle};
 
-bool RequestDebugFrameDump() {
+static std::atomic<u32> debug_frame_dump_frames{1}; // FEAT-SGT-002
+
+bool RequestDebugFrameDump(u32 frames) {
     auto expected = DebugFrameDumpState::Idle;
-    return debug_frame_dump.compare_exchange_strong(expected, DebugFrameDumpState::Pending);
+    if (!debug_frame_dump.compare_exchange_strong(expected, DebugFrameDumpState::Pending)) {
+        return false;
+    }
+    debug_frame_dump_frames.store(std::max<u32>(frames, 1), std::memory_order_release);
+    return true;
+}
+
+u32 DebugFrameDumpFrames() {
+    return debug_frame_dump_frames.load(std::memory_order_acquire);
 }
 
 bool BeginDebugFrameDump() {

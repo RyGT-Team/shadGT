@@ -460,7 +460,7 @@ struct Sampler {
         BitField<29, 1, u64> disable_lsb_ceil;
         BitField<30, 2, u64> unused0;
         BitField<32, 12, u64> border_color_ptr;
-        BitField<42, 18, u64> unused1;
+        BitField<44, 18, u64> unused1;
         BitField<62, 2, BorderColor> border_color_type;
     };
 
@@ -471,6 +471,16 @@ struct Sampler {
     bool Valid() const {
         return max_aniso.Value() <= AnisoRatio::Sixteen && filter_mode.Value() <= FilterMode::Max &&
                mip_filter.Value() <= MipFilter::Linear;
+    }
+
+    /// FIX-GTS-503 (shadgt7's FIX-GT7-178): bits no S# has: word 3's bits 12 to 28, between the
+    /// border colour's index and its type. With one set, the 16 bytes are not a sampler but
+    /// whatever a slot the shader does not use was left holding. Word 0's bit 31 and word 3's
+    /// bit 29 are left out: unused on the PS4's GPU, they have a meaning on the generation the
+    /// PS4 Pro's comes from (compatibility mode, upgraded depth), and what GT7 writes there in
+    /// Pro mode is not known.
+    bool HasReservedBits() const noexcept {
+        return (raw1 & 0x1FFFF00000000000ULL) != 0;
     }
 
     bool operator==(const Sampler& other) const noexcept {

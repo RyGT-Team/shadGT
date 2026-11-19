@@ -13,7 +13,9 @@
 
 namespace Vulkan::SceneTrace {
 #ifndef NDEBUG
-constexpr size_t Limit = 8192;
+// DIAG-SGT-011: room for a whole Shift+F8 burst (24 GT7 frames, about 112,000 rows); 8192 held
+// two frames, so the burst's bad frame was never in its dump.
+constexpr size_t Limit = 131072;
 constexpr u32 NoQuery = ~u32{};
 struct Row {
     u64 frame{}, program{}, companion{}, cpu_ns{};

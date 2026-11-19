@@ -25,6 +25,7 @@
 #include <fmt/format.h>
 
 #include "common/logging/log.h"
+#include "common/game_title.h"
 #include "common/perf_monitor.h"
 #include "common/read_capture.h"
 #include "core/address_space.h"
@@ -1202,8 +1203,27 @@ void MemoryManager::NoteEmulatorWrite(VAddr address, u64 size, const void*,
 
 namespace Libraries::Kernel {
 
+// NEO-GT7-001: the same answer as Ryty's libkernel.prx export (SHADGT_NEO=1 there turns the PS4 Pro
+// mode on), so the game, the Gnm init sequences, the video port and the alternate tiling agree.
+// Read once: it is asked for every draw packet, and it must not change while the game runs. Base
+// PS4 (0) if the export is missing.
 s32 PS4_SYSV_ABI sceKernelIsNeoMode() {
-    return Ryty::IsProMode(Ryty::GetProMode()) ? 1 : 0;
+    // Merge (shadGT + shadgt7): GT7's Pro mode is the runtime's (NEO-GT7-001: ryGT7's libkernel
+    // answers from its own setting), GT Sport's is decided here (ryty_pro_mode.h).
+    if (!Common::IsGt7()) {
+        return Ryty::IsProMode(Ryty::GetProMode()) ? 1 : 0;
+    }
+    using Fn = s32(PS4_SYSV_ABI*)();
+    static const s32 neo = [] {
+        const auto is_neo = RytyFunction<Fn>("libkernel.prx", "WslcK1FQcGI");
+        const s32 value = is_neo ? is_neo() : 0;
+        if (value != 0) {
+            LOG_WARNING(Lib_GnmDriver, "NEO-GT7-001: PS4 Pro mode (sceKernelIsNeoMode = {})",
+                        value);
+        }
+        return value != 0 ? 1 : 0;
+    }();
+    return neo;
 }
 
 // libkernel.prx exports these by NID with the System V ABI.

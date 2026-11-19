@@ -600,8 +600,16 @@ void ApplyCompileState(DriverCompileThreads& d) {
         const char* env = std::getenv("SHADGT_COMPILE_BACKLOG_LOW");
         return !(env && env[0] == '0');
     }();
+    // PERF-GTS-494: in play (a race from its start) the compiles run below normal priority:
+    // the frame rate goes first, whatever the compiles take (no draw waits for them there,
+    // PERF-GTS-493). SHADGT_COMPILE_PLAY_LOW=0: as before.
+    static const bool play_low = [] {
+        const char* env = std::getenv("SHADGT_COMPILE_PLAY_LOW");
+        return !(env && env[0] == '0');
+    }();
     const bool low = d.waits == 0 && (d.backlog == 0 || backlog_low) &&
-                     (d.foreground > 0 || d.catch_up > 0 || d.backlog > 0 || CompileAlwaysLow());
+                     ((play_low && d.in_play) || d.foreground > 0 || d.catch_up > 0 ||
+                      d.backlog > 0 || CompileAlwaysLow());
     d.wide_now.store(wide, std::memory_order_relaxed);
     d.low_now.store(low, std::memory_order_relaxed);
     if (!ProcessPolicyStillAllowed()) return;

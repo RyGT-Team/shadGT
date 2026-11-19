@@ -123,6 +123,11 @@ target_include_directories(shadgt_upload_chunk_trim_test PRIVATE ${CMAKE_SOURCE_
 target_link_libraries(shadgt_upload_chunk_trim_test PRIVATE GTest::gtest_main)
 gtest_discover_tests(shadgt_upload_chunk_trim_test)
 
+add_executable(shadps4_kept_shadow_map_test test_kept_shadow_map.cpp)
+target_include_directories(shadps4_kept_shadow_map_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_kept_shadow_map_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_kept_shadow_map_test)
+
 add_executable(shadps4_color_clear_test test_color_clear.cpp test_color_blend.cpp
     ${CMAKE_SOURCE_DIR}/src/video_core/renderer_vulkan/liverpool_to_vk.cpp
     ${CMAKE_SOURCE_DIR}/src/video_core/amdgpu/pixel_format.cpp
@@ -183,6 +188,11 @@ add_executable(shadps4_buffer_resource_test test_buffer_resource.cpp)
 target_include_directories(shadps4_buffer_resource_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(shadps4_buffer_resource_test PRIVATE GTest::gtest_main fmt::fmt)
 gtest_discover_tests(shadps4_buffer_resource_test)
+
+add_executable(shadps4_sampler_sharp_test test_sampler_sharp.cpp)
+target_include_directories(shadps4_sampler_sharp_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_sampler_sharp_test PRIVATE GTest::gtest_main fmt::fmt)
+gtest_discover_tests(shadps4_sampler_sharp_test)
 
 add_executable(shadgt_imported_view_lease_test test_imported_view_lease.cpp)
 target_include_directories(shadgt_imported_view_lease_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -399,6 +409,14 @@ target_compile_definitions(shadps4_native_cpu_chunk_policy_test PRIVATE NOMINMAX
 target_link_libraries(shadps4_native_cpu_chunk_policy_test PRIVATE GTest::gtest)
 gtest_discover_tests(shadps4_native_cpu_chunk_policy_test)
 
+# GAME-001 / TITLE-001: which game runs, and the defaults each keeps.
+add_executable(shadps4_game_title_test test_game_title.cpp)
+target_include_directories(shadps4_game_title_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_game_title_test PRIVATE cxx_std_23)
+target_compile_definitions(shadps4_game_title_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(shadps4_game_title_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_game_title_test)
+
 add_executable(shadps4_whole_layer_clear_test whole_layer_clear_test.cpp)
 target_include_directories(shadps4_whole_layer_clear_test PRIVATE ${CMAKE_SOURCE_DIR})
 target_compile_features(shadps4_whole_layer_clear_test PRIVATE cxx_std_23)
@@ -437,6 +455,29 @@ target_include_directories(shadps4_native_fence_batch_test PRIVATE ${CMAKE_SOURC
 target_compile_features(shadps4_native_fence_batch_test PRIVATE cxx_std_23)
 target_link_libraries(shadps4_native_fence_batch_test PRIVATE GTest::gtest_main)
 gtest_discover_tests(shadps4_native_fence_batch_test)
+
+if(WIN32)
+    # FIX-GT7-184: whether a guest range holds any committed page (VirtualQuery).
+    add_executable(shadgt_committed_pages_test test_committed_pages.cpp)
+    target_include_directories(shadgt_committed_pages_test PRIVATE ${CMAKE_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/src)
+    target_compile_features(shadgt_committed_pages_test PRIVATE cxx_std_23)
+    target_compile_definitions(shadgt_committed_pages_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(shadgt_committed_pages_test PRIVATE GTest::gtest_main)
+    gtest_discover_tests(shadgt_committed_pages_test)
+endif()
+
+add_executable(shadgt_gt7_preset_options_test test_gt7_preset_options.cpp)
+target_include_directories(shadgt_gt7_preset_options_test PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_features(shadgt_gt7_preset_options_test PRIVATE cxx_std_23)
+target_link_libraries(shadgt_gt7_preset_options_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadgt_gt7_preset_options_test)
+
+add_executable(shadgt_coverage_reduction_test test_coverage_reduction.cpp)
+target_include_directories(shadgt_coverage_reduction_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadgt_coverage_reduction_test PRIVATE cxx_std_23)
+target_link_libraries(shadgt_coverage_reduction_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadgt_coverage_reduction_test)
 
 # FIX-GTS-492: a prepared draw ends with the command memory it was made from.
 add_executable(shadgt_prepared_lifetime_test test_prepared_lifetime.cpp)

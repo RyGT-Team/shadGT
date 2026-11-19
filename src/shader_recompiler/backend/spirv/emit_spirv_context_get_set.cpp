@@ -157,9 +157,18 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
         return ctx.OpLoad(ctx.F32[1],
                           ctx.OpAccessChain(ctx.input_f32, ctx.gl_in, ctx.ConstU32(index),
                                             ctx.ConstU32(0U), ctx.ConstU32(comp)));
-    case IR::Attribute::FragCoord:
-        return ctx.OpLoad(ctx.F32[1],
-                          ctx.OpAccessChain(ctx.input_f32, ctx.frag_coord, ctx.ConstU32(comp)));
+    case IR::Attribute::FragCoord: {
+        const Id value = ctx.OpLoad(
+            ctx.F32[1], ctx.OpAccessChain(ctx.input_f32, ctx.frag_coord, ctx.ConstU32(comp)));
+        // NEO-GTS-512: once per pixel, the position SPI_BARYC_CNTL puts at the sample is sample
+        // 0's (the PS4 Pro's), not the centre.
+        if (comp < 2 && ctx.runtime_info.hw.fs.PixelRate() &&
+            ctx.runtime_info.hw.fs.FragCoordAtSample() && Sirit::ValidId(ctx.sample_table_offset)) {
+            return ctx.OpFAdd(ctx.F32[1], value,
+                              ctx.OpCompositeExtract(ctx.F32[1], ctx.sample_table_offset, comp));
+        }
+        return value;
+    }
     case IR::Attribute::TessellationEvaluationPointU:
         return ctx.OpLoad(ctx.F32[1],
                           ctx.OpAccessChain(ctx.input_f32, ctx.tess_coord, ctx.u32_zero_value));
@@ -189,9 +198,23 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
             return ctx.OpCompositeExtract(ctx.F32[1], ctx.OpLoad(ctx.F32[3], ctx.bary_coord), comp);
         }
         if (ctx.profile.supports_amd_shader_explicit_vertex_parameter) {
+            // (NEO-GT7-005: once per pixel, bary_coord_smooth_sample is the centre's.)
             return ctx.OpLoad(
                 ctx.F32[1],
                 ctx.OpAccessChain(ctx.input_f32, ctx.bary_coord_smooth_sample, ctx.ConstU32(comp)));
+        } else if (ctx.runtime_info.hw.fs.SampleTable() &&
+                   (!ctx.runtime_info.hw.fs.PixelRate() ||
+                    Sirit::ValidId(ctx.sample_table_offset))) {
+            // NEO-GTS-511: at the game's sample position (EmitPrologue's offset), not with
+            // InterpolateAtSample, which custom sample locations forbid (VUID 01524).
+            // NEO-GTS-512: once per pixel, at the game's sample 0, where the PS4 Pro shades.
+            return ctx.OpCompositeExtract(
+                ctx.F32[1],
+                ctx.OpInterpolateAtOffset(ctx.F32[3], ctx.bary_coord, ctx.sample_table_offset),
+                comp);
+        } else if (ctx.runtime_info.hw.fs.PixelRate()) {
+            // NEO-GT7-005: once per pixel, the sample's barycentrics are the centre's.
+            return ctx.OpCompositeExtract(ctx.F32[1], ctx.OpLoad(ctx.F32[3], ctx.bary_coord), comp);
         } else {
             return ctx.OpCompositeExtract(
                 ctx.F32[1],
@@ -264,6 +287,10 @@ Id EmitGetAttributeU32(EmitContext& ctx, IR::Attribute attr, u32 comp) {
     case IR::Attribute::LocalInvocationIndex:
         return ctx.OpLoad(ctx.U32[1], ctx.local_invocation_index);
     case IR::Attribute::SampleIndex:
+        // NEO-GT7-005: a shader that runs once per pixel is sample 0.
+        if (ctx.runtime_info.hw.fs.PixelRate()) {
+            return ctx.u32_zero_value;
+        }
         return ctx.OpLoad(ctx.U32[1], ctx.sample_index);
     case IR::Attribute::SampleMask: {
         const Id mask = ctx.OpLoad(

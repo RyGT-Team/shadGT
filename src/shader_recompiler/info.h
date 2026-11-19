@@ -261,6 +261,11 @@ struct Info : InfoPersistent {
             return;
         }
         if (srt_info.walker_func) {
+#ifdef SHADGT_DIAGNOSTICS
+            if (Common::t_guest_reads_forbidden) [[unlikely]] {
+                Common::NoteForbiddenGuestRead(user_data.data(), user_data.size_bytes());
+            }
+#endif
             const auto walker_lease = srt_walker_owner;
             srt_info.walker_func(user_data.data(), flattened_ud_buf.data(),
                                  flattened_ud_src.data());

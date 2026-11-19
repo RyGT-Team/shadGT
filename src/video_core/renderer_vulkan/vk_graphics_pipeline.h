@@ -153,6 +153,39 @@ public:
     const ShaderObjectState& GetShaderObjectState() const noexcept {
         return so_state;
     }
+    /// NEO-GTS-508: the pipeline's sample count when it takes the game's sample positions
+    /// (dynamic VK_EXT_sample_locations state), else 0.
+    u32 SampleLocationSamples() const noexcept {
+        return sample_location_samples;
+    }
+    /// NEO-GTS-511: the rasterization sample count.
+    u32 RasterSamples() const noexcept {
+        return pipeline_raster_samples;
+    }
+    /// NEO-GTS-511: why it has no custom positions: 0 it has (or shader objects), 1 the device
+    /// or a switch, 2 its pixel shader interpolates at a sample.
+    u32 SampleLocationExclusion() const noexcept {
+        return sample_location_exclusion;
+    }
+    /// NEO-GTS-511: its pixel shader reads the positions table from PushData::quad_sample_mask.
+    bool UsesSampleTable() const noexcept {
+        return uses_sample_table;
+    }
+    /// NEO-GTS-513: its pixel shader reads sample 0's positions from the buffer offsets
+    /// (PushData::Sample0OffsetsByte).
+    bool UsesSample0Offsets() const noexcept {
+        return uses_sample0_offsets;
+    }
+    /// NEO-GTS-511: its pixel shader runs once per pixel because the draw can't have the table.
+    bool PerPixelFallback() const noexcept {
+        return per_pixel_fallback;
+    }
+    /// NEO-GTS-512: its pixel shader runs once per pixel (NEO-GT7-005): 1 at the game's sample 0,
+    /// at the centre 2 as on the console (no per-sample input), 3 without a table, 4 with too
+    /// many buffers for NEO-GTS-513's word; 0 it does not.
+    u32 PixelRateShading() const noexcept {
+        return pixel_rate_shading;
+    }
     const std::array<vk::ShaderEXT, 4>& ShaderObjects() const noexcept {
         return shader_objects;
     }
@@ -228,6 +261,13 @@ private:
     /// Vertex, tessellation control, tessellation evaluation and fragment shader objects.
     std::array<vk::ShaderEXT, 4> shader_objects{};
     ShaderObjectState so_state;
+    u32 sample_location_samples{}; ///< NEO-GTS-508
+    u32 pipeline_raster_samples{1}; ///< NEO-GTS-511
+    u32 sample_location_exclusion{}; ///< NEO-GTS-511
+    bool uses_sample_table{}; ///< NEO-GTS-511
+    bool uses_sample0_offsets{}; ///< NEO-GTS-513
+    bool per_pixel_fallback{}; ///< NEO-GTS-511
+    u32 pixel_rate_shading{}; ///< NEO-GTS-512
 
     GraphicsPipelineKey key;
     u32 lds_emulation{};

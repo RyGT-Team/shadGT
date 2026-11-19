@@ -1,5 +1,27 @@
 # Notes for agents working on shadGT
 
+## Ticket IDs: SGT for both games, GTS or GT7 for one
+
+Every change carries a ticket ID of the form `<KIND>-<GAME>-<NNN>` in its commit subject and in
+the code comments next to it.
+
+| Part | Values |
+|---|---|
+| Kind | `FIX`, `PERF`, `DIAG`, `FEAT` (also `GAME`, `NEO` as already in use) |
+| Game | `SGT` when the change applies to both games (most renderer work), `GTS` for GT Sport only, `GT7` for GT7 only |
+| Number | three digits |
+
+- **SGT has its own count, started at 001 on 2026-11-17** (`FIX-SGT-001`, `FEAT-SGT-002`, ...).
+  GTS and GT7 keep the counts they had; numbers are never reused within one tag.
+- **Use SGT for anything shared**: pipeline cache, native recorder, regions and mirrors, switches,
+  capture tools. Use GTS or GT7 only when the code is gated to one game (a game patch, a hook, a
+  per-game default).
+- **Before taking a number**, check it is free: `git log --all` subjects, `git grep` of the tree and
+  the open and closed PRs' titles (`gh pr list --state all`). Another contributor may have used
+  the next number on a branch you have not fetched.
+- **Old tickets keep their IDs.** Do not rename `FIX-GTS-…` comments of changes that are already
+  pushed; new work on them takes a new SGT number and may name the old one.
+
 ## Switch names: SHADGT_, RYGT_ or SHARED_ (FEAT-GTS-415)
 
 From FEAT-GTS-415 on, an environment switch is named after where it takes effect:
@@ -69,4 +91,5 @@ runtime modules included, and takes a description from whichever file has it. Ad
 - Keep the switch name a plain string literal at the `getenv` call. The launcher finds names that way,
   so a name built at run time (concatenated or formatted) will not be found.
 
-The launcher side is `loader/AdvancedPage.cs` (`SwitchWalker`) and `loader/ADVANCED-PAGE.md` in RyGTS.
+The launcher side is `loader/AdvancedPage.cs` (`SwitchWalker`) and `loader/ADVANCED-PAGE.md` in RyGTS
+and in ryGT7.

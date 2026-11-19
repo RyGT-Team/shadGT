@@ -19,6 +19,8 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #ifdef RYTY_GPU
+#include "common/game_title.h"
+#include "ryty_gpu/ryty_upscale.h"
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
 #endif
 
@@ -71,7 +73,13 @@ static_assert(sizeof(Shader::HwFragmentRuntimeInfo) == 248 && sizeof(Shader::Run
 // still load, as translations of unknown usage (keyed on every resource property, as stored).
 // 17: worker translations own resolved descriptor inputs and compile-time keys.
 // FMask descriptors now store their complete fetch and size-use flag.
-static constexpr u32 ShaderMetaVersion = 18u;
+// 19 (FIX-GT7-182): samplers record whether they are read at an explicit level, in a byte that
+// was padding. Only the texture bias of GT7's temporal DLSS reads that flag, so version 18
+// entries are still read where that bias cannot run (GT Sport, and GT7 where temporal DLSS is
+// not asked for): those players keep their stored translations. Where it is asked for they are
+// translated again, once.
+static constexpr u32 ShaderMetaVersion = 19u;
+static constexpr u32 ShaderMetaVersionNoExplicitLod = 18u;
 static constexpr u32 ShaderMetaVersionWithoutResourceUsage = 15u;
 static constexpr u32 ShaderMetaVersionWithoutAttributeFlags = 14u;
 // 9: rect/quad-list helper shaders built from complete attribute info (FIX-012). Version 8
@@ -84,7 +92,39 @@ static constexpr u32 PipelineKeyVersionWithoutAttributeFlags = 8u;
 static constexpr u32 PipelineKeyVersionOldQuadHelpers = 9u;
 } // namespace Serialization
 
+namespace {
+// FIX-GT7-182: a version 18 entry is read into today's Info, so the flag must sit in what was
+// padding and move nothing.
+struct SamplerResourceV18 {
+    Shader::SharpFetch<AmdGpu::Sampler> sharp_fetch;
+    Shader::SharpFetchPostOp post_op;
+    Shader::SharpLocation post_op_tsharp_dw3_off;
+    bool is_depth;
+    bool is_cube;
+};
+static_assert(sizeof(Shader::SamplerResource) == sizeof(SamplerResourceV18) &&
+                  alignof(Shader::SamplerResource) == alignof(SamplerResourceV18),
+              "the explicit-level flag must not change the stored layout");
+} // namespace
+
 namespace Vulkan {
+
+// FIX-GT7-182: whether stored samplers must say if they are read at an explicit level. Only the
+// texture bias of GT7's temporal DLSS reads the flag (GT Sport's temporal reconstruction has no
+// such bias), so only there are version 18 entries, which lack it, translated again.
+static bool ExplicitLodNeeded() {
+#ifdef RYTY_GPU
+    static const bool needed = Common::IsGt7() && RytyUpscale::TemporalWanted();
+    return needed;
+#else
+    return false;
+#endif
+}
+
+static bool IsReadableShaderMetaVersion(u32 version) {
+    return version == Serialization::ShaderMetaVersion ||
+           (version == Serialization::ShaderMetaVersionNoExplicitLod && !ExplicitLodNeeded());
+}
 
 static std::atomic<bool> single_sample_barycentric_cache_enabled{false};
 // AMD-307: hw.fs.vertex_order_check was padding before. Where the check is off (every device
@@ -262,7 +302,7 @@ bool PeekShaderMeta(std::vector<u8>&& blob, u64& pgm_hash, size_t& perm_idx) {
     Serialization::Reader meta{ar};
     u32 meta_version{};
     meta.Read(meta_version);
-    if (meta_version != Serialization::ShaderMetaVersion) {
+    if (!IsReadableShaderMetaVersion(meta_version)) { // as LoadShaderMeta (FIX-GT7-182)
         return false;
     }
     u32 binary_version{};
@@ -458,7 +498,9 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 meta_version{};
     meta.Read(meta_version);
-    if (meta_version != Serialization::ShaderMetaVersion) {
+    const bool no_explicit_lod =
+        meta_version == Serialization::ShaderMetaVersionNoExplicitLod; // FIX-GT7-182
+    if (!IsReadableShaderMetaVersion(meta_version)) {
         return false;
     }
 
@@ -492,6 +534,13 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     if (!info.Deserialize(ar, perm_hash_ar,
                           meta_version != Serialization::ShaderMetaVersionWithoutAttributeFlags))
         return false;
+    if (no_explicit_lod) {
+        for (auto& sampler : info.samplers) {
+            // FIX-GT7-182: not recorded (the byte was padding): the game's own bias, whatever
+            // comes.
+            sampler.explicit_lod = true;
+        }
+    }
     if (!StoredCubesFit(spec, info, face_cubes,
                         native_cube_cache_enabled.load(std::memory_order_relaxed))) {
         if (other_cube_sampling) {
@@ -503,7 +552,8 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
         return false;
     }
     info.resource_usage_known = false;
-    if (meta_version >= Serialization::ShaderMetaVersion) {
+    // Versions 18 and 19 both hold the resource usage (19 only added the samplers' flag).
+    if (meta_version >= Serialization::ShaderMetaVersionNoExplicitLod) {
         ReadResourceUsage(meta, info);
     }
     return true;

@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "common/elf_info.h"
+#include "common/game_title.h"
 #include "common/logging/log.h"
 #include "common/native_clock.h"
 #include "core/emulator_settings.h"
@@ -53,17 +54,18 @@ void SetOverlayDraw(void (*draw)()) {
 namespace Core {
 
 // Constructed once at renderer startup. As ElfInfo's friend, it fills in what shadGT's loader
-// would have read from the game: GT Sport 1.69 (CUSA03220), SDK 5.05.
+// would have read from the game: GT Sport 1.69 (CUSA03220), SDK 5.05. GAME-005: the title id is
+// the running game's own (CUSA24769 under GT7), so its caches and settings carry GT7's name.
 Emulator::Emulator() : memory{}, controllers{}, linker{} {
     auto& game_info = Common::ElfInfo::Instance();
     game_info.initialized = true;
-    game_info.game_serial = "CUSA03220";
-    game_info.title = "Gran Turismo Sport";
+    game_info.game_serial = std::string{Common::CurrentGameSerial()};
+    game_info.title = Common::IsGt7() ? "Gran Turismo 7" : "Gran Turismo Sport";
     game_info.app_ver = "01.69";
     game_info.firmware_ver = 0x05050000;
     game_info.raw_firmware_ver = 0x05050000;
     game_info.sdk_ver = 0x05050001;
-    game_info.game_folder = std::filesystem::current_path() / "app0";
+    game_info.game_folder = Common::App0Folder(std::filesystem::current_path()); // app0\<serial> or app0
 
     const bool pro = Ryty::IsProMode(Ryty::GetProMode());
     game_info.psf_attributes.support_neo_mode.Assign(pro);

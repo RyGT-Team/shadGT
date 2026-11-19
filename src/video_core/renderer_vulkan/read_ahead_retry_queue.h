@@ -43,6 +43,13 @@ public:
         }
         return std::nullopt;
     }
+    /// FIX-SGT-007: drops the states 3 s old or more without retrying any.
+    void ExpireOld(Clock::time_point now) {
+        while (!states.empty() && now - states.front().first >= std::chrono::seconds{3}) {
+            bytes -= states.front().bytes;
+            states.pop_front();
+        }
+    }
     bool Retry(State state, Clock::time_point now) {
         state.next = now + std::chrono::milliseconds{5};
         return Keep(std::move(state));

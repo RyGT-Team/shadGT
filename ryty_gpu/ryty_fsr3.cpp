@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "common/logging/log.h"
+#include "common/game_title.h"
 #include "common/ryty_config.h"
 #include "core/emulator_settings.h"
 #include "ryty_gpu/ryty_dlss.h"
@@ -612,6 +613,11 @@ float UpscaleRatio() {
 
 bool TemporalRequested() {
     static const bool requested = [] {
+        // GT Sport only, like the rest of the in-frame reconstruction (GtsDlssPass): its capture
+        // knows GT Sport's passes, and GT7 (shadgt7) never had it.
+        if (Common::IsGt7()) {
+            return false;
+        }
         if (const char* env = std::getenv("SHADGT_FSR_TEMPORAL")) {
             return env[0] == '1';
         }

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/game_title.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
@@ -184,7 +185,7 @@ void Setup(std::string_view shadps4_filename) {
     // The launcher's level and everything above it (Info carries the frame-time windows). FIX-222:
     // Warning and Error wrote nothing at all (stdout.log stayed empty at the launcher's Warning);
     // they now keep the warnings and errors, or the errors.
-    const auto stdout_level = StdoutLevel::Read(root / "RyGT.ini");
+    const auto stdout_level = StdoutLevel::Read(Common::RygtIniPath(root)); // <serial>.RyGT.ini
     g_stdout_logger->set_level(static_cast<spdlog::level>(stdout_level));
     g_stdout_logger->flush_on(spdlog::level::err);
 #endif

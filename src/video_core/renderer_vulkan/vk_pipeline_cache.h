@@ -217,7 +217,13 @@ public:
         return scratch_.infos;
     }
 
-    const ComputePipeline* GetComputePipeline();
+    /// PERF-GTS-501: `select_ahead` (the command thread's selection) starts a new pipeline's build
+    /// and returns without waiting for it; TakeComputeDeferred then says the recorder must look
+    /// it up again at the dispatch.
+    const ComputePipeline* GetComputePipeline(bool select_ahead = false);
+    bool TakeComputeDeferred() {
+        return std::exchange(compute_deferred, false);
+    }
 
     /// NAT-030: the pipeline already built for the draw a game job thread is reading (its
     /// registers installed with Liverpool::SetThreadDrawState), or nullptr. Nothing is
@@ -320,6 +326,13 @@ private:
     /// FEAT-GTS-471: this GPU's stored pipelines as the manifest's recipe file (see the .cpp).
     void ExportPipelineRecipes(std::stop_token stop);
 public:
+    /// PERF-GTS-493: in a race, from its start countdown (GAME-006; without that hook, the whole
+    /// race session), no draw and no compute dispatch waits for its pipeline; it is skipped until
+    /// its build is done (draws that write memory, and some translations, still wait: see the .cpp).
+    /// Waits come back during an offline pause, after the finish and in GT Sport's replays.
+    static bool RaceNeverWaits();
+    /// PERF-GTS-494: the play state comes from the race's own state (GAME-006), in a race.
+    static bool RaceSignalPlay();
     /// FEAT-GTS-471: a stored pipeline key file and its shaders' names (program, record SPIR-V hash).
     struct PipelineRecipe {
         std::array<std::pair<u64, u64>, MaxShaderStages> names{};
@@ -327,6 +340,9 @@ public:
     };
 private:
     void ReportPrewarm(std::chrono::steady_clock::time_point now);
+    /// DIAG-GT7-012 (port, Debug builds): the builds skipped draws wait for, every 2 s.
+    void ReportSkippedBuilds(std::chrono::steady_clock::time_point now);
+    std::chrono::steady_clock::time_point skipped_builds_reported{};
     /// PERF-034: waits while a worker builds a pipeline, starting builds for the states the
     /// command thread queues meanwhile. Compilation is owned exclusively by the workers.
     void WaitForBuild(PipelineBuild& build, const DrawIndirectParams params);
@@ -441,6 +457,23 @@ private:
     } legacy_stats;
     void ReportLegacy();
     tsl::robin_map<ComputePipelineKey, std::shared_ptr<ComputePipeline>> compute_pipelines;
+    /// PERF-GTS-493: compute pipelines building on a worker while their dispatches are skipped.
+    struct PendingCompute {
+        std::future<std::unique_ptr<ComputePipeline>> done;
+        std::function<ComputePipeline::SerializationSupport()> sdata;
+        std::function<std::chrono::steady_clock::time_point()> built; ///< when the worker ended
+        std::chrono::steady_clock::time_point start;
+        u64 skipped = 0;
+    };
+    tsl::robin_map<ComputePipelineKey, PendingCompute> pending_computes;
+    bool compute_deferred{}; ///< PERF-GTS-501, see GetComputePipeline
+    /// PERF-GTS-493: the end-of-race report's state (under the lookup lock).
+    struct RaceReport {
+        bool in_race = false;
+        bool running = false;
+        std::chrono::steady_clock::time_point last{};
+    } race_report;
+    void ReportRaceMissing(std::chrono::steady_clock::time_point now);
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<GraphicsPipeline>> graphics_pipelines;
     std::unordered_map<const Pipeline*, std::chrono::steady_clock::time_point> pipeline_last_use;
     std::chrono::steady_clock::time_point retention_now{std::chrono::steady_clock::now()};
@@ -488,7 +521,8 @@ private:
     void CreateDriverCache();
     void SaveDriverCache(bool wait);
     void MaybeSaveDriverCache();
-    /// PERF-GT7-108: the compile pack's start-up compile (SHADGT_COMPILE_PACK=1), on its own thread.
+    /// PERF-GT7-108: the compile pack's start-up compile (SHADGT_COMPILE_PACK=1, with shader
+    /// objects only, off by default since FIX-GTS-366 / FIX-GT7-147), on its own thread.
     void CompilePackShaders(std::stop_token stop);
     std::jthread compile_pack_thread;
     /// PERF-GT7-111: SHADGT_MANIFEST_VERIFY=1 translates every manifest record again at start and
@@ -584,6 +618,9 @@ private:
         std::chrono::steady_clock::time_point play_window{};
         u64 play_frames{}, play_us{}, play_draws{};
         bool in_play{};
+        std::chrono::steady_clock::time_point stall_since{}; ///< FIX-GTS-519
+        bool backlog{}; ///< FIX-GT7-106 (port)
+        std::chrono::steady_clock::time_point backlog_checked{};
     } catch_up;
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<PipelineBuild>> pending_builds;
     std::chrono::steady_clock::time_point stale_ahead_checked{};
@@ -612,6 +649,11 @@ private:
         u64 order{};
     };
     tsl::robin_map<GraphicsPipelineKey, PrewarmUnclaimed> prewarm_unclaimed;
+    /// FIX-GTS-498: keys of graphics pipelines this session built and then released (the
+    /// precompile's, or the retention trim's). A draw that needs one again waits for its rebuild,
+    /// a driver-cache hit, instead of being skipped like a pipeline never built.
+    tsl::robin_map<GraphicsPipelineKey, u8> released_graphics;
+    void NoteReleased(const GraphicsPipelineKey& key);
     u64 prewarm_adopted{};
     u64 prewarm_installed{}; ///< FEAT-GTS-470: precompile builds queued, in install order
     bool PrecompileLibrariesOnly() const;
@@ -635,6 +677,14 @@ private:
     static bool WritesMemory(const std::array<const Shader::Info*, MaxShaderStages>& infos);
     bool PreservesDepthOutput() const;
     bool NeverSkipped(const std::array<const Shader::Info*, MaxShaderStages>& infos);
+    /// DIAG-GTS-515: which of NeverSkipped's rules holds (0: none; 1 one-off, 2 rebuild, 3 GT7
+    /// one-shot, 4 depth only, 5 learned one-off, 6 tessellation).
+    u32 NeverSkippedReason(const std::array<const Shader::Info*, MaxShaderStages>& infos);
+    /// DIAG-GTS-515: why a draw waits for its pipeline instead of being skipped (MenuWaits).
+    u32 WaitReason();
+    /// FIX-GTS-517: a one-off draw's bounded wait hands its build back (skipped_build).
+    static bool OneOffBounded();
+    struct MenuWaitTally; ///< DIAG-GTS-515
     struct AsyncStats {
         u64 deferred{};
         u64 installed{};
@@ -666,7 +716,7 @@ private:
     bool force_wait{};       ///< shadgt7 FIX-198 (lookup lock held)
     bool wait_for_shaders{}; ///< shadgt7 PERF-GT7-020 (lookup lock held)
     bool shaders_unlocked{}; ///< shadgt7 PERF-GT7-036 (lookup lock held)
-    std::shared_ptr<PipelineBuild> skipped_build; ///< shadgt7 PERF-GT7-020: never set here
+    std::shared_ptr<PipelineBuild> skipped_build; ///< shadgt7 PERF-GT7-020 (FIX-GTS-517)
 
     /// FIX-078: a shader the read-ahead found with no matching translation is translated on a
     /// worker thread; the draw that needs it takes the result (or waits for it) instead of
@@ -695,6 +745,8 @@ private:
         std::chrono::steady_clock::time_point ready_since{};
         std::chrono::steady_clock::time_point retry_after{};
         std::chrono::steady_clock::time_point queued_at{};
+        u32 diag_id{};     ///< DIAG-GT7-073 (port)
+        bool diag_ahead{}; ///< DIAG-GT7-073 (port): queued by a read-ahead state
         bool required{}; // protected by the translation queue mutex until claimed
         bool retry_direct_only{}; // fixed before the job is published to workers
         bool cancelled{}; // published before done
@@ -723,6 +775,13 @@ private:
                               Program& program, const Shader::ShaderParams& params,
                               const Shader::RuntimeInfo& runtime_info,
                               const Shader::Backend::Bindings& binding, bool insert);
+#ifndef NDEBUG
+    /// DIAG-GT7-013 (port, Debug builds): why a worker's translation becomes a new permutation.
+    void LogNewPermutation(const Program& program, Shader::HwStage hw_stage,
+                           const Shader::ShaderParams& params,
+                           const Shader::RuntimeInfo& runtime_info,
+                           const Shader::Backend::Bindings& binding);
+#endif
     /// FIX-078 (lookup lock held): queues a translation; false when one with the same inputs is
     /// already queued.
     /// FEAT-GTS-470: records a stored translation on a draw's first use (record mode).
@@ -749,6 +808,10 @@ private:
         u64 waited{};
         double wait_ms{};
         double translate_ms{};
+        // DIAG-GT7-123 (port): the waits by stage (Shader::SwStage), and by why they waited.
+        u64 waited_stage[8]{};
+        double wait_ms_stage[8]{};
+        u64 waited_writer{}, waited_forced{}, waited_shaders{}, waited_dropped{};
         std::chrono::steady_clock::time_point since{};
     } translate_stats;
     std::unique_ptr<TranslateWorkers> translate_workers;

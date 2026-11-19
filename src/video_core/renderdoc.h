@@ -11,8 +11,10 @@
 namespace VideoCore {
 
 #ifndef NDEBUG
-/// One debug frame dump may be pending or in progress at a time.
-bool RequestDebugFrameDump();
+/// One debug frame dump may be pending or in progress at a time. FEAT-SGT-002: `frames` consecutive
+/// frames are collected (F8: 1; Shift+F8's burst: as many as its screenshots).
+bool RequestDebugFrameDump(u32 frames = 1);
+u32 DebugFrameDumpFrames();
 bool BeginDebugFrameDump();
 void FinishDebugFrameDump();
 

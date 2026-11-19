@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <stdexcept>
+#include "common/diagnostics.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/polyfill_thread.h"
@@ -47,9 +48,21 @@ namespace {
 // incompatible store is preserved while a compatible numbered sibling is opened instead.
 
 // Tests: a store of its own for this tag. A test keeps one store per renderer and switches.
+// NEO-GT7-007: SHADGT_NEO_SDWA_CMP=0 translates SDWA compares the old way (to VCC), which breaks the
+// PS4 Pro checkerboard resolve; those translations get a store of their own, so a session run once
+// with the switch leaves nothing wrong in the usual store. Only with the Pro mode's switch
+// (SHADGT_NEO=1; ryGT7's libkernel reads the same switch as RYGT_NEO, which SWITCH-001 hands
+// on under this name): the base mode has no SDWA, so its store stays.
 std::string StoreTag() {
     const char* env = std::getenv("SHADGT_SHADER_STORE_TAG");
-    return env && *env ? std::string{"-"} + env : std::string{};
+    std::string tag = env && *env ? std::string{"-"} + env : std::string{};
+    // NEO-GTS-505: whatever turned the Pro mode on (GT Sport's SHADGT_PS4_PRO or config too):
+    // the base mode has no SDWA, so the tag costs it nothing.
+    const char* sdwa = std::getenv("SHADGT_NEO_SDWA_CMP");
+    if (sdwa && sdwa[0] == '0') {
+        tag += "-sdwa-vcc";
+    }
+    return tag;
 }
 
 } // namespace
@@ -158,6 +171,12 @@ void DataBase::Open() {
                     if (const char* env = std::getenv(name); env && *env) {
                         parts += fmt::format(", {}={}", name, env[0]);
                     }
+                }
+                // DIAG-230 (port): without SHADGT_MANUAL_INTERP, the diagnosis switch changes
+                // NVIDIA's translations (vk_pipeline_cache.cpp); they are kept apart.
+                if (const char* manual = std::getenv("SHADGT_MANUAL_INTERP");
+                    !(manual && *manual) && Common::DiagEnv("SHADGT_DIAG_NO_MANUAL_INTERP")) {
+                    parts += ", no manual interp";
                 }
                 // FIX-GTS-441: translations with the invariant position (the default) are kept
                 // apart from those made without it.

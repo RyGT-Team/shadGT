@@ -207,6 +207,26 @@ bool ComputePipeline::SaveRecipe(const std::filesystem::path& file,
     }
     words.push_back(u32(spirv.size()));
     words.insert(words.end(), spirv.begin(), spirv.end());
+    {
+        // FIX-GT7-150: a recipe that already says this is left as it is (false: nothing kept).
+        // One that says something else is removed first: the write below never replaces a file
+        // (PERF-260). If the warm-up is reading it the removal fails on Windows: the old recipe
+        // stays, and the next slow build writes it.
+        std::error_code size_ec;
+        const auto size = std::filesystem::file_size(file, size_ec);
+        if (!size_ec) {
+            if (size == words.size() * sizeof(u32)) {
+                std::vector<u32> have(words.size());
+                std::ifstream in{file, std::ios::binary};
+                in.read(reinterpret_cast<char*>(have.data()), std::streamsize(size));
+                if (in && have == words) {
+                    return false;
+                }
+            }
+            std::error_code remove_ec;
+            std::filesystem::remove(file, remove_ec);
+        }
+    }
     return WriteComputeWarmRecipeExclusive(file, words);
 }
 

@@ -24,10 +24,12 @@
 namespace Shader::Backend::SPIRV {
 
 bool DirectLoadGroupsEnabled() {
-    // SHADGT_DIRECT_LOAD_GROUPS=0 gives every read its own branch again (a separate store).
+    // PERF-GTS-487: off by default. Grouped reads compile faster but run slower: a GT7 race took
+    // ~19 ms of GPU work a frame with them, ~12 ms without (RTX 4070). SHADGT_DIRECT_LOAD_GROUPS=1
+    // turns them on (a separate store).
     static const bool enabled = [] {
         const char* env = std::getenv("SHADGT_DIRECT_LOAD_GROUPS");
-        return !(env && env[0] == '0');
+        return env && env[0] == '1';
     }();
     return enabled;
 }
@@ -478,12 +480,14 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
             ctx.AddCapability(spv::Capability::FragmentBarycentricKHR);
             ctx.AddCapability(spv::Capability::InterpolationFunction);
         }
-        if (info.loads.Get(IR::Attribute::SampleIndex) ||
-            runtime_info.hw.fs.addr_flags.linear_sample_ena ||
-            runtime_info.hw.fs.addr_flags.persp_sample_ena ||
-            (!profile.supports_amd_shader_explicit_vertex_parameter &&
-             profile.supports_fragment_shader_barycentric &&
-             info.loads.Get(IR::Attribute::BaryCoordSmoothSample))) {
+        // NEO-GT7-005: a shader that runs once per pixel declares no per-sample input at all.
+        if (!runtime_info.hw.fs.PixelRate() &&
+            (info.loads.Get(IR::Attribute::SampleIndex) ||
+             runtime_info.hw.fs.addr_flags.linear_sample_ena ||
+             runtime_info.hw.fs.addr_flags.persp_sample_ena ||
+             (!profile.supports_amd_shader_explicit_vertex_parameter &&
+              profile.supports_fragment_shader_barycentric &&
+              info.loads.Get(IR::Attribute::BaryCoordSmoothSample)))) {
             ctx.AddCapability(spv::Capability::SampleRateShading);
         }
         if (info.loads.GetAny(IR::Attribute::RenderTargetIndex)) {

@@ -10,12 +10,14 @@
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
+#include "common/game_title.h"
 #include "common/path_util.h"
 #include "common/ryty_config.h"
 #include "common/debug.h"
 #include "common/perf_monitor.h"
 #include "common/types.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/kernel/process.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -31,6 +33,9 @@
 #endif
 
 #include <vk_mem_alloc.h>
+#ifdef _WIN32
+#include <windows.h> // FIX-SGT-016: GetModuleHandleW
+#endif
 
 namespace Vulkan {
 
@@ -110,9 +115,8 @@ std::string GetReadableVersion(u32 version) {
 
 // AMD-300 (SHADGT_SIMULATE_GPU=gcn|rdna1|rdna2): the device reports only what an older Radeon's
 // Windows driver offers (gpuinfo.org: RX 580/RX Vega 2.0.283, RX 5700 XT/RX 6800 2.0.353), so a
-// newer card exercises the paths those cards take. It cannot change the hardware's wave size.
-// Nor the vendor ID: on a non-AMD card rdna1|rdna2 keep shader objects on, while a real Radeon
-// draws pipelines by default (FIX-GT7-136); add SHADGT_SHADER_OBJECT=0 to mimic one.
+// newer card exercises the paths those cards take. It cannot change the hardware's wave size
+// nor the vendor ID.
 enum class SimulatedGpu { None, Gcn, Rdna1, Rdna2 };
 
 SimulatedGpu GetSimulatedGpu() {
@@ -383,7 +387,8 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 48> enabled_extensions;
+    // NEO-GTS-508: room for every extension asked for below (over 48 call sites).
+    boost::container::static_vector<const char*, 64> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -540,7 +545,10 @@ bool Instance::CreateDevice() {
     // RTX GPU lost the device while a Nurburgring race loaded (a shader that never finished) and
     // the renderer's video memory grew to 12 to 20 GB of a 6.7 GB budget at the start, with
     // frames of 300 ms to 3.5 s; with pipelines the same start had no long frames and stayed near
-    // 4 GB. SHADGT_SHADER_OBJECT=1 turns them on, on any GPU; =0 and any other value leave them off.
+    // 4 GB. In GT7 (FIX-GT7-147), on an RTX 4070, the small icons of the car interiors (garage)
+    // lost pieces with shader objects and were whole with pipelines, on three renderers
+    // (f26615ed, a283e27e, 422deef9). SHADGT_SHADER_OBJECT=1 turns them on, on any GPU; =0 and
+    // any other value leave them off.
     // SO-012: a start that wants shader objects after a lost device with shader objects on uses
     // pipelines once (the marker is removed, so the next start that wants them tries them again).
     // A start that doesn't want them leaves the marker for that next one.
@@ -693,6 +701,159 @@ bool Instance::CreateDevice() {
     }
     nv_framebuffer_mixed_samples = add_extension(VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME);
     amd_mixed_attachment_samples = add_extension(VK_AMD_MIXED_ATTACHMENT_SAMPLES_EXTENSION_NAME);
+    // NEO-GT7-016: the PS4 Pro mode's checkerboard draws rasterize two samples into one colour
+    // fragment. With VK_AMD_mixed_attachment_samples on the same GCN hardware (TRUNCATE by
+    // default) the fragment's colour follows sample 0 only. NVIDIA's mixed samples default to
+    // MERGE: the colour is written when either sample is covered, so a pixel an edge splits gets
+    // both triangles, and blended glass was blended twice along every shared edge (a light
+    // wireframe on the car windows). VK_NV_coverage_reduction_mode lets those pipelines ask for
+    // TRUNCATE (vk_graphics_pipeline.cpp). NVIDIA lists only mixed combinations; the other
+    // pipelines keep the implicit MERGE (not checked by the validation layers without the
+    // structure). Only in the PS4 Pro mode: sceKernelIsNeoMode is answered (and kept) before the
+    // device is made, and the base mode has no mixed-sample draws.
+    // SHADGT_NEO_COVERAGE_TRUNCATE=0: MERGE, as before.
+    // NEO-GTS-505: in both games' Pro mode.
+    if (nv_framebuffer_mixed_samples && !amd_mixed_attachment_samples &&
+        Libraries::Kernel::sceKernelIsNeoMode() != 0) {
+        const char* env = std::getenv("SHADGT_NEO_COVERAGE_TRUNCATE");
+        const bool wanted = !(env && env[0] == '0');
+        const bool available = std::ranges::any_of(available_extensions, [](const auto& name) {
+            return name == VK_NV_COVERAGE_REDUCTION_MODE_EXTENSION_NAME;
+        });
+        if (wanted && available) {
+            const auto chain =
+                physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
+                                             vk::PhysicalDeviceCoverageReductionModeFeaturesNV>();
+            nv_coverage_reduction =
+                chain.get<vk::PhysicalDeviceCoverageReductionModeFeaturesNV>()
+                    .coverageReductionMode &&
+                add_extension(VK_NV_COVERAGE_REDUCTION_MODE_EXTENSION_NAME);
+        }
+        LOG_WARNING(Render_Vulkan, "NEO-GT7-016: colour coverage of mixed-sample draws: {}",
+                    !wanted                 ? "MERGE (SHADGT_NEO_COVERAGE_TRUNCATE=0)"
+                    : nv_coverage_reduction ? "TRUNCATE where the driver lists it"
+                                            : "MERGE (no VK_NV_coverage_reduction_mode)");
+    }
+    // NEO-GTS-508: in the PS4 Pro mode both games set their own sample positions for multi-sample
+    // draws (PA_SC_AA_SAMPLE_LOCS_PIXEL_*: the checkerboard, a 4-sample pass). With
+    // VK_EXT_sample_locations multi-sample pipelines take them (vk_graphics_pipeline.cpp, set per
+    // draw by DynamicState). Only when the device takes every position the game can ask for
+    // (1/16 pixel, 0..0.9375), lets them change from draw to draw, has the standard positions
+    // (what draws it cannot express keep), and takes the depth images' flag. The extension is
+    // enabled only then. Off with shader objects: their draws would keep the standard positions
+    // while pipelines draw into the same depth target with the game's, and depth tested at other
+    // positions than it was written with is undefined.
+    // SHADGT_SAMPLE_LOCATIONS=0: Vulkan's standard positions, as before.
+    {
+        std::string off;
+        if (Libraries::Kernel::sceKernelIsNeoMode() == 0) {
+            off = "not the PS4 Pro mode";
+        } else if (const char* env = std::getenv("SHADGT_SAMPLE_LOCATIONS"); env && env[0] == '0') {
+            off = "SHADGT_SAMPLE_LOCATIONS=0";
+        } else if (shader_object) {
+            off = "shader objects are on";
+        } else if (std::ranges::none_of(available_extensions, [](const auto& name) {
+                       return name == VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME;
+                   })) {
+            off = "no VK_EXT_sample_locations";
+        } else {
+            const auto chain =
+                physical_device.getProperties2<vk::PhysicalDeviceProperties2,
+                                               vk::PhysicalDeviceSampleLocationsPropertiesEXT>();
+            const auto& p = chain.get<vk::PhysicalDeviceSampleLocationsPropertiesEXT>();
+            if (!p.variableSampleLocations) {
+                off = "positions cannot change between draws (variableSampleLocations)";
+            } else if (p.sampleLocationSubPixelBits < 4) {
+                off = fmt::format("{} sub-pixel bits", p.sampleLocationSubPixelBits);
+            } else if (p.sampleLocationCoordinateRange[0] > 0.0f ||
+                       p.sampleLocationCoordinateRange[1] < 0.9375f) {
+                off = fmt::format("range {}..{}", p.sampleLocationCoordinateRange[0],
+                                  p.sampleLocationCoordinateRange[1]);
+            } else if (!properties.limits.standardSampleLocations) {
+                off = "no standard sample locations";
+            } else if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceMultisamplePropertiesEXT) {
+                off = "no vkGetPhysicalDeviceMultisamplePropertiesEXT";
+            }
+            // The depth formats the renderer makes, with the usage and flags it makes them with
+            // (UsageOf, ImageUsageFlags; formats the device lacks are left out). Each must take
+            // the flag with its multi-sample counts, else no pipeline gets custom positions: a
+            // depth attachment without the flag would break VUID-vkCmdDraw-sampleLocationsEnable-02689.
+            vk::ImageUsageFlags depth_usage =
+                vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
+                vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eDepthStencilAttachment;
+            if (attachment_feedback_loop) {
+                depth_usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
+            }
+            constexpr vk::ImageCreateFlags depth_flags =
+                vk::ImageCreateFlagBits::eMutableFormat | vk::ImageCreateFlagBits::eExtendedUsage;
+            for (const vk::Format format : {vk::Format::eD16Unorm, vk::Format::eD32Sfloat,
+                                            vk::Format::eD24UnormS8Uint,
+                                            vk::Format::eD32SfloatS8Uint}) {
+                if (!off.empty()) {
+                    break;
+                }
+                vk::PhysicalDeviceImageFormatInfo2 info{
+                    .format = format,
+                    .type = vk::ImageType::e2D,
+                    .tiling = vk::ImageTiling::eOptimal,
+                    .usage = depth_usage,
+                    .flags = depth_flags,
+                };
+                const auto plain = physical_device.getImageFormatProperties2(info);
+                if (plain.result != vk::Result::eSuccess) {
+                    continue;
+                }
+                info.flags |= vk::ImageCreateFlagBits::eSampleLocationsCompatibleDepthEXT;
+                const auto flagged = physical_device.getImageFormatProperties2(info);
+                const auto counts = plain.value.imageFormatProperties.sampleCounts;
+                if (flagged.result != vk::Result::eSuccess ||
+                    (flagged.value.imageFormatProperties.sampleCounts & counts) != counts) {
+                    off = fmt::format("{} images refuse the sample-locations flag",
+                                      vk::to_string(format));
+                }
+            }
+            if (off.empty()) {
+                sample_locations = add_extension(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME);
+                if (!sample_locations) {
+                    off = "the extension could not be enabled";
+                }
+            }
+            if (sample_locations) {
+                // NEO-GTS-511: SHADGT_SAMPLE_LOCATIONS_2X=0 keeps every 2-sample draw at the
+                // standard positions (the checkerboard and its depth passes), as 9d6b3efa did.
+                const char* two = std::getenv("SHADGT_SAMPLE_LOCATIONS_2X");
+                two_sample_locations = !(two && two[0] == '0');
+                depth_flag_usage = depth_usage;
+                sample_locations_properties = p;
+                sample_locations_properties.pNext = nullptr;
+                for (u32 i = 1; i < sample_location_grids.size(); ++i) {
+                    const auto count = static_cast<vk::SampleCountFlagBits>(1u << i);
+                    if (p.sampleLocationSampleCounts & count) {
+                        sample_location_grids[i] =
+                            physical_device.getMultisamplePropertiesEXT(count)
+                                .maxSampleLocationGridSize;
+                    }
+                }
+            }
+        }
+        std::string grids;
+        for (u32 i = 1; i < sample_location_grids.size(); ++i) {
+            if (sample_location_grids[i].width != 0) {
+                grids += fmt::format(" {}x: grid {}x{};", 1u << i, sample_location_grids[i].width,
+                                     sample_location_grids[i].height);
+            }
+        }
+        LOG_WARNING(Render_Vulkan, "NEO-GTS-508: the game's sample positions: {}",
+                    sample_locations
+                        ? fmt::format("on,{} 2-sample draws {} (on a 1x1 grid, 2-sample draws "
+                                      "and draws whose quad pixels differ keep the standard "
+                                      "positions)",
+                                      grids,
+                                      !two_sample_locations ? "standard (SHADGT_SAMPLE_LOCATIONS_2X=0)"
+                                      : HasSampleLocationQuadGrid(2) ? "at the game's positions"
+                                                                     : "standard (1x1 grid)")
+                                     : fmt::format("off ({})", off));
+    }
     shader_atomic_float = add_extension(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
     shader_atomic_float2 = add_extension(VK_EXT_SHADER_ATOMIC_FLOAT_2_EXTENSION_NAME);
     if (shader_atomic_float2) {
@@ -762,8 +923,12 @@ bool Instance::CreateDevice() {
     LOG_INFO(Render_Vulkan, "AMD-VRAM-002: memory overallocation allowed: {}", amd_overallocation);
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     // DIAG-243: SHADGT_DEVICE_FAULT=1 enables VK_EXT_device_fault, so a lost device reports the
-    // faulting address and the driver's description.
-    if (const char* env = std::getenv("SHADGT_DEVICE_FAULT"); env && env[0] == '1') {
+    // faulting address and the driver's description, and the renderer notes its last draws.
+    {
+        const char* env = std::getenv("SHADGT_DEVICE_FAULT");
+        note_fault_draws = env && env[0] == '1';
+    }
+    if (note_fault_draws) {
         const auto fault_chain =
             physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
                                          vk::PhysicalDeviceFaultFeaturesEXT>();
@@ -811,7 +976,9 @@ bool Instance::CreateDevice() {
                                      ? "RDNA1 (RX 5000)"
                                  : has("Vega")                              ? "GCN 5 (Vega)"
                                  : has("Radeon RX 4") || has("Radeon RX 5") ? "GCN 4 (RX 400/500)"
-                                                                            : "other Radeon";
+                                 // "Radeon (TM) RX 480 Graphics" has "(TM)" in the middle.
+                                 : IsAmdGcn() ? "GCN"
+                                              : "other Radeon";
         const bool legacy = IsAmdLegacyShaderCompiler();
         LOG_INFO(Render_Vulkan,
                  "AMD-316: {} on driver {} ({}), shader compiler {}; quad control {}, vertex "
@@ -1174,6 +1341,15 @@ bool Instance::CreateDevice() {
         maintenance11_features.pNext = const_cast<void*>(create_info.pNext);
         create_info.pNext = &maintenance11_features;
     }
+    // NEO-GT7-016: the coverage reduction feature joins the chain when its extension is on.
+    vk::PhysicalDeviceCoverageReductionModeFeaturesNV coverage_reduction_features{
+        .coverageReductionMode = true,
+    };
+    if (nv_coverage_reduction) {
+        auto& create_info = device_chain.get<vk::DeviceCreateInfo>();
+        coverage_reduction_features.pNext = const_cast<void*>(create_info.pNext);
+        create_info.pNext = &coverage_reduction_features;
+    }
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
         // ryGT: on some NVIDIA driver and setup combinations the driver rejects the device once
@@ -1211,6 +1387,33 @@ bool Instance::CreateDevice() {
     }
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
+
+    // NEO-GT7-016: the sample counts the driver takes TRUNCATE for. A pipeline whose counts are
+    // not listed keeps MERGE (vk_graphics_pipeline.cpp logs it).
+    if (nv_coverage_reduction &&
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceSupportedFramebufferMixedSamplesCombinationsNV) {
+        const auto [combinations_result, combinations] =
+            physical_device.getSupportedFramebufferMixedSamplesCombinationsNV();
+        if (combinations_result == vk::Result::eSuccess) {
+            for (const auto& combination : combinations) {
+                if (combination.coverageReductionMode == vk::CoverageReductionModeNV::eTruncate) {
+                    truncate_combinations.push_back({
+                        .raster = static_cast<u32>(combination.rasterizationSamples),
+                        .depth = static_cast<u32>(combination.depthStencilSamples),
+                        .color = static_cast<u32>(combination.colorSamples),
+                    });
+                }
+            }
+        }
+        std::string listed;
+        for (const auto& combination : truncate_combinations) {
+            listed += fmt::format(" {}/{}/{}", combination.raster, combination.depth,
+                                  combination.color);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "NEO-GT7-016: {} TRUNCATE combinations (raster/depth/colour sample masks):{}",
+                 truncate_combinations.size(), listed);
+    }
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
@@ -1447,6 +1650,16 @@ void Instance::CollectToolingInfo() const {
         // Intel: Causes crash on start.
         return;
     }
+    // FIX-SGT-016: Nsight Systems' Vulkan layer (ToolsInjection64.dll) wraps
+    // vkGetPhysicalDeviceToolProperties without a next layer to call: the call jumped to address 0
+    // inside the layer and nsys profile --trace=vulkan crashed GT7 before the title screen. The
+    // list only goes to the log, so it is skipped while that layer is loaded.
+#ifdef _WIN32
+    if (GetModuleHandleW(L"ToolsInjection64.dll") != nullptr) {
+        LOG_INFO(Render_Vulkan, "Attached debugging tool: Nsight Systems (tool list not queried)");
+        return;
+    }
+#endif
     const auto [tools_result, tools] = physical_device.getToolProperties();
     if (tools_result != vk::Result::eSuccess) {
         LOG_ERROR(Render_Vulkan, "Could not get Vulkan tool properties: {}",
@@ -1480,6 +1693,59 @@ vk::FormatFeatureFlags2 Instance::GetFormatFeatureFlags(vk::Format format) const
     }
 
     return it->second.optimalTilingFeatures | it->second.bufferFeatures;
+}
+
+vk::ImageCreateFlags Instance::SampleLocationsDepthFlag(vk::Format format, vk::ImageType type,
+                                                        vk::ImageUsageFlags usage,
+                                                        vk::ImageCreateFlags flags) const {
+    // NEO-GTS-508: a depth attachment of a pipeline with custom sample locations must have it
+    // (VUID-vkCmdDraw-sampleLocationsEnable-02689). Depth formats only.
+    if (!sample_locations) {
+        return {};
+    }
+    switch (format) {
+    case vk::Format::eD16Unorm:
+    case vk::Format::eX8D24UnormPack32:
+    case vk::Format::eD32Sfloat:
+    case vk::Format::eD16UnormS8Uint:
+    case vk::Format::eD24UnormS8Uint:
+    case vk::Format::eD32SfloatS8Uint:
+        break;
+    default:
+        return {};
+    }
+    constexpr auto flag = vk::ImageCreateFlagBits::eSampleLocationsCompatibleDepthEXT;
+    // The device's answer for each format, type, usage and flags, asked once.
+    const u64 key = (u64(format) << 40) ^ (u64(type) << 36) ^
+                    (u64(VkImageUsageFlags(usage)) << 16) ^ u64(VkImageCreateFlags(flags));
+    {
+        std::scoped_lock lock{depth_flag_mutex};
+        if (const auto it = depth_flag_answers.find(key); it != depth_flag_answers.end()) {
+            return it->second ? vk::ImageCreateFlags{flag} : vk::ImageCreateFlags{};
+        }
+    }
+    const auto result = physical_device
+                            .getImageFormatProperties2(vk::PhysicalDeviceImageFormatInfo2{
+                                .format = format,
+                                .type = type,
+                                .tiling = vk::ImageTiling::eOptimal,
+                                .usage = usage,
+                                .flags = flags | flag,
+                            })
+                            .result;
+    const bool takes = result == vk::Result::eSuccess;
+    if (!takes) {
+        // Not expected: CreateDevice checked these formats with the usage and flags the
+        // renderer makes depth images with (depth_flag_usage).
+        LOG_ERROR(Render_Vulkan,
+                  "NEO-GTS-508: {} depth images made without the sample-locations flag (usage {}, "
+                  "checked {}; flags {}): {}",
+                  vk::to_string(format), vk::to_string(usage), vk::to_string(depth_flag_usage),
+                  vk::to_string(flags), vk::to_string(result));
+    }
+    std::scoped_lock lock{depth_flag_mutex};
+    depth_flag_answers.emplace(key, takes);
+    return takes ? vk::ImageCreateFlags{flag} : vk::ImageCreateFlags{};
 }
 
 bool Instance::IsFormatSupported(const vk::Format format,

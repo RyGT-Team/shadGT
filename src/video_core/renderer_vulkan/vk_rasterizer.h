@@ -431,7 +431,11 @@ private:
     void UpdateViewportScissorState() const;
     void UpdateDepthStencilState() const;
     void UpdatePrimitiveState(bool is_indexed, bool quad_triangles) const;
-    void UpdateRasterizationState() const;
+    void UpdateRasterizationState(const GraphicsPipeline* pipeline) const;
+    /// NEO-GTS-508: the draw's sample positions for this pipeline (none without the state).
+    /// NEO-GTS-511: `why` says why it gave the standard positions.
+    SampleLocations::Pattern SampleLocationPattern(const GraphicsPipeline* pipeline,
+                                                   SampleLocations::Why* why = nullptr) const;
     void UpdateColorBlendingState(const GraphicsPipeline* pipeline) const;
 
     bool FilterDraw();

@@ -71,6 +71,12 @@ public:
     /// view holds it (call EnsureImported first).
     std::optional<std::pair<const Buffer*, u64>> FindBuffer(VAddr address, u64 size) const;
 
+    /// FIX-SGT-014: one imported buffer over the whole range when no view holds it, for reads
+    /// that must stay in guest memory (they overlap a listed in-place range). A separate alias
+    /// (span view) is made and kept until an unmap meets it; it has no page-table entries. Up
+    /// to 256 MiB each, 32 in all.
+    std::optional<std::pair<const Buffer*, u64>> FindOrImportSpan(VAddr address, u64 size);
+
     /// NAT-107: the imported views holding [address, address + size) in order:
     /// fn(view buffer, offset in it, offset in the range, bytes). False (after calling fn for
     /// the parts before it) when part of the range is not imported.
@@ -158,6 +164,7 @@ private:
     mutable std::mutex mutex;
     ImportedPageCoverage<> imported_coverage;
     std::map<VAddr, View> views; // by begin
+    std::map<VAddr, View> span_views; // FIX-SGT-014: by begin; may overlap `views` and each other
     bool hold_native_releases{};
     std::vector<std::shared_ptr<void>> held_native_releases;
     std::map<VAddr, VAddr> failed; // failed view base -> committed end; invalidated on unmap

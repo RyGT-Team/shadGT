@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <stop_token>
+#include "ryty_gpu/native/buffer_sizes.h"
 #include "ryty_gpu/native/descriptor_dead_handles.h"
 #include <thread>
 #include <condition_variable>
@@ -261,7 +262,204 @@ std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr addr
     return std::make_pair(static_cast<const Buffer*>(view.wrapper.get()), address - view.begin);
 }
 
+// FIX-SGT-014 (SHADGT_LISTED_SPAN_VIEWS=0: as before): a read reaching over a listed in-place
+// range stays in guest memory as one binding even when no view holds it. In GT7's rain a buffer of
+// 77-85 MB from 0x101d8d9490 runs through the GPU culling block (0x1020000000-0x1020412000); no
+// view held it (GT7 maps that memory 2 MB at a time), so FIX-SGT-004 let it fall back to a
+// region, which copied the culling block. Its reader saw that copy while the culling passes wrote
+// the block in place, and the road went dark for single frames (DIAG-SGT-013). The alias here
+// spans the whole read (GuestArenaMapAlias stitches the pieces, FIX-RT-001).
+std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindOrImportSpan(VAddr address,
+                                                                           u64 size) {
+#ifdef _WIN32
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_LISTED_SPAN_VIEWS");
+        return !(env && env[0] == '0');
+    }();
+    if (!enabled || size == 0 || address > UINT64_MAX - size) return std::nullopt;
+    constexpr u64 Granularity = 64 * 1024; // MapViewOfFile3 pieces (FIX-RT-001)
+    const VAddr want_end = address + size;
+    std::scoped_lock lk{mutex};
+    for (const auto& [key, span] : span_views) {
+        if (key > address) break;
+        if (span.begin <= address && want_end <= span.end && span.wrapper) {
+            return std::make_pair(static_cast<const Buffer*>(span.wrapper.get()),
+                                  address - span.begin);
+        }
+    }
+    static std::atomic<u32> refused{};
+    const auto refuse = [&](const char* why) -> std::optional<std::pair<const Buffer*, u64>> {
+        if (refused.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_WARNING(Render_Vulkan, "FIX-SGT-014: no span view over {:#x}+{:#x}: {}", address,
+                        size, why);
+        }
+        return std::nullopt;
+    };
+    if (span_views.size() >= 32) return refuse("32 span views already");
+    const auto map_alias = MapAlias();
+    const auto unmap_alias = UnmapAlias();
+    if (!map_alias || !unmap_alias) return refuse("no GuestArenaMapAlias");
+    // 64 KiB-aligned bounds first; the exact pages when those reach unmapped memory.
+    const auto started = std::chrono::steady_clock::now();
+    VAddr base = address & ~(Granularity - 1);
+    VAddr end = (want_end + Granularity - 1) & ~(Granularity - 1);
+    if (end - base > 256ull << 20) return refuse("over 256 MiB");
+    // A smaller span view at the same start (the read grew: 77 then 85 MB in one race) is
+    // retired like an unmapped one and replaced.
+    const auto retire_at = [&](VAddr at) {
+        if (const auto old = span_views.find(at); old != span_views.end()) {
+            held_native_releases.push_back(std::move(old->second.lease));
+            span_views.erase(old);
+            if (!hold_native_releases) {
+                RetireLeasesAfterSplice(held_native_releases, scheduler.CurrentTick());
+            }
+        }
+    };
+    // Headroom: up to 32 MiB past the read where the memory goes on, so a read that grows keeps
+    // its alias. Importing pins the memory: tens to hundreds of ms on the recorder for this size.
+    VAddr padded_end = end;
+    {
+        const VAddr target = std::min<VAddr>(base + (256ull << 20), end + (32ull << 20));
+        VAddr hi = end;
+        for (int step = 0; step < 64 && hi < target; ++step) {
+            const VAddr more = GuestViewEnd(hi, target - hi);
+            if (more <= hi) break;
+            hi = more;
+        }
+        hi = std::min(hi, target) & ~(Granularity - 1);
+        if (hi > end) padded_end = hi;
+    }
+    retire_at(base);
+    void* alias = map_alias(base, padded_end - base);
+    if (alias) {
+        end = padded_end;
+    } else if (padded_end != end) {
+        alias = map_alias(base, end - base);
+    }
+    if (!alias) {
+        base = address & ~(PageSize - 1);
+        end = (want_end + PageSize - 1) & ~(PageSize - 1);
+        retire_at(base);
+        alias = map_alias(base, end - base);
+    }
+    if (!alias) return refuse("no alias over the range");
+    const auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
+    const VkDevice device = instance.GetDevice();
+    VkMemoryHostPointerPropertiesEXT ptr_props{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    if (d.vkGetMemoryHostPointerPropertiesEXT(device,
+                                              VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                                              alias, &ptr_props) != VK_SUCCESS ||
+        ptr_props.memoryTypeBits == 0) {
+        unmap_alias(alias);
+        return refuse("no memory type for the alias");
+    }
+    VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr,
+                                         VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
+    VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+                                            &flags_info,
+                                            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                                            alias};
+    u32 memory_type_index = static_cast<u32>(std::countr_zero(ptr_props.memoryTypeBits));
+    const auto& mem_props = instance.GetMemoryProperties();
+    for (u32 i = 0; instance.IsIntel() && i < mem_props.memoryTypeCount; ++i) { // FIX-188
+        if ((ptr_props.memoryTypeBits & (1u << i)) &&
+            (mem_props.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eHostCached)) {
+            memory_type_index = i;
+            break;
+        }
+    }
+    VkMemoryAllocateInfo info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &import, end - base,
+                              memory_type_index};
+    VkDeviceMemory memory{};
+    if (d.vkAllocateMemory(device, &info, nullptr, &memory) != VK_SUCCESS) {
+        unmap_alias(alias);
+        return refuse("import refused");
+    }
+    VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+                                              nullptr,
+                                              VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
+    VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
+    buffer_info.size = end - base;
+    buffer_info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                        VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+    VkBuffer buffer{};
+    if (d.vkCreateBuffer(device, &buffer_info, nullptr, &buffer) != VK_SUCCESS ||
+        d.vkBindBufferMemory(device, buffer, memory, 0) != VK_SUCCESS) {
+        if (buffer) d.vkDestroyBuffer(device, buffer, nullptr);
+        d.vkFreeMemory(device, memory, nullptr);
+        unmap_alias(alias);
+        return refuse("buffer over the import failed");
+    }
+    VkBufferDeviceAddressInfo address_info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr,
+                                           buffer};
+    const vk::DeviceAddress device_address = d.vkGetBufferDeviceAddress(device, &address_info);
+    std::shared_ptr<Buffer> wrapper;
+    std::shared_ptr<ImportedViewLease> lease;
+    try {
+        wrapper = std::make_shared<Buffer>(instance, base, end - base, vk::Buffer{buffer});
+        lease = std::make_shared<ImportedViewLease>(
+            [device, unmap_alias, memory, alias, owned = wrapper]() mutable {
+                owned.reset();
+                VULKAN_HPP_DEFAULT_DISPATCHER.vkFreeMemory(device, memory, nullptr);
+                unmap_alias(alias);
+            });
+        span_views.emplace(base, View{base, end, alias, memory, buffer, device_address, lease,
+                                      wrapper});
+    } catch (...) {
+        const bool wrapper_owns_buffer = bool(wrapper);
+        const bool lease_owns_memory = bool(lease);
+        wrapper.reset();
+        lease.reset();
+        if (!wrapper_owns_buffer) {
+            Native::DeadHandles::Note(buffer);
+            Native::BufferSizes::Forget(buffer); // PERF-SGT-020
+            d.vkDestroyBuffer(device, buffer, nullptr);
+        }
+        if (!lease_owns_memory) {
+            d.vkFreeMemory(device, memory, nullptr);
+            unmap_alias(alias);
+        }
+        return refuse("could not retain the span view");
+    }
+    const auto took_ms = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - started).count();
+    static std::atomic<u32> made{};
+    if (made.fetch_add(1, std::memory_order_relaxed) < 16 || took_ms >= 20.0) {
+        LOG_WARNING(Render_Vulkan, "FIX-SGT-014: span view {:#x}+{:#x} for a read {:#x}+{:#x} "
+                    "over a listed in-place range, imported in {:.1f} ms ({} span views)", base,
+                    end - base, address, size, took_ms, span_views.size());
+    }
+    const View& made_view = span_views.at(base);
+    return std::make_pair(static_cast<const Buffer*>(made_view.wrapper.get()), address - base);
+#else
+    return std::nullopt;
+#endif
+}
+
 namespace {
+// FIX-SGT-005: the listed in-place ranges (GT7's launcher sets them; GT Sport has none), as
+// [begin, end). The renderer reads the same list in vk_rasterizer_native.cpp (InplaceRanges).
+const std::vector<std::pair<VAddr, VAddr>>& ListedInPlaceRanges() {
+    static const auto ranges = [] {
+        std::vector<std::pair<VAddr, VAddr>> out;
+        const char* value = std::getenv("SHADGT_NATIVE_INPLACE_RANGES");
+        for (const char* at = value; at && *at;) {
+            char* end = nullptr;
+            const VAddr begin = std::strtoull(at, &end, 16);
+            if (end == at || *end != '+') break;
+            at = end + 1;
+            const u64 size = std::strtoull(at, &end, 16);
+            if (end == at || size == 0) break;
+            out.emplace_back(begin, begin + size);
+            at = *end == ',' ? end + 1 : end;
+        }
+        return out;
+    }();
+    return ranges;
+}
+
 // PERF-GT7-022 (Will Scarlett): import a bounded piece when first used rather
 // than pinning a whole multi-GiB allocation in one driver call. Zero restores
 // the original whole-allocation policy. Invalid/overflowing input uses 256 MiB.
@@ -309,6 +507,56 @@ bool DirectMemory::ImportView(VAddr address, VAddr want_end) {
     if (const auto next = views.upper_bound(base); next != views.end()) {
         end = std::min(end, next->second.begin);
     }
+    // FIX-SGT-005: a listed in-place range is imported as one view even when the game mapped it in
+    // several pieces. GT7 maps its culling memory 2 MB at a time (0x1020200000 and 0x1020400000 are
+    // two Windows allocations), so a view stopped at 0x1020400000 and its buffer 0x10203e0e00+
+    // 0x27100 was in no single view: its writes fell back to a video-memory region that the rest
+    // of the culling did not read, and scenery, the ground or shadows went missing for single
+    // frames until a restart (DIAG-SGT-003). The view now runs from the allocation where the
+    // listed range starts to the one where it ends, when that memory is contiguous and nothing
+    // imported is in the way; GuestArenaMapAlias makes one alias across the pieces.
+    // SHADGT_LISTED_ONE_VIEW=0: as before.
+    static const bool listed_one_view = [] {
+        const char* env = std::getenv("SHADGT_LISTED_ONE_VIEW");
+        return !(env && env[0] == '0');
+    }();
+    const VAddr unwidened_base = base, unwidened_end = end;
+    for (const auto& [listed_begin, listed_end] : ListedInPlaceRanges()) {
+        if (!listed_one_view) break;
+        // The view, not only the address, decides: the first import over GT7's culling memory
+        // came from just below the listed range (0x1020200000), and a plain piece made then kept
+        // the range split for the session.
+        if (end <= listed_begin || base >= listed_end) continue;
+        if (listed_begin >= base && listed_end <= end) continue; // already inside this view
+        VAddr lo = GuestViewBase(listed_begin);
+        if (lo == 0 || lo > base) lo = base;
+        if (auto prev = views.upper_bound(address); prev != views.begin()) {
+            lo = std::max(lo, std::prev(prev)->second.end);
+        }
+        VAddr hi = lo;
+        for (int step = 0; step < 32 && hi < std::max(end, listed_end); ++step) {
+            const VAddr more = GuestViewEnd(hi, 64_MB);
+            if (more <= hi) break;
+            hi = more;
+        }
+        if (const auto next = views.upper_bound(address); next != views.end()) {
+            hi = std::min(hi, next->second.begin);
+        }
+        if (lo <= base && hi >= end && (lo < base || hi > end) && hi - lo <= 256_MB) {
+            static std::mutex log_mutex;
+            static std::map<VAddr, u32> logged; // per listed range
+            std::scoped_lock log_lock{log_mutex};
+            if (logged[listed_begin]++ < 4) {
+                LOG_INFO(Render_Vulkan,
+                         "FIX-SGT-005: view {:#x}+{:#x} widened to {:#x}+{:#x} for listed range "
+                         "{:#x}-{:#x}",
+                         base, end - base, lo, hi - lo, listed_begin, listed_end);
+            }
+            base = lo;
+            end = hi;
+        }
+        break;
+    }
     const auto fail = [&](const char* why) {
         // An unmap/remap can leave the allocation temporarily uncommitted or split
         // before the requested page. That is not a permanent import failure.
@@ -335,6 +583,18 @@ bool DirectMemory::ImportView(VAddr address, VAddr want_end) {
     }
     trace.Next(1, base, end - base);
     void* alias = map_alias(base, end - base);
+    if (!alias && (base != unwidened_base || end != unwidened_end)) {
+        // FIX-SGT-005: no alias across the pieces; import the piece alone, as before.
+        static std::atomic<u32> warned{};
+        if (warned.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-SGT-005: no alias over {:#x}+{:#x}; importing {:#x}+{:#x}", base,
+                        end - base, unwidened_base, unwidened_end - unwidened_base);
+        }
+        base = unwidened_base;
+        end = unwidened_end;
+        alias = map_alias(base, end - base);
+    }
     if (!alias) {
         return fail("no alias (not shared memory)");
     }
@@ -428,6 +688,7 @@ bool DirectMemory::ImportView(VAddr address, VAddr want_end) {
         lease.reset();
         if (!wrapper_owns_buffer) {
             Native::DeadHandles::Note(buffer); // PERF-GTS-375
+            Native::BufferSizes::Forget(buffer); // PERF-SGT-020
             d.vkDestroyBuffer(device, buffer, nullptr);
         }
         if (!lease_owns_memory) {
@@ -612,6 +873,9 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
     trace.Next(0, address, size);
     // Imported-view destruction is queued at OnUnmap to the scheduler's
     // GPU-gated background runner. Never drain old imports on a draw's bind path.
+    // PERF-GT7-129 (port): this already keeps view releases off the recorder, always, so
+    // shadgt7's switch for it (SHADGT_D1_ASYNC_RELEASE) is gone. PERF-GT7-002 (port): its
+    // per-thread memo of imported ranges is imported_coverage below, which needs no lock.
     if (address > ImportedPageCoverage<>::Limit ||
         size > ImportedPageCoverage<>::Limit - address) return false;
     const VAddr end = address + size;
@@ -696,6 +960,21 @@ void DirectMemory::OnUnmap(VAddr address, u64 size) {
                         scheduler.CurrentTick(), n);
         }
         }, [&](auto& held) { RetireLeasesAfterSplice(held, scheduler.CurrentTick()); });
+    // FIX-SGT-014: span views over the unmapped memory go the same way (leased until the GPU
+    // work recorded so far is done).
+    bool spans_dropped = false;
+    for (auto it = span_views.begin(); it != span_views.end();) {
+        if (it->second.begin < end && it->second.end > address) {
+            held_native_releases.push_back(std::move(it->second.lease));
+            it = span_views.erase(it);
+            spans_dropped = true;
+        } else {
+            ++it;
+        }
+    }
+    if (spans_dropped && !hold_native_releases) {
+        RetireLeasesAfterSplice(held_native_releases, scheduler.CurrentTick());
+    }
     // Even a partial unmap can replace part of a failed view with importable memory.
     std::erase_if(failed, [&](const auto& view) {
         return view.first < end && (view.second > address || view.first >= address);

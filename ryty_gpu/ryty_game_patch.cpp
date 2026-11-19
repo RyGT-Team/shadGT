@@ -8,7 +8,9 @@
 // SHADGT_PATCH=<rva>:<original hex>:<new hex>[,...] applies arbitrary patches the same way, for
 // experiments (RVA in GTSport.exe: eboot.bin address + 0x10000).
 
+#include "common/game_title.h"
 #include <cstdio>
+#include <array>
 #include <algorithm>
 #include <bit>
 #include <array>
@@ -26,9 +28,11 @@
 #include <string_view>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 #include <windows.h>
 #include <fmt/format.h>
+#include <nlohmann/json.hpp>
 
 #include "common/diagnostics.h"
 #include "common/ryty_config.h"
@@ -43,6 +47,9 @@
 #include "input/telemetry_haptics_output.h"
 #include "input/trigger_feedback.h"
 #include "ryty_gpu/ryty_dlssg.h"
+#include "core/file_format/psf.h"
+#include "ryty_gpu/gt7_preset_options.h"
+#include "ryty_gpu/ryty_gt7_hdr_status.h"
 
 namespace Vulkan {
 void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label); // DIAG-067
@@ -479,6 +486,8 @@ bool RedirectCall(u8* base, u8* stub, u64 call_rva, u64 target_rva, void* hook, 
                  static_cast<unsigned long long>(call_rva));
     return true;
 }
+
+#include "ryty_gpu/ryty_gt7_hdr_status.inl"
 
 void InstallLewisChallenge(u8* base) {
     const char* env = std::getenv("SHADGT_LEWIS");
@@ -1660,6 +1669,529 @@ void InstallGt7ScriptDump(u8* base) {
     std::fprintf(stderr, "[patch] DIAG-GT7-043 script reads applied\n");
 }
 
+// GAME-002: GT7 can raise the race flag (RytyGtsInRace, FIX-110) as GT Sport does, so that both
+// games run the same race code instead of GT7 staying in the menus' code for ever. GT Sport raises
+// it when the game loads a race_* project script (GTS-003). GT7's races are script applications too
+// (gt7/menu/app/race_single, race_grand_prix, race_replay...), but it loads its whole script package
+// at boot, so a load hook cannot tell which one runs. The flag comes from the game's own state
+// instead: the Organizer's per-frame "org_race" module (GTFramework::Organizer::Impl::initialize's
+// $_7, eboot 0x1e9a5d0 in version 1.71; GT Sport has the same module) does its work only when its
+// gate is open: G = [[Impl+0x2558]+0x18], G+0x74 set and G+0x77 clear. Read on a PS4 Pro at 80 Hz
+// (2026-11-14), the gate opens at the entry of an event and stays open for the whole session
+// (pre-race screen, race, replay), and is closed at the menus. The module's entry is hooked: the
+// gate is read on the game's own thread, each frame it runs. Whether the module runs at the menus
+// was not observed, so the flag also falls when the module has not run for five seconds (one
+// second fell during the stalls of a race's loading and countdown). Another version of the game
+// (other bytes at the entry) keeps today's behaviour, with one line.
+//
+// Only g_in_race is raised: g_race_session and g_project_hooks stay GT Sport's (the first drives
+// writes at GT Sport addresses, the second would make GT7's menus wait for their pipelines, see
+// FIX-GT7-140). In GT7's usual configuration (keep going, native renderer) the one thing the flag
+// changes is Rasterizer::SelectsPipelinesAhead(), which shadgt7 always had on: about 31 ms a
+// frame becomes 22 on a hand-played Dragon Trail race (RTX 4070 only; shadgt7 itself: 17.5).
+//
+// On by default, SHADGT_GT7_RACE_SIGNAL=0 turns it off. At 2,500-3,000 draws a frame (no compile
+// frames, same race, RTX 4070 only): 29.6 ms a frame without, 23.0 with, 22.5 with GAME-003 too.
+// The two defects that kept it off were not its own: the title screen's device loss was
+// FIX-GT7-187 (FillImage), and the scenery flicker showed without the signal too and went with
+// GT7's GPU occlusion culling (GAME-003).
+constexpr u64 kGt7OrgRace = 0x1e9a5d0;
+constexpr u8 kGt7OrgRaceStart[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
+                                   0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x18};
+using OrgRaceFn = void(PS4_SYSV_ABI*)(void*);
+OrgRaceFn g_gt7_org_race = nullptr;
+std::atomic<u64> g_gt7_org_race_ms{0};
+
+// GAME-006: the race runs, from its start countdown (3-2-1, or a rolling start's start) to its
+// finish: the time the player drives. Both games keep it in the race's context P (the race
+// object R's [R+0x18]), which their Organizer's per-frame module org_race reads: a byte set when
+// the start is requested and the countdown begins (GT Sport P+0xae, GT7 P+0xb8: onStartRequest,
+// GT Sport 0x1409c8510 / GT7 0x141f43620 in Ghidra), a byte set when the start time is reached
+// (GT Sport P+0x69, which its endSession logs as "in Race" against "Immediate"; GT7 P+0x75), both
+// cleared by the race's finish block. Read from the code (Ghidra, GT7 1.71 and GT Sport 1.69) and
+// seen in play (11-16, both games, SHADGT_RACE_TRACE=1): the pre-race screen runs a session of
+// race type 3 (DEMO), left out; the race starts at its countdown; the pause menu (offline) stops
+// it and Continue resumes it; Retry ends the session and the next countdown starts it again; the
+// finish (results board) ends it. GT Sport's replays and results never request a start, so they
+// are never "running" (only the countdown-to-finish time is). The renderer's play state follows
+// it (PERF-GTS-494); SHADGT_RACE_START_SIGNAL=0 leaves the play state to the frame-time measure.
+std::atomic<bool> g_race_running{false};
+std::atomic<bool> g_race_signal{false}; ///< GAME-006: a hook reads the start bytes
+std::atomic<u64> g_race_signal_ms{0};
+
+bool RaceStartSignalOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_RACE_START_SIGNAL");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+// GAME-006: a hook that reads the race's state is in, from its install (before the race module
+// first runs: GT Sport's race flag rises with the race project, before org_race's first call, and
+// the renderer must already know that the race is not running yet). The flag falls when the
+// module stops running for five seconds (the menus).
+void StartRaceSignal() {
+    if (g_race_signal.exchange(true, std::memory_order_relaxed)) {
+        return;
+    }
+    std::thread([] {
+        for (;;) {
+            Sleep(250);
+            const u64 last = g_race_signal_ms.load(std::memory_order_relaxed);
+            if (last != 0 && GetTickCount64() - last > 5000 &&
+                g_race_running.exchange(false, std::memory_order_relaxed)) {
+                std::fprintf(stderr, "[patch] GAME-006: the race module has not run for five "
+                                     "seconds: race not running\n");
+            }
+        }
+    }).detach();
+}
+
+void NoteRaceRunning(bool running, const char* game) {
+    g_race_signal_ms.store(GetTickCount64(), std::memory_order_relaxed);
+    if (g_race_running.exchange(running, std::memory_order_relaxed) == running) {
+        return;
+    }
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    std::fprintf(stderr, "[patch] GAME-006 %02d:%02d:%02d.%03d %s race %s\n", now.wHour,
+                 now.wMinute, now.wSecond, now.wMilliseconds, game,
+                 running ? "starts (countdown or start)" : "not running (pre-race, finish, menus)");
+}
+
+// GAME-006: a pointer the game keeps, used only once its memory is known readable (checked again
+// only when the pointer changes, so a frame costs nothing).
+struct ReadCheck {
+    const u8* ptr = nullptr;
+    bool ok = false;
+};
+const u8* Readable(const u8* p, size_t size, ReadCheck& check) {
+    if (!p) return nullptr;
+    if (p != check.ptr) {
+        check.ptr = p;
+        check.ok = ReadableRange(p, size);
+    }
+    return check.ok ? p : nullptr;
+}
+
+// GAME-006: the race's state as the hook reads it, written to stderr when any field changes (at
+// most 400 lines, SHADGT_RACE_TRACE=1): what tells the pre-race screen, the race, the pause and a
+// retry apart.
+struct RaceTrace {
+    int gate = -1, requested = -1, started = -1, phase = -1, type = -1, number = -1;
+    int paused = -1, grid_wait = -1, demo = -1;
+    bool operator==(const RaceTrace&) const = default;
+};
+// SHADGT_RACE_TRACE=1: the trace below (off by default).
+bool RaceTraceOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_RACE_TRACE");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
+void NoteRaceTrace(const char* game, const RaceTrace& t, bool running) {
+    if (!RaceTraceOn()) return;
+    static RaceTrace last;
+    static std::atomic<u32> lines{};
+    if (t == last || lines.load(std::memory_order_relaxed) >= 400) return;
+    last = t;
+    lines.fetch_add(1, std::memory_order_relaxed);
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    std::fprintf(stderr,
+                 "[patch] GAME-006 trace %02d:%02d:%02d.%03d %s: gate %d requested %d started %d "
+                 "phase %d type %d race %d paused %d grid wait %d demo %d -> %s\n",
+                 now.wHour, now.wMinute, now.wSecond, now.wMilliseconds, game, t.gate, t.requested,
+                 t.started, t.phase, t.type, t.number, t.paused, t.grid_wait, t.demo,
+                 running ? "running" : "not running");
+}
+
+void NoteGt7Race(bool race, const char* why) {
+    if (g_in_race.exchange(race) == race) {
+        return;
+    }
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    std::fprintf(stderr, "[patch] GAME-002 %02d:%02d:%02d.%03d GT7 %s (%s)\n", now.wHour,
+                 now.wMinute, now.wSecond, now.wMilliseconds,
+                 race ? "in a race: the race code runs" : "at the menus", why);
+}
+
+void PS4_SYSV_ABI Gt7OrgRaceHook(void* self) {
+    // As the module reads it: Impl = [self+8], G = [[Impl+0x2558]+0x18].
+    const u8* const impl = *reinterpret_cast<u8* const*>(static_cast<u8*>(self) + 8);
+    const u8* const holder = *reinterpret_cast<u8* const*>(impl + 0x2558);
+    const u8* const gate = *reinterpret_cast<u8* const*>(holder + 0x18);
+    const bool open = gate[0x74] != 0 && gate[0x77] == 0;
+    g_gt7_org_race_ms.store(GetTickCount64(), std::memory_order_relaxed);
+    NoteGt7Race(open, open ? "org_race's gate is open" : "org_race's gate is closed");
+    // GAME-006: G is the race's context P; +0xb8 the start requested (countdown), +0x75 started,
+    // +0x118 the session phase (0 open, 1 start requested, 2 finished, 3 none), +0x11c the race
+    // number. The race's parameter ([[R+0x30]], R = holder): race type at +0 (3 = DEMO, the
+    // pre-race screen's session), grid wait at +0x40. The pause menu:
+    // GTFramework::PauseManager [Impl+0x33620], paused at +0x18; offline only ([R+0x5a0] null,
+    // online the menu does not stop the race). Read in the code (Ghidra), seen in play.
+    if (RaceStartSignalOn()) {
+        static ReadCheck holder_check, param_holder_check, param_check, pause_check;
+        RaceTrace t;
+        t.gate = open;
+        t.requested = gate[0xb8];
+        t.started = gate[0x75];
+        t.phase = gate[0x118];
+        t.number = int(*reinterpret_cast<const u32*>(gate + 0x11c));
+        bool online = false;
+        if (const u8* r = Readable(holder, 0x5a8, holder_check)) {
+            online = *reinterpret_cast<const u64*>(r + 0x5a0) != 0;
+            if (const u8* ph = Readable(*reinterpret_cast<u8* const*>(r + 0x30), 8,
+                                        param_holder_check)) {
+                if (const u8* param = Readable(*reinterpret_cast<u8* const*>(ph), 0x44, param_check)) {
+                    t.type = *reinterpret_cast<const s32*>(param);
+                    t.grid_wait = *reinterpret_cast<const s32*>(param + 0x40);
+                }
+            }
+        }
+        // The field alone is checked: Impl spans more than one memory region (a check over
+        // Impl..Impl+0x33628 failed in play and the pause was never read).
+        static ReadCheck impl_check;
+        if (const u8* field = Readable(impl + 0x33620, 8, impl_check)) {
+            if (const u8* pm = Readable(*reinterpret_cast<u8* const*>(field), 0x28, pause_check)) {
+                t.paused = pm[0x18];
+            }
+        }
+        const bool paused = t.paused > 0 && !online;
+        const bool running = open && (t.requested != 0 || t.started != 0) && t.type != 3 && !paused;
+        NoteRaceTrace("GT7", t, running);
+        NoteRaceRunning(running, "GT7");
+    }
+    g_gt7_org_race(self);
+}
+
+void InstallGt7RaceSignal(u8* base) {
+    u8* const entry = base + kGt7OrgRace + kTextRvaShift;
+    constexpr size_t kMoved = sizeof(kGt7OrgRaceStart);
+    const bool gt7_entry = ReadableRange(entry, kMoved) &&
+                           std::memcmp(entry, kGt7OrgRaceStart, kMoved) == 0;
+    const char* env = std::getenv("SHADGT_GT7_RACE_SIGNAL");
+    if (env && env[0] == '0') {
+        if (gt7_entry) {
+            std::fprintf(stderr, "[patch] GAME-002: off (SHADGT_GT7_RACE_SIGNAL=0), GT7 never "
+                                 "raises the race flag\n");
+        }
+        return;
+    }
+    if (!gt7_entry) {
+        // GT Sport (silent), or a GT7 version this address is not for.
+        char name[MAX_PATH]{};
+        GetModuleFileNameA(nullptr, name, sizeof(name));
+        if (std::string_view{name}.ends_with("GT7.exe")) {
+            std::fprintf(stderr, "[patch] GAME-002: org_race is not where version 1.71 has it, GT7 "
+                                 "never raises the race flag\n");
+        }
+        return;
+    }
+    u8* const stubs = AllocNear(base);
+    if (!stubs) {
+        std::fprintf(stderr, "[patch] GAME-002: no memory near the game's code for the hook\n");
+        return;
+    }
+    // The entry's first instructions move to a trampoline; they don't depend on where they run.
+    const u8 jump[6] = {0xff, 0x25, 0, 0, 0, 0}; // jmp qword ptr [rip]
+    std::memcpy(stubs, entry, kMoved);
+    std::memcpy(stubs + kMoved, jump, 6);
+    const u8* const resume = entry + kMoved;
+    std::memcpy(stubs + kMoved + 6, &resume, 8);
+    FlushInstructionCache(GetCurrentProcess(), stubs, kMoved + 14);
+    g_gt7_org_race = reinterpret_cast<OrgRaceFn>(stubs);
+    DWORD old_protect = 0;
+    if (!VirtualProtect(entry, kMoved, PAGE_EXECUTE_READWRITE, &old_protect)) {
+        return;
+    }
+    const void* const hook = reinterpret_cast<void*>(&Gt7OrgRaceHook);
+    std::memcpy(entry, jump, 6);
+    std::memcpy(entry + 6, &hook, 8);
+    std::memset(entry + 14, 0x90, kMoved - 14);
+    DWORD ignored = 0;
+    VirtualProtect(entry, kMoved, old_protect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), entry, kMoved);
+    // The flag falls when the module stops running.
+    std::thread([] {
+        for (;;) {
+            Sleep(250);
+            const u64 last = g_gt7_org_race_ms.load(std::memory_order_relaxed);
+            if (last != 0 && GetTickCount64() - last > 5000) {
+                NoteGt7Race(false, "org_race has not run for five seconds");
+            }
+        }
+    }).detach();
+    std::fprintf(stderr, "[patch] GAME-002 GT7 race signal applied (org_race's gate)\n");
+    if (RaceStartSignalOn()) StartRaceSignal(); // GAME-006
+}
+
+// GAME-006 (GT Sport): org_race's std::function body is a lambda that loads Impl = [self+8] and
+// jumps to the module (0x14060f510: mov rdi, [rdi+8]; jmp 0x1406486a0 in Ghidra). Its first five
+// bytes become a jump to a stub that jumps to GtsOrgRaceHook, which reads R = [Impl+0x25b0],
+// P = [R+0x18] as the module does and calls the module itself. Applied only where every byte
+// checked is GT Sport's.
+constexpr u64 kGtsOrgRaceLambda = 0x5ff510;
+constexpr u64 kGtsOrgRaceBody = 0x6386a0;
+constexpr u8 kGtsOrgRaceLambdaBytes[] = {0x48, 0x8b, 0x7f, 0x08, 0xe9, 0x87, 0x91, 0x03, 0x00};
+constexpr u8 kGtsOrgRaceBodyStart[] = {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89,
+                                       0xfb, 0x48, 0x8d, 0x0d, 0x10, 0x14, 0x44, 0x00};
+using GtsOrgRaceBodyFn = u64(PS4_SYSV_ABI*)(void*);
+GtsOrgRaceBodyFn g_gts_org_race_body = nullptr;
+
+u64 PS4_SYSV_ABI GtsOrgRaceHook(void* self) {
+    u8* const impl = *reinterpret_cast<u8* const*>(static_cast<u8*>(self) + 8);
+    const u8* const race = impl ? *reinterpret_cast<u8* const*>(impl + 0x25b0) : nullptr;
+    const u8* const context = race ? *reinterpret_cast<u8* const*>(race + 0x18) : nullptr;
+    // As the module's gate: in a session (P+0x68) and not ended (P+0x6b). P+0xae start requested,
+    // P+0x69 started, P+0x108 phase, P+0x10c race number; the race's parameter [P]: race type
+    // at +4 (3 = DEMO, the pre-race screen's session), grid wait in bits 1-7 of +0x20; P+0x7eb
+    // the race's pause (the pause menu, offline only); Impl+0x82e50 the script's demo mode (for
+    // the trace). Read in the code (Ghidra), seen in play.
+    static ReadCheck context_check, param_check;
+    RaceTrace t;
+    bool running = false;
+    if (const u8* p = Readable(context, 0x7f0, context_check)) {
+        t.gate = p[0x68] != 0 && p[0x6b] == 0;
+        t.requested = p[0xae];
+        t.started = p[0x69];
+        t.phase = int(*reinterpret_cast<const u32*>(p + 0x108));
+        t.number = int(*reinterpret_cast<const u32*>(p + 0x10c));
+        t.paused = p[0x7eb];
+        if (const u8* param = Readable(*reinterpret_cast<u8* const*>(p), 0x24, param_check)) {
+            t.type = param[4];
+            t.grid_wait = (param[0x20] >> 1) & 0x7f;
+        }
+        if (RaceTraceOn()) t.demo = impl[0x82e50]; // the script's demo mode, for the trace only
+        running = t.gate && (t.requested != 0 || t.started != 0) && t.type != 3 && t.paused == 0;
+    }
+    NoteRaceTrace("GT Sport", t, running);
+    NoteRaceRunning(running, "GT Sport");
+    return g_gts_org_race_body(impl);
+}
+
+void InstallGtsRaceStartSignal(u8* base) {
+    u8* const lambda = base + kGtsOrgRaceLambda + kTextRvaShift;
+    u8* const body = base + kGtsOrgRaceBody + kTextRvaShift;
+    if (!ReadableRange(lambda, sizeof(kGtsOrgRaceLambdaBytes)) ||
+        std::memcmp(lambda, kGtsOrgRaceLambdaBytes, sizeof(kGtsOrgRaceLambdaBytes)) != 0 ||
+        !ReadableRange(body, sizeof(kGtsOrgRaceBodyStart)) ||
+        std::memcmp(body, kGtsOrgRaceBodyStart, sizeof(kGtsOrgRaceBodyStart)) != 0) {
+        return; // GT7 (its own hook reads the bytes), or another GT Sport version
+    }
+    if (!RaceStartSignalOn()) {
+        std::fprintf(stderr, "[patch] GAME-006: off (SHADGT_RACE_START_SIGNAL=0)\n");
+        return;
+    }
+    u8* const stub = AllocNear(base);
+    if (!stub) {
+        std::fprintf(stderr, "[patch] GAME-006: no memory near the game's code for the hook\n");
+        return;
+    }
+    g_gts_org_race_body = reinterpret_cast<GtsOrgRaceBodyFn>(body);
+    const u8 jump[6] = {0xff, 0x25, 0, 0, 0, 0}; // jmp qword ptr [rip]
+    const void* const hook = reinterpret_cast<void*>(&GtsOrgRaceHook);
+    std::memcpy(stub, jump, 6);
+    std::memcpy(stub + 6, &hook, 8);
+    FlushInstructionCache(GetCurrentProcess(), stub, 14);
+    const s64 rel = s64(stub) - s64(lambda + 5);
+    if (rel < INT32_MIN || rel > INT32_MAX) {
+        std::fprintf(stderr, "[patch] GAME-006: the hook's stub is out of reach\n");
+        return;
+    }
+    DWORD old_protect = 0;
+    if (!VirtualProtect(lambda, sizeof(kGtsOrgRaceLambdaBytes), PAGE_EXECUTE_READWRITE,
+                        &old_protect)) {
+        return;
+    }
+    const s32 rel32 = s32(rel);
+    u8 patch[sizeof(kGtsOrgRaceLambdaBytes)] = {0xe9};
+    std::memcpy(patch + 1, &rel32, 4);
+    std::memset(patch + 5, 0x90, sizeof(patch) - 5);
+    std::memcpy(lambda, patch, sizeof(patch));
+    DWORD ignored = 0;
+    VirtualProtect(lambda, sizeof(kGtsOrgRaceLambdaBytes), old_protect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), lambda, sizeof(kGtsOrgRaceLambdaBytes));
+    StartRaceSignal();
+    std::fprintf(stderr, "[patch] GAME-006 GT Sport race start signal applied (org_race)\n");
+}
+
+// GAME-003: GT7 culls its scenery with the code GT Sport uses. GT7 has two implementations of
+// PDIEXT::OcclusionCulling: OcclusionCullingCS, compute shaders whose answers (each object's
+// visibility state) the game's CPU reads back to choose what it draws, and OcclusionCullingPS4,
+// on the CPU, the only one GTSport.exe has. eboot 0x363f2b0, called twice by the factory that
+// makes the object, is the only reader of the command-line option occlusionculling_mode: absent or
+// "cs" returns 1 (compute), "cpu" returns 0 (CPU). With the compute one, the game's scenery list
+// changed for one frame now and then on the merged renderer (groups of scenery gone or other ones
+// drawn, up to 2-3 times a second), and the states it reads lie in a range the renderer holds in a
+// region and writes back (Nsight capture of 2026-11-15 17:31: every write-back recorded, the bad
+// frame's included); the renderer's fault was not found. With occlusionculling_mode=cpu, ten
+// sessions in a row without it. The "mov eax, 1" becomes "mov eax, 0": the same choice in the
+// game's code, whatever its command line says, so GT7 culls like GT Sport and its CPU no longer
+// reads visibility answers from the GPU. Other versions (other bytes) keep the game's own choice,
+// with one line. SHADGT_GT7_OCCLUSION=gpu: the game's own choice. Played on an RTX 4070 and a
+// Ryzen 7 8700G (16 threads) only; the cost on CPUs with fewer threads is not measured.
+// GAME-007: off by default again. The flicker was the renderer's: a buffer memo revalidated in
+// listed in-place memory read GT7's depth pyramid from a copy its writer no longer updated
+// (FIX-GTS-520). With that fixed, the compute culling shows no drops, cold or warm, and takes
+// 18 ms of GPU time a frame where the CPU culling's frames took 38-48 ms on the same replay.
+// SHADGT_GT7_OCCLUSION=cpu applies GAME-003.
+constexpr u64 kGt7OcclusionMode = 0x363f2b0;
+constexpr u8 kGt7OcclusionModeCode[] = {
+    0x55, 0x48, 0x89, 0xe5, 0x53, 0x48, 0x83, 0xec, 0x28, 0x48, 0x8b, 0x1d,
+    0x20, 0xfa, 0xf2, 0x01, 0x48, 0x8d, 0x3d, 0xff, 0xd9, 0xbe, 0x00, 0x48,
+    0x8d, 0x75, 0xd0, 0xba, 0x20, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x03, 0x48,
+    0x89, 0x45, 0xf0, 0xe8, 0x64, 0xb6, 0xd3, 0xff, 0x85, 0xc0, 0x75, 0x1c,
+    0xb8, 0x01, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x0b, 0x48, 0x3b, 0x4d, 0xf0,
+    0x75, 0x07, 0x48, 0x83, 0xc4, 0x28, 0x5b, 0x5d, 0xc3, 0xe8, 0xa6, 0x96,
+    0x71, 0x00, 0x0f, 0x0b, 0xb8, 0x63, 0x73, 0x00, 0x00, 0x33, 0x45, 0xd0,
+    0x0f, 0xb6, 0x4d, 0xd2, 0x66, 0x09, 0xc1, 0x74, 0xd3, 0x31, 0xc0, 0x81,
+    0x7d, 0xd0, 0x63, 0x70, 0x75, 0x00, 0x75, 0xc8, 0xeb, 0xcb};
+constexpr u64 kGt7OcclusionModeOne = 0x31; // the 1 of "mov eax, 1"
+
+void InstallGt7CpuOcclusion(u8* base) {
+    const u64 rva = kGt7OcclusionMode + kTextRvaShift;
+    const u8* const code = base + rva;
+    if (!ReadableRange(code, sizeof(kGt7OcclusionModeCode)) ||
+        std::memcmp(code, kGt7OcclusionModeCode, sizeof(kGt7OcclusionModeCode)) != 0) {
+        // GT Sport, or a GT7 version this address is not for.
+        char name[MAX_PATH]{};
+        GetModuleFileNameA(nullptr, name, sizeof(name));
+        if (std::string_view{name}.ends_with("GT7.exe")) {
+            std::fprintf(stderr, "[patch] GAME-003: the occlusion choice is not where version 1.71 "
+                                 "has it, GT7 picks its occlusion culling itself\n");
+        }
+        return;
+    }
+    const char* env = std::getenv("SHADGT_GT7_OCCLUSION");
+    if (!(env && std::string_view{env} == "cpu")) {
+        std::fprintf(stderr, "[patch] GAME-003: off (GAME-007 default, SHADGT_GT7_OCCLUSION=cpu "
+                             "turns it on), GT7 picks its occlusion culling itself\n");
+        return;
+    }
+    Apply(base, Patch{rva + kGt7OcclusionModeOne, {0x01}, {0x00},
+                      "GAME-003 GT7 culls its scenery on the CPU, as GT Sport does"});
+}
+
+// GAME-008: GT7's job thread Job#0 never sleeps. Its idle loop (eboot 0x333cfe0 in version 1.71)
+// checks six job queues and a flag, runs a PAUSE and goes round again: on a PS4 it has its core to
+// itself, here it kept one core at 98-100% in menus and races alike (sampled: 57% of its time in
+// that loop, most of the rest polling a fence label). The loop's back edge (`je` at 0x333d08a,
+// taken when no queue has work) now goes through a stub that calls Gt7JobIdle first: after
+// SHADGT_GT7_JOB_IDLE_US of idling without a break (500), the thread sleeps
+// SHADGT_GT7_JOB_SLEEP_US (250) on a high-resolution timer per pass, until work comes. Any work
+// (a pass more than 50 us after the last) starts the count again. SHADGT_GT7_JOB_IDLE_US=0: off.
+constexpr u64 kGt7JobIdleBackEdge = 0x333d085; // cmp byte [r14+0x1a],0 ; je loop head
+constexpr u8 kGt7JobIdleBackEdgeCode[] = {0x41, 0x80, 0x7e, 0x1a, 0x00, 0x0f, 0x84, 0x50, 0xff,
+                                          0xff, 0xff};
+constexpr u64 kGt7JobIdleResume = 0x333cfe2; // the loop head after its PAUSE
+// push rax..r11 (volatile), pushfq; align; save xmm0-5; mov rax,<hook>; call rax; restore;
+// pause; jmp qword [rip] (the resume address follows the stub).
+constexpr u8 kGt7JobIdleStub[] = {
+    0x50, 0x51, 0x52, 0x56, 0x57, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53, 0x9c, 0x49,
+    0x89, 0xe3, 0x48, 0x83, 0xe4, 0xf0, 0x48, 0x81, 0xec, 0x90, 0x00, 0x00, 0x00, 0x4c, 0x89,
+    0x9c, 0x24, 0x80, 0x00, 0x00, 0x00, 0xf3, 0x0f, 0x7f, 0x44, 0x24, 0x20, 0xf3, 0x0f, 0x7f,
+    0x4c, 0x24, 0x30, 0xf3, 0x0f, 0x7f, 0x54, 0x24, 0x40, 0xf3, 0x0f, 0x7f, 0x5c, 0x24, 0x50,
+    0xf3, 0x0f, 0x7f, 0x64, 0x24, 0x60, 0xf3, 0x0f, 0x7f, 0x6c, 0x24, 0x70, 0x48, 0xb8, 0x88,
+    0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0xff, 0xd0, 0xf3, 0x0f, 0x6f, 0x44, 0x24, 0x20,
+    0xf3, 0x0f, 0x6f, 0x4c, 0x24, 0x30, 0xf3, 0x0f, 0x6f, 0x54, 0x24, 0x40, 0xf3, 0x0f, 0x6f,
+    0x5c, 0x24, 0x50, 0xf3, 0x0f, 0x6f, 0x64, 0x24, 0x60, 0xf3, 0x0f, 0x6f, 0x6c, 0x24, 0x70,
+    0x48, 0x8b, 0xa4, 0x24, 0x80, 0x00, 0x00, 0x00, 0x9d, 0x41, 0x5b, 0x41, 0x5a, 0x41, 0x59,
+    0x41, 0x58, 0x5f, 0x5e, 0x5a, 0x59, 0x58, 0xf3, 0x90, 0xff, 0x25, 0x00, 0x00, 0x00, 0x00};
+constexpr size_t kGt7JobIdleStubHook = 74; // the imm64 of `mov rax, <hook>`
+
+s64 g_job_idle_ticks = 0;  // continuous idling before a sleep, in QueryPerformanceCounter ticks
+s64 g_job_break_ticks = 0; // a pass this long after the last one found work in between
+s64 g_job_sleep_100ns = 0; // one sleep, in 100 ns units (negative: relative)
+
+void Gt7JobIdle() {
+    thread_local s64 last = 0, idle_from = 0;
+    thread_local HANDLE timer = nullptr;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (now.QuadPart - last > g_job_break_ticks) {
+        idle_from = now.QuadPart;
+    }
+    last = now.QuadPart;
+    if (now.QuadPart - idle_from < g_job_idle_ticks) {
+        return;
+    }
+    if (!timer) {
+        timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                       TIMER_ALL_ACCESS);
+    }
+    LARGE_INTEGER due;
+    due.QuadPart = -g_job_sleep_100ns;
+    if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+        WaitForSingleObject(timer, INFINITE);
+    } else {
+        SwitchToThread();
+    }
+    QueryPerformanceCounter(&now);
+    last = now.QuadPart; // still idle: the next pass sleeps again
+}
+
+void InstallGt7JobIdle(u8* base) {
+    u8* const edge = base + kGt7JobIdleBackEdge + kTextRvaShift;
+    if (!ReadableRange(edge, sizeof(kGt7JobIdleBackEdgeCode)) ||
+        std::memcmp(edge, kGt7JobIdleBackEdgeCode, sizeof(kGt7JobIdleBackEdgeCode)) != 0) {
+        return; // GT Sport, or another GT7 version
+    }
+    const auto read_us = [](const char* name, long long fallback) {
+        const char* env = std::getenv(name);
+        if (!env || !*env) return fallback;
+        char* end = nullptr;
+        const long long value = std::strtoll(env, &end, 10);
+        return end != env && value >= 0 ? value : fallback;
+    };
+    const long long idle_us = read_us("SHADGT_GT7_JOB_IDLE_US", 500);
+    const long long sleep_us = std::max(10LL, read_us("SHADGT_GT7_JOB_SLEEP_US", 250));
+    if (idle_us == 0) {
+        std::fprintf(stderr, "[patch] GAME-008: off (SHADGT_GT7_JOB_IDLE_US=0), Job#0 spins\n");
+        return;
+    }
+    LARGE_INTEGER frequency;
+    QueryPerformanceFrequency(&frequency);
+    g_job_idle_ticks = frequency.QuadPart * idle_us / 1000000;
+    g_job_break_ticks = frequency.QuadPart * 50 / 1000000;
+    g_job_sleep_100ns = sleep_us * 10;
+    u8* const stub = AllocNear(base);
+    if (!stub) {
+        std::fprintf(stderr, "[patch] GAME-008: no memory near the game's code, not applied\n");
+        return;
+    }
+    std::memcpy(stub, kGt7JobIdleStub, sizeof(kGt7JobIdleStub));
+    const void* const hook = reinterpret_cast<void*>(&Gt7JobIdle);
+    std::memcpy(stub + kGt7JobIdleStubHook, &hook, 8);
+    const u8* const resume = base + kGt7JobIdleResume + kTextRvaShift;
+    std::memcpy(stub + sizeof(kGt7JobIdleStub), &resume, 8);
+    FlushInstructionCache(GetCurrentProcess(), stub, sizeof(kGt7JobIdleStub) + 8);
+    // Only the je's rel32 changes: the loop's other entries (18 branches to 0x333cfe2) stay as
+    // they are.
+    u8* const rel = edge + 7;
+    const s64 offset = reinterpret_cast<s64>(stub) - reinterpret_cast<s64>(rel + 4);
+    if (offset < INT32_MIN || offset > INT32_MAX) {
+        std::fprintf(stderr, "[patch] GAME-008: stub out of reach, not applied\n");
+        return;
+    }
+    const s32 rel32 = static_cast<s32>(offset);
+    DWORD old_protect = 0;
+    if (!VirtualProtect(rel, 4, PAGE_EXECUTE_READWRITE, &old_protect)) {
+        return;
+    }
+    std::memcpy(rel, &rel32, 4);
+    DWORD ignored = 0;
+    VirtualProtect(rel, 4, old_protect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), edge, sizeof(kGt7JobIdleBackEdgeCode));
+    std::fprintf(stderr,
+                 "[patch] GAME-008: GT7 Job#0's idle loop sleeps %lld us after %lld us idle\n",
+                 sleep_us, idle_us);
+}
+
 void InstallMiscHooks(u8* base) {
 #ifndef NDEBUG
     const char* diag = Common::DiagEnv("SHADGT_ENV_DIAG");
@@ -1777,9 +2309,13 @@ void SyncDecals() {
     std::wstring dir{exe};
     dir = dir.substr(0, dir.find_last_of(L"\\/") + 1);
     const std::wstring src = dir + L"decals\\";
-    const std::wstring dst = dir + L"temp0\\decals\\";
+    // The game's /temp0 is temp0\<serial> (one folder for both games).
+    const std::string serial{Common::CurrentGameSerial()};
+    const std::wstring temp0 = dir + L"temp0\\" + std::wstring(serial.begin(), serial.end());
+    const std::wstring dst = temp0 + L"\\decals\\";
     CreateDirectoryW(src.c_str(), nullptr);
     CreateDirectoryW((dir + L"temp0").c_str(), nullptr);
+    CreateDirectoryW(temp0.c_str(), nullptr);
     CreateDirectoryW(dst.c_str(), nullptr);
     WIN32_FIND_DATAW found{};
     HANDLE find = FindFirstFileW((dst + L"*.svg").c_str(), &found);
@@ -1822,7 +2358,7 @@ void SyncDecals() {
 // 1024x512 reflection of the wet track (ReflectSetting.enableIfWet of the course settings, checked
 // at eboot 0xab27d2): ~24% of a Tokyo rain frame's draws. Ignoring "wet" leaves the pass out
 // (Tokyo rain, 3 races each: 40.6 fps vs 31.1). Off when GPU.wet_reflections is false in
-// user\custom_configs\CUSA03220.json (the launcher's option) or SHADGT_WET_REFLECTIONS=0.
+// user\custom_configs\<serial>.json (the launcher's option) or SHADGT_WET_REFLECTIONS=0.
 bool WetReflectionsWanted() {
     if (const char* env = std::getenv("SHADGT_WET_REFLECTIONS")) {
         return env[0] != '0';
@@ -2092,6 +2628,88 @@ static void InstallWideCamera(u8* base) {
     Apply(base, Patch{0x86015f, {0xc4, 0xc1, 0x7a, 0x10, 0x84, 0x24, 0xf4, 0x04, 0x00, 0x00},
                       {0xc5, 0xfa, 0x10, 0x05, 0xf9, 0xf0, 0x57, 0x01, 0x66, 0x90},
                       "WIDE-002 scripted view aspect"});
+}
+
+// DLSS-GT7-005: the game's own 4K interface images with temporal DLSS. GT7 (CUSA24769 v1.71) keeps
+// a flag ([0x1462fda71]) that says its output is high resolution: set, the interface loads its
+// /4k/ images and draws its maps larger (513x326 for 308x196); clear, it rewrites /4k/ paths to
+// /2k/. The temporal DLSS path draws the HUD at twice the game's size (NativeRenderer::HudScale),
+// where the 2k images were merely magnified: icons, gauges and maps came out soft beside a build
+// that selects the 4K ones (measured on 2026-11-14: bottom HUD detail 11.7 -> 15.8). The flag is
+// forced where the game computes it (its first value and the one after a display change, keeping
+// the latter's comparison) and set now. The idea and the three addresses are Gabarsolon's, from
+// RyGT-Team/shadgt7 PR 42 (InstallHdUiAssetsGt7); rewritten here on this file's Apply.
+// Only where temporal DLSS is asked for and can run, decided as ryty_upscale.h's TemporalWanted
+// and TemporalRequested decide it, from the settings file (the renderer's settings are not loaded
+// yet): NVIDIA DLSS chosen, Streamline's sl.dlss.dll there and not switched off, no frame
+// generation, not the PS4 Pro mode on a 4K TV (the game picks its own images there). What cannot
+// be known here is whether Streamline will start: a GPU that falls back from DLSS gets the 4K
+// images minified. SHADGT_DLSS_TEMPORAL_UI_4K=0 leaves the game's flag alone, =1 forces it whatever
+// the upscaler. Costs texture memory and loading, neither measured; menus draw the 4K images
+// into the 1080p picture, minified, as does a GPU without 32768-wide viewports in a race.
+void InstallUi4kImagesGt7(u8* base) {
+    const char* own = std::getenv("SHADGT_DLSS_TEMPORAL_UI_4K");
+    if (own && own[0] == '0') {
+        return;
+    }
+    if (!(own && own[0] == '1')) {
+        const char* env = std::getenv("SHADGT_DLSS_TEMPORAL");
+        const char* streamline = std::getenv("SHADGT_DLSS_STREAMLINE");
+        const bool plugin =
+            !(streamline && streamline[0] == '0') &&
+            GetFileAttributesW((Common::RytyExeDirW() + L"dlss\\sl.dlss.dll").c_str()) !=
+                INVALID_FILE_ATTRIBUTES;
+        const bool temporal = env && (env[0] == '0' || env[0] == '1')
+                                  ? env[0] == '1'
+                                  : ConfigFlag("dlss_enabled", false) && plugin &&
+                                        !ConfigFlag("dlssg_enabled", false) &&
+                                        !ConfigFlag("framegen_enabled", false);
+        const char* neo = std::getenv("SHADGT_NEO");
+        const char* tv = std::getenv("SHADGT_NEO_TV");
+        const bool pro_4k =
+            neo && neo[0] == '1' && neo[1] == '\0' && !(tv && std::string_view{tv} == "1080");
+        if (!temporal || pro_4k) {
+            return;
+        }
+    }
+    const Patch patches[] = {
+        {0x181bc7c, {0x20, 0xd0, 0x88, 0x05, 0xed, 0x1d, 0xae, 0x04},
+         {0xb0, 0x01, 0x88, 0x05, 0xed, 0x1d, 0xae, 0x04},
+         "DLSS-GT7-005 4K interface images (1/2)"},
+        {0x18f3751, {0x20, 0xca, 0x40, 0x38, 0xd6, 0x0f, 0x85, 0xc2, 0x02, 0x00, 0x00},
+         {0xb2, 0x01, 0x40, 0x38, 0xd6, 0x0f, 0x85, 0xc2, 0x02, 0x00, 0x00},
+         "DLSS-GT7-005 4K interface images (2/2)"},
+    };
+    constexpr u64 flag_rva = 0x62fda71;
+    // Both writers and the flag are checked before anything changes: another executable must not
+    // get half of this.
+    for (const Patch& patch : patches) {
+        if (!ReadableRange(base + patch.rva, patch.original.size()) ||
+            std::memcmp(base + patch.rva, patch.original.data(), patch.original.size()) != 0) {
+            std::fprintf(stderr,
+                         "[patch] DLSS-GT7-005 4K interface images: the bytes at %#llx differ, "
+                         "not applied\n",
+                         static_cast<unsigned long long>(patch.rva));
+            return;
+        }
+    }
+    if (!ReadableRange(base + flag_rva, 1) || base[flag_rva] > 1) {
+        std::fprintf(stderr, "[patch] DLSS-GT7-005 4K interface images: the flag is unreadable or "
+                             "not a flag, not applied\n");
+        return;
+    }
+    for (const Patch& patch : patches) {
+        if (!Apply(base, patch)) {
+            return;
+        }
+    }
+    DWORD old_protect = 0;
+    if (VirtualProtect(base + flag_rva, 1, PAGE_READWRITE, &old_protect)) {
+        base[flag_rva] = 1;
+        DWORD ignored = 0;
+        VirtualProtect(base + flag_rva, 1, old_protect, &ignored);
+        std::fprintf(stderr, "[patch] DLSS-GT7-005: the game's 4K interface images are selected\n");
+    }
 }
 
 void InstallMirrorHalfRate(u8* base) {
@@ -3170,6 +3788,433 @@ void Install(u8* base) {
 
 } // namespace Gt7Cipher
 
+void RytySetGt7HdrStatusCompatibility(bool available) {
+    Gt7HdrStatus::g_available.store(available, std::memory_order_relaxed);
+}
+
+// NEO-GT7-014: GT7's graphics presets, option by option. GT7 fills its preset in one function
+// (GT7.exe+0x1bcc7c0: GT7_PS4, GT7_PS4Pro_4K for a Pro on a TV above 1080p, GT7_PS4Pro_2K for a
+// Pro on a 1080p TV) and copies it into GTRender::GraphicsConfig (+0x1bccba0, called from
+// +0x1bcc4bd and +0x173149c). That copy is hooked: with SHADGT_NEO_EXTRAS set, five values the Pro
+// presets differ on are forced in whichever preset the game picked, each on or off on its own:
+//   blur        motion blur in races (race effect flags 0x08, motion blur off, and 0x10, a
+//               second blur off, cleared; off: both set, as in the PS4 and Pro 4K presets)
+//   replays60   replays and photo mode at 60 fps (frame divisor 1 for modes 1, 3 and 6; off: 2)
+//   replayblur  the second blur in replays and photo mode (flag 0x10 cleared in modes 1, 2, 3
+//               and 6; off: set)
+//   garage60    the high-quality garage scenes (mode 5) at 60 fps (divisor 1; off: 2)
+//   lod         level of detail kept 1.3 times farther (the preset's detail scale 1.3; off: 1.0)
+// SHADGT_NEO_EXTRAS=blur,lod turns those two on and the three others off; "all" and "none" too
+// (gt7_preset_options.h). Unset: the game's presets as they are (the Pro 1080p one has all five,
+// the others none). Preset layout (0x350 bytes, read from +0x1bcc7c0 and +0x1bccba0): +0x18
+// detail scale (float), mode m at 0x48 + 0x60 m with its frame divisor at +0 (u32) and effect
+// flags at +0x50 (u64), preset number at +0x348. Modes: 0 race, 1 and 3 replay, 2 replay
+// variant, 4 garage, 5 high-quality garage, 6 photo, 7 Scapes. Every option on costs GPU time;
+// checked in play on an RTX 4070 only, with GT7.exe 01.00 (the one this file's RVAs are from).
+namespace Gt7Presets {
+
+using namespace Gt7PresetOptions;
+
+constexpr u64 kPresetCopy = 0x1bccba0; // GT7.exe RVA (the PE's own, no kTextRvaShift)
+// mov eax, [rsi + 0x348]; xor edx, edx; mov [rdi + 0x4a4], eax: 14 bytes that don't depend on
+// where they run, then xor eax, eax at +0xe. They hold the offsets of the preset's number and of
+// its copy in the config, and appear once in GT7.exe 01.00.
+constexpr u8 kPresetCopyStart[14] = {0x8b, 0x86, 0x48, 0x03, 0x00, 0x00, 0x31,
+                                     0xd2, 0x89, 0x87, 0xa4, 0x04, 0x00, 0x00};
+
+using PresetCopyFn = void(PS4_SYSV_ABI*)(u8*, u8*);
+PresetCopyFn g_copy = nullptr;
+u32 g_on = 0;
+
+u8* Mode(u8* preset, int mode) {
+    return preset + 0x48 + 0x60 * mode;
+}
+
+void SetFlag(u8* preset, int mode, u64 flags, bool set) {
+    u64 value = 0;
+    std::memcpy(&value, Mode(preset, mode) + 0x50, 8);
+    value = set ? (value | flags) : (value & ~flags);
+    std::memcpy(Mode(preset, mode) + 0x50, &value, 8);
+}
+
+void SetDivisor(u8* preset, int mode, u32 divisor) {
+    std::memcpy(Mode(preset, mode), &divisor, 4);
+}
+
+const char* OnOff(u32 bit) {
+    return (g_on & bit) ? "on" : "off";
+}
+
+void PS4_SYSV_ABI PresetCopyHook(u8* config, u8* preset) {
+    SetFlag(preset, 0, 0x18, (g_on & Blur) == 0);
+    for (const int mode : {1, 3, 6}) {
+        SetDivisor(preset, mode, (g_on & Replays60) ? 1 : 2);
+    }
+    for (const int mode : {1, 2, 3, 6}) {
+        SetFlag(preset, mode, 0x10, (g_on & ReplayBlur) == 0);
+    }
+    SetDivisor(preset, 5, (g_on & Garage60) ? 1 : 2);
+    const float scale = (g_on & Lod) ? 1.3f : 1.0f;
+    std::memcpy(preset + 0x18, &scale, 4);
+    s32 number = 0;
+    std::memcpy(&number, preset + 0x348, 4);
+    std::fprintf(stderr,
+                 "[patch] NEO-GT7-014: preset %d: blur %s, replays60 %s, replayblur %s, "
+                 "garage60 %s, lod %s\n",
+                 number, OnOff(Blur), OnOff(Replays60), OnOff(ReplayBlur), OnOff(Garage60),
+                 OnOff(Lod));
+    g_copy(config, preset);
+}
+
+// The game's code (.elf0) as [begin, end), when all of it is committed and readable; else empty.
+std::pair<u8*, u8*> GameCode(u8* base) {
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
+    for (u32 i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        if (std::memcmp(section->Name, ".elf0", 6) != 0) {
+            continue;
+        }
+        u8* const begin = base + section->VirtualAddress;
+        u8* const end = begin + section->Misc.VirtualSize;
+        for (u8* at = begin; at < end;) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (!VirtualQuery(at, &info, sizeof(info)) || info.State != MEM_COMMIT ||
+                (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+                return {};
+            }
+            at = reinterpret_cast<u8*>(info.BaseAddress) + info.RegionSize;
+        }
+        return {begin, end};
+    }
+    return {};
+}
+
+// The copy at its RVA in GT7.exe 01.00; in another version, the one place in the game's code
+// (.elf0) that starts a function (16-byte aligned) with these 14 bytes. None or several, or no
+// readable .elf0 (another program): null.
+u8* FindPresetCopy(u8* base) {
+    const auto [begin, end] = GameCode(base);
+    if (!begin || end - begin < static_cast<std::ptrdiff_t>(sizeof(kPresetCopyStart))) {
+        return nullptr;
+    }
+    u8* const known = base + kPresetCopy;
+    if (known >= begin && known + sizeof(kPresetCopyStart) <= end &&
+        std::memcmp(known, kPresetCopyStart, sizeof(kPresetCopyStart)) == 0) {
+        return known;
+    }
+    u8* found = nullptr;
+    for (u8* at = begin; at + sizeof(kPresetCopyStart) <= end; at += 16) {
+        if (std::memcmp(at, kPresetCopyStart, sizeof(kPresetCopyStart)) == 0) {
+            if (found) {
+                return nullptr;
+            }
+            found = at;
+        }
+    }
+    return found;
+}
+
+void Install(u8* base) {
+    if (!Common::IsGt7()) {
+        return; // NEO-GTS-506: GT Sport's options are GtsProOptions'
+    }
+    const char* env = std::getenv("SHADGT_NEO_EXTRAS");
+    if (!env || !*env) {
+        return;
+    }
+    const u32 on = Parse(env, [](std::string_view item) {
+        std::fprintf(stderr, "[patch] NEO-GT7-014: unknown option '%.*s' in SHADGT_NEO_EXTRAS, "
+                             "ignored\n",
+                     static_cast<int>(item.size()), item.data());
+    });
+    u8* const copy = FindPresetCopy(base);
+    if (!copy) {
+        std::fprintf(stderr, "[patch] NEO-GT7-014: preset copy not found (another GT7 version), "
+                             "SHADGT_NEO_EXTRAS not applied\n");
+        return;
+    }
+    if (copy != base + kPresetCopy) {
+        std::fprintf(stderr, "[patch] NEO-GT7-014: preset copy found at GT7.exe+%#llx\n",
+                     static_cast<unsigned long long>(copy - base));
+    }
+    u8* const trampoline = AllocNear(base);
+    if (!trampoline) {
+        std::fprintf(stderr, "[patch] NEO-GT7-014: no memory near the game's code for the hook\n");
+        return;
+    }
+    // The copy's first instructions move to the trampoline, then jump back after them.
+    const u8 jump[6] = {0xff, 0x25, 0, 0, 0, 0}; // jmp qword ptr [rip]
+    std::memcpy(trampoline, copy, sizeof(kPresetCopyStart));
+    std::memcpy(trampoline + sizeof(kPresetCopyStart), jump, 6);
+    const u8* const resume = copy + sizeof(kPresetCopyStart);
+    std::memcpy(trampoline + sizeof(kPresetCopyStart) + 6, &resume, 8);
+    FlushInstructionCache(GetCurrentProcess(), trampoline, sizeof(kPresetCopyStart) + 14);
+    g_on = on;
+    g_copy = reinterpret_cast<PresetCopyFn>(trampoline);
+    DWORD old_protect = 0;
+    if (!VirtualProtect(copy, sizeof(kPresetCopyStart), PAGE_EXECUTE_READWRITE, &old_protect)) {
+        std::fprintf(stderr, "[patch] NEO-GT7-014: code not writable (error %lu), not applied\n",
+                     GetLastError());
+        return;
+    }
+    const void* const hook = reinterpret_cast<void*>(&PresetCopyHook);
+    std::memcpy(copy, jump, 6);
+    std::memcpy(copy + 6, &hook, 8);
+    DWORD ignored = 0;
+    VirtualProtect(copy, sizeof(kPresetCopyStart), old_protect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), copy, sizeof(kPresetCopyStart));
+    std::fprintf(stderr, "[patch] NEO-GT7-014 preset options applied (SHADGT_NEO_EXTRAS=%s)\n", env);
+}
+
+} // namespace Gt7Presets
+
+// NEO-GTS-506: GT Sport's PS4 Pro options, one by one, with GT7's names (SHADGT_NEO_EXTRAS,
+// gt7_preset_options.h). GT Sport has no preset table: each option is its own test of the Pro
+// byte (0x1431c9572, set by the video init 0x141c6de30) and of the 4K byte (0x1431c9571, TV taller
+// than 1080). Read in Ghidra (GT Sport 1.69, RECHERCHE-OPTIONS-PRO-GTSPORT.md):
+// - blur: the race cameras' motion blur, which a Pro on a 1080p TV turns on (0x140862250..
+//   0x1408625c1 sets EffectParameter.motionblur.enable, +0x264, the field the launcher's
+//   "disable motion blur" option reads);
+// - replays60: 60 fps instead of 30 in the reduced-rate view (the replays, by the press of the
+//   time: not proven in the code), flag at 0x140861b59, applied at 0x1406452ea;
+// - lod: a view scale of 1.3 instead of 1.0 (+0x138, GT7's level-of-detail factor), chosen at
+//   0x14110fd51.
+// GT7's replayblur and garage60 have no GT Sport counterpart found. Unset or empty: the game's own
+// rules (a Pro on a 1080p TV has the three, on a 4K TV none). Set: the listed options on, the
+// others off, in the base mode and either Pro mode; the Pro mode's other differences stay (a Pro
+// with "none" is not a base PS4). Still left to the game: VR for blur only (replays60 and lod are
+// forced in VR too, which the emulator never reports), and the cameras whose own flags ask for
+// blur or 60 fps on any PS4. Forced on outside a Pro 1080p, blur enters code only that mode ran:
+// +0x264 and two fields with no reader found (+0x1d45/+0x1d46); whether the blur pass needs more
+// is to be seen in the game. Not measured: the GPU cost of an option forced on a base PS4 (rule: no
+// frame over 50 ms, never under 30 fps).
+namespace GtsProOptions {
+
+using namespace Gt7PresetOptions;
+
+struct Site {
+    u64 rva;
+    std::vector<u8> original;
+    std::vector<u8> on;  ///< empty: left as it is when the option is on
+    std::vector<u8> off; ///< empty: left as it is when the option is off
+    const char* what;
+};
+
+void Install(u8* base) {
+    if (Common::IsGt7()) {
+        return;
+    }
+    const char* env = std::getenv("SHADGT_NEO_EXTRAS");
+    if (!env || !*env) {
+        return; // as GT7: empty is unset
+    }
+    const uint32_t options = Parse(env, [](std::string_view unknown) {
+        std::fprintf(stderr, "[patch] NEO-GTS-506: unknown option '%.*s' in SHADGT_NEO_EXTRAS, "
+                             "ignored\n",
+                     static_cast<int>(unknown.size()), unknown.data());
+    });
+    const std::vector<u8> nop6{0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+    const Site sites[] = {
+        // blur: the 4K test no longer skips the forcing (jz -> two nops), the Pro test reads 1
+        // (mov dl,[Pro] -> mov dl,1); off: the jump to the Pro block goes (jnz -> six nops).
+        {0x862261, {0x74, 0x15}, {0x90, 0x90}, {}, "blur: also on a 4K TV"},
+        {0x86226a, {0x8a, 0x15, 0x02, 0x73, 0x96, 0x02}, {0xb2, 0x01, 0x90, 0x90, 0x90, 0x90}, {},
+         "blur: as on a Pro"},
+        {0x862272, {0x0f, 0x85, 0x23, 0x03, 0x00, 0x00}, {}, nop6, "blur: off on a Pro"},
+        // replays60: the 4K test jumps to the Pro test (jz -> jmp), which answers 1 (setnz al ->
+        // mov al,1); off: it answers 0 (xor al,al).
+        {0x861b44, {0x74, 0x13}, {0xeb, 0x13}, {}, "replays60: also on a 4K TV"},
+        {0x861b60, {0x0f, 0x95, 0xc0}, {0xb0, 0x01, 0x90}, {0x30, 0xc0, 0x90}, "replays60"},
+        // lod: the 4K test falls through (jz -> six nops) to the Pro test, which always jumps to the
+        // 1.3 (jnz -> jmp 0x141110fe4); off: the Pro test never jumps (1.0).
+        {0x110fd62, {0x0f, 0x84, 0xea, 0x0c, 0x00, 0x00}, nop6, {}, "lod: also on a 4K TV"},
+        {0x110fd6f, {0x0f, 0x85, 0x6f, 0x12, 0x00, 0x00}, {0xe9, 0x70, 0x12, 0x00, 0x00, 0x90},
+         nop6, "lod"},
+    };
+    const auto wanted = [&](const Site& site) {
+        const std::string_view what{site.what};
+        const uint32_t bit = what.starts_with("blur") ? Blur
+                             : what.starts_with("replays60") ? Replays60
+                                                             : Lod;
+        return (options & bit) != 0;
+    };
+    // Every site checked before any is changed: another executable version stays untouched.
+    for (const Site& site : sites) {
+        MEMORY_BASIC_INFORMATION info{};
+        const u8* target = base + site.rva;
+        if (!VirtualQuery(target, &info, sizeof(info)) || info.State != MEM_COMMIT ||
+            reinterpret_cast<uintptr_t>(target) + site.original.size() >
+                reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize ||
+            (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
+            std::memcmp(target, site.original.data(), site.original.size()) != 0) {
+            std::fprintf(stderr, "[patch] NEO-GTS-506: %s: bytes differ (another GT Sport "
+                                 "version), SHADGT_NEO_EXTRAS not applied\n",
+                         site.what);
+            return;
+        }
+    }
+    for (const Site& site : sites) {
+        const std::vector<u8>& bytes = wanted(site) ? site.on : site.off;
+        if (bytes.empty()) {
+            continue;
+        }
+        if (!Apply(base, Patch{site.rva, site.original, bytes,
+                               std::string{"NEO-GTS-506 "} + site.what +
+                                   (wanted(site) ? " on" : " off")})) {
+            // The code stays valid either way; the options are then partly the game's own.
+            std::fprintf(stderr, "[patch] NEO-GTS-506: stopped at %s, the remaining options are "
+                                 "the game's own\n",
+                         site.what);
+            return;
+        }
+    }
+    // The launcher's "disable motion blur" (InstallMotionBlurOption) wins over blur: it patches
+    // the reader of the same field.
+    const bool blur_disabled = ConfigFlag("disable_motion_blur", false);
+    std::fprintf(stderr, "[patch] NEO-GTS-506 GT Sport Pro options: blur %s, replays60 %s, lod %s "
+                         "(SHADGT_NEO_EXTRAS=%s)\n",
+                 options & Blur ? (blur_disabled ? "on but disabled by disable_motion_blur" : "on")
+                                : "off",
+                 options & Replays60 ? "on" : "off", options & Lod ? "on" : "off", env);
+}
+
+} // namespace GtsProOptions
+
+// FIX-GT7-162: launching a replay crashed once (a read of address 0 on a Job thread at GT7.exe
+// +0x1eaac3b). Each frame of an event, GT7's work module org_race (the std::function of
+// GTFramework::Organizer::Impl::initialize's lambda $_7, GT7.exe+0x1eaa5d0) sets the race sound
+// (bgm_effect, sfx_attenuation) from the Organizer's GTRace::RaceContext and reads the first
+// 32-bit field of the object the context's shared_ptr at +0x58 points to, without a check. The
+// race sequence (GTRaceApp::Sequence::Impl, module race_app) empties that shared_ptr during an
+// event (GT7.exe+0x1f251e0) and it is filled again shortly after. Both modules have the same order
+// key in the frame's first phase, and the game's executor only waits for its jobs between
+// different keys, so the two run as concurrent jobs of one frame: nothing in the game's code
+// orders the read and the emptying. The callback's two loads of the shared_ptr (control block,
+// then pointer) go to a stub that tests the pointer first: null, the function leaves through its
+// own end before any reference is taken, so that frame skips its race sound settings; set, the
+// game's code goes on as before (with or without a control block). This also covers an emptying
+// that lands between the two loads; one that lands after both and before the reference is taken
+// is still the game's own, narrower, window. Applied only where every byte checked below is GT7's
+// (no other game or version is changed). SHADGT_RACE_CONTEXT_GUARD=0 turns it off.
+namespace Gt7RaceContextGuard {
+
+// mov rbx,[r13+0x60] (control block); mov r15,[r13+0x58] (pointer); test rbx,rbx; jz kNoRef.
+// The two loads (8 bytes) become a jmp to the stub.
+constexpr u64 kLoad = 0x1eaa889;
+constexpr u8 kLoadBytes[] = {0x49, 0x8b, 0x5d, 0x60, 0x4d, 0x8b, 0x7d, 0x58, 0x48,
+                             0x85, 0xdb, 0x0f, 0x84, 0xa1, 0x03, 0x00, 0x00};
+constexpr size_t kLoadsSize = 8;
+// With a control block: a reference taken (lea r14,[rbx+8]; ... call), the read, the release.
+constexpr u64 kRefPath = 0x1eaa89a;
+constexpr u8 kRefPathBytes[] = {0x4c, 0x8d, 0x73, 0x08, 0x4c, 0x89, 0xf7, 0xbe, 0x01, 0x00, 0x00,
+                                0x00, 0x31, 0xd2, 0xe8, 0x33, 0xab, 0xeb, 0x01, 0x45, 0x8b, 0x3f};
+// Without one: mov r15d,[r15] (the read that faulted); jmp kResume.
+constexpr u64 kNoRef = 0x1eaac3b;
+constexpr u8 kNoRefBytes[] = {0x45, 0x8b, 0x3f, 0xe9, 0x88, 0xfc, 0xff, 0xff};
+// cmp r15d,10: where both paths go on.
+constexpr u64 kResume = 0x1eaa8cb;
+constexpr u8 kResumeBytes[] = {0x41, 0x83, 0xff, 0x0a};
+// The function's end, also reached from other paths: rbx reloaded with the stack guard's address,
+// guard check against [rbp-0x30], add rsp,0x18, pops of rbx, r12-r15 and rbp, ret.
+constexpr u64 kEnd = 0x1eaaae8;
+constexpr u8 kEndBytes[] = {0x48, 0x8b, 0x1d, 0xf1, 0x41, 0x6d, 0x03, 0x48, 0x8b, 0x03, 0x48,
+                            0x3b, 0x45, 0xd0, 0x75, 0x5b, 0x48, 0x83, 0xc4, 0x18, 0x5b, 0x41,
+                            0x5c, 0x41, 0x5d, 0x41, 0x5e, 0x41, 0x5f, 0x5d, 0xc3};
+
+std::atomic<u64> g_skipped{0};
+
+// Called from the stub on the game's Job thread when the pointer is null.
+void PS4_SYSV_ABI Skipped(const void* control_block) {
+    const u64 count = g_skipped.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count <= 8 || (count & (count - 1)) == 0) {
+        std::fprintf(stderr,
+                     "[patch] FIX-GT7-162: race context empty (%s), this frame's race sound "
+                     "settings skipped (%llu so far)\n",
+                     control_block ? "pointer cleared, control block still read" : "emptied",
+                     static_cast<unsigned long long>(count));
+    }
+}
+
+bool Matches(u8* base, u64 rva, const u8* bytes, size_t size) {
+    return ReadableRange(base + rva, size) && std::memcmp(base + rva, bytes, size) == 0;
+}
+
+void Install(u8* base) {
+    const char* env = std::getenv("SHADGT_RACE_CONTEXT_GUARD");
+    if (env && env[0] == '0') {
+        return;
+    }
+    if (!Matches(base, kLoad, kLoadBytes, sizeof(kLoadBytes)) ||
+        !Matches(base, kRefPath, kRefPathBytes, sizeof(kRefPathBytes)) ||
+        !Matches(base, kNoRef, kNoRefBytes, sizeof(kNoRefBytes)) ||
+        !Matches(base, kResume, kResumeBytes, sizeof(kResumeBytes)) ||
+        !Matches(base, kEnd, kEndBytes, sizeof(kEndBytes))) {
+        // GT Sport, or another GT7 build: silent unless the switch was set.
+        if (env && env[0]) {
+            std::fprintf(stderr, "[patch] FIX-GT7-162: original bytes differ, not applied\n");
+        }
+        return;
+    }
+    u8* const stub = AllocNear(base);
+    if (!stub) {
+        std::fprintf(stderr, "[patch] FIX-GT7-162: no memory near the game's code, not applied\n");
+        return;
+    }
+    std::vector<u8> code;
+    const auto bytes = [&](std::initializer_list<u8> list) { code.insert(code.end(), list); };
+    const auto imm64 = [&](u64 value) {
+        for (int i = 0; i < 8; ++i) code.push_back(static_cast<u8>(value >> (8 * i)));
+    };
+    const auto jump = [&](u64 rva) { // jmp [rip] -> the game's code
+        bytes({0xff, 0x25, 0, 0, 0, 0});
+        imm64(reinterpret_cast<u64>(base + rva));
+    };
+    code.insert(code.end(), kLoadBytes, kLoadBytes + kLoadsSize); // the game's two loads
+    bytes({0x4d, 0x85, 0xff});       // test r15, r15
+    bytes({0x74, 0x00});             // jz empty (set below)
+    const size_t jz_empty = code.size() - 1;
+    bytes({0x48, 0x85, 0xdb});       // test rbx, rbx
+    bytes({0x74, 0x0e});             // jz no_ref (over the next jump: 6 + 8 bytes)
+    jump(kRefPath);                  // a control block: reference, read, release, as the game does
+    bytes({0x45, 0x8b, 0x3f});       // no_ref: mov r15d, [r15]   (the game's kNoRef read)
+    jump(kResume);
+    const size_t empty = code.size();
+    // The function's end reloads rbx and pops every callee-saved register from its frame, so the
+    // stub may use rbx to keep rsp across a 16-byte aligned call of Skipped(control block).
+    bytes({0x48, 0x89, 0xdf});       // mov rdi, rbx
+    bytes({0x48, 0x89, 0xe3});       // mov rbx, rsp
+    bytes({0x48, 0x83, 0xe4, 0xf0}); // and rsp, -16
+    bytes({0x48, 0xb8});             // mov rax, Skipped
+    imm64(reinterpret_cast<u64>(&Skipped));
+    bytes({0xff, 0xd0});             // call rax
+    bytes({0x48, 0x89, 0xdc});       // mov rsp, rbx
+    jump(kEnd);
+    code[jz_empty] = static_cast<u8>(empty - (jz_empty + 1));
+    std::memcpy(stub, code.data(), code.size());
+
+    const auto distance =
+        reinterpret_cast<intptr_t>(stub) - reinterpret_cast<intptr_t>(base + kLoad + 5);
+    DWORD previous = 0;
+    if (distance < INT32_MIN || distance > INT32_MAX ||
+        !VirtualProtect(stub, 0x1000, PAGE_EXECUTE_READ, &previous)) {
+        std::fprintf(stderr, "[patch] FIX-GT7-162: stub out of reach or not executable, not applied\n");
+        VirtualFree(stub, 0, MEM_RELEASE);
+        return;
+    }
+    FlushInstructionCache(GetCurrentProcess(), stub, code.size());
+    // jmp stub; int3 x3 (nothing jumps inside the two loads).
+    const std::vector<u8> original(kLoadBytes, kLoadBytes + kLoadsSize);
+    std::vector<u8> replacement{0xe9, 0, 0, 0, 0, 0xcc, 0xcc, 0xcc};
+    const s32 relative = static_cast<s32>(distance);
+    std::memcpy(replacement.data() + 1, &relative, sizeof(relative));
+    if (!Apply(base, Patch{kLoad, original, replacement, "FIX-GT7-162 race context guard"})) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+    }
+}
+
+} // namespace Gt7RaceContextGuard
+
 void RytyApplyGamePatches() {
     InstallPhotoExport();
     InstallScopedMenuCompiles(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
@@ -3178,12 +4223,16 @@ void RytyApplyGamePatches() {
     InstallExperimentalSceneViewport(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallMenuSnapshotSessionGuard(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallIdleKeyboardClose(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    Gt7HdrStatus::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    Gt7Presets::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // NEO-GT7-014
+    GtsProOptions::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // NEO-GTS-506
     InstallWideCamera(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTriggerTelemetry(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTriggerTelemetryGt7(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallUi4kImages(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallMirrorHalfRate(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallMotionBlurOption(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallUi4kImagesGt7(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // DLSS-GT7-005
     if (!WetReflectionsWanted()) {
         // jne (reflect when wet) -> two nops
         Apply(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)),
@@ -3193,7 +4242,12 @@ void RytyApplyGamePatches() {
     InstallLewisChallenge(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallScriptPatches(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallGt7ScriptDump(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // DIAG-GT7-043
+    InstallGt7RaceSignal(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // GAME-002
+    InstallGtsRaceStartSignal(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // GAME-006
+    InstallGt7CpuOcclusion(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // GAME-003
+    InstallGt7JobIdle(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));      // GAME-008
     Gt7Cipher::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));     // PERF-GT7-113
+    Gt7RaceContextGuard::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // FIX-GT7-162
 #ifndef NDEBUG
     InstallTextEntryDiag(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
 #endif
@@ -3207,6 +4261,13 @@ void RytyApplyGamePatches() {
 }
 
 namespace Vulkan {
+// GAME-006: the race runs (from its start countdown to its finish), and whether a hook reads it.
+bool RytyRaceRunning() {
+    return g_race_running.load(std::memory_order_relaxed);
+}
+bool RytyRaceStartSignal() {
+    return RaceStartSignalOn() && g_race_signal.load(std::memory_order_relaxed);
+}
 // FIX-110: true while a race project runs (see NoteProjectScript).
 bool RytyGtsInRace() {
     return g_in_race.load(std::memory_order_relaxed);

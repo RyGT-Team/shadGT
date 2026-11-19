@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "discord_rpc_handler.h"
+#include "common/game_title.h"
 
 namespace DiscordRPCHandler {
 
@@ -20,14 +21,10 @@ constexpr const char* Gt7ApplicationId = "1440143189372567552"; // "Gran Turismo
 constexpr const char* Gt7Icon = "https://cdn.discordapp.com/app-icons/1563296318623977472/"
                                 "184b3f0882be7369afbcdbb523416da6.png?size=512";
 
-static bool IsGt7(const std::string& game_name, const std::string& game_id) {
-    // CUSA24767 (America), CUSA24769 (Europe); other regions by title ("Gran Turismo® 7").
-    return game_id == "CUSA24767" || game_id == "CUSA24769" ||
-           (game_name.starts_with("Gran Turismo") && game_name.ends_with(" 7"));
-}
-
-void RPC::init(const std::string& game_name, const std::string& game_id) {
-    gt7 = IsGt7(game_name, game_id) && *Gt7ApplicationId != '\0';
+void RPC::init(const std::string&, const std::string&) {
+    // GAME-001: the one game test (by GT7.exe under Ryty, whose title id is GT Sport's for both
+    // games; by serial and name in the standalone emulator).
+    gt7 = Common::IsGt7() && *Gt7ApplicationId != '\0';
     DiscordEventHandlers handlers{};
     Discord_Initialize(gt7 ? Gt7ApplicationId : GtsApplicationId, &handlers, 1, nullptr);
     rpcEnabled = true;

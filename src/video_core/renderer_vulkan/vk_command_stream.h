@@ -764,6 +764,20 @@ public:
     void setAttachmentFeedbackLoopEnableEXT(vk::ImageAspectFlags aspects) const {
         Call([=](vk::CommandBuffer cmd) { cmd.setAttachmentFeedbackLoopEnableEXT(aspects); });
     }
+    /// NEO-GTS-508: the locations are copied with the command.
+    void setSampleLocationsEXT(const vk::SampleLocationsInfoEXT& info) const {
+        if (!ring) {
+            direct.setSampleLocationsEXT(info);
+            return;
+        }
+        ASSERT(info.pNext == nullptr);
+        const u32 count = info.sampleLocationsCount;
+        Record(CommandRing::Bytes<vk::SampleLocationEXT>(count), [&](CommandRing::Extra& extra) {
+            vk::SampleLocationsInfoEXT copy = info;
+            copy.pSampleLocations = extra.Copy(info.pSampleLocations, count);
+            return [copy](vk::CommandBuffer cmd) { cmd.setSampleLocationsEXT(copy); };
+        });
+    }
 
     void beginDebugUtilsLabelEXT(const vk::DebugUtilsLabelEXT& label) const {
         if (!ring) {

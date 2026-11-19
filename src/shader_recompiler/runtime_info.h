@@ -262,6 +262,46 @@ struct HwFragmentRuntimeInfo {
     AmdGpu::ShaderExportFormat z_export_format;
     u8 num_samples{1};
     u8 mrtz_mask{};
+    // NEO-GT7-005: mrtz_mask's bit 7 (the export masks use bits 0-3) asks for a pixel shader
+    // that runs once per pixel: its draw rasterizes more samples than its colour targets have
+    // (the PS4 Pro's checkerboard: 2-sample depth, 1-fragment colour) under
+    // VK_NV_framebuffer_mixed_samples, where Vulkan forbids per-sample shading. It lives in a
+    // byte the comparison already covers, so stored translations keep their layout and nothing
+    // changes where the bit is never set.
+    static constexpr u8 MrtzPixelRate = 0x80;
+    bool PixelRate() const noexcept {
+        return (mrtz_mask & MrtzPixelRate) != 0;
+    }
+    // NEO-GTS-511: bit 6 asks for per-sample barycentrics read at the game's sample positions
+    // (InterpolateAtOffset with the positions table PushData::quad_sample_mask carries) instead of
+    // InterpolateAtSample, which pipelines with custom sample locations must not use. Bit 5 marks
+    // a pixel-rate shader (bit 7) that runs once per pixel only because its draw can't have that
+    // table; the translation reads only bit 7. Set only in the PS4 Pro mode, for 2-sample draws
+    // that take the game's positions, so other translations are unchanged.
+    static constexpr u8 MrtzSampleTable = 0x40;
+    static constexpr u8 MrtzPixelRateFallback = 0x20;
+    bool SampleTable() const noexcept {
+        return (mrtz_mask & MrtzSampleTable) != 0;
+    }
+    // NEO-GTS-512: bit 6 with bit 7 (a pixel-rate shader of the checkerboard's colour draws)
+    // reads its per-sample barycentrics at the game's sample 0 (the table's entry for its quad
+    // pixel), where the PS4 Pro shades the colour, not at the pixel centre. Bit 4 adds that
+    // offset to FragCoord.xy too, when SPI_BARYC_CNTL puts the position at the sample.
+    static constexpr u8 MrtzFragCoordSample = 0x10;
+    bool FragCoordAtSample() const noexcept {
+        return (mrtz_mask & MrtzFragCoordSample) != 0;
+    }
+    // NEO-GTS-513: bits 7, 6 and 5 together: as NEO-GTS-512, but the table's slot is taken (a
+    // game AA mask, FIX-227's LDS scratch), so sample 0's entries come from the pixel shader's
+    // buffer offsets (PushData::Sample0OffsetsByte), when it has 12 buffers at most (else the
+    // centre). Bit 5 alone with bit 7 stays NEO-GTS-511's per-pixel fallback.
+    static constexpr u8 MrtzSample0InOffsets = MrtzPixelRate | MrtzSampleTable | MrtzPixelRateFallback;
+    bool SampleTableInOffsets() const noexcept {
+        return (mrtz_mask & MrtzSample0InOffsets) == MrtzSample0InOffsets;
+    }
+    bool PerPixelFallback() const noexcept {
+        return (mrtz_mask & MrtzPixelRateFallback) != 0 && !SampleTable();
+    }
     bool front_face_all_bits{false};
     bool dual_source_blending{false};
     bool clip_distance_emulation{false};

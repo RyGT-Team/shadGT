@@ -1314,7 +1314,32 @@ u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_
             }
         }
     }
-    gone.clear();
+    return RetireTaken(taken, on_evict);
+}
+
+u32 ImageRegistry::EvictListed(std::span<const ImageEntry* const> listed, u64 before,
+                               const std::function<void(ImageEntry&)>& on_evict) {
+    std::vector<std::unique_ptr<ImageEntry>> taken;
+    for (const ImageEntry* wanted : listed) {
+        Shard& shard = ShardOf(wanted->info.guest_address);
+        std::unique_lock lock{shard.mutex};
+        const auto [first, last] = shard.images.equal_range(wanted->info.guest_address);
+        for (auto it = first; it != last; ++it) {
+            if (it->second.get() != wanted) continue;
+            // OPT-010: one a job thread found since stays.
+            if (wanted->last_use.load(std::memory_order_relaxed) < before) {
+                taken.push_back(std::move(it->second));
+                shard.images.erase(it);
+            }
+            break;
+        }
+    }
+    return taken.empty() ? 0 : RetireTaken(taken, on_evict);
+}
+
+u32 ImageRegistry::RetireTaken(std::vector<std::unique_ptr<ImageEntry>>& taken,
+                               const std::function<void(ImageEntry&)>& on_evict) {
+    std::unordered_set<const ImageEntry*> gone;
     for (const auto& entry : taken) {
         gone.insert(entry.get());
     }

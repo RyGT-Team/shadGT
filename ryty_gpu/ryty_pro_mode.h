@@ -7,6 +7,9 @@
 #include <string_view>
 #include <utility>
 
+#include "common/game_title.h"
+#include "common/ryty_config.h"
+
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -39,52 +42,29 @@ inline std::optional<bool> ParseConfigBool(std::string_view text, std::string_vi
 // The launcher's explicit boolean, if present.
 inline std::optional<bool> ConfigBool(std::string_view key) {
 #ifdef _WIN32
-    char path[MAX_PATH];
-    const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
-    if (length == 0 || length >= MAX_PATH) {
+    // GAME-005: the game's own settings file (Common::RytyGameConfigPathW); FIX-230: Unicode
+    // and long-path safe.
+    const std::string text = Common::RytyReadGameConfig();
+    if (text.empty()) {
         return std::nullopt;
     }
-    std::string config{path, length};
-    config = config.substr(0, config.find_last_of("\\/") + 1) + "user\\custom_configs\\CUSA03220.json";
-    std::FILE* file = std::fopen(config.c_str(), "rb");
-    if (!file) {
-        return std::nullopt;
-    }
-    std::string text;
-    char chunk[4096];
-    while (const size_t n = std::fread(chunk, 1, sizeof(chunk), file)) {
-        text.append(chunk, n);
-    }
-    std::fclose(file);
     return ParseConfigBool(text, key);
 #else
     return std::nullopt;
 #endif
 }
 
-// Whether `key` is true in user\custom_configs\CUSA03220.json (the launcher's options).
+// Whether `key` is true in user\custom_configs\<serial>.json (the launcher's options).
 inline bool ConfigTrue(std::string_view key) { return ConfigBool(key).value_or(false); }
 
 // The number after `key` in the config (the launcher's options), or `fallback`.
 inline double ConfigNumber(std::string_view key, double fallback) {
 #ifdef _WIN32
-    char path[MAX_PATH];
-    const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
-    if (length == 0 || length >= MAX_PATH) {
+    // GAME-005: the game's own settings file (Common::RytyGameConfigPathW).
+    const std::string text = Common::RytyReadGameConfig();
+    if (text.empty()) {
         return fallback;
     }
-    std::string config{path, length};
-    config = config.substr(0, config.find_last_of("\\/") + 1) + "user\\custom_configs\\CUSA03220.json";
-    std::FILE* file = std::fopen(config.c_str(), "rb");
-    if (!file) {
-        return fallback;
-    }
-    std::string text;
-    char chunk[4096];
-    while (const size_t n = std::fread(chunk, 1, sizeof(chunk), file)) {
-        text.append(chunk, n);
-    }
-    std::fclose(file);
     const std::string quoted = "\"" + std::string{key} + "\"";
     const size_t found = text.find(quoted);
     if (found == std::string::npos) {
@@ -107,12 +87,22 @@ inline bool ProConfigEnabled() {
     return ConfigTrue("ps4_pro");
 }
 
-// SHADGT_PS4_PRO overrides the config (0 forces base mode); the config option means Neo 1080.
+// GT Sport's PS4 Pro mode, which the renderer answers to the game (GT Sport's runtime has none;
+// GT7's is its runtime's, read through sceKernelIsNeoMode, and this stays Base there as before).
+// NEO-GTS-505: in order, SHADGT_PS4_PRO (0 forces the base mode, 1080, 1 or 2160), then the switch
+// GT7 uses, SHADGT_NEO=1 with SHADGT_NEO_TV=1080 for a Pro on a 1080p TV (2160, the default, for
+// a 4K TV), then the GPU.ps4_pro config of RyGTS's launcher (Neo 1080).
 inline ProMode GetProMode() {
     static const ProMode mode = [] {
-        const char* value = std::getenv("SHADGT_PS4_PRO");
-        if (value) {
+        if (Common::IsGt7()) {
+            return ProMode::Base;
+        }
+        if (const char* value = std::getenv("SHADGT_PS4_PRO")) {
             return ParseProMode(std::string_view{value});
+        }
+        if (const char* neo = std::getenv("SHADGT_NEO"); neo && std::string_view{neo} == "1") {
+            const char* tv = std::getenv("SHADGT_NEO_TV");
+            return tv && std::string_view{tv} == "1080" ? ProMode::Neo1080 : ProMode::Neo4K;
         }
         return ProConfigEnabled() ? ProMode::Neo1080 : ProMode::Base;
     }();
@@ -121,17 +111,6 @@ inline ProMode GetProMode() {
 
 constexpr bool IsProMode(ProMode mode) {
     return mode != ProMode::Base;
-}
-
-constexpr std::pair<unsigned, unsigned> ProOutputSize(ProMode mode, unsigned width,
-                                                     unsigned height) {
-    if (mode == ProMode::Neo4K) {
-        return {3840, 2160};
-    }
-    if (mode == ProMode::Neo1080) {
-        return {1920, 1080};
-    }
-    return {width, height};
 }
 
 } // namespace Ryty

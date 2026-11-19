@@ -59,10 +59,12 @@
 #endif
 #include "common/read_capture.h"
 #include "common/scope_exit.h"
+#include "video_core/title_defaults.h"
 #include "common/singleton.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/kernel/process.h"
 #include "core/memory.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/info.h"
@@ -273,6 +275,32 @@ static PipelineCleanupWorker& PipelineRetirementWorker() {
     });
     return worker;
 }
+// PERF-SGT-017 (SHADGT_PIPELINE_OWNER_BATCH=0: as before): the recorder gave each spliced list's
+// pipeline keep-alives to the cleanup worker on their own, 1,670 times a second in a GT7 race: a
+// std::function allocation, the queue's lock and a wake system call each time (Nsight Systems:
+// ZwAlertThreadByThreadId under PipelineCleanupWorker::Enqueue), only for the worker to drop the
+// references. They are collected here and handed over 512 at a time or after 100 ms; a keep-alive
+// held a little longer changes nothing. Flushed before the worker is drained at shutdown.
+namespace {
+struct CompletedOwnerBatch {
+    std::mutex mutex;
+    std::vector<std::shared_ptr<const void>> owners;
+    std::chrono::steady_clock::time_point since{};
+};
+CompletedOwnerBatch& CompletedOwners() {
+    static CompletedOwnerBatch batch;
+    return batch;
+}
+void FlushCompletedPipelineOwners() {
+    std::vector<std::shared_ptr<const void>> owners;
+    {
+        auto& batch = CompletedOwners();
+        std::scoped_lock lock{batch.mutex};
+        owners.swap(batch.owners);
+    }
+    if (!owners.empty()) PipelineRetirementWorker().Enqueue([owners = std::move(owners)] {});
+}
+} // namespace
 
 
 namespace {
@@ -292,6 +320,8 @@ bool CompilationInProgress() {
 
 #ifdef RYTY_GPU
 bool RytyGtsInRace(); // FIX-110, ryty_game_patch.cpp
+bool RytyRaceRunning();     // GAME-006, ryty_game_patch.cpp
+bool RytyRaceStartSignal(); // GAME-006
 bool RytyGtsProjectHooks(); // FIX-GT7-140
 bool RytyGtsMenuCaptureCanContinue();
 bool RytyGtsMenuCaptureAvailable();
@@ -396,6 +426,16 @@ static std::filesystem::path g_programs_dir;
 // FEAT-GTS-470: on by default (SHADGT_MANIFEST_RECORD=0 turns it off): every translation and every
 // stored one a draw first uses gets a record, so the manifest covers what was played and a
 // pre-translation after a renderer or driver update, here or on another GPU, misses less.
+// PERF-GTS-502 (SHADGT_FRONTEND_SPLIT, on unless 0): the command thread translates a shader only
+// as far as the passes that read the game's memory; the worker does the rest before its SPIR-V.
+static bool FrontendSplitOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_FRONTEND_SPLIT");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
 static bool ManifestRecordOn() {
     static const bool on = [] {
         const char* env = std::getenv("SHADGT_MANIFEST_RECORD");
@@ -635,6 +675,8 @@ struct OwnedTranslation {
     Shader::Pools pools;
     Shader::RuntimeInfo compiled_runtime;
     std::optional<Shader::IR::Program> program;
+    /// PERF-GTS-502: the first half of the translation, when the worker does the second.
+    Shader::FrontendHandle front;
     /// PERF-GT7-111: the manifest record of this translation (its SPIR-V hash comes on the worker).
     std::unique_ptr<ManifestRecord> record;
     explicit OwnedTranslation(const Shader::RuntimeInfo& runtime) : compiled_runtime{runtime} {}
@@ -676,6 +718,16 @@ extern "C" __declspec(dllexport) int RytyTestOwnedTranslationInputs() {
         }
     }
     return cases;
+}
+
+// DIAG-GT7-073 (port, diagnosis, SHADGT_DIAG_TRANSLATE_JOBS=1): each background translation,
+// and why a finished one did not match the lookup that tried it.
+static bool TranslateJobsDiag() {
+    static const bool enabled = [] {
+        const char* env = Common::DiagEnv("SHADGT_DIAG_TRANSLATE_JOBS");
+        return env && env[0] == '1';
+    }();
+    return enabled;
 }
 
 class PipelineCache::TranslateWorkers {
@@ -771,6 +823,8 @@ private:
                 LOG_WARNING(Render_Vulkan, "SHADER-WORKER-FAIL: shader {:#x}: {}", job->hash,
                             error.what());
             }
+            // PERF-GTS-502: a failed job's IR (its second half may have failed here) goes now.
+            job->prepared_translation.reset();
             {
                 std::scoped_lock lk{job->mutex};
                 if (!job->module) {
@@ -785,7 +839,7 @@ private:
     void Translate(TranslateJob& job, Shader::Pools& pools) {
         TranslationActivity activity;
         auto prepared = std::static_pointer_cast<OwnedTranslation>(job.prepared_translation);
-        ASSERT(prepared && prepared->program && job.info);
+        ASSERT(prepared && (prepared->program || prepared->front) && job.info);
         auto& info = job.info;
         auto binding = job.start;
 #ifndef NDEBUG
@@ -793,6 +847,11 @@ private:
 #endif
         try {
             Common::RecoverableScope recoverable;
+            if (prepared->front) {
+                // PERF-GTS-502: the passes after the guest reads, here rather than on the command
+                // thread.
+                prepared->program.emplace(Shader::TranslateProgramBack(std::move(prepared->front)));
+            }
             job.spv = Shader::Backend::SPIRV::EmitSPIRV(
                 profile, prepared->compiled_runtime, *prepared->program, binding);
             job.spec = Shader::StageSpecialization(*info, job.runtime_info, profile, job.start,
@@ -817,6 +876,20 @@ private:
             info->resource_usage_known = false;
         }
         job.module = CompileSPV(job.spv, device, keep_code);
+        if (TranslateJobsDiag()) { // DIAG-GT7-073 (port)
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-GT7-073: translated #{} age {:.0f} ms ahead {} {:#x} stage {} start "
+                        "{}/{}, {} code words, spv {} words {:#x}, runtime {:#x}, user data {:#x}",
+                        job.diag_id,
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                                  job.queued_at)
+                            .count(),
+                        job.diag_ahead, job.hash, u32(job.hw_stage), job.start.unified,
+                        job.start.buffer, job.code.size(), job.spv.size(),
+                        XXH3_64bits(job.spv.data(), job.spv.size() * sizeof(u32)),
+                        XXH3_64bits(&job.runtime_info, sizeof(job.runtime_info)),
+                        XXH3_64bits(job.user_data.data(), sizeof(job.user_data)));
+        }
 #ifndef NDEBUG
         job.translate_ms +=
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
@@ -904,6 +977,8 @@ static void NoteSkippedDraw() {
 
 #ifdef RYTY_GPU
 bool RytyGtsInRace(); // FIX-110, ryty_game_patch.cpp
+bool RytyRaceRunning();     // GAME-006, ryty_game_patch.cpp
+bool RytyRaceStartSignal(); // GAME-006
 #endif
 
 bool CompileSlowMotion() {
@@ -987,6 +1062,8 @@ public:
     }
     ~PipelineBuildWorkers() {
         if (catch_up) SetCatchUpPolicy(false);
+        if (backlog) Common::SetCompileBacklog(false); // FIX-GT7-106 (port)
+        if (in_play) Common::SetCompileInPlay(false);  // FIX-GT7-109 (port)
         if (boost_wide) Common::SetCompileCoresWide(false); // FEAT-GTS-470
         for (auto& thread : threads) {
             thread.request_stop();
@@ -1027,24 +1104,42 @@ public:
     }
     static u32 UsualWidth() { return NumWorkers(); }
     void SetPace(u32 limit) { queue.SetReadAheadLimit(limit); }
+    // SetCatchUp, SetBacklog and SetInPlay are called from UpdateCatchUp only (catch_up_mutex).
     bool SetCatchUp(bool on) {
         if (on == catch_up) return true;
         if (on) {
-            const u32 width = std::max(NumWorkers(), std::min(8u, StartupWorkers()));
-            if (!TryGrowCompileWorkers(threads, width, [this] {
-                    threads.emplace_back([this](std::stop_token stop) { Work(stop); });
-                })) {
+            if (!GrowExtraWorkers()) {
                 LOG_WARNING(Render_Vulkan, "Catch-up workers unavailable; retaining normal admission");
                 return false;
             }
             SetCatchUpPolicy(true);
-            queue.SetForegroundLimit(width);
+            catch_up = true;
+            ApplyLimit();
         } else {
-            queue.SetForegroundLimit(NumWorkers());
+            catch_up = false;
+            ApplyLimit();
             SetCatchUpPolicy(false);
         }
-        catch_up = on;
         return true;
+    }
+    /// FIX-GT7-106 (port): many draws on screen wait for their pipelines (outside play): as wide
+    /// as a catch-up, on every core below normal priority (Common::SetCompileBacklog).
+    bool SetBacklog(bool on) {
+        if (on == backlog) return true;
+        if (on && !GrowExtraWorkers()) return false;
+        backlog = on;
+        ApplyLimit();
+        Common::SetCompileBacklog(on);
+        return true;
+    }
+    /// FIX-GT7-109 (port): in play (a race), no more than PlayWidth builds at once, whatever
+    /// waits, and the driver's compiler threads stay on the compile cores.
+    void SetInPlay(bool on) {
+        if (!NarrowInPlay()) on = false;
+        if (on == in_play) return;
+        in_play = on;
+        ApplyLimit();
+        Common::SetCompileInPlay(on);
     }
     bool Busy() { return queue.Busy(); }
 
@@ -1053,6 +1148,9 @@ public:
     }
     bool ForegroundIdle() {
         return queue.ForegroundIdle();
+    }
+    size_t Pending() {
+        return queue.Pending(); // DIAG-GT7-012 (port)
     }
 
 private:
@@ -1063,6 +1161,45 @@ private:
         }();
         if (low) Common::SetCompileCatchUp(on);
         else Common::SetCompileCoresWide(on);
+    }
+
+    /// PERF-GT7-029: a catch-up's width; FIX-GT7-106 (port): a backlog's too.
+    static u32 ExtraWidth() {
+        return std::max(NumWorkers(), std::min(8u, StartupWorkers()));
+    }
+    bool GrowExtraWorkers() {
+        return TryGrowCompileWorkers(threads, ExtraWidth(), [this] {
+            threads.emplace_back([this](std::stop_token stop) { Work(stop); });
+        });
+    }
+    // FIX-GT7-109 (port): measured on GT7 only. With 4 builds at once in a race the recorder's
+    // submits waited in the driver behind the compiles (frames of 60-115 ms on a new track);
+    // 2 at once did not. GT Sport's races keep going on skipped draws with their own pacing
+    // (PERF-GT7-034's step back) and were never measured narrowed.
+    // PERF-GTS-489: 2 at once is the default for both games; it is what took the compile stutter
+    // out of play. SHADGT_COMPILE_PLAY_WIDTH=<n> narrows to n; 0: never.
+    static bool NarrowInPlay() {
+        static const bool on = [] {
+            const char* env = std::getenv("SHADGT_COMPILE_PLAY_WIDTH");
+            if (env && *env) return std::strtoul(env, nullptr, 10) != 0;
+            return true;
+        }();
+        return on;
+    }
+    static u32 PlayWidth() {
+        static const u32 width = [] {
+            u32 n = 2;
+            if (const char* env = std::getenv("SHADGT_COMPILE_PLAY_WIDTH"); env && *env) {
+                n = u32(std::strtoul(env, nullptr, 10));
+            }
+            return std::clamp(n, 1u, NumWorkers());
+        }();
+        return width;
+    }
+    void ApplyLimit() {
+        queue.SetForegroundLimit(in_play                ? PlayWidth()
+                                 : catch_up || backlog ? ExtraWidth()
+                                                       : NumWorkers());
     }
 
     static u32 NumWorkers() {
@@ -1117,6 +1254,8 @@ private:
     BuildQueue queue;
     std::vector<std::jthread> threads;
     bool catch_up{};
+    bool backlog{}; ///< FIX-GT7-106 (port)
+    bool in_play{}; ///< FIX-GT7-109 (port)
     bool boost_wide{}; // FEAT-GTS-470: SetBoost widened the compile cores
 };
 
@@ -1279,7 +1418,19 @@ bool PipelineCache::ReadsVertexValues(const AmdGpu::ShaderProgram& program) {
         }
     }
     std::scoped_lock lk{vertex_value_mutex};
-    vertex_value_programs.emplace(address, found);
+    if (vertex_value_programs.emplace(address, found).second) {
+        // DIAG-222 (port, diagnosis, SHADGT_DIAG_BARY_COUNT): how many pixel shaders read
+        // per-vertex values; counted under the mutex, on any GPU (see BuildRuntimeInfo).
+        static u32 programs = 0, matching = 0;
+        ++programs;
+        matching += found;
+        static const bool diag = Common::DiagEnv("SHADGT_DIAG_BARY_COUNT") != nullptr;
+        if (diag && (found || programs % 100 == 0)) {
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-222: {} of {} pixel shaders read vertex values ({:#x}{})",
+                        matching, programs, params.hash, found ? " does" : "");
+        }
+    }
     return found;
 }
 
@@ -1382,6 +1533,10 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
             S().graphics_key.num_samples, direct_barycentric_requested);
         info.hw.fs.single_sample_barycentric =
             candidate && (all_shaders || ReadsVertexValues(regs.ps_program));
+        static const bool diag_count = Common::DiagEnv("SHADGT_DIAG_BARY_COUNT") != nullptr;
+        if (diag_count) {
+            ReadsVertexValues(regs.ps_program); // DIAG-222 (port): counted on any GPU
+        }
         info.hw.fs.front_face_all_bits = regs.barycentric_control.front_face_all_bits;
         info.hw.fs.quad_sample_mask =
             regs.reg_array[0xa30e] != ~0u || regs.reg_array[0xa30f] != ~0u;
@@ -1396,6 +1551,148 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
                                (stencil_ref_export_enable << 1) |
                                (regs.depth_shader_control.mask_export_enable << 2) |
                                (regs.depth_shader_control.coverage_to_mask_enable << 3);
+        // NEO-GT7-005: in the PS4 Pro mode, a draw rasterizing more samples (its depth's) than
+        // one of its colour targets has fragments runs its pixel shader once per pixel, where
+        // Vulkan requires it: VK_NV_framebuffer_mixed_samples (per-sample shading with fewer
+        // colour samples lost the GPU, writing to address 0). VK_AMD_mixed_attachment_samples
+        // has no such rule: AMD keeps the shader as it is. SHADGT_NEO_PIXEL_RATE=0: as before.
+        static const bool neo_pixel_rate = [] {
+            const char* env = std::getenv("SHADGT_NEO_PIXEL_RATE");
+            return Libraries::Kernel::sceKernelIsNeoMode() != 0 && // NEO-GTS-505: both games
+                   !(env && env[0] == '0');
+        }();
+        if (neo_pixel_rate && instance.IsMixedDepthSamplesSupported() &&
+            !instance.IsMixedAnySamplesSupported()) {
+            const u32 raster = S().graphics_key.num_samples; // the depth's, at this point
+            bool fewer = false;
+            for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+                const auto& col_buf = regs.color_buffers[cb];
+                if (col_buf && regs.color_target_mask.GetMask(cb) != 0) {
+                    fewer |= col_buf.NumSamples() < raster;
+                }
+            }
+            if (fewer) {
+                info.hw.fs.mrtz_mask |= Shader::HwFragmentRuntimeInfo::MrtzPixelRate;
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 3) {
+                    LOG_WARNING(Render_Vulkan,
+                                "NEO-GT7-005: pixel shader at {:#x} runs once per pixel: {} "
+                                "raster samples, fewer colour fragments (mixed samples)",
+                                regs.ps_program.Address<VAddr>(), raster);
+                }
+            }
+        }
+        // NEO-GTS-511: a 2-sample draw that takes the game's sample positions (a GPU with a 2x2
+        // grid for 2 samples) and runs its pixel shader per sample reads its per-sample
+        // barycentrics at those positions: InterpolateAtOffset with the positions table the draw
+        // pushes in PushData::quad_sample_mask (MrtzSampleTable). Without it the translation uses
+        // InterpolateAtSample, which pipelines with custom positions must not use, and such a
+        // pipeline kept the standard positions on the depth every other draw wrote at the game's
+        // (black blocks in GT7's trees: their alpha-tested depth passes run per sample). The
+        // table needs that push slot free: no game AA mask (it would use it), no hull shader
+        // (FIX-227's LDS emulation puts its scratch address there). Else the shader runs once
+        // per pixel (centre, sample 0) at the game's positions: it loses its per-sample alpha
+        // test, never the depth's positions. Only where the translation would interpolate at a
+        // sample (KHR barycentrics; AMD's explicit vertex parameter interpolates at the
+        // positions itself).
+        if (!info.hw.fs.PixelRate() && info.hw.fs.addr_flags.persp_sample_ena &&
+            !profile.supports_amd_shader_explicit_vertex_parameter &&
+            profile.supports_fragment_shader_barycentric &&
+            !info.hw.fs.single_sample_barycentric) {
+            u32 raster = S().graphics_key.num_samples; // the depth's, at this point
+            for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+                const auto& col_buf = regs.color_buffers[cb];
+                if (col_buf && regs.color_target_mask.GetMask(cb) != 0) {
+                    raster = std::max<u32>(raster, col_buf.NumSamples());
+                }
+            }
+            if (raster == 2 && instance.TakesSampleLocations(2)) {
+                // NEO-GTS-513: the slot is taken only where FIX-227 emulates the LDS
+                // (TessLdsEmulation), not by every hull shader.
+                const bool table = instance.TakesSampleTable() && !info.hw.fs.quad_sample_mask &&
+                                   TessLdsEmulation(regs) == 0;
+                info.hw.fs.mrtz_mask |=
+                    table ? Shader::HwFragmentRuntimeInfo::MrtzSampleTable
+                          : u8(Shader::HwFragmentRuntimeInfo::MrtzPixelRate |
+                               Shader::HwFragmentRuntimeInfo::MrtzPixelRateFallback);
+                static std::atomic<u32> logged_table{};
+                static std::atomic<u32> logged_pixel{};
+                if ((table ? logged_table : logged_pixel).fetch_add(1, std::memory_order_relaxed) <
+                    3) {
+                    LOG_WARNING(Render_Vulkan,
+                                "NEO-GTS-511: pixel shader at {:#x} (2 samples, per-sample "
+                                "inputs): {}",
+                                regs.ps_program.Address<VAddr>(),
+                                table ? "per sample at the game's positions (table)"
+                                : !instance.TakesSampleTable()
+                                    ? "once per pixel (interpolation offsets out of range)"
+                                : info.hw.fs.quad_sample_mask ? "once per pixel (AA mask set)"
+                                                              : "once per pixel (hull shader LDS)");
+                }
+            }
+        }
+        // NEO-GTS-512: a pixel-rate shader (NEO-GT7-005: the checkerboard's colour draws under
+        // NVIDIA's mixed samples) of a 2-sample draw at the game's positions reads its
+        // per-sample barycentrics at the game's sample 0, with the positions table: where the
+        // PS4 Pro shades the colour (its UVs, velocities and derivatives), not at the centre of
+        // the checkerboard pixel (painted lines zigzagged half a 4K pixel). FragCoord too when
+        // SPI_BARYC_CNTL puts it at the sample. Same slot rule as the per-sample table: with a
+        // game AA mask or a hull shader (FIX-227) it stays at the centre, as before.
+        // SHADGT_NEO_SAMPLE0=0: at the centre.
+        static const bool neo_sample0 = [] {
+            const char* env = std::getenv("SHADGT_NEO_SAMPLE0");
+            return !(env && env[0] == '0');
+        }();
+        const bool fragcoord_at_sample = regs.barycentric_control.pos_float_location == 2 &&
+                                         (regs.ps_input_addr.pos_x_float_ena ||
+                                          regs.ps_input_addr.pos_y_float_ena);
+        if (neo_sample0 && info.hw.fs.PixelRate() &&
+            !(info.hw.fs.mrtz_mask & Shader::HwFragmentRuntimeInfo::MrtzPixelRateFallback) &&
+            (info.hw.fs.addr_flags.persp_sample_ena || fragcoord_at_sample) &&
+            !profile.supports_amd_shader_explicit_vertex_parameter &&
+            profile.supports_fragment_shader_barycentric &&
+            !info.hw.fs.single_sample_barycentric) {
+            u32 raster = S().graphics_key.num_samples; // the depth's, at this point
+            for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+                const auto& col_buf = regs.color_buffers[cb];
+                if (col_buf && regs.color_target_mask.GetMask(cb) != 0) {
+                    raster = std::max<u32>(raster, col_buf.NumSamples());
+                }
+            }
+            if (raster == 2 && instance.TakesSampleLocations(2)) {
+                // NEO-GTS-513: where the table's slot is taken (a game AA mask, FIX-227's LDS
+                // scratch), sample 0's entries go in the pixel shader's buffer offsets instead
+                // (bits 7, 6 and 5; the translation and the draw check its 12 buffers at most).
+                const bool table = instance.TakesSampleTable();
+                const bool slot_free =
+                    !info.hw.fs.quad_sample_mask && TessLdsEmulation(regs) == 0;
+                if (table) {
+                    info.hw.fs.mrtz_mask |= u8(
+                        Shader::HwFragmentRuntimeInfo::MrtzSampleTable |
+                        (slot_free ? u8{0} : Shader::HwFragmentRuntimeInfo::MrtzPixelRateFallback) |
+                        (fragcoord_at_sample ? Shader::HwFragmentRuntimeInfo::MrtzFragCoordSample
+                                             : u8{0}));
+                }
+                static std::atomic<u32> logged_slot{};
+                static std::atomic<u32> logged_offsets{};
+                static std::atomic<u32> logged_centre{};
+                auto& logged = !table ? logged_centre : slot_free ? logged_slot : logged_offsets;
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 3) {
+                    LOG_WARNING(Render_Vulkan,
+                                "NEO-GTS-512: pixel shader at {:#x} (once per pixel, 2 samples): "
+                                "{}{}",
+                                regs.ps_program.Address<VAddr>(),
+                                !table ? "at the centre (interpolation offsets out of range)"
+                                : fragcoord_at_sample
+                                    ? "inputs and FragCoord at the game's sample 0"
+                                    : "inputs at the game's sample 0",
+                                !table || slot_free ? ""
+                                : info.hw.fs.quad_sample_mask
+                                    ? " (NEO-GTS-513: in the buffer offsets, AA mask set)"
+                                    : " (NEO-GTS-513: in the buffer offsets, hull shader LDS)");
+                }
+            }
+        }
         const auto& cb0_blend = regs.blend_control[0];
         if (cb0_blend.enable) {
             info.hw.fs.dual_source_blending =
@@ -1479,6 +1776,25 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.sw.tcs.offchip_lds_enable = regs.hs_program.settings.oc_lds_en;
         info.sw.tcs.lds_emulation = u8(TessLdsEmulation(regs));
         info.sw.tcs.num_patches = u8(info.sw.tcs.lds_emulation ? regs.ls_hs_config.num_patches : 0);
+        // DIAG-239 (port, diagnosis, SHADGT_DIAG_TCS_CONFIG): each new LS/HS configuration, 60
+        // lines at most.
+        if (static const bool diag = Common::DiagEnv("SHADGT_DIAG_TCS_CONFIG") != nullptr; diag) {
+            static std::mutex seen_mutex;
+            static std::vector<u32> seen;
+            const u32 combo = u32(regs.ls_hs_config.num_patches) |
+                              (u32(regs.ls_hs_config.hs_input_control_points) << 8) |
+                              (u32(regs.ls_hs_config.hs_output_control_points) << 16);
+            std::scoped_lock lock{seen_mutex};
+            if (seen.size() < 60 && std::ranges::find(seen, combo) == seen.end()) {
+                seen.push_back(combo);
+                LOG_WARNING(Render_Vulkan, "DIAG-239: hs patches {} input cp {} output threads {} "
+                            "offchip {} tess type {}",
+                            u32(regs.ls_hs_config.num_patches),
+                            u32(regs.ls_hs_config.hs_input_control_points),
+                            u32(regs.ls_hs_config.hs_output_control_points),
+                            u32(regs.hs_program.settings.oc_lds_en), u32(regs.tess_config.type));
+            }
+        }
         break;
     }
     case SwStage::TessellationEval: {
@@ -1496,6 +1812,18 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
 static bool WarmComputeOn() {
     static const bool on = [] { const char* p = std::getenv("SHADGT_WARM_COMPUTE");
                                 return !(p && p[0] == '0'); }();
+    return on;
+}
+
+// PERF-GT7-032 (port): a build the GPU's commands wait for runs above normal priority off the
+// compile cores while the other compiles stay there below normal (Common::BeginForegroundCompile).
+// In a GT7 race on a new track two compute pipelines took 1.3-1.6 s each beside a catch-up's
+// compiles on every core. SHADGT_FOREGROUND_COMPILE=0: built as the other compiles are.
+static bool ForegroundCompileOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_FOREGROUND_COMPILE");
+        return !(env && env[0] == '0');
+    }();
     return on;
 }
 
@@ -2337,13 +2665,16 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         // single-colour triangles (hills at Fuji on an RX 6600 XT). AMD's older compiler keeps
         // that path (AMD-314), so it does GCN's P1/P2 arithmetic by hand, as 217d4011 does for
         // the KHR path. SHADGT_MANUAL_INTERP=0/1 overrides.
+        // DIAG-230 (port, diagnosis): SHADGT_DIAG_NO_MANUAL_INTERP turns off NVIDIA's default
+        // hand-made interpolation (its translations get a store of their own, cache_storage.cpp).
         .needs_manual_interpolation =
             [&] {
                 if (const char* env = std::getenv("SHADGT_MANUAL_INTERP"); env && *env) {
                     return env[0] != '0';
                 }
                 return (instance.IsFragmentShaderBarycentricSupported() &&
-                        instance.GetDriverID() == vk::DriverId::eNvidiaProprietary) ||
+                        instance.GetDriverID() == vk::DriverId::eNvidiaProprietary &&
+                        !Common::DiagEnv("SHADGT_DIAG_NO_MANUAL_INTERP")) ||
                        (instance.IsAmdShaderExplicitVertexParameterSupported() &&
                         instance.IsAmdLegacyShaderCompiler());
             }(),
@@ -2375,16 +2706,16 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     }
     profile.lds_read_counters = DiagLdsReadCountersAddress(instance); // DIAG-GTS-459
 #ifdef RYTY_GPU
-    // FIX-GTS-364: an RX 480 drew GT7 right only with the legacy 2D-array cube sampling path, so
-    // GCN Radeons take it by default. SHADGT_NATIVE_CUBE=0 picks the legacy path on any GPU, =1
-    // the native one.
+    // FIX-GTS-364 (FIX-GT7-151): an RX 480 drew GT7 right only with the legacy 2D-array cube
+    // sampling path, so GCN Radeons take it by default. SHADGT_NATIVE_CUBE=0 picks the legacy
+    // path on any GPU, =1 the native one.
     {
         const char* native_cube_env = std::getenv("SHADGT_NATIVE_CUBE");
         const bool native_cube = native_cube_env && *native_cube_env ? native_cube_env[0] != '0'
                                                                      : !instance.IsAmdGcn();
         profile.native_cube_sampling =
             NativeModeRequested() && instance.IsImageCubeArraySupported() && native_cube;
-        LOG_INFO(Render_Vulkan, "FIX-GTS-364: native cube sampling {}{}",
+        LOG_INFO(Render_Vulkan, "FIX-GTS-364 (FIX-GT7-151): native cube sampling {}{}",
                  profile.native_cube_sampling ? "on" : "off",
                  native_cube_env && *native_cube_env ? " (SHADGT_NATIVE_CUBE)"
                  : instance.IsAmdGcn()              ? " (GCN Radeon)"
@@ -2537,8 +2868,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             const char* prewarm = std::getenv("SHADGT_PREWARM");
 #ifdef RYTY_GPU
             // PERF-098: GPU.precompile_shaders (on by default) unless the variable says otherwise.
+            // TITLE-001: not on GT7 unless the variable asks for it.
             const bool prewarm_on =
-                prewarm ? prewarm[0] != '0' : EmulatorSettings.IsPrecompileShaders();
+                prewarm ? prewarm[0] != '0'
+                        : VideoCore::CurrentTitleDefaults().stored_pipelines_prebuilt &&
+                              EmulatorSettings.IsPrecompileShaders();
 #else
             const bool prewarm_on = prewarm && prewarm[0] == '1';
 #endif
@@ -2641,6 +2975,7 @@ PipelineCache::~PipelineCache() {
     // Shutdown only: deliver all GPU-complete handoffs and drain before device teardown.
     scheduler.Finish();
     scheduler.PopPendingOperations();
+    FlushCompletedPipelineOwners(); // PERF-SGT-017
     PipelineRetirementWorker().Drain();
     SaveDriverCache(true);
 }
@@ -2652,12 +2987,54 @@ static u64 DriverCacheMaxBytes() {
     static const u64 limit = [] {
         const char* env = std::getenv("SHADGT_DRIVER_CACHE_MAX_MB");
         if (!env || !*env) {
-            return u64{4096} << 20;
+            // TITLE-001: 4096 for GT Sport, 2048 for GT7 (FIX-GT7-049).
+            return u64{VideoCore::CurrentTitleDefaults().driver_cache_max_mb} << 20;
         }
         const long long mb = std::strtoll(env, nullptr, 10);
         return mb < 0 ? ~u64{0} : u64(mb) << 20;
     }();
     return limit;
+}
+
+// FIX-SGT-010 (SHADGT_DRIVER_CACHE_ROTATE_MB): a driver cache file over this size is moved to
+// .old at start and the driver begins an empty one (title_defaults.h has why). Unset: 1024 for
+// GT7, 2048 for GT Sport; 0 turns it off. Separate from the limit above, which the launcher sets
+// from the disk budget (up to 100 GB): that one only stops a larger file being loaded.
+static u64 DriverCacheRotateBytes() {
+    static const u64 limit = [] {
+        const char* env = std::getenv("SHADGT_DRIVER_CACHE_ROTATE_MB");
+        if (!env || !*env) {
+            return u64{VideoCore::CurrentTitleDefaults().driver_cache_rotate_mb} << 20;
+        }
+        const long long mb = std::strtoll(env, nullptr, 10);
+        return mb <= 0 ? u64{0} : u64(mb) << 20;
+    }();
+    return limit;
+}
+
+// FIX-SGT-010: moves an oversized driver cache to <file>.old (replacing an earlier .old) before it
+// is opened. Returns true when the file was moved, so the session starts and saves a fresh cache.
+static bool RotateOversizedDriverCache(const std::filesystem::path& path) {
+    const u64 rotate = DriverCacheRotateBytes();
+    if (rotate == 0) return false;
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error || size <= rotate) return false;
+    auto old = path;
+    old += ".old";
+    std::filesystem::remove(old, error);
+    error.clear();
+    std::filesystem::rename(path, old, error);
+    if (error) {
+        LOG_WARNING(Render_Vulkan, "FIX-SGT-010: driver cache {} is {} MB, over {} MB, but could "
+                    "not be moved to .old ({}); loading it as before",
+                    path.filename().string(), size >> 20, rotate >> 20, error.message());
+        return false;
+    }
+    LOG_WARNING(Render_Vulkan, "FIX-SGT-010: driver cache {} was {} MB, over {} MB: moved to {} "
+                "and starting an empty one (pipelines build again this session)",
+                path.filename().string(), size >> 20, rotate >> 20, old.filename().string());
+    return true;
 }
 
 // Bounded persistence is automatic; the environment variable is a diagnostic opt-out.
@@ -2668,6 +3045,10 @@ static bool DriverCacheFileEnabled() {
 #endif
 #ifdef RYTY_GPU
     const char* env = std::getenv("SHADGT_DRIVER_CACHE");
+    if (VideoCore::CurrentTitleDefaults().driver_cache_follows_pipeline_cache &&
+        !EmulatorSettings.IsPipelineCacheEnabled()) {
+        return false; // TITLE-001: GT7, as shadgt7
+    }
     return (!env || env[0] != '0') && DriverCacheMaxBytes() != 0; // PERF-167: 0 turns it off
 #else
     return EmulatorSettings.IsPipelineCacheEnabled();
@@ -2762,6 +3143,7 @@ void PipelineCache::CreateDriverCache() {
         driver_cache_path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
             fmt::format("{}-{:04x}-{:04x}-{:08x}-{}.vkpipelinecache", serial,
                         identity.vendorID, identity.deviceID, identity.driverVersion, uuid);
+        RotateOversizedDriverCache(driver_cache_path); // FIX-SGT-010
         std::error_code exists_error;
         const bool existing_cache = std::filesystem::exists(driver_cache_path, exists_error);
         if (exists_error) rejected_driver_cache.store(true);
@@ -3075,8 +3457,9 @@ void PipelineCache::FinishBuild(PipelineBuild& build) {
           }
       };
       const bool foreground = build.urgent.load(std::memory_order_acquire);
-      if (foreground) Common::BeginForegroundCompile();
-      SCOPE_EXIT { if (foreground) Common::EndForegroundCompile(); };
+      const bool foreground_compile = foreground && ForegroundCompileOn(); // PERF-GT7-032 (port)
+      if (foreground_compile) Common::BeginForegroundCompile();
+      SCOPE_EXIT { if (foreground_compile) Common::EndForegroundCompile(); };
       // FIX-419-GTS (follows FIX-GT7-030): a build a draw waits for does not wait for another
       // build's shared libraries.
       g_pipeline_build_urgent = foreground;
@@ -3138,6 +3521,24 @@ void PipelineCache::BuildOnScreen() {
     if (best) FinishBuild(*best);
 }
 
+// FIX-GTS-516: PERF-GTS-494 made the play state the race's own wherever GAME-006's race signal
+// exists, menus included: there the game was never "in play". shadgt7 measured it by frame time
+// everywhere, so a heavy menu scene (GT7's dealership, at a cold start under 50 fps) counted as
+// play: one-off draws waited 12 ms a frame at most and were skipped after. Out of play the rules
+// made for Scapes' photos apply (FIX-GT7-131 layouts, FIX-GT7-135 texture levels waiting whatever
+// the budget, 40 ms a frame): with shaders not compiled the dealership stopped up to 1.3 s a draw
+// and its guest clocks were held 24 s in 3 minutes (DIAG-GTS-515), D-pad presses lost. Now the
+// race's state applies in a race session only (RytyGtsInRace: its loading and pre-race screen stay
+// out of play, as PERF-GTS-494 wants); elsewhere the frame-time measure. SHADGT_MENU_PLAY_MEASURE=0:
+// the race's state everywhere, as before.
+static bool RaceStatePlay(bool race_signal) {
+    static const bool menu_measure = [] {
+        const char* env = std::getenv("SHADGT_MENU_PLAY_MEASURE");
+        return !(env && env[0] == '0');
+    }();
+    return race_signal && (!menu_measure || RytyGtsInRace());
+}
+
 void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
     static const bool enabled = [] { const char* v = std::getenv("SHADGT_COMPILE_CATCH_UP"); return !(v && v[0] == '0'); }();
     static const bool paced = [] { const char* v = std::getenv("SHADGT_CATCH_UP_PACE"); return !(v && v[0] == '0'); }();
@@ -3174,14 +3575,84 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
             const double fps = 1000.0 / std::max(ms, 0.001);
             const bool slow = state.in_play ? ms > 17.5 : ms > 19.0;
             const bool held = state.in_play && hold_draws > 0.0 && draws_a_frame >= hold_draws;
-            const bool play = fps >= 5.0 && (slow || held);
+            // PERF-GTS-494: in a race session with GAME-006's hook, the play state is the
+            // race's own (from its start countdown to its finish), see below. Elsewhere
+            // (menus, Scapes, without the hook or with SHADGT_RACE_START_SIGNAL=0): the
+            // frame-time measure above.
+            // FIX-GTS-516: the race's state only in a race session; out of one (menus, GT7's
+            // dealership, Scapes) the frame-time measure, as shadgt7 always did, see RaceStatePlay.
+            bool measured = fps >= 5.0 && (slow || held);
+            // FIX-GTS-519: a stall (under 5 frames a second) while in play keeps play for
+            // SHADGT_PLAY_STALL_HOLD_MS (3000; 0: as before); only a longer one counts as a load.
+            // In GT7's dealership with shaders not compiled each stall turned play off, which
+            // turned on the waits without a deadline (FIX-GT7-135, harmful kinds) and the next
+            // stall: play went off and on every second (DIAG-GTS-518, 6.7 s of draws waited for).
+            static const auto stall_hold = std::chrono::milliseconds{[] {
+                const char* env = std::getenv("SHADGT_PLAY_STALL_HOLD_MS");
+                return env && *env ? std::strtol(env, nullptr, 10) : 3000L;
+            }()};
+            if (fps < 5.0 && state.in_play && stall_hold.count() > 0) {
+                if (state.stall_since == std::chrono::steady_clock::time_point{}) {
+                    state.stall_since = now;
+                }
+                measured = now - state.stall_since < stall_hold;
+            } else {
+                state.stall_since = {};
+            }
+            const bool play = RaceStatePlay(RaceSignalPlay()) ? RytyRaceRunning() : measured;
             g_game_in_play.store(play, std::memory_order_relaxed);
             if (play != state.in_play) {
                 state.in_play = play;
+                build_workers->SetInPlay(play); // FIX-GT7-109 (port)
                 LOG_INFO(Render_Vulkan,
                          "FIX-GT7-109: the game at {:.1f} ms a frame, {:.0f} draws a frame: {}",
                          ms, draws_a_frame, play ? "in play" : "not in play");
             }
+        }
+        // PERF-GTS-494: the race's own state applies at once, not at the next second: the
+        // loading and the pre-race screen are not play (the compiles are not held back there,
+        // every core once many draws wait, FIX-GT7-106); from the countdown, two builds at once
+        // below normal priority, the frame rate first.
+        if (RaceStatePlay(RaceSignalPlay())) {
+            const bool play = RytyRaceRunning();
+            g_game_in_play.store(play, std::memory_order_relaxed);
+            if (play != state.in_play) {
+                state.in_play = play;
+                build_workers->SetInPlay(play);
+                LOG_INFO(Render_Vulkan, "PERF-GTS-494: the race {}: {}",
+                         play ? "starts" : "is not running", play ? "in play" : "not in play");
+            }
+        }
+    }
+    ReportRaceMissing(now); // PERF-GTS-493
+    // FIX-GT7-106 (port): while many draws on screen wait for their pipelines (a first GT7 race:
+    // ~1,600, the road side, trees and sky missing for minutes), compiles use every core, as wide
+    // as a catch-up, below normal priority, until few are left. On 3 cores the world filled in
+    // at ~3.5 pipelines a second, on every core at ~7. The catch-up alone ended after a second
+    // there: it counts skips, not the builds still owed. Never in play (FIX-GT7-109): with
+    // compiles on every core the game's and the renderer's threads shared their cores. The
+    // condition is what the game shows (draws owed a pipeline), so it applies to both games.
+    // SHADGT_COMPILE_BACKLOG=<n>: from n draws (256 by default, off below n / 4), 0 never.
+    static const size_t backlog_enter = [] {
+        const char* env = std::getenv("SHADGT_COMPILE_BACKLOG");
+        return env && *env ? size_t(std::strtoull(env, nullptr, 10)) : size_t{256};
+    }();
+    if (backlog_enter != 0 && now - state.backlog_checked >= std::chrono::milliseconds{250}) {
+        state.backlog_checked = now;
+        size_t waiting = 0;
+        {
+            std::scoped_lock lk2{on_screen_mutex};
+            waiting = on_screen.size();
+        }
+        const bool want = (waiting >= backlog_enter ||
+                           (state.backlog && waiting > backlog_enter / 4)) &&
+                          !state.in_play;
+        if (want != state.backlog && build_workers->SetBacklog(want)) {
+            state.backlog = want;
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-GT7-106: {} draws on screen wait for their pipelines: compiles {}",
+                        waiting,
+                        want ? "on every core, below normal priority" : "back to their cores");
         }
     }
     if (!enabled) return;
@@ -3357,6 +3828,20 @@ bool ReplayTranslate(const Shader::Profile& profile, Shader::Pools& pools,
     try {
         Common::RecoverableScope recoverable;
         const auto ir = Shader::TranslateProgram(params.code, pools, info, runtime_info, profile);
+        // PERF-GTS-490: this translation applies this run's learned direct paths (PERF-GTS-479),
+        // the record keeps the paths of the run that made it. SPIR-V stored under a record must
+        // have the record's paths: one slot without the direct path would read nothing where the
+        // record says in place, and a stage without its direct table shifts every later binding.
+        // A record that differs stays without SPIR-V (the listing skips it; the game translates
+        // the program when it draws it).
+        if (info.buffers.size() != stored.buffers.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < info.buffers.size(); ++i) {
+            if (info.buffers[i].NoDirect() != stored.buffers[i].NoDirect()) {
+                return false;
+            }
+        }
         spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir, binding);
         if (inspect) {
             // PB-4: the translation's resources (their sharps come from the record's user data).
@@ -3953,12 +4438,43 @@ bool PipelineCache::LegacyWaits() const {
 }
 
 std::chrono::microseconds PipelineCache::QuickWait() {
-    if (CompileMode() == 2) return std::chrono::microseconds{0};
+    // FIX-GTS-522: keep going (compile mode 2) and races skipped every draw whose pipeline was not
+    // built yet, even one the driver had cached: 1,434 of 1,476 GT7 builds in a race took under
+    // 2 ms and each of their draws still popped in a frame later. Their draws now wait a little:
+    // per 16 ms window SHADGT_QUICK_WAIT_US in all (4000; 2000 in a race), half of it per draw at
+    // most. 0: no wait in keep-going mode or races, as before.
+    static const std::chrono::microseconds keep_going_budget = [] {
+        const char* env = std::getenv("SHADGT_QUICK_WAIT_US");
+        return std::chrono::microseconds{env && *env ? std::max(0ll, std::strtoll(env, nullptr, 10))
+                                                     : 4000ll};
+    }();
+    std::chrono::microseconds window_budget{4000};
+    bool limited = false;
+    if (CompileMode() == 2) {
+        if (keep_going_budget.count() == 0) return std::chrono::microseconds{0};
+        window_budget = keep_going_budget;
+        limited = true;
+    }
 #ifdef RYTY_GPU
-    // Deferrable race draws poll the worker result, rather than spending up to 4 ms per
-    // frame waiting. Memory-writing and never-skipped draws still take the required wait.
-    if (RytyGtsInRace()) return std::chrono::microseconds{0};
+    if (RytyGtsInRace()) {
+        if (keep_going_budget.count() == 0) return std::chrono::microseconds{0};
+        window_budget = keep_going_budget / 2;
+        limited = true;
+    }
 #endif
+    if (limited) {
+        using namespace std::chrono;
+        static thread_local steady_clock::time_point window{};
+        static thread_local microseconds used{};
+        const auto now = steady_clock::now();
+        if (now - window > milliseconds{16}) {
+            window = now;
+            used = microseconds{0};
+        }
+        const auto wait = std::clamp(window_budget - used, microseconds{0}, window_budget / 2);
+        used += wait;
+        return wait;
+    }
     // FIX-114: a draw whose new pipeline is building waits for it a little, so the pipelines
     // that build quickly (the driver had them, or small ones) are drawn at once and only the
     // slow ones pop in a moment later. At most 4 ms of waiting in any 16 ms, 2 ms per draw.
@@ -3998,6 +4514,110 @@ bool PipelineCache::MenusWait() {
                                        RytyGtsProjectHooks());
 #else
     return false;
+#endif
+}
+
+bool PipelineCache::RaceNeverWaits() {
+#ifdef RYTY_GPU
+    // PERF-GTS-493: a cold race (no shader translated, nothing in the driver's cache) stopped
+    // for the draws and dispatches that still waited for their pipeline: one-off pictures
+    // (FIX-198, FIX-GT7-121/135/153), GT7's one-shot list, learned one-off kinds, and every
+    // compute dispatch (built one by one, the game waiting: 472 waits, 160 s over eight cold GT7
+    // sessions, RTX 4070 only), up to frames of 80 s at a race load. While a race runs (see
+    // below) they are now skipped like every other draw until their build is done, and a
+    // compute dispatch until its pipeline is built on a worker: the game never stops for a
+    // pipeline. The price: a picture the game draws only once, or a dispatch it runs only once,
+    // may stay missing for the race (the end-of-race report lists them, see ReportRaceMissing).
+    // Still waited for: draws that write memory (PERF-076, none measured in those sessions),
+    // the translation of a compute shader or of a draw that may not be skipped
+    // (SkipTranslationWait), and a capture in progress (MenusWait). Both games: the race flag is
+    // GT Sport's race projects and GT7's org_race gate (GAME-002). SHADGT_RACE_NEVER_WAITS=0:
+    // as before.
+    // With GAME-006's race state, only from the start countdown on: the loading and the pre-race
+    // screen wait for these as before (a picture or a dispatch made only there, such as GT
+    // Sport's 16384x16384 circuit shadow map, was otherwise lost for the whole race; the user's
+    // rule: waits are allowed before the 3-2-1, never after it). Without the hook: the whole
+    // race session.
+    // FIX-SGT-006: once a race session has reached its countdown, it stays "running" until the
+    // session ends. GAME-006 reads "not running" at a time trial's lap line too (finish), and
+    // there the ghost that appears after a lap waited for its new pipelines: GT Sport held its
+    // clocks 257 and 299 ms at that moment (FIX-044, fragment libraries of 310-360 ms). Only the
+    // loading and pre-race screen before the session's first countdown wait now.
+    // SHADGT_RACE_WAITS_AFTER_FINISH=1: waits come back at each finish, as before.
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_RACE_NEVER_WAITS");
+        return !(env && env[0] == '0');
+    }();
+    static const bool waits_after_finish = [] {
+        const char* env = std::getenv("SHADGT_RACE_WAITS_AFTER_FINISH");
+        return env && env[0] == '1';
+    }();
+    static std::atomic<bool> session_started{false};
+    if (!RytyGtsInRace()) {
+        session_started.store(false, std::memory_order_relaxed);
+        return false;
+    }
+    const bool running = RytyRaceRunning();
+    if (running) session_started.store(true, std::memory_order_relaxed);
+    const bool started =
+        running || (!waits_after_finish && session_started.load(std::memory_order_relaxed));
+    return enabled && AsyncPipelines() && (started || !RytyRaceStartSignal());
+#else
+    return false;
+#endif
+}
+
+bool PipelineCache::RaceSignalPlay() {
+#ifdef RYTY_GPU
+    // PERF-GTS-494: GAME-006's hook reads the race's state, and a race session is on.
+    return RytyRaceStartSignal() && RytyGtsInRace();
+#else
+    return false;
+#endif
+}
+
+void PipelineCache::ReportRaceMissing(std::chrono::steady_clock::time_point now) {
+#ifdef RYTY_GPU
+    // PERF-GTS-493: the end-of-race report of the compute side (the lookup lock is held): the
+    // dispatches skipped while their pipeline built, and the pipelines whose dispatch never
+    // came back once built (a dispatch the game runs only once: lost for this race). Written
+    // when the race stops running or the race session ends, and every 60 s in a race.
+    const bool in_race = RytyGtsInRace();
+    const bool running = RytyRaceRunning();
+    const bool session_ended = race_report.in_race && !in_race;
+    const bool ended = session_ended || (race_report.running && !running);
+    const bool periodic = in_race && !pending_computes.empty() &&
+                          now - race_report.last >= std::chrono::seconds{60};
+    race_report.in_race = in_race;
+    race_report.running = running;
+    if ((!ended && !periodic) || pending_computes.empty()) return; // nothing missing: no line
+    race_report.last = now;
+    u32 building = 0, never_installed = 0;
+    u64 skipped = 0;
+    std::string list;
+    for (const auto& [key, entry] : pending_computes) {
+        const bool built = entry.done.wait_for(std::chrono::seconds{0}) ==
+                           std::future_status::ready;
+        (built ? never_installed : building) += 1;
+        skipped += entry.skipped;
+        if (list.size() < 1200) {
+            list += fmt::format(" {:#x} ({}, {} skipped, {:.0f} s ago);",
+                                std::hash<ComputePipelineKey>{}(key),
+                                built ? "built, its dispatch never came back" : "building",
+                                entry.skipped,
+                                std::chrono::duration<double>(now - entry.start).count());
+        }
+    }
+    LOG_WARNING(Render_Vulkan,
+                "PERF-GTS-493 {}: compute pipelines not installed: {} built whose dispatch never "
+                "came back, {} still building; {} dispatches skipped for them{}{}",
+                session_ended ? "end of the race session"
+                : ended       ? "race stopped (pause, retry or finish)"
+                              : "race report (60 s)",
+                never_installed, building, skipped,
+                list.empty() ? "" : ":", list);
+#else
+    (void)now;
 #endif
 }
 
@@ -4334,7 +4954,20 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
         ++started;
         return true;
     };
-    if (RetryBlockedReadAhead() && !force_legacy && !fallback_nested) {
+    // FIX-SGT-007 (shadgt7's FIX-GT7-015, lost in the merge): blocked states are retried only
+    // while a draw waits for its pipeline or a state is restored (the game stopped, as at a new
+    // track's start, which they are for). Retried during play, up to 3 s after their draw, their
+    // user data had moved on: in a GT7 race they started ~500 builds a second of keys no draw
+    // asked for, compiled by the workers for minutes. Otherwise they are dropped once 3 s old,
+    // as before. SHADGT_READ_AHEAD_RETRY_ALWAYS=1: retried whenever, as PERF-311 did.
+    static const bool retry_always = [] {
+        const char* env = std::getenv("SHADGT_READ_AHEAD_RETRY_ALWAYS");
+        return env && env[0] == '1';
+    }();
+    if (RetryBlockedReadAhead() && !retry_always && !waiting) {
+        blocked_ahead_states.ExpireOld(std::chrono::steady_clock::now());
+    }
+    if (RetryBlockedReadAhead() && (waiting || retry_always) && !force_legacy && !fallback_nested) {
         const auto now = std::chrono::steady_clock::now();
         for (size_t remaining = blocked_ahead_states.size(); remaining && in_budget(); --remaining) {
             auto item = blocked_ahead_states.TakeReady(now);
@@ -4460,6 +5093,82 @@ void PipelineCache::WaitForBuild(PipelineBuild& build, const DrawIndirectParams 
 #endif
 }
 
+// DIAG-GTS-515: out of races (menus, loads), the draws that waited for their new pipeline
+// instead of being skipped, by the rule that made them wait, and how long: every 10 s a summary,
+// and a line for each wait of 20 ms or more (64 at most). At a car selection (GT Sport) or GT7's
+// dealership every new car stopped the menu (RECHERCHE-MENUS-FROIDS.md). Waits under 1 ms (the
+// pipeline was ready within the quick wait) are not counted.
+namespace MenuWaits {
+constexpr std::array<const char*, 10> kNames{
+    "legacy translations", "writes memory",     "capture or menu policy", "one-off picture (FIX-198)",
+    "rebuild (FIX-GTS-498)", "GT7 one-shot shader", "depth only",          "learned one-off",
+    "tessellation",          "other"};
+inline std::array<std::atomic<u64>, 10> count{};
+inline std::array<std::atomic<u64>, 10> us{};
+inline std::atomic<s64> last_ms{0};
+inline std::atomic<u32> lines{0};
+} // namespace MenuWaits
+
+struct PipelineCache::MenuWaitTally {
+    MenuWaitTally(bool on_, u32 reason_, u64 hash_, const AmdGpu::Regs& regs)
+        : on{on_}, reason{std::min<u32>(reason_, 9)}, hash{hash_},
+          start{std::chrono::steady_clock::now()} {
+        if (on && regs.depth_buffer.DepthValid()) {
+            depth = regs.depth_buffer.DepthAddress();
+            width = regs.depth_buffer.Pitch();
+            height = regs.depth_buffer.Height();
+        }
+    }
+    ~MenuWaitTally() {
+        if (!on) {
+            return;
+        }
+        using namespace std::chrono;
+        const auto now = steady_clock::now();
+        const u64 waited = u64(duration_cast<microseconds>(now - start).count());
+        if (waited < 1000) {
+            return;
+        }
+        MenuWaits::count[reason].fetch_add(1, std::memory_order_relaxed);
+        MenuWaits::us[reason].fetch_add(waited, std::memory_order_relaxed);
+        if (waited >= 20000 && MenuWaits::lines.fetch_add(1, std::memory_order_relaxed) < 64) {
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-GTS-515: a draw waited {:.1f} ms for its new pipeline {:#x} out of "
+                        "a race: {}; depth {:#x} {}x{}",
+                        waited / 1000.0, hash, MenuWaits::kNames[reason], depth, width, height);
+        }
+        const s64 ms = duration_cast<milliseconds>(now.time_since_epoch()).count();
+        s64 last = MenuWaits::last_ms.load(std::memory_order_relaxed);
+        if (last == 0) {
+            MenuWaits::last_ms.compare_exchange_strong(last, ms, std::memory_order_relaxed);
+            return;
+        }
+        if (ms - last < 10000 || !MenuWaits::last_ms.compare_exchange_strong(last, ms)) {
+            return;
+        }
+        std::string text;
+        for (u32 i = 0; i < MenuWaits::kNames.size(); ++i) {
+            const u64 n = MenuWaits::count[i].exchange(0, std::memory_order_relaxed);
+            const u64 t = MenuWaits::us[i].exchange(0, std::memory_order_relaxed);
+            if (n != 0) {
+                text += fmt::format("{}{} {} ({:.0f} ms)", text.empty() ? "" : ", ",
+                                    MenuWaits::kNames[i], n, t / 1000.0);
+            }
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "DIAG-GTS-515: out of races, draws that waited for their new pipeline in the "
+                    "last {} s: {}",
+                    (ms - last) / 1000, text);
+    }
+    bool on;
+    u32 reason;
+    u64 hash;
+    std::chrono::steady_clock::time_point start;
+    VAddr depth{};
+    u32 width{};
+    u32 height{};
+};
+
 const GraphicsPipeline* PipelineCache::GetGraphicsPipelineUnlocked(
     const DrawIndirectParams params, std::unique_lock<LookupLock>& lock) {
     ASSERT(lock.owns_lock());
@@ -4489,7 +5198,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineUnlocked(
         auto listings = std::move(unlocked_listings);
         t_required_lookup_lock = nullptr;
         WaitOutsideLookup(lock, unlocked_required_waits, [&] {
-            Common::GuestClock::CompilePause pause;
+            Common::GuestClock::CompilePause pause{Common::GuestClock::HoldSite::LookupTranslations};
             for (const auto& job : jobs) {
                 std::unique_lock job_lock{job->mutex};
                 job->cv.wait(job_lock, [&] { return job->done.load(); });
@@ -4505,6 +5214,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineUnlocked(
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     UpdateCatchUp(std::chrono::steady_clock::now());
+#ifndef NDEBUG
+    ReportSkippedBuilds(std::chrono::steady_clock::now()); // DIAG-GT7-012 (port)
+#endif
     // PERF-034: builds for the upcoming draws the command thread read ahead start first.
     BuildQueuedStates(params, false);
     // PERF-038: then, while no draw waits for pipelines, stored ones go to the background.
@@ -4582,6 +5294,25 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     }
     if (!key_valid) {
         return nullptr;
+    }
+    {
+        // DIAG-225 (port, diagnosis, SHADGT_DIAG_AA_MASK): draws with no pixel shader while
+        // PA_SC_AA_MASK hides pixels (the quad sample mask is applied in the pixel shader only).
+        static const bool diag = Common::DiagEnv("SHADGT_DIAG_AA_MASK") != nullptr;
+        const auto& r = Regs();
+        if (diag && !S().infos[u32(Shader::SwStage::Fragment)] &&
+            (r.reg_array[0xa30e] != ~0u || r.reg_array[0xa30f] != ~0u)) {
+            static std::atomic<u32> counter{};
+            const u32 count = ++counter;
+            if (count <= 30 || count % 500 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "DIAG-225: draw {} with no pixel shader under AA mask {:08x} {:08x}, "
+                            "depth write {}, depth test {}",
+                            count, r.reg_array[0xa30e], r.reg_array[0xa30f],
+                            u32(r.depth_control.depth_write_enable),
+                            u32(r.depth_control.depth_enable));
+            }
+        }
     }
 #ifndef NDEBUG
     // A normal key may be replaced by a legacy fallback before PipelineForCurrentKey.
@@ -4874,6 +5605,9 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
 #endif
                 NoteSkippedDraw(); // PERF-103
                 NoteAsyncSkip(stored, true);
+                if (wait_for_shaders && OneOffBounded()) {
+                    skipped_build = stored; // FIX-GTS-517: waited for with a deadline
+                }
                 return nullptr;
             }
             if (!(t_required_lookup_lock &&
@@ -4951,8 +5685,13 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
 #endif
             NoteSkippedDraw(); // PERF-103
             NoteAsyncSkip(build, false);
+            if (wait_for_shaders && OneOffBounded()) {
+                skipped_build = build; // FIX-GTS-517: waited for with a deadline
+            }
             return nullptr;
         }
+        // DIAG-GTS-515: out of races, why this draw waits for its pipeline, and how long.
+        MenuWaitTally menu_wait_tally{!RaceNeverWaits(), WaitReason(), pipeline_hash, Regs()};
         if (build) {
             // A read-ahead job becomes urgent once this draw actually needs it.
             // Requeue the shared build at the front rather than waiting behind
@@ -4976,7 +5715,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 ++build->required_waiters;
                 SCOPE_EXIT { --build->required_waiters; };
                 WaitOutsideLookup(*lock, unlocked_required_waits, [&] {
-                    Common::GuestClock::CompilePause pause;
+                    Common::GuestClock::CompilePause pause{Common::GuestClock::HoldSite::RequiredBuild};
                     Common::SetCompileCoresWide(true);
                     SCOPE_EXIT { Common::SetCompileCoresWide(false); };
                     while (build->done.wait_for(std::chrono::milliseconds{5}) !=
@@ -5002,7 +5741,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             const bool widen_compile = build->done.wait_for(std::chrono::microseconds{0}) !=
                                        std::future_status::ready;
             if (widen_compile) {
-                hold.emplace();
+                hold.emplace(Common::GuestClock::HoldSite::BuildWait);
                 Common::SetCompileCoresWide(true);
             }
             SCOPE_EXIT { if (widen_compile) Common::SetCompileCoresWide(false); };
@@ -5085,8 +5824,9 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
     return it->second.get();
 }
 
-const ComputePipeline* PipelineCache::GetComputePipeline() {
+const ComputePipeline* PipelineCache::GetComputePipeline(bool select_ahead) {
     fallback_miss = false;
+    compute_deferred = false;
     bool key_valid = RefreshComputeKey();
     if (!key_valid && fallback_miss) {
         // D10: as for graphics, the old translation while the new one is made.
@@ -5105,47 +5845,144 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (!key_valid) {
         return nullptr;
     }
+    // PERF-GTS-493: in a race a dispatch whose pipeline is still building is skipped; out of a
+    // race it waits for it below, as before.
+    auto pending = pending_computes.find(compute_key);
+    const bool race_skips = RaceNeverWaits() && !MenusWait(); // not while a capture runs
+    // PERF-GTS-501: out of a race the command thread's selection does not wait for a compute
+    // pipeline either: it starts the build and goes on (selecting the next draws and starting
+    // their builds meanwhile); the recorder looks the pipeline up again at the dispatch and waits
+    // for it there. A cold GT7 menu waited 58 times for compute pipelines on the command thread,
+    // 11.5 s, each a different pipeline built one after the other (RTX 4070 only).
+    // SHADGT_COMPUTE_SELECT_WAITS=1: the selection waits as before.
+    static const bool select_defers = [] {
+        const char* env = std::getenv("SHADGT_COMPUTE_SELECT_WAITS");
+        return !(env && env[0] == '1');
+    }();
+    const bool defers = select_ahead && select_defers && !race_skips && !MenusWait();
+    if (pending != pending_computes.end() && (race_skips || defers) &&
+        pending->second.done.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
+        if (race_skips) ++pending.value().skipped;
+        compute_deferred = defers;
+        return nullptr;
+    }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     if (is_new) {
-        Common::GuestClock::CompilePause hold; // FIX-044
+        std::optional<Common::GuestClock::CompilePause> hold; // FIX-044, while it is waited for
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
-        LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
+        if (pending == pending_computes.end()) {
+            LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
+        }
 
         ComputePipeline::SerializationSupport sdata{};
-        ++Common::GetWorkCounters().pipelines_compiled;
         RYDIAG_SCOPE(PipelineBuild, pipeline_hash);
-        // Compute dispatches cannot be dropped: later draws may consume their writes. Own the
-        // shader inputs on a bounded compiler worker and publish the completed pipeline before
-        // recording the dispatch; do not hand the worker mutable command-thread state.
+        // Out of a race a compute dispatch is not dropped: later draws may consume its writes,
+        // so the pipeline is published before the dispatch is recorded (in a race,
+        // PERF-GTS-493 skips it until a worker has built it). The shader inputs are owned by
+        // the worker's job; it is never handed mutable command-thread state.
         struct ComputeBuild {
             Shader::Info info;
             std::vector<u32> user_data;
             ComputePipeline::SerializationSupport sdata{};
+            std::chrono::steady_clock::time_point built{}; ///< PERF-GTS-493: when the worker ended
         };
-        auto inputs = std::make_shared<ComputeBuild>();
-        inputs->info = *S().infos[0];
-        inputs->user_data.assign(inputs->info.user_data.begin(), inputs->info.user_data.end());
-        inputs->info.user_data = inputs->user_data;
-        const auto key = compute_key;
-        const auto module = S().modules[0];
-        auto job = std::make_shared<std::packaged_task<std::unique_ptr<ComputePipeline>()>>(
-            [this, inputs, key, module] {
-                Common::BeginForegroundCompile();
-                SCOPE_EXIT { Common::EndForegroundCompile(); };
-                return std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
-                    *pipeline_cache, key, inputs->info, module, inputs->sdata);
-            });
-        auto completion = job->get_future();
-        if (!build_workers) build_workers = std::make_unique<PipelineBuildWorkers>();
-        build_workers->Push([job] { (*job)(); }, BuildQueue::Kind::Urgent);
+        // FIX-GT7-150: how long this build took, from its queueing to the worker's end (the
+        // recipe check below; for one built in the background, not the frames skipped after).
+        std::chrono::steady_clock::time_point build_start;
+        std::future<std::unique_ptr<ComputePipeline>> completion;
+        std::function<ComputePipeline::SerializationSupport()> take_sdata;
+        std::function<std::chrono::steady_clock::time_point()> take_built;
+        if (pending != pending_computes.end()) {
+            // PERF-GTS-493: built in the background while its dispatches were skipped.
+            build_start = pending->second.start;
+            completion = std::move(pending.value().done);
+            take_sdata = std::move(pending.value().sdata);
+            take_built = std::move(pending.value().built);
+            const u64 skipped = pending->second.skipped;
+            pending_computes.erase(pending);
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 200) {
+                const auto now = std::chrono::steady_clock::now();
+                const auto built = completion.wait_for(std::chrono::seconds{0}) ==
+                                           std::future_status::ready
+                                       ? take_built()
+                                       : now;
+                LOG_WARNING(Render_Vulkan,
+                            "PERF-GTS-493: compute pipeline {:#x} built by a worker {:.0f} ms "
+                            "after it was queued, installed {:.0f} ms after; {} dispatches "
+                            "skipped meanwhile",
+                            pipeline_hash,
+                            std::chrono::duration<double, std::milli>(built - build_start).count(),
+                            std::chrono::duration<double, std::milli>(now - build_start).count(),
+                            skipped);
+            }
+        } else {
+            ++Common::GetWorkCounters().pipelines_compiled;
+            build_start = std::chrono::steady_clock::now();
+            auto inputs = std::make_shared<ComputeBuild>();
+            inputs->info = *S().infos[0];
+            inputs->user_data.assign(inputs->info.user_data.begin(), inputs->info.user_data.end());
+            inputs->info.user_data = inputs->user_data;
+            const auto key = compute_key;
+            const auto module = S().modules[0];
+            auto job = std::make_shared<std::packaged_task<std::unique_ptr<ComputePipeline>()>>(
+                [this, inputs, key, module] {
+                    const bool foreground = ForegroundCompileOn(); // PERF-GT7-032 (port)
+                    if (foreground) Common::BeginForegroundCompile();
+                    SCOPE_EXIT { if (foreground) Common::EndForegroundCompile(); };
+                    auto made = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap,
+                        profile, *pipeline_cache, key, inputs->info, module, inputs->sdata);
+                    inputs->built = std::chrono::steady_clock::now();
+                    return made;
+                });
+            completion = job->get_future();
+            take_sdata = [inputs] { return inputs->sdata; };
+            take_built = [inputs] { return inputs->built; };
+            if (!build_workers) build_workers = std::make_unique<PipelineBuildWorkers>();
+            build_workers->Push([job] { (*job)(); }, BuildQueue::Kind::Urgent);
+            if ((race_skips || defers) &&
+                completion.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
+                // PERF-GTS-493: in a race this dispatch and the next ones with this pipeline are
+                // skipped until a worker has built it. PERF-GTS-501: out of one, the selection
+                // goes on and the recorder waits for it at the dispatch.
+                pending_computes.emplace(compute_key,
+                                         PendingCompute{std::move(completion), std::move(take_sdata),
+                                                        std::move(take_built), build_start,
+                                                        race_skips ? 1u : 0u});
+                compute_pipelines.erase(it);
+                compute_deferred = defers;
+                return nullptr;
+            }
+        }
+        if (completion.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
+            hold.emplace(Common::GuestClock::HoldSite::Compute);
+        }
         it.value() = completion.get();
+        hold.reset();
         it.value()->SetStageInfo(*S().infos[0]);
+        const double ms =
+            std::chrono::duration<double, std::milli>(take_built() - build_start).count();
         if (const Shader::Info* info = S().infos[0]; WarmComputeOn() && info) {
             const auto dir = WarmComputeDir();
             const auto file = dir / fmt::format("{:#018x}-{:#018x}.bin", pipeline_hash,
                                                   ComputePipeline::RecipePolicy(instance, profile));
             std::error_code ec;
-            if (!std::filesystem::exists(file, ec)) {
+            // FIX-GT7-150 (SHADGT_WARM_COMPUTE_REFRESH=0: as before): a recipe was written once and
+            // never again, so once a renderer update changed a program's translation the warm-up
+            // went on building the old code at every start while the pipeline of the new code was
+            // built here, the game waiting: on a PC whose recipes were five days old, the same 16
+            // of 335 were built here in every session the driver lacked them (60 ms to 1.6 s
+            // each, 8-10 s in all; the SPIR-V of all 16 differed from their recipe's). A build
+            // that took long although its recipe was there has a recipe that did not serve: it is
+            // compared with this pipeline's code and written again when different (a recipe the
+            // warm-up had not reached yet is the same, and left alone).
+            static const bool refresh = [] {
+                // GT7 by default; GT Sport keeps its recipes as written (PERF-260) unless =1.
+                const char* env = std::getenv("SHADGT_WARM_COMPUTE_REFRESH");
+                return env && *env ? env[0] != '0' : Common::IsGt7();
+            }();
+            const bool known = std::filesystem::exists(file, ec);
+            if (!known || (refresh && ms >= 50.0)) {
                 std::optional<size_t> perm;
                 if (const auto prog = program_cache.find(info->pgm_hash); prog != program_cache.end()) {
                     const auto& modules = prog->second->modules;
@@ -5156,10 +5993,15 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
                 if (perm) Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
                     fmt::format("{:#018x}_{}", info->pgm_hash, *perm), spirv);
                 std::filesystem::create_directories(dir, ec);
-                if (IsCompleteSpirv(spirv)) it.value()->SaveRecipe(file, spirv);
+                if (IsCompleteSpirv(spirv) && it.value()->SaveRecipe(file, spirv) && known) {
+                    LOG_INFO(Render_Vulkan,
+                             "FIX-GT7-150: compute pipeline {:#x} took {:.0f} ms although its "
+                             "recipe was there; the recipe held other code and is written again",
+                             pipeline_hash, ms);
+                }
             }
         }
-        sdata = inputs->sdata;
+        sdata = take_sdata();
         if (!S().key_uses_legacy) { // D10
             RegisterPipelineData(compute_key, sdata);
         }
@@ -5656,7 +6498,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 #endif
     // FIX-044: translating a shader on the GPU thread holds the guest clocks; a PS4 runs
     // precompiled shaders, so the game never sees this time pass.
-    Common::GuestClock::CompilePause hold;
+    Common::GuestClock::CompilePause hold{Common::GuestClock::HoldSite::CompileModule};
     ++Common::GetWorkCounters().shaders_compiled;
     RYDIAG_SCOPE(ShaderCompile, info.pgm_hash);
     last_spv_hash = 0;
@@ -5789,17 +6631,33 @@ PipelineCache::StoredListing PipelineCache::ReadStoredListing(u64 pgm_hash,
     return listing;
 }
 
-// PERF-GTS-479: a stored translation is used only when each direct candidate's path (direct or
-// SSBO only) is what this run decides, so learned buffers are translated again once, and a
-// buffer later seen read in place gets its direct path back. Without D2 the flag changes nothing.
+// PERF-GTS-479: a stored translation whose buffer has no direct path (SSBO only) is refused when
+// the learned file no longer says that buffer is never read in place (a read in place was seen
+// since, or learning is off or not loaded): that buffer gets its direct path back. Without D2 the
+// flag changes nothing.
+// PERF-GTS-490: a stored translation WITH the direct path is kept even when the learned file says
+// the buffer is never read in place. Binding follows the translation's own flags, and the direct
+// path reads both ways (the run that stored it played with it); dropping it only saved compile time
+// already paid, and the new SPIR-V then missed the driver cache. A second cold GT7 start had
+// translated 2,201 shaders and built ~2,000 pipelines again (median 334 ms, freezes up to 2.4 s);
+// with this, 34 programs of the first start and median builds of 1 ms (RTX 4070 only). New
+// translations still follow the learned path. SHADGT_KEEP_DIRECT_TRANSLATIONS=0: PERF-GTS-479's
+// strict rule (any difference refused).
 static bool LearnedDirectMatches(const Shader::Info& info, const Shader::Profile& profile) {
     if (!profile.direct_buffers) {
         return true;
     }
+    static const bool keep_direct = [] {
+        const char* env = std::getenv("SHADGT_KEEP_DIRECT_TRANSLATIONS");
+        return !(env && env[0] == '0');
+    }();
     for (u32 i = 0; i < info.buffers.size(); ++i) {
         const auto& buffer = info.buffers[i];
-        if (buffer.IsDirectCandidate() &&
-            buffer.NoDirect() != Shader::DirectLearning::NoDirect(info.pgm_hash, i)) {
+        if (!buffer.IsDirectCandidate()) {
+            continue;
+        }
+        const bool learned_off = Shader::DirectLearning::NoDirect(info.pgm_hash, i);
+        if (buffer.NoDirect() ? !learned_off : (learned_off && !keep_direct)) {
             return false;
         }
     }
@@ -5845,7 +6703,7 @@ void PipelineCache::ApplyStoredListing(StoredListing&& listing, Program& program
             fixed != else_scope_fixed.end() && perm_idx < fixed->second.boundary) {
             continue;
         }
-        // PERF-GTS-479: translated with other learned direct paths than this run's.
+        // PERF-GTS-479/490: translated without a direct path the learned file now wants back.
         if (!LearnedDirectMatches(*info, profile)) {
             continue;
         }
@@ -6585,6 +7443,7 @@ void PipelineCache::AdoptPrewarmed() {
         if (build->libraries_only ||
             (prewarm_adopted >= PrecompileKeep() && !graphics_pipelines.contains(build->key))) {
             prewarm_adopted += build->libraries_only ? 0 : 1;
+            NoteReleased(build->key); // FIX-GTS-498
             dropped.emplace_back(std::shared_ptr<GraphicsPipeline>(std::move(build->pipeline)));
             pending_builds.erase(pending);
             ++adopted;
@@ -6770,6 +7629,19 @@ bool PipelineCache::PreservesDepthOutput() const {
     if (!race_depth_wait && CompileMode() == 2 && RytyGtsInRace()) {
         return false;
     }
+    // FIX-GTS-514 (test switch, SHADGT_MENU_DEPTH_WAIT=0): out of races too, a depth-only draw
+    // does not wait here for its new pipeline, as on shadgt7 (which never had this rule): at a
+    // car selection or GT7's dealership every new car's shadow and depth passes waited, the menu
+    // crawled and D-pad presses were lost while the guest clocks were held. The native renderer's
+    // one-off rule (FIX-198, DrawMustNotSkip) still makes a draw into a depth picture not drawn
+    // lately wait, within its frame's budget. Default: waits, as before.
+    static const bool menu_depth_wait = [] {
+        const char* env = std::getenv("SHADGT_MENU_DEPTH_WAIT");
+        return !(env && env[0] == '0');
+    }();
+    if (!menu_depth_wait && CompileMode() == 2) {
+        return false;
+    }
 #endif
     const auto& regs = Regs();
     if (!regs.depth_control.depth_enable || !regs.depth_control.depth_write_enable ||
@@ -6799,20 +7671,72 @@ static bool LearnedOneOffWait(const AmdGpu::Regs& regs) {
     return false;
 }
 
+// FIX-GTS-498: FIX-GTS-468 releases the precompile's pipelines past SHADGT_PRECOMPILE_KEEP and,
+// under memory pressure, the retention trim releases others. A draw that needed one again found
+// no pipeline and, in keep-going mode, was skipped while it was rebuilt: GT Sport's transmission
+// screen popped on every visit (bisected to the ryty-gpu merge that brought FIX-GTS-468 in;
+// SHADGT_PRECOMPILE_KEEP=-1 removed it). Its rebuild is a driver-cache hit of a few ms, so such a
+// draw waits for it. SHADGT_REBUILD_WAIT=0: skipped as before. Lookup mutex held.
+static bool RebuildWaitOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_REBUILD_WAIT");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+void PipelineCache::NoteReleased(const GraphicsPipelineKey& key) {
+    if (RebuildWaitOn()) {
+        released_graphics.try_emplace(key, u8{1});
+    }
+}
+
 bool PipelineCache::NeverSkipped(const std::array<const Shader::Info*, MaxShaderStages>& infos) {
-    // shadgt7 FIX-198 / PERF-GT7-020: a one-off target's draw (SetForceWait, SetWaitForShaders)
-    // waits for its pipeline and shaders.
-    if (force_wait || wait_for_shaders) return true;
+    return NeverSkippedReason(infos) != 0;
+}
+
+bool PipelineCache::OneOffBounded() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_ONE_OFF_BOUNDED");
+        return !(env && env[0] == '0');
+    }();
+    // Out of a race session only: a race's loading and pre-race screen keep the waits they had
+    // (GT Sport's 16384x16384 circuit shadow map is drawn once there, see RaceNeverWaits).
+#ifdef RYTY_GPU
+    return on && !RytyGtsInRace();
+#else
+    return on;
+#endif
+}
+
+u32 PipelineCache::NeverSkippedReason(
+    const std::array<const Shader::Info*, MaxShaderStages>& infos) {
+    // FIX-GTS-498: a pipeline this session built and released is rebuilt from the driver cache.
+    // FIX-SGT-001: before PERF-GTS-493's race rule, which is for new pipelines (cold compiles of
+    // hundreds of ms). After it, a pipeline the trim had retired was skipped in a race while it
+    // was rebuilt, and that scenery popped back in: GT7 on an 8 GB GPU went over the trim's
+    // reserve in races (6437 of 7180 MiB), and 1945 pipelines were retired in one session. A
+    // rebuild here is a driver-cache hit of a few ms. (FIX-GTS-504 before the merge of 11-17.)
+    if (!released_graphics.empty() && released_graphics.contains(S().graphics_key)) return 2;
+    if (RaceNeverWaits()) return 0; // PERF-GTS-493
+    // shadgt7 FIX-198: a one-off target's draw past its bounded wait (SetForceWait) waits for its
+    // pipeline. FIX-GTS-517: not one in its bounded wait (SetWaitForShaders, PERF-GT7-020): its
+    // build is handed back (skipped_build) and waited for out of the lookup lock until the frame's
+    // deadline (Rasterizer::AcquireGraphicsPipelineWaiting, FIX-GT7-109), as on shadgt7. The
+    // 11-09 merge made it wait here, under the lock and without a deadline: with shaders not
+    // compiled GT7's dealership stopped up to 1.9 s a draw (DIAG-GTS-515).
+    // SHADGT_ONE_OFF_BOUNDED=0: as the merge did.
+    if (force_wait || (wait_for_shaders && !OneOffBounded())) return 1;
     if (const auto* fragment = infos[u32(Shader::SwStage::Fragment)];
-        fragment && IsGt7OneShotShader(fragment->pgm_hash)) return true;
+        fragment && IsGt7OneShotShader(fragment->pgm_hash)) return 3;
     // A loading-time shadow bake may run only once. Preserve depth-only output
     // without forcing ordinary menu color draws to wait for compilation.
     if (PreservesDepthOutput()) {
-        return true;
+        return 4;
     }
-    if (LearnedOneOffWait(Regs())) return true;
+    if (LearnedOneOffWait(Regs())) return 5;
     // Keep going: rendering must not wait for a cosmetic pipeline.
-    if (CompileMode() == 2) return false;
+    if (CompileMode() == 2) return 0;
     // FIX-064: tessellated draws wait for their pipeline. On GT Sport's race summary they are
     // the driver figure; skipped while each of its pipelines built, parts of it blinked out
     // frame after frame. -DisablePerf 88 skips them like other draws.
@@ -6823,10 +7747,21 @@ bool PipelineCache::NeverSkipped(const std::array<const Shader::Info*, MaxShader
     static const bool skip_in_races = Common::PerfFeatureEnabled(138);
 #ifdef RYTY_GPU
     if (AsyncMenuPipelines() || (skip_in_races && RytyGtsInRace())) {
-        return false;
+        return 0;
     }
 #endif
-    return wait_for_tessellation && infos[u32(Shader::SwStage::TessellationControl)] != nullptr;
+    return wait_for_tessellation && infos[u32(Shader::SwStage::TessellationControl)] != nullptr
+               ? 6
+               : 0;
+}
+
+u32 PipelineCache::WaitReason() {
+    // DIAG-GTS-515: in the order of the skip condition (GetGraphicsPipeline).
+    if (LegacyWaits()) return 0;
+    if (WritesMemory(S().infos)) return 1;
+    if (const u32 rule = NeverSkippedReason(S().infos); rule != 0) return 2 + rule;
+    if (MenusWait()) return 2;
+    return 9;
 }
 
 bool PipelineCache::WritesMemory(const std::array<const Shader::Info*, MaxShaderStages>& infos) {
@@ -6870,6 +7805,59 @@ bool PipelineCache::AsyncPipelines() {
         return on && Common::PerfFeatureEnabled(76);
     }();
     return enabled;
+}
+
+void PipelineCache::ReportSkippedBuilds(std::chrono::steady_clock::time_point now) {
+#ifndef NDEBUG
+    // DIAG-GT7-012 (port): the builds draws are skipped for, every 2 s while there are any. In a
+    // GT7 race on a new track ~4,000 draws a second were skipped for three minutes (the catch-up
+    // never ended) while a few builds finished in 2 s, often none. Here, not in ReportPrewarm,
+    // which runs only with the background prewarm (off for GT7, TITLE-001).
+    if (now - skipped_builds_reported < std::chrono::seconds{2}) {
+        return;
+    }
+    skipped_builds_reported = now;
+    u32 count = 0;
+    u32 started = 0;
+    const PipelineBuild* oldest = nullptr;
+    const PipelineBuild* most = nullptr;
+    for (const auto& [key, build] : pending_builds) {
+        if (!build->async || build->skips.load(std::memory_order_relaxed) == 0 ||
+            build->done.wait_for(std::chrono::microseconds{0}) == std::future_status::ready) {
+            continue;
+        }
+        ++count;
+        started += build->started.load(std::memory_order_relaxed) ? 1 : 0;
+        if (!oldest || build->queued < oldest->queued) {
+            oldest = build.get();
+        }
+        if (!most || build->skips.load(std::memory_order_relaxed) >
+                         most->skips.load(std::memory_order_relaxed)) {
+            most = build.get();
+        }
+    }
+    if (count == 0) {
+        return;
+    }
+    const auto describe = [&](const PipelineBuild& build) {
+        return fmt::format("{:#x}, queued {:.1f} s ago, {}, {} draws skipped",
+                           std::hash<GraphicsPipelineKey>{}(build.key),
+                           std::chrono::duration<double>(now - build.queued).count(),
+                           build.started.load(std::memory_order_relaxed) ? "building"
+                                                                         : "not started",
+                           build.skips.load(std::memory_order_relaxed));
+    };
+    size_t screen = 0;
+    {
+        std::scoped_lock lk{on_screen_mutex};
+        screen = on_screen.size();
+    }
+    LOG_WARNING(Render_Vulkan,
+                "DIAG-GT7-012: {} pipelines still building for skipped draws ({} started, {} "
+                "jobs queued, {} on screen waiting); the oldest {}; the most skipped {}",
+                count, started, build_workers ? build_workers->Pending() : 0, screen,
+                describe(*oldest), describe(*most));
+#endif
 }
 
 void PipelineCache::ReportPrewarm(std::chrono::steady_clock::time_point now) {
@@ -7803,9 +8791,12 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
         }
         {
             SCOPE_EXIT { Common::t_guest_read_log = previous_log; };
-            prepared->program.emplace(Shader::TranslateProgram(job->code, prepared->pools,
-                                                               *job->info,
-                                                               prepared->compiled_runtime, profile));
+            // PERF-GTS-502: the part that reads the game's memory here, the rest on the worker.
+            prepared->front = Shader::TranslateProgramFront(job->code, prepared->pools, *job->info,
+                                                            prepared->compiled_runtime, profile);
+            if (!FrontendSplitOn()) {
+                prepared->program.emplace(Shader::TranslateProgramBack(std::move(prepared->front)));
+            }
         }
         if (record) {
             auto rec = std::make_unique<ManifestRecord>();
@@ -7847,6 +8838,9 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
     } catch (const std::bad_alloc&) {
         return false;
     }
+    static std::atomic<u32> diag_next_id{}; // DIAG-GT7-073 (port)
+    job->diag_id = ++diag_next_id;
+    job->diag_ahead = regs_override != nullptr;
     jobs.push_back(job);
     try {
         translate_workers->Queue(job);
@@ -7859,6 +8853,57 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
 #endif
     return true;
 }
+
+#ifndef NDEBUG
+void PipelineCache::LogNewPermutation(const Program& program, Shader::HwStage hw_stage,
+                                      const Shader::ShaderParams& params,
+                                      const Shader::RuntimeInfo& runtime_info,
+                                      const Shader::Backend::Bindings& binding) {
+    // DIAG-GT7-013 (port): why a known program gets a new permutation from a worker's translation
+    // (each one is a pipeline compile, up to a second, its draws skipped meanwhile), for a draw
+    // or a read-ahead state: how the lookup differs from each existing permutation, with the V#
+    // of a differing buffer. GetProgram's own "New permutation" line covers the translations
+    // made on this thread. Each permutation's info is set to this lookup's user data, as
+    // GetProgram's match does.
+    if (std::ranges::none_of(program.modules, [](const auto& m) { return bool(m.info); })) {
+        return;
+    }
+    static u64 events = 0;
+    const u64 event = ++events;
+    if (event > 80 && event % 100 != 0) {
+        return;
+    }
+    std::string reasons;
+    u32 listed = 0;
+    for (size_t perm_idx = 0; perm_idx < program.modules.size() && listed < 8; ++perm_idx) {
+        const auto& permutation = program.modules[perm_idx];
+        if (!permutation.info) {
+            continue;
+        }
+        ++listed;
+        auto& info = *permutation.info;
+        info.pgm_base = params.Base();
+        info.user_data = params.user_data;
+        info.RefreshFlatBuf();
+        const auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+        u32 index{};
+        const char* reason = permutation.spec.FirstDifference(spec, index);
+        reasons += fmt::format(" {}:{}[{}]", perm_idx, reason ? reason : "none", index);
+        if (reason && std::string_view{reason}.starts_with("buffer") &&
+            index < info.buffers.size()) {
+            const auto sharp = info.buffers[index].GetSharp(info);
+            std::array<u32, 4> words{};
+            std::memcpy(words.data(), &sharp, sizeof(words));
+            reasons += fmt::format("(V# {:08x} {:08x} {:08x} {:08x})", words[0], words[1],
+                                   words[2], words[3]);
+        }
+    }
+    LOG_WARNING(Render_Vulkan,
+                "DIAG-GT7-013: new permutation {} of {}_{:#x} for {}; existing ones differ in:{}",
+                event, hw_stage, params.hash, regs_override ? "a read-ahead state" : "a draw",
+                reasons);
+}
+#endif
 
 bool PipelineCache::TakeReadyTranslation(HwStage hw_stage, SwStage sw_stage, u64 hash,
                                          Program& program,
@@ -7880,11 +8925,31 @@ bool PipelineCache::TakeReadyTranslation(HwStage hw_stage, SwStage sw_stage, u64
         // FIX-GT7-024: the lookup's on the right, as GetProgram compares (its bitsets decide).
         if (job->hw_stage != hw_stage || job->sw_stage != sw_stage ||
             job->spec != Shader::StageSpecialization(info, runtime_info, profile, binding)) {
+            if (TranslateJobsDiag() && job->hw_stage == hw_stage && job->sw_stage == sw_stage) {
+                // DIAG-GT7-073 (port): why it is not this lookup's.
+                static std::atomic<u32> logged{};
+                if (++logged <= 3000) {
+                    u32 index{};
+                    const auto spec =
+                        Shader::StageSpecialization(info, runtime_info, profile, binding);
+                    const char* reason = job->spec.FirstDifference(spec, index);
+                    LOG_WARNING(Render_Vulkan, "DIAG-GT7-073: #{} not for this {}: {}[{}]",
+                                job->diag_id, regs_override != nullptr ? "read-ahead" : "draw",
+                                reason ? reason : "none", index);
+                }
+            }
             continue;
         }
         if (!insert) {
             return true;
         }
+        if (TranslateJobsDiag()) {
+            LOG_WARNING(Render_Vulkan, "DIAG-GT7-073: #{} taken by a {}", job->diag_id,
+                        regs_override != nullptr ? "read-ahead" : "draw");
+        }
+#ifndef NDEBUG
+        LogNewPermutation(program, hw_stage, params, runtime_info, binding); // DIAG-GT7-013 (port)
+#endif
         size_t perm_idx = program.modules.size();
         if (const auto end = stored_perm_end.find(hash); end != stored_perm_end.end()) {
             perm_idx = std::max(perm_idx, end->second);
@@ -7945,12 +9010,18 @@ bool PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
         bool hs_waited = false; // PERF-GT7-115
 #ifndef NDEBUG
         bool waited = false;
+        u32 stage = 7;        // DIAG-GT7-123 (port)
+        bool dropped = false; // DIAG-GT7-123 (port): taken off the queue as too old
 #endif
         for (const auto& job : jobs) {
             if (MatchesTranslationRequest(*job, hw_stage, sw_stage, runtime_info, binding) &&
                 !job->done) {
                 // As CompileModule: the game never sees a PS4 wait for a shader.
-                Common::GuestClock::CompilePause hold;
+                Common::GuestClock::CompilePause hold{Common::GuestClock::HoldSite::TranslationJob};
+                // PERF-GTS-494: a thread waits for this translation: the compiles' jobs taken
+                // meanwhile run at normal priority (one already running keeps its own).
+                Common::SetCompileCoresWide(true);
+                SCOPE_EXIT { Common::SetCompileCoresWide(false); };
                 RYDIAG_SCOPE(ShaderCompile, hash);
                 // The draw needs this shader now; don't wait behind speculative work.
                 if (CompileCpuBatchEnabled(1)) translate_workers->Prioritize(job);
@@ -7970,6 +9041,10 @@ bool PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
                 } else {
                     job->cv.wait(lk, [&] { return job->done.load(); });
                 }
+#ifndef NDEBUG
+                stage = std::min<u32>(u32(job->sw_stage), 7);
+                dropped |= job->cancelled;
+#endif
             }
         }
         if (hs_waited) {
@@ -7977,12 +9052,19 @@ bool PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
         }
 #ifndef NDEBUG
         if (waited) {
-#ifndef NDEBUG
             ++translate_stats.waited;
-#endif
-            translate_stats.wait_ms += std::chrono::duration<double, std::milli>(
-                                           std::chrono::steady_clock::now() - wait_start)
-                                           .count();
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - wait_start)
+                                  .count();
+            translate_stats.wait_ms += ms;
+            // DIAG-GT7-123 (port): the waits by stage, and why they waited.
+            ++translate_stats.waited_stage[stage];
+            translate_stats.wait_ms_stage[stage] += ms;
+            const auto writer = code_writes_memory.find(hash);
+            translate_stats.waited_writer += writer != code_writes_memory.end() && writer->second;
+            translate_stats.waited_forced += force_wait;
+            translate_stats.waited_shaders += wait_for_shaders;
+            translate_stats.waited_dropped += dropped;
         }
 #endif
     }
@@ -7992,7 +9074,12 @@ bool PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
         if (!job->done) {
             return false;
         }
-        if (job->cancelled) return true;
+        if (job->cancelled) {
+            if (TranslateJobsDiag()) {
+                LOG_WARNING(Render_Vulkan, "DIAG-GT7-073: #{} too old", job->diag_id);
+            }
+            return true;
+        }
         if (!job->info || !job->module) {
             if (!job->failure_reported) {
 #ifndef NDEBUG
@@ -8024,6 +9111,9 @@ bool PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
         if (now - job->ready_since < std::chrono::seconds{30} && ready.size() <= 32) {
             return false;
         }
+        if (TranslateJobsDiag()) {
+            LOG_WARNING(Render_Vulkan, "DIAG-GT7-073: #{} expired", job->diag_id); // (port)
+        }
         ForgetModuleCode(instance.GetDevice(), job->module);
         instance.GetDevice().destroyShaderModule(job->module);
 #ifndef NDEBUG
@@ -8042,6 +9132,23 @@ bool PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
                         std::chrono::duration<double>(now - stats.since).count(), stats.queued,
                         stats.used, stats.translate_ms, stats.expired, stats.duplicate,
                         stats.failed, stats.waited, stats.wait_ms);
+            if (stats.waited != 0) {
+                // DIAG-GT7-123 (port)
+                std::string by_stage;
+                static constexpr const char* names[8] = {"fs", "hs", "ds", "vs", "gs", "cs",
+                                                         "?", "?"};
+                for (u32 i = 0; i < 8; ++i) {
+                    if (stats.waited_stage[i] != 0) {
+                        by_stage += fmt::format(" {} {}/{:.0f} ms", names[i], stats.waited_stage[i],
+                                                stats.wait_ms_stage[i]);
+                    }
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "DIAG-GT7-123: waits by stage:{}; memory writers {}, forced {}, "
+                            "wait-for-shaders {}, dropped as too old {}",
+                            by_stage, stats.waited_writer, stats.waited_forced,
+                            stats.waited_shaders, stats.waited_dropped);
+            }
             if (const u64 skipped = std::exchange(HsWindow().skipped, 0); skipped != 0) {
                 LOG_WARNING(Render_Vulkan,
                             "PERF-GT7-115: {} tessellated draws skipped past the hull shader "
@@ -8405,6 +9512,37 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
                                                       Shader::LaneReadUnbranchEnabled());
         }
       }
+        // NEO-GT7-007: PS4 Pro programs with SDWA compares or selections, stored before they
+        // were translated (only Pro code has SDWA, so the base mode never looks). Stores are
+        // never cleared for another build here (FIX-271), so the check stays on. Bit 4096: 2048
+        // is the lane-read marker of this tree (lane_read_policy.h).
+        // At a program's first use only: this block also runs at every compute lookup, and
+        // the census decodes the whole program. Both games' Pro mode (NEO-GTS-505).
+        static const bool neo = Libraries::Kernel::sceKernelIsNeoMode() != 0; // NEO-GTS-505
+        if (neo && first_use) {
+            const auto use = Shader::NeoCodeCensus(params.code);
+            if (use.sdwa_compares_to_sgpr + use.sdwa_selects != 0) {
+                needed_fixes |= 4096u;
+            }
+        }
+    }
+    // NEO-GT7-008 (diagnosis, SHADGT_NEO_CENSUS=1): the PS4 Pro encodings each program uses, at
+    // its first use; DPP and the MIMG G16/A16/D16 bits are not translated yet.
+    static const bool neo_census = [] {
+        const char* env = std::getenv("SHADGT_NEO_CENSUS");
+        return Libraries::Kernel::sceKernelIsNeoMode() != 0 && env && env[0] == '1';
+    }();
+    if (neo_census && first_use) {
+        const auto use = Shader::NeoCodeCensus(params.code);
+        if (use.sdwa_compares_to_sgpr + use.sdwa_selects + use.dpp + use.mimg_g16 + use.mimg_a16 +
+                use.mimg_d16 !=
+            0) {
+            LOG_WARNING(Render_Vulkan,
+                        "NEO-GT7-008: {}_{:#x} uses SDWA compares to SGPRs {}, SDWA selections {}, "
+                        "DPP {}, MIMG G16 {} A16 {} D16 {}",
+                        hw_stage, params.hash, use.sdwa_compares_to_sgpr, use.sdwa_selects,
+                        use.dpp, use.mimg_g16, use.mimg_a16, use.mimg_d16);
+        }
     }
     const auto known = else_scope_fixed.find(params.hash);
     const auto session = session_fix_marks.find(params.hash);
@@ -8859,7 +9997,7 @@ void PipelineCache::RecoverAttributeFlags(Shader::Info& info,
     // FIX-012: a shader from a cache entry stored without its attribute loads/stores is
     // translated again for them (its stored SPIR-V is kept), because the rect/quad-list helper
     // shaders forward exactly the outputs these flags name. The entry is stored again with them.
-    Common::GuestClock::CompilePause hold; // FIX-044
+    Common::GuestClock::CompilePause hold{Common::GuestClock::HoldSite::Retranslate}; // FIX-044
     Shader::Info translated{info.hw_stage, info.sw_stage, params};
     auto translate_runtime_info = runtime_info;
     [[maybe_unused]] const auto program =
@@ -8901,6 +10039,7 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
             } else if (std::holds_alternative<ComputePipelineKey>(key)) {
                 auto& compute_key = std::get<ComputePipelineKey>(key);
                 compute_pipelines.erase(compute_key);
+                pending_computes.erase(compute_key); // PERF-GTS-493
             }
         }
     }
@@ -8959,7 +10098,26 @@ std::optional<std::vector<u32>> PipelineCache::GetShaderPatch(u64 hash, Shader::
 
 namespace Vulkan {
 void PipelineCache::ReleaseCompletedPipelineOwners(std::vector<std::shared_ptr<const void>> owners) {
-    PipelineRetirementWorker().Enqueue([owners = std::move(owners)] {});
+    static const bool batched = [] { // PERF-SGT-017
+        const char* env = std::getenv("SHADGT_PIPELINE_OWNER_BATCH");
+        return !(env && env[0] == '0');
+    }();
+    if (!batched) {
+        PipelineRetirementWorker().Enqueue([owners = std::move(owners)] {});
+        return;
+    }
+    if (owners.empty()) return;
+    bool flush;
+    {
+        auto& batch = CompletedOwners();
+        const auto now = std::chrono::steady_clock::now();
+        std::scoped_lock lock{batch.mutex};
+        if (batch.owners.empty()) batch.since = now;
+        batch.owners.insert(batch.owners.end(), std::make_move_iterator(owners.begin()),
+                            std::make_move_iterator(owners.end()));
+        flush = batch.owners.size() >= 512 || now - batch.since >= std::chrono::milliseconds{100};
+    }
+    if (flush) FlushCompletedPipelineOwners();
 }
 std::shared_ptr<const void> PipelineCache::KeepAlive(const GraphicsPipeline* pipeline) const {
     if (!pipeline) return {};
@@ -9024,7 +10182,15 @@ void PipelineCache::TrimUnusedPipelines() {
     if (PipelineRetirementWorker().PendingCount() >= 512) return;
     // Queued selections hold a shared reference; retirement cannot invalidate them.
     constexpr size_t retire_batch = 128;
-    const auto cutoff = now - seconds{5};
+    // FIX-GTS-523: a pipeline unused for this long may be retired under pressure (it was 5 s). On
+    // an 8 GB GPU GT7 is always within the reserve, so the trim ran all the time and retired every
+    // pipeline five seconds out of view; back in view, its draw was skipped while it was rebuilt
+    // and the scenery popped every 3-5 s. SHADGT_PIPELINE_IDLE_S sets it (5: as before).
+    static const auto idle = [] {
+        const char* env = std::getenv("SHADGT_PIPELINE_IDLE_S");
+        return seconds{env && *env ? std::max<long long>(1, std::strtoll(env, nullptr, 10)) : 120};
+    }();
+    const auto cutoff = now - idle;
     std::vector<std::shared_ptr<const void>> retired;
     // FIX-GTS-468: without pressure too, the precompile's pipelines no draw used go once it is
     // done (beyond SHADGT_PRECOMPILE_KEEP); the driver's cache rebuilds one quickly if needed.
@@ -9063,6 +10229,7 @@ void PipelineCache::TrimUnusedPipelines() {
             pipeline_last_use.erase(it->second.get());
             if constexpr (std::is_same_v<Key, GraphicsPipelineKey>) {
                 prewarm_unclaimed.erase(key); // FIX-GTS-468
+                NoteReleased(key);            // FIX-GTS-498
             }
             retired.emplace_back(std::move(it.value()));
             cache.erase(it);
@@ -9070,7 +10237,11 @@ void PipelineCache::TrimUnusedPipelines() {
     };
     if (under_pressure) {
         trim(graphics_pipelines);
-        trim(compute_pipelines);
+        // FIX-GTS-521: compute pipelines stay under VRAM pressure. They are few and small, and one
+        // retired was built again while its dispatches were skipped (keep going, PERF-GTS-493):
+        // GT7's GPU culling then tested against a depth pyramid that was not built, and scenery
+        // dropped out while the pressure lasted. Under RAM pressure alone they still go.
+        if (ram_pressure && !vram_pressure) trim(compute_pipelines);
     }
     if (retired.empty()) return;
     const auto count = retired.size();
@@ -9084,8 +10255,9 @@ void PipelineCache::TrimUnusedPipelines() {
     });
     if (!under_pressure) return; // RetireUnclaimedPrewarm logs its own progress
     LOG_INFO(Render_Vulkan, "Pipeline memory pressure: {} MiB used / {} MiB budget, "
-             "2048 MiB reserve, {} MiB RAM free{}; retired {} unused pipelines, {} cached, "
-             "{} stored never drawn", usage_bytes >> 20, budget_bytes >> 20, ram_available >> 20,
+             "{} MiB reserve, {} MiB RAM free{}; retired {} unused pipelines, {} cached, "
+             "{} stored never drawn", usage_bytes >> 20, budget_bytes >> 20,
+             PipelineRetentionReserve(budget_bytes) >> 20, ram_available >> 20,
              ram_pressure ? " (RAM pressure)" : "", count,
              graphics_pipelines.size() + compute_pipelines.size(), prewarm_unclaimed.size());
 }
@@ -9217,6 +10389,7 @@ void PipelineCache::RetireUnclaimedPrewarm(std::vector<std::shared_ptr<const voi
         retired.emplace_back(std::move(it.value()));
         graphics_pipelines.erase(it);
         prewarm_unclaimed.erase(key);
+        NoteReleased(key); // FIX-GTS-498
         ++taken;
     }
     prewarm_settle_queue.insert(prewarm_settle_queue.begin(), busy.begin(), busy.end());

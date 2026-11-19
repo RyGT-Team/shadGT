@@ -112,16 +112,30 @@ void MarkGpuCommandThread();
 void TakeHold();
 void ReleaseHold();
 
+/// DIAG-GTS-518: where a hold was taken, for the per-site totals.
+enum class HoldSite : u8 {
+    Other,
+    LookupTranslations, ///< GetGraphicsPipelineUnlocked: translations and listings, no deadline
+    RequiredBuild,      ///< a never-skipped draw's pipeline build, out of the lookup lock
+    BuildWait,          ///< a draw's pipeline build, in the lookup
+    Compute,            ///< a compute pipeline
+    CompileModule,      ///< a shader translated on the GPU thread
+    TranslationJob,     ///< a translation a worker makes, waited for
+    Retranslate,        ///< FIX-012: a stored shader translated again
+    Count
+};
+
 /// Holds the guest clocks for its lifetime when created on the GPU command thread.
 class CompilePause {
 public:
-    CompilePause();
+    explicit CompilePause(HoldSite site = HoldSite::Other);
     ~CompilePause();
     CompilePause(const CompilePause&) = delete;
     CompilePause& operator=(const CompilePause&) = delete;
 
 private:
     bool active{};
+    HoldSite site{};
     std::chrono::steady_clock::time_point start{};
 };
 

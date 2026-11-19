@@ -1,4 +1,5 @@
 #include "common/debug_environment.h"
+#include "common/game_title.h"
 #include "common/geometry_trace.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
@@ -66,6 +67,7 @@
 namespace Vulkan {
 #ifdef RYTY_GPU
 bool RytyGtsInRace();
+bool RytyGtsMenuCaptureAvailable(); // ryty_game_patch.cpp
 #endif
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
@@ -241,7 +243,10 @@ bool Rasterizer::SelectsPipelinesAhead() const {
 #ifdef RYTY_GPU
     // Thumbnail dependencies must stop the recorder at the actual draw, with
     // its guest-clock hold, rather than compile ahead of its queued resources.
-    if (!RytyGtsInRace()) return false;
+    // PERF-GTS-488: only where the game's menu captures are hooked (GT Sport's icon captures).
+    // A game without them (GT7: the hooks match GT Sport's code only) has no such dependency
+    // and selects ahead at its menus too, as shadgt7 always did.
+    if (!RytyGtsInRace() && RytyGtsMenuCaptureAvailable()) return false;
 #endif
     // PERF-047: -DisablePerf 59 selects every pipeline on the recorder thread as before.
     static const bool enabled = Common::PerfFeatureEnabled(59);
@@ -439,7 +444,13 @@ Rasterizer::SelectedPipelinePtr Rasterizer::SelectComputePipelineAhead() {
     selected.indirect = false;
     selected.is_compute = true;
     std::scoped_lock lk{pipeline_cache.LookupMutex()};
-    selected.compute = pipeline_cache.GetComputePipeline();
+    selected.compute = pipeline_cache.GetComputePipeline(true);
+    if (pipeline_cache.TakeComputeDeferred()) {
+        // PERF-GTS-501: its build started; no selection, so the dispatch is a barrier job for
+        // the buffer stage and the recorder looks the pipeline up itself (and waits for it).
+        selected_recycler.Give(std::move(snapshot));
+        return nullptr;
+    }
     selected.keepalive[1] = pipeline_cache.KeepAlive(selected.compute);
     if (selected.compute) {
         CopyComputeStage(selected.stages);
@@ -2468,6 +2479,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    if (pipeline->SampleLocationSamples() != 0) {
+        DynState().ResendSampleLocations(cmdbuf); // NEO-GTS-508
+    }
 
     if (quad_triangles) {
         // Non-indexed quads index from 0 with the first vertex as the vertex offset, which
@@ -2784,6 +2798,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    if (pipeline->SampleLocationSamples() != 0) {
+        DynState().ResendSampleLocations(cmdbuf); // NEO-GTS-508
+    }
 
     if (is_indexed) {
         ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
@@ -3238,15 +3255,11 @@ std::optional<std::pair<const VideoCore::Buffer*, u64>> Rasterizer::DirectReadBu
 
 #ifdef RYTY_GPU
 // FIX-419-GTS (follows shadgt7's fence batching): GT7's two labels its job threads spin on are
-// never batched. GT7 only (CUSA24767/CUSA24769 or its title): the addresses are GT7's.
+// never batched. GT7 only: the addresses are GT7's. GAME-001 decides (its own serial and name test
+// never matched under Ryty, whose serial was GT Sport's for both games, so the exemption shadgt7
+// always had was off in the unified renderer).
 static bool Gt7SpunLabel(VAddr address) {
-    static const bool gt7 = [] {
-        const auto& elf = Common::ElfInfo::Instance();
-        const std::string_view id = elf.GameSerial();
-        const std::string_view name = elf.Title();
-        return id == "CUSA24767" || id == "CUSA24769" ||
-               (name.starts_with("Gran Turismo") && name.ends_with(" 7"));
-    }();
+    static const bool gt7 = Common::IsGt7();
     return gt7 && ((address >= 0x102046a3f0 && address < 0x102046a400) ||
                    (address >= 0x10200004e0 && address < 0x1020000500));
 }
@@ -3773,7 +3786,7 @@ void Rasterizer::FrameDumpFlip() {
         }
         return;
     }
-    if (++frames_seen < (debug_frame_dump_active ? 1u : dump_frames)) {
+    if (++frames_seen < (debug_frame_dump_active ? VideoCore::DebugFrameDumpFrames() : dump_frames)) {
         FrameDumpEvent(fmt::format("---- flip {} ----", frames_seen));
         return;
     }
@@ -4303,6 +4316,19 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     std::array<StageResourceBindings, Shader::MaxStageTypes> stage_bindings{};
     const auto stages = pipeline->GetStages();
     ctx->push_data = MakeUserData(liverpool->DrawRegs());
+    if (!pipeline->IsCompute()) {
+        // NEO-GTS-511: the pixel shader's positions table (as the native renderer's Draw).
+        const auto* graphics = static_cast<const GraphicsPipeline*>(pipeline);
+        if (graphics->UsesSampleTable()) {
+            ctx->push_data.quad_sample_mask =
+                SampleLocations::QuadTable(SampleLocationPattern(graphics));
+        }
+        if (graphics->UsesSample0Offsets()) { // NEO-GTS-513
+            const u32 word = SampleLocations::Sample0Word(SampleLocationPattern(graphics));
+            std::memcpy(&ctx->push_data.buf_offsets[Shader::PushData::Sample0OffsetsByte], &word,
+                        sizeof(word));
+        }
+    }
     for (u32 i = 0; i < stages.size(); ++i) {
         const auto* stage = stages[i];
         if (!stage) {
@@ -6775,7 +6801,7 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
     UpdateViewportScissorState();
     UpdateDepthStencilState();
     UpdatePrimitiveState(is_indexed, quad_triangles);
-    UpdateRasterizationState();
+    UpdateRasterizationState(pipeline);
     UpdateColorBlendingState(pipeline);
 
     auto& dynamic_state = DynState(); // NAT-101
@@ -7098,10 +7124,29 @@ void Rasterizer::UpdatePrimitiveState(const bool is_indexed, const bool quad_tri
     dynamic_state.SetFrontFace(front_face);
 }
 
-void Rasterizer::UpdateRasterizationState() const {
+void Rasterizer::UpdateRasterizationState(const GraphicsPipeline* pipeline) const {
     const auto& regs = liverpool->DrawRegs();
     auto& dynamic_state = DynState(); // NAT-101
     dynamic_state.SetLineWidth(regs.line_control.Width());
+    dynamic_state.SetSampleLocations(SampleLocationPattern(pipeline)); // NEO-GTS-508
+}
+
+SampleLocations::Pattern Rasterizer::SampleLocationPattern(const GraphicsPipeline* pipeline,
+                                                           SampleLocations::Why* why) const {
+    // NEO-GTS-508: PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0..X1Y1 (DIAG-GTS-507's decoding), for a
+    // pipeline with the dynamic sample-locations state; none for the others.
+    const u32 samples = pipeline ? pipeline->SampleLocationSamples() : 0;
+    if (samples == 0) {
+        return {};
+    }
+    constexpr u32 kLocs = 0xA2FE;
+    const auto& regs = liverpool->DrawRegs();
+    std::array<u32, 16> locs;
+    for (u32 i = 0; i < locs.size(); ++i) {
+        locs[i] = regs.reg_array[kLocs + i];
+    }
+    return SampleLocations::FromRegisters(locs, regs.aa_config.NumSamples(), samples,
+                                          instance.HasSampleLocationQuadGrid(samples), why);
 }
 
 void Rasterizer::UpdateColorBlendingState(const GraphicsPipeline* pipeline) const {

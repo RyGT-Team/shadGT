@@ -2,10 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <cstdlib>
+#include <string_view>
 #include "common/assert.h"
 #include "common/elf_info.h"
+#include "common/game_title.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/kernel/process.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/system/userservice.h"
 #include "core/libraries/videoout/driver.h"
@@ -19,12 +23,48 @@
 #endif
 #include "ryty_gpu/ryty_diag.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#ifdef RYTY_GPU
+#include "core/file_format/psf.h"
+#include "ryty_gpu/ryty_gt7_hdr_status.h"
+#endif
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
 
 namespace Libraries::VideoOut {
 
 static std::unique_ptr<VideoOutDriver> driver;
+
+static bool GameSupportsHdr() {
+    const auto& game_info = Common::ElfInfo::Instance();
+#ifdef RYTY_GPU
+    // The converted-title shim retains Sport's hardcoded attributes. Only query
+    // the real title's HDR bit after the host has offered HDR; do not change Neo
+    // or any other title attribute, or the SDR-only host path.
+    if (presenter->IsHDRSupported()) {
+        static const bool supported = [&] {
+            PSF param_sfo;
+            // FIX-GT7-146: GT7 only. Any other title with the HDR bit in its param.sfo (GT
+            // Sport has HDR on a console) would be offered HDR10 with nothing of this path
+            // tried on it.
+            if (param_sfo.Open(game_info.GetGameFolder() / "sce_sys" / "param.sfo") &&
+                param_sfo.GetString("TITLE_ID") == "CUSA24769") {
+                if (const auto attributes = param_sfo.GetInteger("ATTRIBUTE")) {
+                    Common::PSFAttributes game_attributes{};
+                    game_attributes.raw = static_cast<u32>(*attributes);
+                    return game_attributes.support_hdr.Value() != 0;
+                }
+            }
+            return game_info.GetPSFAttributes().support_hdr.Value() != 0;
+        }();
+        RytySetGt7HdrStatusCompatibility(supported);
+        return supported;
+    }
+#endif
+#ifdef RYTY_GPU
+    RytySetGt7HdrStatusCompatibility(false);
+#endif
+    return game_info.GetPSFAttributes().support_hdr.Value() != 0;
+}
 
 void PS4_SYSV_ABI sceVideoOutSetBufferAttribute(BufferAttribute* attribute, PixelFormat pixelFormat,
                                                 u32 tilingMode, u32 aspectRatio, u32 width,
@@ -402,17 +442,27 @@ void PaceFlipSubmit() {
 s32 PS4_SYSV_ABI sceVideoOutGetDeviceCapabilityInfo(
     s32 handle, SceVideoOutDeviceCapabilityInfo* pDeviceCapabilityInfo) {
     pDeviceCapabilityInfo->capability = 0;
-    LOG_INFO(Lib_VideoOut, "HDR: capability query (swapchain HDR {}, game flag {})",
-             presenter->IsHDRSupported(),
+    const bool hdr_available = presenter->IsHDRSupported();
+    LOG_INFO(Lib_VideoOut, "HDR: capability query (swapchain HDR {}, game flag {})", hdr_available,
              Common::ElfInfo::Instance().GetPSFAttributes().support_hdr.Value());
-    if (presenter->IsHDRSupported()) {
-        auto& game_info = Common::ElfInfo::Instance();
-        // ryGT: the converted GT Sport carries no PSF HDR attribute, but the game has HDR10
-        // output; with HDR allowed (GPU.hdr_allowed) it is offered anyway.
-        bool game_hdr = game_info.GetPSFAttributes().support_hdr;
 #ifdef RYTY_GPU
-        game_hdr = true;
+    if (!hdr_available && Common::IsGt7()) {
+        RytySetGt7HdrStatusCompatibility(false);
+    }
 #endif
+    if (hdr_available) {
+        // GT7: the real title's HDR bit (FIX-GT7-146).
+        bool game_hdr = false;
+        if (Common::IsGt7()) {
+            game_hdr = GameSupportsHdr();
+        } else {
+            // ryGT: the converted GT Sport carries no PSF HDR attribute, but the game has HDR10
+            // output; with HDR allowed (GPU.hdr_allowed) it is offered anyway.
+            game_hdr = Common::ElfInfo::Instance().GetPSFAttributes().support_hdr;
+#ifdef RYTY_GPU
+            game_hdr = true;
+#endif
+        }
         if (game_hdr) {
             pDeviceCapabilityInfo->capability |= ORBIS_VIDEO_OUT_DEVICE_CAPABILITY_BT2020_PQ;
         }
@@ -493,10 +543,20 @@ s32 PS4_SYSV_ABI sceVideoOutConfigureOutputMode_(s32 handle, u32 reserved, const
         break;
     case OrbisVideoOutColorimetry::Bt2020PQ:
 #ifdef RYTY_GPU
-        port->is_hdr = presenter->IsHDRSupported(); // ryGT: see sceVideoOutGetDeviceCapabilityInfo
-        Ryty::g_hdr_output = port->is_hdr;
+        if (Common::IsGt7()) {
+            // FIX-GT7-146: the real title's HDR bit. Ryty::g_hdr_output stays off: GT7's
+            // interface is already PQ-encoded (FIX-GT7-143), GT Sport's HDR-UI layer is not
+            // for it.
+            if (GameSupportsHdr()) {
+                port->is_hdr = true;
+            }
+        } else {
+            // ryGT: see sceVideoOutGetDeviceCapabilityInfo
+            port->is_hdr = presenter->IsHDRSupported();
+            Ryty::g_hdr_output = port->is_hdr;
+        }
 #else
-        if (Common::ElfInfo::Instance().GetPSFAttributes().support_hdr) {
+        if (GameSupportsHdr()) {
             port->is_hdr = true;
         }
 #endif
@@ -525,13 +585,35 @@ s32 PS4_SYSV_ABI sceVideoOutSetWindowModeMargins(s32 handle, s32 top, s32 bottom
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
 #ifdef RYTY_GPU
-    const auto mode = Ryty::GetProMode();
-    const auto [width, height] = Ryty::ProOutputSize(mode, EmulatorSettings.GetInternalScreenWidth(),
-                                                  EmulatorSettings.GetInternalScreenHeight());
-    driver = std::make_unique<VideoOutDriver>(width, height);
-    LIB_FUNCTION("WslcK1FQcGI", "libkernel", 1, "libkernel", Kernel::sceKernelIsNeoMode);
-    LOG_INFO(Lib_VideoOut, "PRO-EXPERIMENT: hardware {}, reported output {}x{}",
-             Ryty::IsProMode(mode) ? "Neo" : "base", width, height);
+    u32 port_width = EmulatorSettings.GetInternalScreenWidth();
+    u32 port_height = EmulatorSettings.GetInternalScreenHeight();
+    // NEO-GT7-001: in the PS4 Pro mode the port reports a 2160p TV, as a Pro on a 4K set does:
+    // both games pick their 3200x1800 checkerboard picture from the TV height (GT7's video init
+    // 0x1417a6ea0, GT Sport's 0x141c6de30: the same choice, and 3840x2160 display surfaces on a
+    // Pro). The base mode keeps the configured port.
+    // NEO-GT7-013: SHADGT_NEO_TV=1080 reports a 1080p TV instead, as a Pro on a 1080p set: both
+    // draw 1920x1080 without the checkerboard; GT7 takes its third preset, GT7_PS4Pro_2K (60 fps
+    // replays and photo mode, motion blur in the race; NEO-GT7-014 in ryty_game_patch.cpp).
+    // NEO-GTS-505: one port for both games. GT7's Pro mode is its runtime's answer; GT Sport's
+    // runtime has none, so the renderer decides it (ryty_pro_mode.h) and answers the game.
+    if (Libraries::Kernel::sceKernelIsNeoMode()) {
+        bool tv_1080;
+        if (Common::IsGt7()) {
+            const char* tv = std::getenv("SHADGT_NEO_TV");
+            tv_1080 = tv && std::string_view{tv} == "1080";
+        } else {
+            tv_1080 = Ryty::GetProMode() == Ryty::ProMode::Neo1080;
+        }
+        port_width = tv_1080 ? 1920 : 3840;
+        port_height = tv_1080 ? 1080 : 2160;
+        LOG_WARNING(Lib_VideoOut, "{}: video port {}x{} (PS4 Pro on a {} TV)",
+                    tv_1080 ? "NEO-GT7-013" : "NEO-GT7-001", port_width, port_height,
+                    tv_1080 ? "1080p" : "2160p");
+    }
+    if (!Common::IsGt7()) {
+        LIB_FUNCTION("WslcK1FQcGI", "libkernel", 1, "libkernel", Kernel::sceKernelIsNeoMode);
+    }
+    driver = std::make_unique<VideoOutDriver>(port_width, port_height);
 #else
     driver = std::make_unique<VideoOutDriver>(EmulatorSettings.GetInternalScreenWidth(),
                                               EmulatorSettings.GetInternalScreenHeight());

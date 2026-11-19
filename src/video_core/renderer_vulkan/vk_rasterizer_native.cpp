@@ -16666,6 +16666,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
     }
     Native::OrderedTiming::NoteResolve(resolve_recorded); // DIAG-SGT-023
+    // DIAG-SGT-023: the rest of the draw is the encode side (ends with the draw's scope).
+    Native::OrderedTiming::Scope encode_phase{Native::OrderedTiming::EncodePhase};
     auto* parallel=FindParallelRuntime(this);
     const auto partition_mode=parallel && parallel->applied_mode.Enabled()?1u:0u;
     RecordPartitionEndGuard end_partition_guard{parallel?&parallel->record_partition[partition_mode][4]:nullptr};
@@ -21770,6 +21772,7 @@ void NativeRenderer::DispatchDirect() {
     const bool recorded = image_work || s.resource_recording_serial != work_before;
     bind_phase.reset();
     Native::OrderedTiming::NoteResolve(recorded); // DIAG-SGT-023
+    Native::OrderedTiming::Scope encode_phase{Native::OrderedTiming::EncodePhase};
     const std::optional<u64> texel = b.stored.size() == 1
         ? SameTexelKey(pipeline->GetStage(Shader::SwStage::Compute), b.image_entries)
         : std::nullopt;
@@ -25256,7 +25259,9 @@ static void ReportOrderedFraction(u64 frame) {
     const u64 ordered = t.kind[size_t(OT::Kind::Ordered)];
     const u64 barrier = t.kind[size_t(OT::Kind::Barrier)];
     const u64 resolve = t.kind[size_t(OT::Kind::Resolve)];
-    const double all = double(std::max<u64>(1, parallel + uncertain + ordered + barrier + resolve));
+    const u64 encode = t.kind[size_t(OT::Kind::Encode)];
+    const double all =
+        double(std::max<u64>(1, parallel + uncertain + ordered + barrier + resolve + encode));
     std::array<u32, OT::SiteCount> order{};
     std::iota(order.begin(), order.end(), 0u);
     std::ranges::sort(order, [&](u32 a, u32 b) { return t.site[a] > t.site[b]; });
@@ -25274,12 +25279,13 @@ static void ReportOrderedFraction(u64 frame) {
     LOG_INFO(Render_Vulkan,
              "DIAG-SGT-023: {:.0f} frames, {:.0f} draws and {:.0f} dispatches a frame; recorder ms a "
              "frame {:.2f} = parallel {:.2f} + uncertain {:.2f} + ordered {:.2f} + barrier {:.2f} + "
-             "binding phase {:.2f}; "
+             "binding phase {:.2f} + encode phase {:.2f}; "
              "ordered {:.1f}%, ordered and barrier {:.1f}%, with uncertain {:.1f}%; draw and "
              "dispatch time outside tagged sites {:.2f} ms; tagged sites (a frame, largest first):{}",
              frames, double(t.draws) / frames, double(t.dispatches) / frames,
-             ms(parallel + uncertain + ordered + barrier + resolve), ms(parallel), ms(uncertain),
-             ms(ordered), ms(barrier), ms(resolve), 100.0 * double(ordered) / all,
+             ms(parallel + uncertain + ordered + barrier + resolve + encode), ms(parallel),
+             ms(uncertain), ms(ordered), ms(barrier), ms(resolve), ms(encode),
+             100.0 * double(ordered) / all,
              100.0 * double(ordered + barrier) / all,
              100.0 * double(ordered + barrier + uncertain) / all, ms(parallel), top);
     // The same time if the binding phase is resolved in draw order into a per-draw record (the
@@ -25315,6 +25321,13 @@ static void ReportOrderedFraction(u64 frame) {
     }
     LOG_INFO(Render_Vulkan, "DIAG-SGT-023 splices a frame by calling line (vk_rasterizer_native.cpp):{}",
              splices);
+    // A resolve thread feeding an encode thread: the encode side is the encode phase's own time;
+    // everything else stays on the resolve side (with the recorder's time outside any draw).
+    LOG_INFO(Render_Vulkan,
+             "DIAG-SGT-023 pipeline: encode side {:.2f} ms a frame ({:.1f}% of scoped recorder "
+             "time), resolve side {:.2f} ms",
+             ms(encode), 100.0 * double(encode) / all,
+             ms(parallel + uncertain + ordered + barrier + resolve));
     const auto per_frame = [&](u64 n) { return double(n) / frames; };
     LOG_INFO(Render_Vulkan,
              "DIAG-SGT-023 prepared draws a frame (OPT-010): found {:.1f}, none {:.1f}, used {:.1f}, "

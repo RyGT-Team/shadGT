@@ -30,6 +30,10 @@ enum class Kind : std::uint8_t {
     /// uploads; not the tagged sites inside it): ordered too if the recorders encode from a
     /// per-draw record resolved in draw order, order-free as the plan first had it.
     Resolve,
+    /// From the end of the binding phase to the end of the draw or dispatch (render pass, state,
+    /// descriptors, the draw itself, HUD and temporal re-records, the old coordinator's
+    /// admission), less the tagged sites inside it: what an encode thread would take.
+    Encode,
     Count,
 };
 
@@ -67,6 +71,7 @@ enum Site : std::uint8_t {
     FillCopyWrite,
     Mapping,
     BindPhase,
+    EncodePhase,
     SiteCount,
 };
 
@@ -77,7 +82,7 @@ inline constexpr std::array<Kind, SiteCount> kKind{
     Kind::Ordered,   Kind::Ordered,   Kind::Ordered,   Kind::Ordered,   Kind::Ordered,
     Kind::Ordered,   Kind::Ordered,   Kind::Uncertain, Kind::Ordered,   Kind::Ordered,
     Kind::Ordered,   Kind::Ordered,   Kind::Uncertain, Kind::Barrier,   Kind::Barrier,
-    Kind::Barrier,   Kind::Barrier,   Kind::Resolve,
+    Kind::Barrier,   Kind::Barrier,   Kind::Resolve,   Kind::Encode,
 };
 
 inline constexpr std::array<const char*, SiteCount> kName{
@@ -89,7 +94,7 @@ inline constexpr std::array<const char*, SiteCount> kName{
     "RefreshSources", "ApplyRewrite",   "RegistryFind",    "MakeImage",
     "NoteWrites",     "CommitPrepared", "LongSetsUpkeep",  "PipelineLookup",
     "Splice",         "FindDisplay",    "Fill/Copy/InlineWrite", "Unmap/NewMapping",
-    "BindPhase",
+    "BindPhase",      "EncodePhase",
 };
 
 inline bool Enabled() {

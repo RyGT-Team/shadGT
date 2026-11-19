@@ -4261,7 +4261,7 @@ void NativeRenderer::EndRendering(u32 reason, [[maybe_unused]] std::source_locat
     RecordPartitionClock end_partition{t_record_partition_end};
     auto* sidecar=FindParallelRuntime(this);
 #if !defined(NDEBUG)
-    if (stream.rendering || (sidecar && sidecar->active)) DiagNotePassEnd(where);
+    if (Ctx().stream.rendering || (sidecar && sidecar->active)) DiagNotePassEnd(where);
 #endif
     if(sidecar)sidecar->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::EndPass);
     if(sidecar)sidecar->FinishSerialEligibleRun();
@@ -18949,7 +18949,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                                   .layerCount = 1},
                 .imageOffset = {g_pixel_trace.x, g_pixel_trace.y, 0},
                 .imageExtent = {g_pixel_trace.w, g_pixel_trace.h, 1}};
-            stream.cmd.copyImageToBuffer(
+            Ctx().stream.cmd.copyImageToBuffer(
                 vk::Image{Handle<VkImage_T>(traced->image->NativeHandle())},
                 vk::ImageLayout::eGeneral,
                 vk::Buffer{Handle<VkBuffer_T>(g_pixel_trace.buffer->NativeHandle())}, copy);
@@ -18983,7 +18983,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                     .imageOffset = {TracedPixels[i].first, TracedPixels[i].second, 0},
                     .imageExtent = {1, 1, 1}};
             }
-            stream.cmd.copyImageToBuffer(
+            Ctx().stream.cmd.copyImageToBuffer(
                 vk::Image{Handle<VkImage_T>(targets.colors[0]->image->NativeHandle())},
                 vk::ImageLayout::eGeneral,
                 vk::Buffer{Handle<VkBuffer_T>(g_pixel_trace.buffer->NativeHandle())}, copies);
@@ -23213,11 +23213,11 @@ void NativeRenderer::ProbeWatchedPictures() {
                     .imageOffset = {s32(rect[0]), s32(rect[1]), 0},
                     .imageExtent = {rect[2], rect[3], 1},
                 };
-                stream.cmd.copyImageToBuffer(
+                Ctx().stream.cmd.copyImageToBuffer(
                     vk::Image{Handle<VkImage_T>(entry.image->NativeHandle())},
                     vk::ImageLayout::eGeneral,
                     vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())}, region);
-                stream.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeHost);
+                Ctx().stream.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeHost);
                 probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, size, frame,
                                   entry.write_version.load(), rect[2], rect[3], !entry.from_cpu,
                                   watched, true, 1, 1});
@@ -23238,22 +23238,22 @@ void NativeRenderer::ProbeWatchedPictures() {
                     });
                     offset += u64(w) * h * std::max(desc.layers, 1u) * 4;
                 }
-                stream.cmd.copyImageToBuffer(
+                Ctx().stream.cmd.copyImageToBuffer(
                     vk::Image{Handle<VkImage_T>(entry.image->NativeHandle())},
                     vk::ImageLayout::eGeneral,
                     vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())}, regions);
-                stream.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeHost);
+                Ctx().stream.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeHost);
                 probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, size, frame,
                                   entry.write_version.load(), desc.width, desc.height,
                                   !entry.from_cpu, watched, true, desc.mips,
                                   std::max(desc.layers, 1u)});
             } else {
                 auto copies = Native::MipCopies(entry.info);
-                stream.list->CopyImageToBuffer(entry.image.get(), buffer.get(), copies);
-                stream.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeHost);
-                stream.pipelines.Invalidate();
-                stream.so_known = false; // SO-010
-                ForgetBindings(stream); // OPT-014
+                Ctx().stream.list->CopyImageToBuffer(entry.image.get(), buffer.get(), copies);
+                Ctx().stream.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeHost);
+                Ctx().stream.pipelines.Invalidate();
+                Ctx().stream.so_known = false; // SO-010
+                ForgetBindings(Ctx().stream); // OPT-014
                 probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, size, frame,
                                   entry.write_version.load(), entry.info.size.width,
                                   entry.info.size.height, !entry.from_cpu, watched, false});
@@ -24891,7 +24891,7 @@ void NativeRenderer::ProbeDisplay(const Native::ImageEntry& entry) {
     }
     Begin();
     GlobalBarrier();
-    stream.cmd.copyImageToBuffer(
+    Ctx().stream.cmd.copyImageToBuffer(
         vk::Image{Handle<VkImage_T>(entry.image->NativeHandle())}, vk::ImageLayout::eGeneral,
         vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
         vk::BufferImageCopy{.bufferOffset = 0,
@@ -25719,9 +25719,9 @@ void NativeRenderer::Report() {
     }
     LOG_INFO(Render_Vulkan,
         "OPT-PIPELINE-BINDS: graphics emitted={} reused={}, compute emitted={} reused={} in 10 s",
-        stream.pipelines.emitted[0], stream.pipelines.reused[0],
-        stream.pipelines.emitted[1], stream.pipelines.reused[1]);
-    stream.pipelines.ResetCounts();
+        Ctx().stream.pipelines.emitted[0], Ctx().stream.pipelines.reused[0],
+        Ctx().stream.pipelines.emitted[1], Ctx().stream.pipelines.reused[1]);
+    Ctx().stream.pipelines.ResetCounts();
     LOG_INFO(Render_Vulkan, "OPT-DESCRIPTORS: {} identical sets reused, {} sets allocated in 10 s",
              stats.descriptor_reuses, stats.descriptor_allocations);
     {
@@ -25732,8 +25732,8 @@ void NativeRenderer::Report() {
                  "VRAM-OWNERS: native descriptor_pools active={} free={} retiring={} "
                  "upload_chunks active={} free={} retiring={} images_live={} images_evicted={} "
                  "views_retiring={} upload_free_bytes={}",
-                 stream.pools.size(), free_pools.size(), retiring_pools.size(),
-                 stream.chunks.size(), free_chunks.size(), retiring_chunks.size(),
+                 Ctx().stream.pools.size(), free_pools.size(), retiring_pools.size(),
+                 Ctx().stream.chunks.size(), free_chunks.size(), retiring_chunks.size(),
                  registry->Count(), registry_stats.evicted.load(), retired_views.size(), upload_free_bytes);
     }
     LOG_INFO(Render_Vulkan, "NAT: flat uploads reused={} uploaded={} bytes_saved={} bytes_hashed={} reference_bytes_copied={} upload_bytes={} reuse_enabled={} retained_reference_bytes={}",
@@ -25904,7 +25904,7 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
     }
     LOG_INFO(Render_Vulkan, "NAT: descriptor allocation calls={} reserve hits={} unused={}; "
              "update calls left to the command thread {} (PERF-GTS-371)",
-             stats.descriptor_allocate_calls, stats.descriptor_reserve_hits, stream.descriptor_reserve.SpareCount(),
+             stats.descriptor_allocate_calls, stats.descriptor_reserve_hits, Ctx().stream.descriptor_reserve.SpareCount(),
              stats.descriptor_async_updates);
     if (DescriptorAllocDiagEnabled() && descriptor_alloc_owner == this) {
         const auto& m=descriptor_alloc_metrics;
@@ -25916,7 +25916,7 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
             LOG_INFO(Render_Vulkan,"DESC-ALLOC-DIAG batch={} attempt={} success={} capacity={} other={} samples={} wall_ns_sum={} wall_ns_max={} cpu_samples={} cpu_100ns_sum={} cpu_100ns_max={}",
                 batch,attempt,m.results[batch][attempt][0],m.results[batch][attempt][1],m.results[batch][attempt][2],t.samples,t.wall_ns,t.wall_max_ns,t.cpu_samples,t.cpu_100ns,t.cpu_max_100ns);
         }
-        LOG_INFO(Render_Vulkan,"DESC-ALLOC-DIAG pool_initial={} pool_rotation={} spare={}",m.pool_initial,m.pool_rotate,stream.descriptor_reserve.SpareCount());
+        LOG_INFO(Render_Vulkan,"DESC-ALLOC-DIAG pool_initial={} pool_rotation={} spare={}",m.pool_initial,m.pool_rotate,Ctx().stream.descriptor_reserve.SpareCount());
         for (u32 kind=0;kind<2;++kind) LOG_INFO(Render_Vulkan,
             "DESC-BIND-DIAG kind={} sets={} runs={} multi_runs={}",
             kind,descriptor_bind_sets[kind],descriptor_bind_runs[kind],descriptor_bind_multi[kind]);
@@ -26222,8 +26222,8 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
     LOG_INFO(Render_Vulkan, "Snapshot direct compare: {} attempts, {} hits, {} faults, {} copy bytes avoided",
              stats.snapshot_direct_attempts, stats.snapshot_direct_hits, stats.snapshot_direct_faults,
              stats.snapshot_direct_bytes);
-    if (SnapshotLease::Requested() && snapshot_upload_memo) {
-        auto& cache = *snapshot_upload_memo;
+    if (SnapshotLease::Requested() && Ctx().snapshot_upload_memo) {
+        auto& cache = *Ctx().snapshot_upload_memo;
 #ifdef _WIN32
         static bool module_notice_reported = false;
         SnapshotLease::FirstModuleNotice notice{};

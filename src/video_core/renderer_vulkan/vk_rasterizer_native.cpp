@@ -15848,6 +15848,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             }
         }
     }
+    // DIAG-SGT-023: the binding phase's time, and whether it recorded resource work (a barrier
+    // into the stream) at the draw's place, which a draw resolved ahead could not leave out.
+    std::optional<Native::OrderedTiming::Scope> bind_phase;
+    bind_phase.emplace(Native::OrderedTiming::BindPhase);
+    const u64 resolve_serial = Ctx().stream.resource_recording_serial;
     Targets targets;
     {
         PhaseClock clock{stats.phase_ns[1]};
@@ -16441,6 +16446,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             if (image.imageView == old_view) image.imageView = new_view;
         b.key_layout = nullptr; // cached descriptor keys named the original views
     }
+    bool resolve_recorded = Ctx().stream.resource_recording_serial != resolve_serial; // DIAG-SGT-023
+    bind_phase.reset();
     // An image sampled while this draw uses it as an attachment is a feedback attachment. Native
     // images normally stay in GENERAL, but that does not make an overlapping attachment
     // read legal. Enter the feedback layout for this draw and restore GENERAL afterward.
@@ -16637,12 +16644,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     // target it is a part of) go in before the draw, which counts as drawing its whole view.
     if (PartSyncOn()) {
         const u64 copies_before = stats.source_copies;
+        const u64 sources_serial = Ctx().stream.resource_recording_serial; // DIAG-SGT-023
         for (size_t cb = 0; cb < targets.colors.size(); ++cb) {
             if (auto* color = const_cast<Native::ImageEntry*>(targets.colors[cb])) {
                 RefreshSources(*color);
                 SyncPartFromWholes(*color, targets.color_ranges[cb]);
             }
         }
+        resolve_recorded |= Ctx().stream.resource_recording_serial != sources_serial;
         if (stats.source_copies != copies_before) {
 #if !defined(NDEBUG)
             g_barrier_draw_rule = 4; // DIAG-GTS-451
@@ -16650,6 +16659,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             GlobalBarrier(); // the copies are done before the draw writes the targets
         }
     }
+    Native::OrderedTiming::NoteResolve(resolve_recorded); // DIAG-SGT-023
     auto* parallel=FindParallelRuntime(this);
     const auto partition_mode=parallel && parallel->applied_mode.Enabled()?1u:0u;
     RecordPartitionEndGuard end_partition_guard{parallel?&parallel->record_partition[partition_mode][4]:nullptr};
@@ -21712,6 +21722,8 @@ void NativeRenderer::DispatchDirect() {
     Stream& s = Begin();
     const u64 work_before = s.resource_recording_serial;
     DrawBindings& b = Ctx().bindings;
+    std::optional<Native::OrderedTiming::Scope> bind_phase; // DIAG-SGT-023
+    bind_phase.emplace(Native::OrderedTiming::BindPhase);
     b.Clear();
     b.push = UserData(regs);
     BindStagesStable(pipeline->GetStages(), regs, true, b);
@@ -21749,6 +21761,8 @@ void NativeRenderer::DispatchDirect() {
     if (b.region_writeback) ValidateRegionPlan(*b.region_writeback);
     const u64 program = pipeline->GetStage(Shader::SwStage::Compute).pgm_hash;
     const bool recorded = image_work || s.resource_recording_serial != work_before;
+    bind_phase.reset();
+    Native::OrderedTiming::NoteResolve(recorded); // DIAG-SGT-023
     const std::optional<u64> texel = b.stored.size() == 1
         ? SameTexelKey(pipeline->GetStage(Shader::SwStage::Compute), b.image_entries)
         : std::nullopt;
@@ -23965,8 +23979,9 @@ u32 NativeRenderer::ReadGds(u32 gds_offset) {
     return value;
 }
 
-void NativeRenderer::Splice() {
+void NativeRenderer::Splice(std::source_location where) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::Splice}; // DIAG-SGT-023
+    Native::OrderedTiming::NoteSplice(where.line());
     std::scoped_lock lock{mutex};
     AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Splices};
     Stream& s = Ctx().stream;
@@ -25231,31 +25246,66 @@ static void ReportOrderedFraction(u64 frame) {
     const u64 uncertain = t.kind[size_t(OT::Kind::Uncertain)];
     const u64 ordered = t.kind[size_t(OT::Kind::Ordered)];
     const u64 barrier = t.kind[size_t(OT::Kind::Barrier)];
-    const double all = double(std::max<u64>(1, parallel + uncertain + ordered + barrier));
+    const u64 resolve = t.kind[size_t(OT::Kind::Resolve)];
+    const double all = double(std::max<u64>(1, parallel + uncertain + ordered + barrier + resolve));
     std::array<u32, OT::SiteCount> order{};
     std::iota(order.begin(), order.end(), 0u);
     std::ranges::sort(order, [&](u32 a, u32 b) { return t.site[a] > t.site[b]; });
     std::string top;
-    u32 listed = 0;
     for (const u32 site : order) {
-        if (listed == 10 || t.site[site] == 0) {
+        if (t.site[site] == 0) {
             break;
         }
         if (site == OT::DrawTotal || site == OT::DispatchTotal) {
             continue;
         }
-        top += fmt::format(" {} {:.2f};", OT::kName[site], ms(t.site[site]));
-        ++listed;
+        top += fmt::format(" {} {:.2f} ms {:.0f}x;", OT::kName[site], ms(t.site[site]),
+                           double(t.calls[site]) / frames);
     }
     LOG_INFO(Render_Vulkan,
              "DIAG-SGT-023: {:.0f} frames, {:.0f} draws and {:.0f} dispatches a frame; recorder ms a "
-             "frame {:.2f} = parallel {:.2f} + uncertain {:.2f} + ordered {:.2f} + barrier {:.2f}; "
+             "frame {:.2f} = parallel {:.2f} + uncertain {:.2f} + ordered {:.2f} + barrier {:.2f} + "
+             "binding phase {:.2f}; "
              "ordered {:.1f}%, ordered and barrier {:.1f}%, with uncertain {:.1f}%; draw and "
-             "dispatch time outside tagged sites {:.2f} ms; largest tagged sites (ms a frame):{}",
+             "dispatch time outside tagged sites {:.2f} ms; tagged sites (a frame, largest first):{}",
              frames, double(t.draws) / frames, double(t.dispatches) / frames,
-             ms(parallel + uncertain + ordered + barrier), ms(parallel), ms(uncertain), ms(ordered),
-             ms(barrier), 100.0 * double(ordered) / all, 100.0 * double(ordered + barrier) / all,
+             ms(parallel + uncertain + ordered + barrier + resolve), ms(parallel), ms(uncertain),
+             ms(ordered), ms(barrier), ms(resolve), 100.0 * double(ordered) / all,
+             100.0 * double(ordered + barrier) / all,
              100.0 * double(ordered + barrier + uncertain) / all, ms(parallel), top);
+    // The same time if the binding phase is resolved in draw order into a per-draw record (the
+    // recorders then encode from it): its own time is ordered as well.
+    OT::EndRun(t);
+    std::string runs;
+    for (size_t bucket = 0; bucket < t.runs.size(); ++bucket) {
+        const u64 low = u64{1} << bucket;
+        const std::string length = bucket == 7   ? fmt::format("{}+", low)
+                                   : bucket == 0 ? std::string{"1"}
+                                                 : fmt::format("{}-{}", low, 2 * low - 1);
+        runs += fmt::format(" {}: {:.1f} ({:.1f}% of draws);", length,
+                            double(t.runs[bucket]) / frames,
+                            100.0 * double(t.run_draws[bucket]) /
+                                double(std::max<u64>(1, t.resolved)));
+    }
+    LOG_INFO(Render_Vulkan,
+             "DIAG-SGT-023 resolve: binding phase {:.2f} ms a frame of its own; resolved ahead, "
+             "ordered and barrier {:.1f}%, with uncertain {:.1f}% (parallel left {:.2f} ms); {:.0f} "
+             "draws and dispatches a frame resolved, {:.1f}% of them recorded resource work at their "
+             "place; runs without (a frame, by length):{}",
+             ms(resolve), 100.0 * double(ordered + barrier + resolve) / all,
+             100.0 * double(ordered + barrier + resolve + uncertain) / all, ms(parallel),
+             double(t.resolved) / frames,
+             100.0 * double(t.resolve_recorded) / double(std::max<u64>(1, t.resolved)), runs);
+    auto lines = t.splice_lines;
+    std::ranges::sort(lines, [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::string splices;
+    for (const auto& [line, count] : lines) {
+        if (count != 0) {
+            splices += fmt::format(" {} {:.1f};", line, double(count) / frames);
+        }
+    }
+    LOG_INFO(Render_Vulkan, "DIAG-SGT-023 splices a frame by calling line (vk_rasterizer_native.cpp):{}",
+             splices);
     t = {};
     last_frame = frame;
     last_ticks = ticks;

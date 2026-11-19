@@ -142,7 +142,8 @@ public:
 
     /// Ends the command list recorded so far and runs it in the scheduler's current command
     /// buffer (called before anything else is recorded there or it is submitted).
-    void Splice();
+    /// DIAG-SGT-023: `where` names the most frequent callers.
+    void Splice(std::source_location where = std::source_location::current());
 
     /// The picture at a display buffer, for the presenter (none when nothing drew there).
     struct Display {

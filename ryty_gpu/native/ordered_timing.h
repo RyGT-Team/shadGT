@@ -26,6 +26,10 @@ enum class Kind : std::uint8_t {
     Uncertain, ///< could become order-free with work (pipeline lookup, registry find, targets)
     Ordered,   ///< changes shared state or consumes pending state: needs the ticket turn
     Barrier,   ///< needs both recorder threads drained (splice, flip, fills, unmaps)
+    /// The binding phase's own time (targets, buffers, textures, vertices, writebacks, image
+    /// uploads; not the tagged sites inside it): ordered too if the recorders encode from a
+    /// per-draw record resolved in draw order, order-free as the plan first had it.
+    Resolve,
     Count,
 };
 
@@ -62,6 +66,7 @@ enum Site : std::uint8_t {
     FindDisplay,
     FillCopyWrite,
     Mapping,
+    BindPhase,
     SiteCount,
 };
 
@@ -72,7 +77,7 @@ inline constexpr std::array<Kind, SiteCount> kKind{
     Kind::Ordered,   Kind::Ordered,   Kind::Ordered,   Kind::Ordered,   Kind::Ordered,
     Kind::Ordered,   Kind::Ordered,   Kind::Uncertain, Kind::Ordered,   Kind::Ordered,
     Kind::Ordered,   Kind::Ordered,   Kind::Uncertain, Kind::Barrier,   Kind::Barrier,
-    Kind::Barrier,   Kind::Barrier,
+    Kind::Barrier,   Kind::Barrier,   Kind::Resolve,
 };
 
 inline constexpr std::array<const char*, SiteCount> kName{
@@ -84,6 +89,7 @@ inline constexpr std::array<const char*, SiteCount> kName{
     "RefreshSources", "ApplyRewrite",   "RegistryFind",    "MakeImage",
     "NoteWrites",     "CommitPrepared", "LongSetsUpkeep",  "PipelineLookup",
     "Splice",         "FindDisplay",    "Fill/Copy/InlineWrite", "Unmap/NewMapping",
+    "BindPhase",
 };
 
 inline bool Enabled() {
@@ -101,14 +107,67 @@ inline std::uint64_t Ticks() {
 /// One thread's accumulated ticks, read and reset by that thread's report.
 struct Totals {
     std::array<std::uint64_t, SiteCount> site{};
+    std::array<std::uint64_t, SiteCount> calls{}; ///< entries of each site's scope
     std::array<std::uint64_t, static_cast<std::size_t>(Kind::Count)> kind{};
     std::uint64_t draws = 0;
     std::uint64_t dispatches = 0;
+    /// Draws and dispatches whose binding phase ran to the end, and those of them that recorded
+    /// resource work (copies, uploads, clears: a barrier) into the stream at their place.
+    std::uint64_t resolved = 0;
+    std::uint64_t resolve_recorded = 0;
+    /// Runs of consecutive resolved draws and dispatches that recorded none, by length
+    /// (1, 2-3, 4-7, ..., 128 and more): how many, and how many draws in them.
+    std::array<std::uint64_t, 8> runs{};
+    std::array<std::uint64_t, 8> run_draws{};
+    std::uint64_t run = 0;
+    /// Splices by the line that asked for them (the first 32 lines seen).
+    std::array<std::pair<std::uint32_t, std::uint64_t>, 32> splice_lines{};
 };
 
 inline Totals& Local() {
     static thread_local Totals totals;
     return totals;
+}
+
+inline void EndRun(Totals& totals) {
+    if (totals.run == 0) {
+        return;
+    }
+    std::uint64_t bucket = 0;
+    while (bucket < 7 && (totals.run >> (bucket + 1)) != 0) {
+        ++bucket;
+    }
+    ++totals.runs[bucket];
+    totals.run_draws[bucket] += totals.run;
+    totals.run = 0;
+}
+
+/// A draw's or dispatch's binding phase ended; `recorded`: it recorded resource work.
+inline void NoteSplice(std::uint32_t line) {
+    if (!Enabled()) {
+        return;
+    }
+    for (auto& [at, count] : Local().splice_lines) {
+        if (at == line || at == 0) {
+            at = line;
+            ++count;
+            return;
+        }
+    }
+}
+
+inline void NoteResolve(bool recorded) {
+    if (!Enabled()) {
+        return;
+    }
+    Totals& totals = Local();
+    ++totals.resolved;
+    if (recorded) {
+        ++totals.resolve_recorded;
+        EndRun(totals);
+    } else {
+        ++totals.run;
+    }
 }
 
 struct StackFrame {
@@ -139,6 +198,9 @@ public:
             return;
         }
         Kind kind = kKind[site];
+        if (kind == Kind::Barrier) {
+            EndRun(Local()); // both recorders drain here: a run of draws resolved ahead ends
+        }
         if (stack.depth != 0) {
             const Kind parent = stack.frames[stack.depth - 1].kind;
             if (parent == Kind::Ordered || parent == Kind::Barrier) {
@@ -158,6 +220,7 @@ public:
         const std::uint64_t own = elapsed > frame.children ? elapsed - frame.children : 0;
         Totals& totals = Local();
         totals.site[frame.site] += own;
+        ++totals.calls[frame.site];
         totals.kind[static_cast<std::size_t>(frame.kind)] += own;
         if (frame.site == DrawTotal) {
             ++totals.draws;

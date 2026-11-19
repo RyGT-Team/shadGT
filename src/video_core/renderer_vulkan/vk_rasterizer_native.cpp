@@ -13035,19 +13035,22 @@ void NativeRenderer::FlushLongSets() {
 }
 
 static int RecorderBinderWanted() {
-    // FEAT-SGT-022 (SHADGT_RECORDER_BINDER=1): PushBindings on a thread of its own; =2 the same
-    // with a drain after every job. Not with parallel recording (its captures and pending
-    // updates are the recorder's) nor with the descriptor diagnostics, whose counters the
-    // recorder reports.
+    // FEAT-SGT-022: PushBindings on a thread of its own, on by default (GT7 at Alsace: 55.0 to
+    // 57.2 fps); SHADGT_RECORDER_BINDER=0 off, =2 a drain after every job. Not with parallel
+    // recording (its captures and pending updates are the recorder's) nor with the descriptor
+    // diagnostics, whose counters the recorder reports.
     static const int wanted = [] {
         const char* env = std::getenv("SHADGT_RECORDER_BINDER");
-        const int mode = env && (env[0] == '1' || env[0] == '2') ? env[0] - '0' : 0;
+        const bool asked = env && *env;
+        const int mode = !asked ? 1 : env[0] == '1' || env[0] == '2' ? env[0] - '0' : 0;
         if (mode == 0) return 0;
         const char* reuse_diag = std::getenv("SHADGT_DIAG_DESCRIPTOR_REUSE");
         if (ParallelRecordingRequested() || DescriptorAllocDiagEnabled() ||
             (reuse_diag && reuse_diag[0] == '1')) {
-            LOG_WARNING(Render_Vulkan, "FEAT-SGT-022: SHADGT_RECORDER_BINDER is ignored with "
-                                       "parallel recording or the descriptor diagnostics");
+            if (asked) {
+                LOG_WARNING(Render_Vulkan, "FEAT-SGT-022: SHADGT_RECORDER_BINDER is ignored with "
+                                           "parallel recording or the descriptor diagnostics");
+            }
             return 0;
         }
         return mode;

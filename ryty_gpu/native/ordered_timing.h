@@ -161,10 +161,12 @@ inline void NotePrepared(std::uint32_t outcome) {
     }
 }
 
+/// A splice that ended a list: both recorders drain, a run of draws resolved ahead ends.
 inline void NoteSplice(std::uint32_t line) {
     if (!Enabled()) {
         return;
     }
+    EndRun(Local());
     for (auto& [at, count] : Local().splice_lines) {
         if (at == line || at == 0) {
             at = line;
@@ -216,7 +218,7 @@ public:
             return;
         }
         Kind kind = kKind[site];
-        if (kind == Kind::Barrier) {
+        if (kind == Kind::Barrier && site != Splice) {
             EndRun(Local()); // both recorders drain here: a run of draws resolved ahead ends
         }
         if (stack.depth != 0) {

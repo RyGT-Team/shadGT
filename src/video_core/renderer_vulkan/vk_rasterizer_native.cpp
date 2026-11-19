@@ -23988,13 +23988,15 @@ u32 NativeRenderer::ReadGds(u32 gds_offset) {
 
 void NativeRenderer::Splice(std::source_location where) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::Splice}; // DIAG-SGT-023
-    Native::OrderedTiming::NoteSplice(where.line());
     std::scoped_lock lock{mutex};
     AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Splices};
     Stream& s = Ctx().stream;
     if (!s.list) {
         return;
     }
+    // DIAG-SGT-023: only a splice that ends a list drains (the submit callback after
+    // ChunkFlushCheck's own splice finds none open).
+    Native::OrderedTiming::NoteSplice(where.line());
     s.upload_incarnation=s.upload_incarnation && s.upload_incarnation!=UINT64_MAX ? s.upload_incarnation+1 : 0;
     const u64 boundary_signal=ActiveSubmitSignal()?ActiveSubmitSignal():r.scheduler.CurrentTick();
     EndRendering();

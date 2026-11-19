@@ -107,6 +107,51 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "ryty_gpu/ryty_diag.h"
 
+namespace {
+// DIAG-SGT-024 (diagnostics builds): how program searches are decided, by stage group (pixel,
+// other graphics, compute), logged every 5 s: the memo's replays, the last match's packed and
+// full checks, the loop over permutations and the specializations it builds.
+enum SearchCount : unsigned {
+    SearchCalls, SearchAhead, SearchMemo, SearchLastTried, SearchLastPacked, SearchLastSpec,
+    SearchLoop, SearchLoopSpecs, SearchLoopMatched, SearchNone, SearchCountKinds,
+};
+#ifdef SHADGT_DIAGNOSTICS
+std::array<std::array<std::atomic<u64>, SearchCountKinds>, 3> g_search_counts{};
+std::atomic<long long> g_search_report{0};
+void NoteSearch(Shader::HwStage hw_stage, SearchCount what) {
+    const size_t group = hw_stage == Shader::HwStage::Fragment ? 0
+                         : hw_stage == Shader::HwStage::Compute ? 2 : 1;
+    g_search_counts[group][what].fetch_add(1, std::memory_order_relaxed);
+    if (what != SearchCalls) return;
+    const long long now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    long long last = g_search_report.load(std::memory_order_relaxed);
+    if (last == 0) {
+        g_search_report.compare_exchange_strong(last, now);
+        return;
+    }
+    if (now - last < 5 || !g_search_report.compare_exchange_strong(last, now)) return;
+    static constexpr std::array<const char*, 3> group_names{"pixel", "other graphics", "compute"};
+    std::string text;
+    for (size_t g = 0; g < 3; ++g) {
+        std::array<u64, SearchCountKinds> c{};
+        for (size_t k = 0; k < SearchCountKinds; ++k) c[k] = g_search_counts[g][k].exchange(0);
+        if (c[SearchCalls] == 0) continue;
+        text += fmt::format(" {}: {} searches ({} read-ahead), memo {}, last match tried {} "
+                            "(packed {}, full {}), loop {} ({} specializations built, {} matched), "
+                            "none {};",
+                            group_names[g], c[SearchCalls], c[SearchAhead], c[SearchMemo],
+                            c[SearchLastTried], c[SearchLastPacked], c[SearchLastSpec],
+                            c[SearchLoop], c[SearchLoopSpecs], c[SearchLoopMatched],
+                            c[SearchNone]);
+    }
+    LOG_INFO(Render_Vulkan, "DIAG-SGT-024 program searches in {} s:{}", now - last, text);
+}
+#else
+inline void NoteSearch(Shader::HwStage, SearchCount) {}
+#endif
+} // namespace
+
 namespace Shader::Optimization {
 extern thread_local std::span<const u32> g_diag_compiling_code;
 extern thread_local u64 g_diag_compiling_hash;
@@ -9413,6 +9458,8 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
     if (t_lookup_only) {
         return GetProgramForJob(hw_stage, params, runtime_info, binding); // NAT-031
     }
+    NoteSearch(hw_stage, SearchCalls); // DIAG-SGT-024
+    if (regs_override) NoteSearch(hw_stage, SearchAhead);
     if (program_cache.contains(params.hash)) pending_listings.erase(params.hash);
     if (store_readers && !program_cache.contains(params.hash)) {
         auto pending = pending_listings.find(params.hash);
@@ -9630,6 +9677,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
                        memo.modules_size == program->modules.size() &&
                        memo.runtime_info == runtime_info && memo.start == binding &&
                        std::ranges::equal(memo.user_data, params.user_data);
+    if (memo_usable) NoteSearch(hw_stage, SearchMemo); // DIAG-SGT-024
     const auto start_binding = binding;
     boost::container::small_vector<std::vector<u32>, 4> flats;
     // Leaves the memo's replay: the buffers of the permutations before `end` were the memo's.
@@ -9648,6 +9696,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         last_match < program->modules.size()) {
         auto& permutation = program->modules[last_match];
         if (permutation.info && !permutation.stored) {
+            NoteSearch(hw_stage, SearchLastTried); // DIAG-SGT-024
             auto& info = *permutation.info;
             info.pgm_base = params.Base();
             info.user_data = params.user_data;
@@ -9665,10 +9714,12 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
                                fetch == permutation.spec.fetch_shader_data;
             }
             bool matched = packed_match && fast_mode == 1;
+            if (matched) NoteSearch(hw_stage, SearchLastPacked); // DIAG-SGT-024
             if (!matched) {
                 Common::PhaseTimer spec_timer{Common::Phase::SelSpec};
                 const auto current_spec = TryMatchingSpecialization(info, runtime_info, profile, binding);
                 matched = current_spec && permutation.spec == *current_spec;
+                if (matched) NoteSearch(hw_stage, SearchLastSpec); // DIAG-SGT-024
                 if (packed_match && !matched) {
                     LOG_ERROR(Render_Vulkan, "PERF-GT7-058 packed specialization mismatch: {:#x}", params.hash);
                 }
@@ -9692,6 +9743,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         }
     }
     bool tess_checked = false;
+    NoteSearch(hw_stage, SearchLoop); // DIAG-SGT-024
     for (size_t perm_idx = 0; perm_idx < program->modules.size(); ++perm_idx) {
         auto& permutation = program->modules[perm_idx];
         if (!permutation.info) {
@@ -9733,6 +9785,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
             ++diag_memo;
         } else {
             std::optional<Common::PhaseTimer> spec_timer{std::in_place, Common::Phase::SelSpec};
+            NoteSearch(hw_stage, SearchLoopSpecs); // DIAG-SGT-024
             const auto spec = TryMatchingSpecialization(info, runtime_info, profile, binding);
             spec_timer.reset();
             if (!spec) {
@@ -9748,12 +9801,14 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
                     spec_miss_reasons.push_back(reason);
                 }
             }
+#ifdef SHADGT_DIAGNOSTICS // PERF-SGT-025: a string built per rejected permutation, for a log
             if (!matches && program->modules.size() >= 4 && mismatch_reasons.size() < 600) {
                 u32 index{};
                 const char* reason = permutation.spec.FirstDifference(*spec, index);
                 mismatch_reasons +=
                     fmt::format(" {}:{}[{}]", perm_idx, reason ? reason : "none", index);
             }
+#endif
         }
         // Newly active resources must match the compiled specialization; inactive ones can reuse
         // it.
@@ -9785,6 +9840,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
             memo.flats.assign(flats.begin(), flats.end());
         }
         last_match = perm_idx; // R7
+        if (!memo_usable) NoteSearch(hw_stage, SearchLoopMatched); // DIAG-SGT-024
         if (!memo_usable && SpecFastMode()) RecordSpecInputs(permutation, info, runtime_info, binding);
         if (!info.attribute_flags_known && IsTessEmulatedDraw()) {
             RecoverAttributeFlags(info, permutation.spec, params, runtime_info, perm_idx);
@@ -9796,6 +9852,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         return std::make_tuple(&info, permutation.module, HashCombine(params.hash, perm_idx));
     }
     match_timer.reset();
+    NoteSearch(hw_stage, SearchNone); // DIAG-SGT-024: no permutation matched
     // A queued state owns registers, but not the guest resources they point to. Reuse
     // known permutations for read-ahead; let the actual draw translate a new one.
     if (regs_override && !ReadAheadNewShadersEnabled()) {

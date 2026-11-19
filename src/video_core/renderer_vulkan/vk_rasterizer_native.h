@@ -1555,6 +1555,9 @@ private:
     struct PreparedDraw {
         const void* packet = nullptr;
         u32 epoch = 0;
+        /// FEAT-SGT-022: the last binder job binding from this draw's bindings (0: none); the
+        /// draw is given back only once that job has run.
+        u64 binder_job = 0;
         const GraphicsPipeline* pipeline = nullptr;
         std::shared_ptr<const void> pipeline_keepalive;
         std::atomic<std::shared_ptr<void>> ahead_descriptor_lease;
@@ -1761,6 +1764,11 @@ private:
     /// been recorded (Splice, after the coordinator was drained).
     std::vector<PreparedDraw*> late_bound_prepared;
     std::vector<PreparedDraw*> late_bound_done; ///< recorded: given back at the next draw
+    /// FEAT-SGT-022 (recorder): prepared draws whose binds the binder still makes, and the
+    /// prepared draw the current draw binds from.
+    std::vector<PreparedDraw*> binder_held;
+    PreparedDraw* binding_prepared = nullptr;
+    void ReleaseBinderHeld();
     /// FIX-GTS-393: the recorder, for parallel recording: whether `info` (buffer info
     /// `info_index` of the prepared draw) binds bytes of the arena that hold until the GPU ran
     /// the list being recorded (their segments are marked for it again).

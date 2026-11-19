@@ -93,6 +93,11 @@ public:
         }
     }
 
+    /// Any thread: whether job `seq` has run.
+    bool Done(std::uint64_t seq) const noexcept {
+        return done.load(std::memory_order_acquire) >= seq;
+    }
+
     /// Any thread: waits until job `seq` has run.
     void WaitDone(std::uint64_t seq) const {
         std::uint32_t turns = 0;

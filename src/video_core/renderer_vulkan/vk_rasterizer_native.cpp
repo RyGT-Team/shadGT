@@ -13123,7 +13123,9 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     // captures) are made here, after the binder's.
     const bool in_slot = &b >= c.binding_slots.data() &&
                          &b < c.binding_slots.data() + c.binding_slots.size();
-    if (binder && in_slot && !parallel_binding_capture && s.cmd.Ring()) {
+    // A prepared draw's bindings live in it, kept until its jobs have run (FreePrepared).
+    const bool in_prepared = binding_prepared && &b == &binding_prepared->bindings;
+    if (binder && (in_slot || in_prepared) && !parallel_binding_capture && s.cmd.Ring()) {
         const u64 from = OT::Enabled() ? OT::Ticks() : 0;
         BindJob& job = binder->Next();
         if (OT::Enabled()) OT::NoteBinder(OT::BinderWaitTicks, OT::Ticks() - from);
@@ -13135,7 +13137,11 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         job.inputs = TakeBindInputs(s, b);
         job.inputs.on_binder = true;
         const u64 seq = binder->Push();
-        c.binding_jobs[&b - c.binding_slots.data()] = seq;
+        if (in_slot) {
+            c.binding_jobs[&b - c.binding_slots.data()] = seq;
+        } else {
+            binding_prepared->binder_job = seq;
+        }
         auto* const owner = binder.get();
         s.cmd.Control([owner, seq](Scheduler& scheduler) {
             owner->WaitDone(seq);
@@ -15719,10 +15725,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         for (PreparedDraw* done : late_bound_done) FreePrepared(done);
         late_bound_done.clear();
     }
+    if (!binder_held.empty()) {
+        ReleaseBinderHeld(); // FEAT-SGT-022
+    }
     struct GiveBack {
         NativeRenderer& n;
         PreparedDraw* p;
         ~GiveBack() {
+            n.binding_prepared = nullptr; // FEAT-SGT-022
             if (p) {
                 n.FreePrepared(p);
             }
@@ -16356,6 +16366,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         Native::OrderedTiming::NotePrepared(Native::OrderedTiming::PreparedUsed);
     }
     DrawBindings& b = from_prepared ? prepared->bindings : NextBindings();
+    binding_prepared = from_prepared ? prepared : nullptr; // FEAT-SGT-022: its binds may go to the binder
     // GT7-UW: a HUD draw showing a small picture drawn with depth this frame (the race's maps).
     // DLSS-GT7-001: the same sign, without a HUD layer, tells the prototype a race is on.
     const auto note_race_hud = [&] {
@@ -19718,7 +19729,27 @@ NativeRenderer::PreparedDraw* NativeRenderer::NewPrepared() {
     return draw;
 }
 
+void NativeRenderer::ReleaseBinderHeld() {
+    // FEAT-SGT-022: prepared draws whose binder jobs have run go back now (in order: jobs run
+    // in order, so the first one still running stops the walk).
+    size_t released = 0;
+    while (released < binder_held.size() && binder &&
+           binder->Done(binder_held[released]->binder_job)) {
+        binder_held[released]->binder_job = 0;
+        FreePrepared(binder_held[released]);
+        ++released;
+    }
+    binder_held.erase(binder_held.begin(), binder_held.begin() + released);
+}
+
 void NativeRenderer::FreePrepared(PreparedDraw* draw) {
+    // FEAT-SGT-022: a draw whose binds the binder still makes keeps its bindings until then
+    // (only the recorder gives back drawn prepared draws; others never had a job).
+    if (draw->binder_job != 0 && binder && !binder->Done(draw->binder_job)) {
+        binder_held.push_back(draw);
+        return;
+    }
+    draw->binder_job = 0;
     // PERF-GTS-392: the recorder gave each prepared draw back cleared: Reset was 1.9% of its
     // CPU time in a race at Tokyo, most of it clearing fields the recorder had never read
     // (written by the worker that prepared the draw, on another core). The draw is now cleared

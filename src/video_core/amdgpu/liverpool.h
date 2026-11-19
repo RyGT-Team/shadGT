@@ -469,6 +469,18 @@ private:
     std::unordered_map<VAddr, PendingLabel> pending_labels;
     u64 label_jobs{};
     u64 waits_moved{};
+#ifndef NDEBUG
+    /// DIAG-SGT-027: how WAIT_REG_MEM waits that drain the recorder end, by queue (gfx, asc):
+    /// packets reaching the first drain; ended right after it by the label or by a recorded
+    /// fence; left for the loop; loop turns; turns with nothing handed to the recorder since
+    /// the last drain; of those, turns a recorded fence ended (a skipped drain would have
+    /// missed them); turns a queued label write would have satisfied.
+    struct WaitDrainTally {
+        u64 packets, label_first, fence_first, loops, turns, turns_unchanged,
+            fence_on_unchanged, pending_label;
+    };
+    std::array<WaitDrainTally, 2> wait_drains{};
+#endif
     // PERF-035: commands from other threads run on the recorder instead of after a drain.
     u64 commands_recorded{};
     // PERF-048: waits on labels another queue writes, found after letting it decode first.

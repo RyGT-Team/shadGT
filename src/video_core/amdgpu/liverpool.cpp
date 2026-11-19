@@ -1408,6 +1408,20 @@ void Liverpool::ReportDrawPipe() {
                     stats.stage_idle_us / 1000, stats.stage_prepare_us / 1000,
                     stats.stage_lead_us / 1000, stats.stage_sync_us / 1000);
     }
+    for (size_t q = 0; q < wait_drains.size(); ++q) { // DIAG-SGT-027
+        const auto& t = wait_drains[q];
+        if (t.packets == 0) continue;
+        LOG_WARNING(Render,
+                    "DIAG-SGT-027 {} WAIT_REG_MEM drains in {:.1f} s: {} waits drained, ended "
+                    "after the first drain by the label {} / by a recorded fence {}, {} looped; "
+                    "{} loop turns ({:.1f} a looping wait), {} with nothing handed to the "
+                    "recorder since the last drain (a recorded fence ended {} of those); a "
+                    "queued label write would have satisfied {} turns",
+                    q == 0 ? "gfx" : "asc", seconds, t.packets, t.label_first, t.fence_first,
+                    t.loops, t.turns, t.loops ? double(t.turns) / double(t.loops) : 0.0,
+                    t.turns_unchanged, t.fence_on_unchanged, t.pending_label);
+    }
+    wait_drains = {};
     waits_moved = 0;
 #endif
 }
@@ -2999,6 +3013,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                 u32(wait_reg_mem->function.Value()));
                 };
                 const auto wait_start = FrontendWaitNow();
+#ifndef NDEBUG
+                bool diag_drained = false; // DIAG-SGT-027
+#endif
                 // PERF-031: what is waited on may be written by recorded work (a fence, a copy, a
                 // flip); let the recorder finish before waiting.
                 if (!wait_reg_mem->Test(regs.reg_array)) {
@@ -3057,6 +3074,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     }
                     if (!wait_reg_mem->Test(regs.reg_array)) {
                         SyncRecorder("wait reg mem");
+#ifndef NDEBUG
+                        ++wait_drains[0].packets; // DIAG-SGT-027
+                        diag_drained = true;
+#endif
                     }
                 }
                 const bool waited = !wait_reg_mem->Test(regs.reg_array);
@@ -3071,18 +3092,47 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 GpuWaitDiagnostics diagnostics;
+#ifndef NDEBUG
+                if (diag_drained && !waited) ++wait_drains[0].label_first; // DIAG-SGT-027
+#endif
                 if (waited && SatisfiedByPendingFence(rasterizer, wait_reg_mem)) {
+#ifndef NDEBUG
+                    ++wait_drains[0].fence_first; // DIAG-SGT-027
+#endif
                     break;
                 }
+#ifndef NDEBUG
+                if (waited) ++wait_drains[0].loops; // DIAG-SGT-027
+                u64 diag_pushed_at_drain = draw_pipe ? draw_pipe->PushedJobs() : 0;
+#endif
                 if (rasterizer && !wait_reg_mem->Test(regs.reg_array)) {
                     rasterizer->FlushForDeferredFences();
                 }
                 // Other queues run while this one yields and may record more work.
                 // DIAG-047: a queue's job writing this label meanwhile is counted.
                 waited_label = reinterpret_cast<VAddr>(wait_reg_mem->Address<u32*>());
+#ifndef NDEBUG
+                // DIAG-SGT-027: the same loop, counted (a drain and a fence check a turn).
+                const auto diag_turn = [&] {
+                    auto& tally = wait_drains[0];
+                    ++tally.turns;
+                    const bool unchanged =
+                        draw_pipe && draw_pipe->PushedJobs() == diag_pushed_at_drain;
+                    tally.turns_unchanged += unchanged;
+                    tally.pending_label += PendingLabelSatisfies(*wait_reg_mem);
+                    SyncRecorder("wait reg mem");
+                    diag_pushed_at_drain = draw_pipe ? draw_pipe->PushedJobs() : 0;
+                    const bool fence = !wait_reg_mem->Test(regs.reg_array) &&
+                                       SatisfiedByPendingFence(rasterizer, wait_reg_mem);
+                    tally.fence_on_unchanged += unchanged && fence;
+                    return !fence;
+                };
+                while (!wait_reg_mem->Test(regs.reg_array) && diag_turn()) {
+#else
                 while (!wait_reg_mem->Test(regs.reg_array) &&
                        (SyncRecorder("wait reg mem"),
                         !SatisfiedByPendingFence(rasterizer, wait_reg_mem))) {
+#endif
                     if (diagnostics.Ready()) {
                         report_wait();
                         if (rasterizer) {
@@ -3769,13 +3819,45 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             }
             // PERF-031: what is waited on may be written by recorded work; the pending-fence
             // check reads the rasterizer, which only the drained recorder lets the command use.
+#ifndef NDEBUG
+            // DIAG-SGT-027: the first drain and each loop turn, counted.
+            bool diag_in_loop = false;
+            u64 diag_pushed_at_drain = 0;
+#endif
             const auto unmet = [&] {
                 if (wait_reg_mem->Test(regs.reg_array)) {
                     return false;
                 }
+#ifndef NDEBUG
+                auto& tally = wait_drains[1];
+                bool unchanged = false;
+                if (diag_in_loop) {
+                    ++tally.turns;
+                    unchanged = draw_pipe && draw_pipe->PushedJobs() == diag_pushed_at_drain;
+                    tally.turns_unchanged += unchanged;
+                    tally.pending_label += PendingLabelSatisfies(*wait_reg_mem);
+                } else {
+                    ++tally.packets;
+                }
+#endif
                 SyncRecorder("wait reg mem");
+#ifndef NDEBUG
+                diag_pushed_at_drain = draw_pipe ? draw_pipe->PushedJobs() : 0;
+                const bool label = wait_reg_mem->Test(regs.reg_array);
+                const bool fence = !label && SatisfiedByPendingFence(rasterizer, wait_reg_mem);
+                if (!diag_in_loop) {
+                    tally.label_first += label;
+                    tally.fence_first += fence;
+                    tally.loops += !label && !fence;
+                } else {
+                    tally.fence_on_unchanged += unchanged && fence;
+                }
+                diag_in_loop = true;
+                return !label && !fence;
+#else
                 return !wait_reg_mem->Test(regs.reg_array) &&
                        !SatisfiedByPendingFence(rasterizer, wait_reg_mem);
+#endif
             };
             const bool waited = unmet();
             while (waited && unmet()) {

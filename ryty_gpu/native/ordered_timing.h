@@ -10,6 +10,8 @@
 // inside an ordered or barrier scope everything counts as ordered or barrier, whatever the
 // child is. What remains of a draw's or dispatch's total once the tagged scopes are taken out
 // is the parallel candidate. Off: one predictable branch per scope.
+// Built only with diagnostics (SHADGT_DIAGNOSTICS: RelWithDebInfo and Debug by default); in
+// Release, Enabled() is false at compile time, a Scope is empty and every count compiles away.
 
 #include <array>
 #include <cstdint>
@@ -97,6 +99,7 @@ inline constexpr std::array<const char*, SiteCount> kName{
     "BindPhase",      "EncodePhase",
 };
 
+#ifdef SHADGT_DIAGNOSTICS
 inline bool Enabled() {
     static const bool on = [] {
         const char* env = std::getenv("SHADGT_DIAG_ORDERED_FRACTION");
@@ -104,6 +107,11 @@ inline bool Enabled() {
     }();
     return on;
 }
+#else
+inline constexpr bool Enabled() {
+    return false;
+}
+#endif
 
 inline std::uint64_t Ticks() {
     return __rdtsc();
@@ -223,6 +231,7 @@ inline Stack& LocalStack() {
     return stack;
 }
 
+#ifdef SHADGT_DIAGNOSTICS
 class Scope {
 public:
     explicit Scope(Site site) {
@@ -273,5 +282,13 @@ public:
 private:
     bool active = false;
 };
+#else
+class Scope {
+public:
+    explicit Scope(Site) noexcept {}
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+};
+#endif
 
 } // namespace Native::OrderedTiming

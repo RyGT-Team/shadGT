@@ -19,7 +19,7 @@ struct Upload {u32 info{},offset{},size{};int flat_stage{-1};};
 struct Prepared {u64 upload_receipt_incarnation{},proof_mode_state{1};std::shared_ptr<Context> proof_context=std::make_shared<Context>();std::vector<Upload> uploads;std::vector<u8> upload_bytes;struct {std::vector<vk::DescriptorBufferInfo> buffers;} bindings;};
 struct Stage {std::vector<u32> flattened_ud_buf;};
 struct Owner {
-    struct Stream {u64 upload_incarnation{1};} stream;std::array<u8,64> data{};bool valid{true},invalidate{};
+    struct Stream {u64 upload_incarnation{1};} stream;Owner& Ctx(){return *this;} /* FEAT-SGT-022 */std::array<u8,64> data{};bool valid{true},invalidate{};
     std::tuple<unsigned,u64,u8*> Allocate(u64,u64,bool* proof) {if(proof)*proof=valid;if(invalidate)Bump();return {7,0,data.data()};}
     vk::DescriptorBufferInfo UploadFlatData(u32,const u8*,u32 size,bool* proof) {if(proof)*proof=valid;if(invalidate)Bump();return {7,0,size};}
     void Bump(){auto& s=stream;

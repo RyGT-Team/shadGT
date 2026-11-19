@@ -1705,6 +1705,10 @@ struct NativeRenderer::SnapshotUploadMemo {
     void Clear() { memo.Clear(); hints.Clear(); tokens.Reset(); }
 };
 
+// FEAT-SGT-022: out of line, where SnapshotUploadMemo is complete.
+NativeRenderer::RecordContext::RecordContext() = default;
+NativeRenderer::RecordContext::~RecordContext() = default;
+
 bool NativeModeRequested() {
     // NAT-160: the launcher's renderer choice (GPU.native_renderer in the game's settings, so
     // GTSport.exe started on its own follows it too); SHADGT_NATIVE=1 or =0 overrides it.
@@ -1879,7 +1883,7 @@ u64 NativeRenderer::ReuseGeneration() const {
 
 std::pair<vk::Buffer, u64> NativeRenderer::UploadBytes(u32 slot, const void* data, u32 size,
                                                       u64 align) {
-    Stream& s = stream;
+    Stream& s = Ctx().stream;
     if (ReuseOn() && slot < s.upload_memos.size()) {
         UploadMemo& memo = s.upload_memos[slot];
         if (memo.list == s.serial && memo.bytes.size() == size &&
@@ -2251,7 +2255,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
             }
             detail.Next(6);
             auto wrapped = device->WrapBuffer(reinterpret_cast<u64>(static_cast<VkBuffer>(buffer)),
-                                               stream.chunks.back().buffer->Size());
+                                               Ctx().stream.chunks.back().buffer->Size());
             staged.buffer = wrapped.get();
             staged.offset = offset;
             staged.kind = 4;
@@ -2619,7 +2623,7 @@ NativeRenderer::~NativeRenderer() {
         while(!ahead_shutdown->pools.DestroyReady(timeline->Completed()))std::this_thread::yield();
 
     }
-    if (stream.list) Splice();
+    if (Ctx().stream.list) Splice();
     // Snapshot owners also need GPU retirement when direct imports are unavailable.
     r.scheduler.Finish();
     if (ParallelRingOn()) { // PERF-GTS-399: as without parallel recording, above
@@ -2627,12 +2631,12 @@ NativeRenderer::~NativeRenderer() {
         r.scheduler.SyncCommandThread();
     }
     retired_pipeline_owners.ClearAfterGpuIdle();
-    stream.writeback_plan_leases.clear();
+    Ctx().stream.writeback_plan_leases.clear();
     retired_writeback_plans.ClearAfterGpuIdle();
     if (auto* direct = r.buffer_cache.GetDirectMemory()) {
         // Teardown must also cover an earlier enqueue failure and any pending scheduler
         // callback that has not yet run, before either device or imported backing dies.
-        stream.imported_view_leases.clear();
+        Ctx().stream.imported_view_leases.clear();
         direct->ReleaseHeldAfterGpuIdle();
     }
     SaveOneOffKinds(true); // PERF-GT7-023
@@ -2643,7 +2647,7 @@ NativeRenderer::~NativeRenderer() {
     for (const auto& [tick, pool] : retiring_pools) {
         vk_device.destroyDescriptorPool(pool);
     }
-    for (const auto pool : stream.pools) {
+    for (const auto pool : Ctx().stream.pools) {
         vk_device.destroyDescriptorPool(pool);
     }
     for (const auto pool : gpu_timing_pools) { // DIAG-GT7-001
@@ -2760,7 +2764,7 @@ bool NativeRenderer::HudStreamOn() {
 
 // Called with the HUD list swapped in as the stream.
 void NativeRenderer::BeginHudStream() {
-    Stream& s = stream;
+    Stream& s = Ctx().stream;
     if (s.list) {
         return;
     }
@@ -2788,8 +2792,8 @@ void NativeRenderer::BeginHudStream() {
 
 // Runs the HUD list after the main one (in the same command buffer, at the same tick).
 void NativeRenderer::SpliceHudStream(u64 tick) {
-    SpliceStream(hud_stream, tick);
-    SpliceStream(hud_black_stream, tick); // DLSS-GT7-001
+    SpliceStream(Ctx().hud_stream, tick);
+    SpliceStream(Ctx().hud_black_stream, tick); // DLSS-GT7-001
     temporal.hud_batch_open = false;
 }
 
@@ -2808,7 +2812,7 @@ void NativeRenderer::CloseHudBatch() {
                     "DLSS-GT7-001: HUD draws batched in their own lists: {} draws in {} batches",
                     temporal.batched_draws, temporal.batches);
     }
-    if (stream.list) {
+    if (Ctx().stream.list) {
         Splice(); // the main list, then the HUD lists
         return;
     }
@@ -3818,14 +3822,14 @@ void NativeRenderer::BeginAhead() {
     if (!reuse || intel || parallel || worker) return;
     std::scoped_lock lock{mutex};
     const bool ring_available = RingEnabled() && r.scheduler.CommandThreadRing() && !Native::GpuCheckpoints::Requested();
-    if (!NativeBeginAheadAllowed(reuse, intel, parallel, worker, stream.list != nullptr, ring_available)) return;
+    if (!NativeBeginAheadAllowed(reuse, intel, parallel, worker, Ctx().stream.list != nullptr, ring_available)) return;
     Begin();
 }
 
 CmdBuf NativeRenderer::CmdOf(Native::Rhi::CommandList& list) const {
-    if (stream.list == &list) return stream.cmd;
-    if (hud_stream.list == &list) return hud_stream.cmd; // GT7-UW
-    if (hud_black_stream.list == &list) return hud_black_stream.cmd; // DLSS-GT7-001
+    if (Ctx().stream.list == &list) return Ctx().stream.cmd;
+    if (Ctx().hud_stream.list == &list) return Ctx().hud_stream.cmd; // GT7-UW
+    if (Ctx().hud_black_stream.list == &list) return Ctx().hud_black_stream.cmd; // DLSS-GT7-001
     ASSERT_MSG(list.NativeHandleSlot() == nullptr, "Deferred list is not the active stream");
     return CmdBuf{vk::CommandBuffer{Handle<VkCommandBuffer_T>(list.NativeHandle())}};
 }
@@ -3836,14 +3840,14 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     if (temporal.hud_batch_open && !temporal.display_draw_now) {
         CloseHudBatch();
     }
-    Stream& s = stream;
+    Stream& s = Ctx().stream;
     if (s.list) {
         return s;
     }
     // Zero permanently disables receipts after incarnation overflow.
     s.upload_incarnation=s.upload_incarnation && s.upload_incarnation!=UINT64_MAX ? s.upload_incarnation+1 : 0;
     UploadMemoFor(this).Clear(); // new list: old upload-buffer bindings cannot be reused
-    if (snapshot_upload_memo) snapshot_upload_memo->Clear();
+    if (Ctx().snapshot_upload_memo) Ctx().snapshot_upload_memo->Clear();
     if (r.instance.IsIntel()) {
         // FIX-188: Intel Arc (#65) records into the scheduler's own command buffer.
         r.scheduler.EndRendering();
@@ -4152,7 +4156,7 @@ void NativeRenderer::BindGraphics(Stream& s, const GraphicsPipeline& pipeline,
 }
 
 void NativeRenderer::FlushLdsReaders(u32) {
-    Stream& s = stream;
+    Stream& s = Ctx().stream;
     if (s.lds_readers.empty()) return;
     auto readers = std::move(s.lds_readers);
     s.lds_readers.clear();
@@ -4240,7 +4244,7 @@ void NativeRenderer::FlushLdsReaders(u32) {
 }
 
 void NativeRenderer::EndRendering(u32 reason, [[maybe_unused]] std::source_location where) {
-    if (!stream.lds_readers.empty()) FlushLdsReaders(reason);
+    if (!Ctx().stream.lds_readers.empty()) FlushLdsReaders(reason);
     RecordPartitionClock end_partition{t_record_partition_end};
     auto* sidecar=FindParallelRuntime(this);
 #if !defined(NDEBUG)
@@ -4253,16 +4257,16 @@ void NativeRenderer::EndRendering(u32 reason, [[maybe_unused]] std::source_locat
         const auto captured_draws=pass.draws.size(); // transfer can swap the vector
         NATIVE_DIAGNOSTIC(++sidecar->pass_size_hist[std::min<std::size_t>(8,pass.draws.size())]);
         u64 coordinator_start=0,coordinator_end=0;const bool cpu_started=ParallelGateDiagEnabled() && DescriptorThreadCpu100ns(coordinator_start);
-        stream.rendering=false; // the captured pass has not begun on stream.cmd
+        Ctx().stream.rendering=false; // the captured pass has not begun on stream.cmd
         if(sidecar->draw_stream) {
             // CPU recording may already be underway, but all draw preparation
             // stays in this prefix until the complete rendering scope is sealed.
             auto ticket=std::move(sidecar->draw_stream);
             sidecar->coordinator->FinishStream(ticket);
-            stream.list=sidecar->coordinator->StreamReplacement(ticket);
-            ASSERT_MSG(stream.list,"stream replacement command list missing");
-            stream.cmd=StreamCmdOf(*stream.list); // PERF-GTS-399
-            stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;
+            Ctx().stream.list=sidecar->coordinator->StreamReplacement(ticket);
+            ASSERT_MSG(Ctx().stream.list,"stream replacement command list missing");
+            Ctx().stream.cmd=StreamCmdOf(*Ctx().stream.list); // PERF-GTS-399
+            Ctx().stream.dynamic.Invalidate();Ctx().stream.pipelines.Invalidate();Ctx().stream.vertex_state_known=false;
             sidecar->sync_pins.Queued(sidecar->pin_slot);
             NATIVE_DIAGNOSTIC(++sidecar->queued);
             sidecar->pass_closure.Close(captured_draws,true,reason);
@@ -4277,16 +4281,16 @@ void NativeRenderer::EndRendering(u32 reason, [[maybe_unused]] std::source_locat
         }
         bool queued=false;
         if((pass.draws.size()>=8 || ParallelSmallPassBatchEnabled()) && !sidecar->closing) {
-            const auto reset=[&]() noexcept {stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;};
+            const auto reset=[&]() noexcept {Ctx().stream.dynamic.Invalidate();Ctx().stream.pipelines.Invalidate();Ctx().stream.vertex_state_known=false;};
             if(Native::Parallel::RotateSegment(*sidecar->coordinator,*device,sidecar->epoch,
-                    stream.list,[this]{return AcquireReplacementList();},sidecar->lease,64*1024,reset,
+                    Ctx().stream.list,[this]{return AcquireReplacementList();},sidecar->lease,64*1024,reset,
 #if !defined(NDEBUG)
                     &sidecar->rotation_diag
 #else
                     nullptr
 #endif
                     )) {
-                stream.cmd = StreamCmdOf(*stream.list); // PERF-GTS-399
+                Ctx().stream.cmd = StreamCmdOf(*Ctx().stream.list); // PERF-GTS-399
                 std::size_t bytes=sizeof(pass)+pass.draws.capacity()*sizeof(Native::Parallel::Draw);
                 for(const auto& draw:pass.draws) bytes+=draw.descriptor_bytes;
                 try {queued=pass.draws.size()>=8 ? (sidecar->transfer_applied_mode.Enabled() ? sidecar->coordinator->TryPassTransfer(sidecar->epoch,pass,bytes) : sidecar->coordinator->TryPass(sidecar->epoch,pass,bytes)) : sidecar->coordinator->TrySmallPass(sidecar->epoch,pass,bytes);}
@@ -4295,9 +4299,9 @@ void NativeRenderer::EndRendering(u32 reason, [[maybe_unused]] std::source_locat
         }
         if(queued) {NATIVE_DIAGNOSTIC(++sidecar->queued);sidecar->sync_pins.Queued(sidecar->pin_slot);} else {
             NATIVE_DIAGNOSTIC(++sidecar->synchronous);
-            ASSERT_MSG(Native::Parallel::RecordPass(stream.cmd,r.instance,pass),"parallel pass synchronous fallback failed");
+            ASSERT_MSG(Native::Parallel::RecordPass(Ctx().stream.cmd,r.instance,pass),"parallel pass synchronous fallback failed");
             ASSERT_MSG(sidecar->sync_pins.Tag(sidecar->pin_slot,sidecar->epoch),"parallel synchronous owner pin failed");
-            stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;
+            Ctx().stream.dynamic.Invalidate();Ctx().stream.pipelines.Invalidate();Ctx().stream.vertex_state_known=false;
         }
         sidecar->pass_closure.Close(captured_draws,queued,reason);
         pass.draws.clear();sidecar->scratch_draws.swap(pass.draws);
@@ -4308,9 +4312,9 @@ void NativeRenderer::EndRendering(u32 reason, [[maybe_unused]] std::source_locat
         }
         return;
     }
-    if (stream.rendering) {
-        stream.cmd.endRendering();
-        stream.rendering = false;
+    if (Ctx().stream.rendering) {
+        Ctx().stream.cmd.endRendering();
+        Ctx().stream.rendering = false;
     }
 }
 
@@ -4319,8 +4323,8 @@ bool NativeRenderer::ContinueSmallParallelPass(const RenderState& target,u32 rea
     if(!sidecar || !sidecar->active || sidecar->draw_stream)return false;
     auto& pass=*sidecar->active;
     if(!CanInlineContinuation(pass.draws.size(),ParallelSmallPassBatchEnabled(),sidecar->closing,
-            stream.rendering,stream.render==target && pass.target==target,
-            stream.list==sidecar->active_list,stream.cmd.Direct()==sidecar->active_cmd,
+            Ctx().stream.rendering,Ctx().stream.render==target && pass.target==target,
+            Ctx().stream.list==sidecar->active_list,Ctx().stream.cmd.Direct()==sidecar->active_cmd,
             r.scheduler.CurrentTick()==sidecar->epoch,safe))return false;
     // Trace state can change during preflight; an open scope would suppress
     // SceneTrace::Prepare at the common serial tail.
@@ -4332,14 +4336,14 @@ bool NativeRenderer::ContinueSmallParallelPass(const RenderState& target,u32 rea
     NATIVE_DIAGNOSTIC(++sidecar->pass_size_hist[std::min<std::size_t>(8,draws)]);
     u64 begin=0,end=0;const bool timed=ParallelGateDiagEnabled() && DescriptorThreadCpu100ns(begin);
     vk::Pipeline last{};
-    ASSERT_MSG(Native::Parallel::RecordPassInline(stream.cmd,r.instance,pass,stream.dynamic,last),
+    ASSERT_MSG(Native::Parallel::RecordPassInline(Ctx().stream.cmd,r.instance,pass,Ctx().stream.dynamic,last),
                "parallel pass inline continuation failed");
     ASSERT_MSG(sidecar->sync_pins.Tag(sidecar->pin_slot,sidecar->epoch),"parallel synchronous owner pin failed");
     NATIVE_DIAGNOSTIC(++sidecar->synchronous);NATIVE_DIAGNOSTIC(++sidecar->inline_continuations);
     sidecar->pass_closure.Close(draws,false,reason);
     // Only graphics was bound by replay; preserve independent compute binding.
-    stream.pipelines.handles[0]=last;
-    stream.vertex_state_known=false;
+    Ctx().stream.pipelines.handles[0]=last;
+    Ctx().stream.vertex_state_known=false;
     pass.draws.clear();sidecar->scratch_draws.swap(pass.draws);
     sidecar->pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;
     sidecar->active.reset();sidecar->lease.reset();
@@ -4350,7 +4354,7 @@ bool NativeRenderer::ContinueSmallParallelPass(const RenderState& target,u32 rea
 }
 
 void NativeRenderer::BeginRendering(const RenderState& state) {
-    Stream& s = stream;
+    Stream& s = Ctx().stream;
     if (s.rendering && s.render == state) {
         return;
     }
@@ -4487,7 +4491,7 @@ void NativeRenderer::GlobalBarrier([[maybe_unused]] std::source_location where) 
         }
     }
 #endif
-    Stream& s = stream;
+    Stream& s = Ctx().stream;
     EndRendering(0, where);
     ++s.resource_recording_serial;
     const vk::MemoryBarrier2 barrier{
@@ -4511,7 +4515,7 @@ void NativeRenderer::GlobalBarrier([[maybe_unused]] std::source_location where) 
 }
 
 void NativeRenderer::PassBarrier(std::source_location where) {
-    Stream& s = stream;
+    Stream& s = Ctx().stream;
     EndRendering(0, where);
     constexpr auto stages = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
                             vk::PipelineStageFlagBits2::eEarlyFragmentTests |
@@ -4746,7 +4750,7 @@ bool NativeRenderer::SendWritebacksDue() {
 
 void NativeRenderer::FlushWritebacks() {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::FlushWritebacks}; // DIAG-SGT-023
-    if (writebacks.empty() || !stream.list) {
+    if (writebacks.empty() || !Ctx().stream.list) {
         return;
     }
     AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::WriteBacks};
@@ -4759,7 +4763,7 @@ void NativeRenderer::FlushWritebacks() {
                          .count();
         }
     } timed{.total = stats.writeback_ns}; // DIAG-188
-    Stream& s = stream;
+    Stream& s = Ctx().stream;
     auto* direct = r.buffer_cache.GetDirectMemory();
     const u64 alignment = r.instance.StorageMinAlignment();
     struct DownloadCopy { vk::Buffer destination; u64 source_offset, destination_offset, size; };
@@ -5157,7 +5161,7 @@ void NativeRenderer::PrepareImages(std::span<const Native::ImageEntry* const> bo
     if (!init && !uploads) {
         return;
     }
-    Stream& s = stream;
+    Stream& s = Ctx().stream;
     trace.Next(2);
     EndRendering();
     if (init) {
@@ -5189,7 +5193,7 @@ void NativeRenderer::PrepareImages(const DrawBindings& b) {
 void NativeRenderer::ChunkFlushCheck() {
     // Long lists are run and submitted as they grow, so the GPU starts on them (as the old
     // path's SubmitChunkIfNeeded does).
-    if (stream.commands >= SpliceAfter) {
+    if (Ctx().stream.commands >= SpliceAfter) {
         Splice();
         r.scheduler.Flush();
         return;
@@ -5206,7 +5210,7 @@ void NativeRenderer::ChunkFlushCheck() {
         if (*env == '-' || end == env || *end || value > UINT32_MAX) return 32u;
         return std::max<u32>(u32(value), 1u);
     }();
-    if (feed_min == 0 || stream.commands < feed_min || (stream.commands & 15) != 0) {
+    if (feed_min == 0 || Ctx().stream.commands < feed_min || (Ctx().stream.commands & 15) != 0) {
         return;
     }
     // PERF-GTS-397: not while a parallel pass is open. With parallel recording the GPU is
@@ -5331,7 +5335,7 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
 }
 
 std::tuple<vk::Buffer, u64, u8*> NativeRenderer::Allocate(u64 size, u64 align, bool* backing_proven) {
-    Stream& s = stream;
+    Stream& s = Ctx().stream;
     align = std::max<u64>(align, 16);
     if (s.chunks.empty() ||
         Common::AlignUp(s.chunk_used, align) + size > s.chunks.back().buffer->Size()) {
@@ -5854,7 +5858,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr add
     }
     SortRegionWrites();
     Mirror* mirror = MirrorHolding(address, size);
-    if (mirror && !mirror->dirty_pages.empty() && !stream.list) {
+    if (mirror && !mirror->dirty_pages.empty() && !Ctx().stream.list) {
         Begin(); // a new list makes the pending mirrors first (they can take this one in)
         mirror = MirrorHolding(address, size);
     }
@@ -5865,8 +5869,8 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr add
         }
         mirror->used_frame = frame;
         NATIVE_DIAGNOSTIC(++stats.mirror_binds);
-        memo_kind = MemoKind::Mirror; // OPT-003
-        memo_mirror = mirror;
+        Ctx().memo_kind = MemoKind::Mirror; // OPT-003
+        Ctx().memo_mirror = mirror;
         return std::pair{vk::Buffer{Handle<VkBuffer_T>(mirror->buffer->NativeHandle())},
                          u64{address - mirror->begin}};
     }
@@ -5973,7 +5977,7 @@ bool NativeRenderer::RefreshMirror(Mirror& mirror) {
 
 void NativeRenderer::MakePendingMirrors() {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::MakePendingMirrors}; // DIAG-SGT-023
-    if (pending_mirrors.empty() || !stream.list) {
+    if (pending_mirrors.empty() || !Ctx().stream.list) {
         return;
     }
     mirror_promotion_budget.BeginFrame(frame);
@@ -6017,7 +6021,7 @@ void NativeRenderer::MakePendingMirrors() {
         return (env ? std::strtoull(env, nullptr, 10) : 1024) * 1_MB;
     }();
     auto* direct = r.buffer_cache.GetDirectMemory();
-    Stream& s = stream;
+    Stream& s = Ctx().stream;
     bool copied = false;
     bool evicted = false;
     for (size_t range_index = 0; range_index < ranges.size(); ++range_index) {
@@ -6430,8 +6434,8 @@ bool NativeRenderer::PrepareRegionWritebackRange(WritebackPlan& plan,
         std::erase_if(plan.forget_pages, [&](const auto& page) {
             return Native::WritebackPageAlreadyPlanned(plan.parts, page.first, page.second);
         });
-        Native::ReserveAdditional(stream.writeback_plan_leases, 2);
-        Native::ReserveAdditional(stream.pooled_snapshots, plan.before.size());
+        Native::ReserveAdditional(Ctx().stream.writeback_plan_leases, 2);
+        Native::ReserveAdditional(Ctx().stream.pooled_snapshots, plan.before.size());
         std::unordered_set<VAddr> pending_nodes;
         for (const auto& part : plan.parts) {
             auto found = regions.find(part.region_begin);
@@ -8414,13 +8418,13 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
     if (write) SnapshotLease::MarkUnsafe(address, size, 16);
     PhaseClock guest_clock{stats.guest_buffer_ns}; // NAT-145
     NATIVE_DIAGNOSTIC(++stats.guest_buffer_calls);
-    last_mirror = nullptr; // OPT-004
+    Ctx().last_mirror = nullptr; // OPT-004
     // OPT-003: the range's last result, when nothing it depends on changed.
     const u32 flags = u32(write) | (u32(mirror) << 1);
     const std::array<u64, 3> memo_key{address, size, flags};
     const u64 slot = NextMemoEnabled() ? MemoHash(memo_key.data(), memo_key.size(), 0)
                                       : XXH3_64bits(memo_key.data(), sizeof(memo_key));
-    BufferMemo& memo = buffer_memos[slot & (buffer_memos.size() - 1)];
+    BufferMemo& memo = Ctx().buffer_memos[slot & (Ctx().buffer_memos.size() - 1)];
     // PERF-GT7-047 (Will Scarlett): unrelated region/mirror changes do not
     // invalidate owned-range memos. In-place reads still take the full lookup.
     if (memo.Matches(address, size, flags) && memo.generation != buffer_generation) {
@@ -8466,55 +8470,55 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
                 NATIVE_DIAGNOSTIC(++stats.mirror_binds);
                 memo_m->used_frame = frame;
             }
-            last_bound = memo.BoundAs();
-            last_mirror = memo_m; // OPT-004
+            Ctx().last_bound = memo.BoundAs();
+            Ctx().last_mirror = memo_m; // OPT-004
             NATIVE_DIAGNOSTIC(++stats.buffer_memo_hits);
-            if (BindSplitDiagOn() && last_bound != Bound::Mirror) { // DIAG-SGT-003
+            if (BindSplitDiagOn() && Ctx().last_bound != Bound::Mirror) { // DIAG-SGT-003
                 NoteBindSplit(address, size,
-                              last_bound == Bound::Region ? (write ? BindRegionWrite : BindRegionRead)
+                              Ctx().last_bound == Bound::Region ? (write ? BindRegionWrite : BindRegionRead)
                               : write                     ? BindInPlaceWrite
                                                           : BindInPlaceRead,
                               frame, g_bind_hash);
             }
             if (InPlaceDiagOn()) { // DIAG-GTS-524
                 NoteBoundBytes(address, size, write,
-                               last_bound == Bound::InPlace  ? (write ? 1 : 0)
-                               : last_bound == Bound::Region ? 3
+                               Ctx().last_bound == Bound::InPlace  ? (write ? 1 : 0)
+                               : Ctx().last_bound == Bound::Region ? 3
                                                              : 4,
                                frame);
             }
             return std::pair{memo.buffer, memo.Offset()};
         }
     }
-    memo_kind = MemoKind::None;
-    memo_region = nullptr;
-    memo_mirror = nullptr;
+    Ctx().memo_kind = MemoKind::None;
+    Ctx().memo_region = nullptr;
+    Ctx().memo_mirror = nullptr;
     g_inplace_diag_snapshot = false; // DIAG-GTS-524
     g_mirror_miss = 0;
     const auto result = GuestBufferLookup(address, size, write, mirror);
-    if (result && BindSplitDiagOn() && last_bound != Bound::Mirror &&
-        !(last_bound == Bound::InPlace && g_inplace_diag_snapshot)) { // DIAG-SGT-003
+    if (result && BindSplitDiagOn() && Ctx().last_bound != Bound::Mirror &&
+        !(Ctx().last_bound == Bound::InPlace && g_inplace_diag_snapshot)) { // DIAG-SGT-003
         NoteBindSplit(address, size,
-                      last_bound == Bound::Region ? (write ? BindRegionWrite : BindRegionRead)
+                      Ctx().last_bound == Bound::Region ? (write ? BindRegionWrite : BindRegionRead)
                       : write                     ? BindInPlaceWrite
                                                   : BindInPlaceRead,
                       frame, g_bind_hash);
     }
     if (result && InPlaceDiagOn()) {
         NoteBoundBytes(address, size, write,
-                       last_bound == Bound::InPlace  ? (g_inplace_diag_snapshot ? 2 : write ? 1 : 0)
-                       : last_bound == Bound::Region ? 3
+                       Ctx().last_bound == Bound::InPlace  ? (g_inplace_diag_snapshot ? 2 : write ? 1 : 0)
+                       : Ctx().last_bound == Bound::Region ? 3
                                                      : 4,
                        frame, mirror ? g_mirror_miss : 0);
     }
-    if (result && memo_kind == MemoKind::Mirror) {
-        last_mirror = memo_mirror; // OPT-004
+    if (result && Ctx().memo_kind == MemoKind::Mirror) {
+        Ctx().last_mirror = Ctx().memo_mirror; // OPT-004
     }
-    if (result && memo_kind != MemoKind::None && result->second <= BufferMemo::OffsetMask) {
+    if (result && Ctx().memo_kind != MemoKind::None && result->second <= BufferMemo::OffsetMask) {
         // PERF-SGT-018: a mirror's pointer only when the lookup's kind says mirror, a region's only
         // for a region, as the two separate fields held them.
-        Region* const keep_region = memo_region;
-        Mirror* const keep_mirror = keep_region ? nullptr : memo_mirror;
+        Region* const keep_region = Ctx().memo_region;
+        Mirror* const keep_mirror = keep_region ? nullptr : Ctx().memo_mirror;
         memo = BufferMemo{
             .address = address,
             .size = size,
@@ -8522,7 +8526,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
             .hard_generation = buffer_hard_generation,
             .log_seq = buffer_log.Seq(),
             .buffer = result->first,
-            .offset_meta = BufferMemo::Pack(result->second, flags, last_bound, keep_region,
+            .offset_meta = BufferMemo::Pack(result->second, flags, Ctx().last_bound, keep_region,
                                             keep_mirror),
             .owner = keep_region ? static_cast<void*>(keep_region)
                                  : static_cast<void*>(keep_mirror),
@@ -8546,19 +8550,19 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     // PERF-GTS-365: a gather from before this write is stale where it overlaps it. Only those are
     // dropped: clearing them all at every written binding made the list gather again and again.
     // The scan starts the largest gather's size below the write: nothing starting earlier reaches it.
-    if (write && !stream.gathers.empty()) {
+    if (write && !Ctx().stream.gathers.empty()) {
         const u64 end = address + size;
-        const u64 from = address > stream.gather_max ? address - stream.gather_max : 0;
-        for (auto it = stream.gathers.lower_bound({from, 0});
-             it != stream.gathers.end() && it->first.first < end;) {
+        const u64 from = address > Ctx().stream.gather_max ? address - Ctx().stream.gather_max : 0;
+        for (auto it = Ctx().stream.gathers.lower_bound({from, 0});
+             it != Ctx().stream.gathers.end() && it->first.first < end;) {
             if (it->first.first + it->first.second > address) {
-                it = stream.gathers.erase(it);
+                it = Ctx().stream.gathers.erase(it);
             } else {
                 ++it;
             }
         }
     }
-    last_bound = Bound::Region;
+    Ctx().last_bound = Bound::Region;
     NotePerFrameRange(address, size); // FIX-GT7-122
     // FIX-SGT-004 (SHADGT_LISTED_IN_PLACE=0: as before): a range in the listed in-place ranges is
     // bound in guest memory even when a region reaches over it. Writes there never made a region,
@@ -8587,13 +8591,13 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
                 found = direct->FindOrImportSpan(address, size);
             }
             if (found) {
-                last_bound = Bound::InPlace;
+                Ctx().last_bound = Bound::InPlace;
                 if (write) {
                     DropMirrors(address, size); // NAT-150: the GPU writes guest memory there
                 } else if (!mirror) {
-                    memo_kind = MemoKind::InPlace; // OPT-003
+                    Ctx().memo_kind = MemoKind::InPlace; // OPT-003
                 }
-                if (write) memo_kind = MemoKind::InPlace;
+                if (write) Ctx().memo_kind = MemoKind::InPlace;
                 return std::pair{found->first->Handle(), found->second};
             }
         }
@@ -8612,8 +8616,8 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
         if (region) {
             RefreshRegion(*region, address, size);
             NATIVE_DIAGNOSTIC(++stats.region_binds);
-            memo_kind = MemoKind::Region; // OPT-003
-            memo_region = region;
+            Ctx().memo_kind = MemoKind::Region; // OPT-003
+            Ctx().memo_region = region;
             return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
                              u64{address - region->begin}};
         }
@@ -8641,8 +8645,8 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     if (write && write_regions && size <= 256_MB && address < inplace_from && !listed_in_place) {
         if (Region* region = MakeRegion(address, size, true)) {
             NATIVE_DIAGNOSTIC(++stats.region_binds);
-            memo_kind = MemoKind::Region; // OPT-003
-            memo_region = region;
+            Ctx().memo_kind = MemoKind::Region; // OPT-003
+            Ctx().memo_region = region;
             return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
                              u64{address - region->begin}};
         }
@@ -8650,17 +8654,17 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     // FIX-170 (diagnosis, SHADGT_NATIVE_SNAPSHOT_BELOW=<bytes>): small read-only shader buffers
     // (constants) are copied when the draw is recorded instead of read in place by the GPU later.
     if (!mirror && !write && size <= SnapshotBelow()) {
-        last_bound = Bound::InPlace;
+        Ctx().last_bound = Bound::InPlace;
         g_inplace_diag_snapshot = true; // DIAG-GTS-524
         return SnapshotRange(address, size);
     }
     if (mirror && !write) {
         if (const auto mirrored = MirrorBuffer(address, size)) {
-            last_bound = Bound::Mirror; // NAT-150
+            Ctx().last_bound = Bound::Mirror; // NAT-150
             return mirrored;
         }
     }
-    last_bound = Bound::InPlace;
+    Ctx().last_bound = Bound::InPlace;
     if (write) {
         DropMirrors(address, size); // NAT-150: the GPU writes guest memory there
     }
@@ -8668,7 +8672,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
         direct && direct->EnsureImported(address, size)) {
         if (const auto found = direct->FindBuffer(address, size)) {
             if (!mirror) {
-                memo_kind = MemoKind::InPlace; // OPT-003 (vertices and indices keep looking:
+                Ctx().memo_kind = MemoKind::InPlace; // OPT-003 (vertices and indices keep looking:
             }                                  // they become mirrors when bound again)
             return std::pair{found->first->Handle(), found->second};
         }
@@ -8727,9 +8731,9 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
     // can't read it: NAT-106).
     NATIVE_DIAGNOSTIC(++stats.copied_reads);
     NATIVE_DIAGNOSTIC(stats.copied_bytes += size);
-    if (stream.list && size > 4_KB && size <= SnapshotMemoMaxBytes) {
-        if (!snapshot_upload_memo) snapshot_upload_memo = std::make_unique<SnapshotUploadMemo>();
-        auto& cache = *snapshot_upload_memo;
+    if (Ctx().stream.list && size > 4_KB && size <= SnapshotMemoMaxBytes) {
+        if (!Ctx().snapshot_upload_memo) Ctx().snapshot_upload_memo = std::make_unique<SnapshotUploadMemo>();
+        auto& cache = *Ctx().snapshot_upload_memo;
         const u64 lease_frame = frame + (frame != UINT64_MAX);
         static const bool direct_compare = [] {
             const char* value = std::getenv("SHADGT_NATIVE_SNAPSHOT_DIRECT_COMPARE");
@@ -9084,12 +9088,12 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GatherOnGpu(VAddr addr
             since = now;
         }
     }
-    if (reuse_gathers && !stream.gathers.empty()) {
-        if (const u64 unmaps = g_guest_unmaps.load(std::memory_order_acquire); unmaps != stream.gather_unmaps) {
-            stream.gathers.clear();
-            stream.gather_max = 0;
-            stream.gather_unmaps = unmaps;
-        } else if (const auto found = stream.gathers.find({address, size}); found != stream.gathers.end()) {
+    if (reuse_gathers && !Ctx().stream.gathers.empty()) {
+        if (const u64 unmaps = g_guest_unmaps.load(std::memory_order_acquire); unmaps != Ctx().stream.gather_unmaps) {
+            Ctx().stream.gathers.clear();
+            Ctx().stream.gather_max = 0;
+            Ctx().stream.gather_unmaps = unmaps;
+        } else if (const auto found = Ctx().stream.gathers.find({address, size}); found != Ctx().stream.gathers.end()) {
             ++reused;
             return std::pair{found->second, u64{0}};
         }
@@ -9415,7 +9419,7 @@ bool NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
 
 bool NativeRenderer::TargetsFromMemo(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline,
                                      Targets& out) {
-    TargetsMemo& m = targets_memo;
+    TargetsMemo& m = Ctx().targets_memo;
     const auto& key = pipeline.GetGraphicsKey();
     if (!m.valid ||
         m.generation != registry->Generation() + unmap_generation.load(std::memory_order_relaxed) ||
@@ -9669,7 +9673,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
     state.height = static_cast<u16>(std::min<u32>(height, 0xffff));
     state.num_layers = static_cast<u16>(
         num_layers == std::numeric_limits<u16>::max() ? 1u : std::max(num_layers, 1u));
-    TargetsMemo& m = targets_memo; // OPT-013
+    TargetsMemo& m = Ctx().targets_memo; // OPT-013
     m.valid = memo;
     if (memo) {
         m.generation = generation;
@@ -9983,8 +9987,8 @@ void NativeRenderer::ProbeDraw(const Targets& targets, const AmdGpu::Regs& regs)
     const u32 bits = target.info.num_bits;
     {
         // The state the draw was recorded with.
-        const auto& d = stream.dynamic;
-        probe_bound += fmt::format(" | pipe {:x}", u64(static_cast<VkPipeline>(stream.pipelines.handles[0])) & 0xffffff);
+        const auto& d = Ctx().stream.dynamic;
+        probe_bound += fmt::format(" | pipe {:x}", u64(static_cast<VkPipeline>(Ctx().stream.pipelines.handles[0])) & 0xffffff);
         for (const auto& v : d.viewports) {
             probe_bound += fmt::format(" vp {}/{} {}x{} {}..{}", v.x, v.y, v.width, v.height,
                                        v.minDepth, v.maxDepth);
@@ -10007,7 +10011,7 @@ void NativeRenderer::ProbeDraw(const Targets& targets, const AmdGpu::Regs& regs)
         probe_bound += fmt::format(
             " | zfunc {} cmp {} zclip near/far off {}/{} clamp off {} zscale {} zoffset {} "
             "zmin {} zmax {} depth att {:x}",
-            u32(regs.depth_control.depth_func), u32(stream.dynamic.depth_compare_op),
+            u32(regs.depth_control.depth_func), u32(Ctx().stream.dynamic.depth_compare_op),
             u32(regs.clipper_control.zclip_near_disable),
             u32(regs.clipper_control.zclip_far_disable),
             u32(regs.depth_render_override.disable_viewport_clamp), vp.zscale, vp.zoffset,
@@ -10039,7 +10043,7 @@ void NativeRenderer::ProbeDraw(const Targets& targets, const AmdGpu::Regs& regs)
     Begin();
     GlobalBarrier();
     for (u32 i = 0; i < 2; ++i) {
-        stream.cmd.copyImageToBuffer(
+        Ctx().stream.cmd.copyImageToBuffer(
             vk::Image{Handle<VkImage_T>(target.image->NativeHandle())}, vk::ImageLayout::eGeneral,
             vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
             vk::BufferImageCopy{.bufferOffset = block * i,
@@ -10060,7 +10064,7 @@ void NativeRenderer::ProbeDraw(const Targets& targets, const AmdGpu::Regs& regs)
             const auto [address, size] = probe_buffers[i];
             if (direct->EnsureImported(address, size)) {
                 if (const auto found = direct->FindBuffer(address, size)) {
-                    stream.cmd.copyBuffer(found->first->Handle(),
+                    Ctx().stream.cmd.copyBuffer(found->first->Handle(),
                                           vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
                                           vk::BufferCopy{.srcOffset = found->second,
                                                          .dstOffset = block * 2 + 512 * i,
@@ -10073,7 +10077,7 @@ void NativeRenderer::ProbeDraw(const Targets& targets, const AmdGpu::Regs& regs)
     }
     if (sampled->image && sampled->image->Desc().width >= 16 &&
         sampled->image->Desc().height >= 16 && texture_bytes <= 4096) {
-        stream.cmd.copyImageToBuffer(
+        Ctx().stream.cmd.copyImageToBuffer(
             vk::Image{Handle<VkImage_T>(sampled->image->NativeHandle())},
             vk::ImageLayout::eGeneral, vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
             vk::BufferImageCopy{.bufferOffset = block * 2 + 1024,
@@ -10090,7 +10094,7 @@ void NativeRenderer::ProbeDraw(const Targets& targets, const AmdGpu::Regs& regs)
     std::string vertex_recorded;
     for (u32 i = 0; i < probe_vertices.size(); ++i) {
         const auto& pv = probe_vertices[i];
-        stream.cmd.copyBuffer(pv.buffer, vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
+        Ctx().stream.cmd.copyBuffer(pv.buffer, vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
                               vk::BufferCopy{.srcOffset = pv.offset,
                                              .dstOffset = block * 2 + 1024 + 4096 + 512 * i,
                                              .size = pv.size});
@@ -10105,7 +10109,7 @@ void NativeRenderer::ProbeDraw(const Targets& targets, const AmdGpu::Regs& regs)
     if (const auto* z = targets.depth; z && z->image && z->info.props.is_depth &&
         z->info.num_bits == 32 && z->image->Desc().width >= at[0] + 16 &&
         z->image->Desc().height >= rows[0] + 16) {
-        stream.cmd.copyImageToBuffer(
+        Ctx().stream.cmd.copyImageToBuffer(
             vk::Image{Handle<VkImage_T>(z->image->NativeHandle())}, vk::ImageLayout::eGeneral,
             vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
             vk::BufferImageCopy{.bufferOffset = block * 2 + 1024 + 4096 + 1024,
@@ -10189,7 +10193,7 @@ void NativeRenderer::StripImage(const Native::ImageEntry& target, bool dispatch)
     }
     Begin();
     GlobalBarrier();
-    stream.cmd.copyImageToBuffer(
+    Ctx().stream.cmd.copyImageToBuffer(
         vk::Image{Handle<VkImage_T>(target.image->NativeHandle())}, vk::ImageLayout::eGeneral,
         vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
         vk::BufferImageCopy{.bufferOffset = 0,
@@ -10290,7 +10294,7 @@ void NativeRenderer::ProbeDispatch(const Shader::Info& stage, const DrawBindings
     const auto copy_texels = [&](const Native::ImageEntry& image, u64 offset, u32 mip,
                                  u32 count, bool center) {
         const auto& desc = image.image->Desc();
-        stream.cmd.copyImageToBuffer(
+        Ctx().stream.cmd.copyImageToBuffer(
             vk::Image{Handle<VkImage_T>(image.image->NativeHandle())}, vk::ImageLayout::eGeneral,
             vk::Buffer{Handle<VkBuffer_T>(dispatch_probes.back().buffer->NativeHandle())},
             vk::BufferImageCopy{
@@ -10437,7 +10441,7 @@ void NativeRenderer::ProbeRefresh(const Native::ImageEntry& texture, const std::
         return;
     }
     GlobalBarrier();
-    stream.cmd.copyImageToBuffer(
+    Ctx().stream.cmd.copyImageToBuffer(
         vk::Image{Handle<VkImage_T>(texture.image->NativeHandle())}, vk::ImageLayout::eGeneral,
         vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
         vk::BufferImageCopy{.bufferOffset = 0,
@@ -10503,7 +10507,7 @@ void NativeRenderer::CompareRegion(VAddr base, u64 size, u32 stride, vk::Buffer 
     }
     Begin();
     GlobalBarrier(); // the region's copy-ins are done
-    stream.cmd.copyBuffer(buffer, vk::Buffer{Handle<VkBuffer_T>(readback->NativeHandle())},
+    Ctx().stream.cmd.copyBuffer(buffer, vk::Buffer{Handle<VkBuffer_T>(readback->NativeHandle())},
                           vk::BufferCopy{.srcOffset = offset, .dstOffset = 0, .size = size});
     GlobalBarrier();
     // Per page: frames since the CPU last wrote it (FIX-194's cpu_pages), '-' if not known.
@@ -10540,7 +10544,7 @@ void NativeRenderer::CaptureImage(const Native::ImageEntry& entry, u64 at_frame,
     }
     Begin();
     GlobalBarrier();
-    stream.cmd.copyImageToBuffer(
+    Ctx().stream.cmd.copyImageToBuffer(
         vk::Image{Handle<VkImage_T>(entry.image->NativeHandle())}, vk::ImageLayout::eGeneral,
         vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
         vk::BufferImageCopy{.bufferOffset = 0,
@@ -10660,7 +10664,7 @@ void NativeRenderer::CompareFlatSources(const Shader::Info& stage) {
             if (readback && readback->Mapped()) {
                 Begin();
                 GlobalBarrier();
-                stream.cmd.copyBuffer(
+                Ctx().stream.cmd.copyBuffer(
                     vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
                     vk::Buffer{Handle<VkBuffer_T>(readback->NativeHandle())},
                     vk::BufferCopy{.srcOffset = at - region->begin, .dstOffset = 0, .size = bytes});
@@ -10972,7 +10976,7 @@ void NativeRenderer::ProbeVolume() {
     }
     Begin();
     GlobalBarrier();
-    stream.cmd.copyImageToBuffer(
+    Ctx().stream.cmd.copyImageToBuffer(
         vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())}, vk::ImageLayout::eGeneral,
         vk::Buffer{Handle<VkBuffer_T>(volume_probe->NativeHandle())},
         vk::BufferImageCopy{.bufferOffset = 0,
@@ -11226,7 +11230,7 @@ void NativeRenderer::ReportProgramTextures() {
             if (buffer && buffer->Mapped()) {
                 Begin();
                 GlobalBarrier();
-                stream.cmd.copyImageToBuffer(
+                Ctx().stream.cmd.copyImageToBuffer(
                     vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},
                     vk::ImageLayout::eGeneral,
                     vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
@@ -11689,7 +11693,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                     if (direct && direct->EnsureImported(base, size)) {
                         if (const auto view = direct->FindBuffer(base, size)) {
                             in_view = std::pair{view->first->Handle(), view->second};
-                            last_bound = Bound::InPlace;
+                            Ctx().last_bound = Bound::InPlace;
                             if (BindSplitDiagOn()) { // DIAG-SGT-003
                                 NoteBindSplit(base, size, BindInPlaceRead, frame, stage.pgm_hash);
                             }
@@ -11751,14 +11755,14 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                             // below orders it; the bump only made RunNeedsBarrier add a full
                             // barrier before every such dispatch (GT Sport's cube-map filter
                             // 0xd0af5a54, ~144 dispatches a frame in the garage, never overlapped).
-                            stream.cmd.copyBuffer(source, target,
+                            Ctx().stream.cmd.copyBuffer(source, target,
                                 vk::BufferCopy{.srcOffset = offset, .dstOffset = 0,
                                                .size = PrefixSize});
-                            stream.list->Barrier(Native::Rhi::ScopeTransfer,
+                            Ctx().stream.list->Barrier(Native::Rhi::ScopeTransfer,
                                                  Native::Rhi::ScopeCompute);
                             info = {target, 0, PrefixSize};
                             direct_entries[buffer_index][3] = u32(PrefixSize);
-                            stream.keep.push_back(std::move(prefix));
+                            Ctx().stream.keep.push_back(std::move(prefix));
                         }
                     }
                     // Bounded zero-copy scalar prefix: alias an existing imported view.
@@ -11800,13 +11804,13 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                                                   ? SnapshotRange(base, 12)
                                                   : (in_view ? in_view : GuestBuffer(
                                                         base, size, desc.is_written, mirror_bound))) {
-                    log_buffer(last_bound == Bound::Region   ? "region"
-                               : last_bound == Bound::Mirror ? "mirror"
+                    log_buffer(Ctx().last_bound == Bound::Region   ? "region"
+                               : Ctx().last_bound == Bound::Mirror ? "mirror"
                                                              : "in place");
                     // A transfer fill may only use the exact CPU-owned argument snapshot
                     // already bound to this dispatch, never a later read of guest memory.
                     if (stage.pgm_hash == 0x8aa6e00c && !desc.is_written && size >= 12) {
-                        for (const auto& chunk : stream.chunks) {
+                        for (const auto& chunk : Ctx().stream.chunks) {
                             if (chunk.buffer->Mapped() &&
                                 vk::Buffer{Handle<VkBuffer_T>(chunk.buffer->NativeHandle())} ==
                                     found->first && found->second <= chunk.buffer->Size() &&
@@ -11819,7 +11823,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                             }
                         }
                     }
-                    if (watched && last_bound == Bound::Region && !desc.is_written) {
+                    if (watched && Ctx().last_bound == Bound::Region && !desc.is_written) {
                         CompareRegion(base, size, vsharp.GetStride(), found->first, found->second,
                                       stage.pgm_hash); // DIAG-211 (diagnosis)
                     }
@@ -11862,7 +11866,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
 size_t NativeRenderer::TextureMemoSlot(const std::array<u64, 4>& raw_sharp, u32 flags) const {
     const u64 hash = NextMemoEnabled() ? MemoHash(raw_sharp.data(), raw_sharp.size(), flags)
         : XXH3_64bits_withSeed(raw_sharp.data(), sizeof(raw_sharp), flags);
-    return hash & (texture_memos.size() - 1);
+    return hash & (Ctx().texture_memos.size() - 1);
 }
 
 void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs& regs,
@@ -11884,7 +11888,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                                    (image_desc.NumBindings(stage) << 16) |
                                    (u32(image_desc.post_op == Shader::SharpFetchPostOp::NativeCubeSampling) << 31);
             const char* line =
-                reinterpret_cast<const char*>(&texture_memos[TextureMemoSlot(raw_sharp, memo_flags)]);
+                reinterpret_cast<const char*>(&Ctx().texture_memos[TextureMemoSlot(raw_sharp, memo_flags)]);
             _mm_prefetch(line, _MM_HINT_T0);
             _mm_prefetch(line + 64, _MM_HINT_T0);
         }
@@ -11991,7 +11995,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                         if (buffer && buffer->Mapped()) {
                             Begin();
                             GlobalBarrier();
-                            stream.cmd.copyBuffer(
+                            Ctx().stream.cmd.copyBuffer(
                                 vk::Buffer{Handle<VkBuffer_T>(over->buffer->NativeHandle())},
                                 vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
                                 vk::BufferCopy{.srcOffset = src - over->begin,
@@ -12109,7 +12113,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                                ((image_desc.constant_mip_index & 0xff) << 6) |
                                (num_bindings << 16) | (u32(cube_sampling) << 31);
         if (num_bindings <= 4 && stage.pgm_hash != 0xaa3822a3 && !r.FrameDumpCollecting()) {
-            memo = &texture_memos[TextureMemoSlot(raw_sharp, memo_flags)];
+            memo = &Ctx().texture_memos[TextureMemoSlot(raw_sharp, memo_flags)];
             // Revalidate the complete lookup/returned-image range before ever
             // dereferencing the old entry. Unmaps always invalidate it.
             if (memo->entry && memo->flags == memo_flags && memo->sharp == raw_sharp &&
@@ -13028,7 +13032,7 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     if (bind_point == vk::PipelineBindPoint::eGraphics) {
         trace.AccumulateInto(stats.bind_phase_ns, stats.bind_phase_calls); // DIAG-GTS-372
     }
-    Stream& s = stream;
+    Stream& s = Ctx().stream;
     const CmdBuf cmdbuf{s.cmd};
     static const bool reuse_enabled = [] {
         const char* env = std::getenv("SHADGT_NATIVE_REUSE");
@@ -13671,7 +13675,7 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
             if (sampled) {
                 in_place.Note(BoundKind(0), base, size); // NAT-142
             }
-            near = found ? last_mirror : nullptr;
+            near = found ? Ctx().last_mirror : nullptr;
             near_generation = buffer_generation;
         }
         v.buffers.push_back(found ? found->first : vk::Buffer{});
@@ -13709,8 +13713,8 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
                                 "{:08x}", frame, index, base, sharp_size, guest.GetStride(),
                                 !found                        ? "nowhere"
                                 : via_near                    ? "near mirror"
-                                : last_bound == Bound::Region ? "region"
-                                : last_bound == Bound::Mirror ? "mirror"
+                                : Ctx().last_bound == Bound::Region ? "region"
+                                : Ctx().last_bound == Bound::Mirror ? "mirror"
                                                               : "in place",
                                 found ? found->second : 0, head[0], head[1], head[2], head[3]);
                     if (found && size <= 512_KB) {
@@ -13729,7 +13733,7 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
                 std::memcpy(head.data(), bytes.data(), std::min<u64>(length, 16));
                 probe_vertices.push_back({base, length, found->first, found->second,
                                           XXH3_64bits(bytes.data(), length),
-                                          via_near ? 9u : u32(last_bound),
+                                          via_near ? 9u : u32(Ctx().last_bound),
                                           head});
             }
         }
@@ -13993,7 +13997,7 @@ bool NativeRenderer::ResolveIndices(const AmdGpu::Regs& regs, bool is_indexed, u
 }
 
 void NativeRenderer::RecordVertexIndex(const VertexIndexState& v) {
-    Stream& s = stream;
+    Stream& s = Ctx().stream;
     const CmdBuf cmdbuf{s.cmd};
     const bool dynamic_input = r.instance.IsVertexInputDynamicState();
     // OPT-005: what the list already has is not recorded again (vertex input state and vertex
@@ -14248,7 +14252,7 @@ static std::optional<u64> SameTexelKey(const Shader::Info& cs,
 }
 
 bool NativeRenderer::NeedsBarrierFor(const DrawBindings& b) const {
-    const Stream& s = stream;
+    const Stream& s = Ctx().stream;
     if (s.buffers_written || writebacks_due) {
         return true;
     }
@@ -15103,7 +15107,7 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
             NoteHistory(address, size, 3, history_program);
         }
     }
-    Stream& s = stream;
+    Stream& s = Ctx().stream;
     const auto note = [&](const Native::ImageEntry* entry, const DrawnRange* range = nullptr) {
         if (range && range->mips != 0) {
             WrittenRange(entry, *range); // FIX-208: only the mips and layers drawn
@@ -16195,7 +16199,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             buffer_freshness_certified=true;
         }
     }
-    DrawBindings& b = from_prepared ? prepared->bindings : bindings;
+    DrawBindings& b = from_prepared ? prepared->bindings : Ctx().bindings;
     // GT7-UW: a HUD draw showing a small picture drawn with depth this frame (the race's maps).
     // DLSS-GT7-001: the same sign, without a HUD layer, tells the prototype a race is on.
     const auto note_race_hud = [&] {
@@ -17888,7 +17892,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 continue;
             }
             GlobalBarrier();
-            stream.cmd.copyBuffer(vi->buffers[i],
+            Ctx().stream.cmd.copyBuffer(vi->buffers[i],
                                   vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
                                   vk::BufferCopy{.srcOffset = vi->offsets[i], .dstOffset = 0,
                                                  .size = bytes});
@@ -18240,7 +18244,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
         };
         const auto issue = [&] {
-        const CmdBuf cmdbuf{stream.cmd}; // GT7-UW: the HUD list's when it is swapped in
+        const CmdBuf cmdbuf{Ctx().stream.cmd}; // GT7-UW: the HUD list's when it is swapped in
         if (indirect) {
             RecordIndirect(*indirect, *arguments, is_indexed); // NAT-161
             return;
@@ -18643,14 +18647,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             s.cmd.pushConstants(pipeline->GetLayout(), AllGraphicsStageBits,
                 u32(offsetof(Shader::PushData, quad_sample_mask)), 8u, b.push.quad_sample_mask.data());
         }
-        if (hud_white_state && HudStreamOn() && !stream.wrapped_list && !second_inline) {
+        if (hud_white_state && HudStreamOn() && !Ctx().stream.wrapped_list && !second_inline) {
             // GT7-UW: the same draw over white, in the HUD list (its state recorded there too).
-            std::swap(stream, hud_stream);
+            std::swap(Ctx().stream, Ctx().hud_stream);
             BeginHudStream();
             BeginRendering(*hud_white_state);
             bind_state();
             issue();
-            std::swap(stream, hud_stream);
+            std::swap(Ctx().stream, Ctx().hud_stream);
         } else if (hud_white_state) {
             // GT7-UW: the same draw again over white (the pipeline, bindings and dynamic state
             // stay bound across the change of attachment).
@@ -18686,13 +18690,13 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             // DLSS-GT7-001: the same draw over black and over white, in the HUD lists.
             hud_black_state = batched_black; // bind_state sizes it for the HUD pictures
             for (const bool white : {false, true}) {
-                Stream& side = white ? hud_stream : hud_black_stream;
-                std::swap(stream, side);
+                Stream& side = white ? Ctx().hud_stream : Ctx().hud_black_stream;
+                std::swap(Ctx().stream, side);
                 BeginHudStream();
                 BeginRendering(white ? *batched_white : *batched_black);
                 bind_state();
                 record_draw();
-                std::swap(stream, side);
+                std::swap(Ctx().stream, side);
             }
             temporal.hud_batch_open = true;
             ++temporal.batched_draws;
@@ -19356,7 +19360,7 @@ void NativeRenderer::RecordIndirect(const IndirectDraw& indirect, const Indirect
                                     bool is_indexed) {
     // The guest's argument structures are Vulkan's (pm4_cmds.h): index or vertex count,
     // instance count, first index or vertex, (base vertex,) first instance.
-    const CmdBuf cmdbuf{stream.cmd};
+    const CmdBuf cmdbuf{Ctx().stream.cmd};
     if (buffers.count) {
         if (is_indexed) {
             cmdbuf.drawIndexedIndirectCount(buffers.args, buffers.args_offset, buffers.count,
@@ -21120,7 +21124,7 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     const u64 alignment = r.instance.StorageMinAlignment();
     trace.Next(5);
     p.upload_receipt_incarnation=0;
-    const u64 upload_incarnation=stream.upload_incarnation;
+    const u64 upload_incarnation=Ctx().stream.upload_incarnation;
     const bool receipt_requested=trusted && p.proof_context && p.proof_context->Valid(p.proof_mode_state);
     bool uploads_proven=receipt_requested && upload_incarnation && !p.uploads.empty();
     for (const auto& upload : p.uploads) {
@@ -21148,7 +21152,7 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         }
         uploads_proven=uploads_proven && backing_proven;
     }
-    if(uploads_proven && stream.upload_incarnation==upload_incarnation)
+    if(uploads_proven && Ctx().stream.upload_incarnation==upload_incarnation)
         p.upload_receipt_incarnation=upload_incarnation;
     trace.Next(6);
     {
@@ -21707,7 +21711,7 @@ void NativeRenderer::DispatchDirect() {
     SyncUiReads(pipeline->GetStages());
     Stream& s = Begin();
     const u64 work_before = s.resource_recording_serial;
-    DrawBindings& b = bindings;
+    DrawBindings& b = Ctx().bindings;
     b.Clear();
     b.push = UserData(regs);
     BindStagesStable(pipeline->GetStages(), regs, true, b);
@@ -22120,7 +22124,7 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
-    DrawBindings& b = bindings;
+    DrawBindings& b = Ctx().bindings;
     b.Clear();
     b.push = UserData(regs);
     const u64 indirect_region_before = regions_taken_in;
@@ -23527,7 +23531,7 @@ void NativeRenderer::EvictImages() {
             }
         }
         held_versions.erase(&entry);
-        std::erase(stream.written, &entry);
+        std::erase(Ctx().stream.written, &entry);
         std::erase(writebacks, &entry);
         pending_linear_downloads.erase(&entry);
         std::erase(frame_writebacks, &entry);
@@ -23611,12 +23615,12 @@ void NativeRenderer::UnwatchPages(VAddr begin, VAddr end) {
 void NativeRenderer::ReleaseUnusedWatches() {
     std::scoped_lock watch_lock{fill_watch_mutex};
     Native::SlowCallTrace<2> trace{true, "retired-page-watches", {"live-ranges", "unwatch"}};
-    if (snapshot_upload_memo && SnapshotLease::Requested()) {
+    if (Ctx().snapshot_upload_memo && SnapshotLease::Requested()) {
         // Reserve before removing ownership: an allocation failure must leave
         // every existing watch represented in the lease table.
         retired_watch_ranges.reserve(retired_watch_ranges.size() +
             SnapshotLease::OwnedRanges{}.ranges.size());
-        const auto released = snapshot_upload_memo->leases.ReleaseUnsafe(false);
+        const auto released = Ctx().snapshot_upload_memo->leases.ReleaseUnsafe(false);
         for (size_t i = 0; i < released.count; ++i) {
             const auto range = released.ranges[i];
             retired_watch_ranges.emplace_back(range.address, range.address + range.size);
@@ -23624,9 +23628,9 @@ void NativeRenderer::ReleaseUnusedWatches() {
         // Stale menu/race ranges must not permanently consume the bounded
         // table. This removes source metadata only; upload bindings retain
         // their own lifetime, and all live owners below still retain watches.
-        const auto idle = snapshot_upload_memo->leases.ReleaseUnused(
+        const auto idle = Ctx().snapshot_upload_memo->leases.ReleaseUnused(
             frame + (frame != UINT64_MAX), 120);
-        LEASE_COUNT(snapshot_upload_memo->lease_idle_retired += idle.count);
+        LEASE_COUNT(Ctx().snapshot_upload_memo->lease_idle_retired += idle.count);
         for (size_t i = 0; i < idle.count; ++i) {
             const auto range = idle.ranges[i];
             retired_watch_ranges.emplace_back(range.address, range.address + range.size);
@@ -23671,8 +23675,8 @@ void NativeRenderer::ReleaseUnusedWatches() {
         for (const auto& [base, mirror] : mirrors) {
             retain(mirror.begin, mirror.end);
         }
-        if (snapshot_upload_memo) {
-            const auto owned = snapshot_upload_memo->leases.AllOwnedRanges();
+        if (Ctx().snapshot_upload_memo) {
+            const auto owned = Ctx().snapshot_upload_memo->leases.AllOwnedRanges();
             for (size_t i = 0; i < owned.count; ++i) {
                 const auto range = owned.ranges[i];
                 retain(range.address, range.address + range.size);
@@ -23965,7 +23969,7 @@ void NativeRenderer::Splice() {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::Splice}; // DIAG-SGT-023
     std::scoped_lock lock{mutex};
     AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Splices};
-    Stream& s = stream;
+    Stream& s = Ctx().stream;
     if (!s.list) {
         return;
     }
@@ -24048,7 +24052,7 @@ void NativeRenderer::Splice() {
         }
     }
     UploadMemoFor(this).Clear(); // bindings expire before upload chunks can be recycled
-    if (snapshot_upload_memo) snapshot_upload_memo->Clear();
+    if (Ctx().snapshot_upload_memo) Ctx().snapshot_upload_memo->Clear();
     for (auto& upload : s.flat_uploads) {
         upload.bytes.clear();
         upload.binding = {};
@@ -24357,7 +24361,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
             .baseArrayLayer = 0,
             .layerCount = 1,
         };
-        stream.cmd.copyImage(vk::Image{Handle<VkImage_T>(corner_of->image->NativeHandle())},
+        Ctx().stream.cmd.copyImage(vk::Image{Handle<VkImage_T>(corner_of->image->NativeHandle())},
                              vk::ImageLayout::eGeneral,
                              vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},
                              vk::ImageLayout::eGeneral,
@@ -26245,7 +26249,7 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
     // requested (SHADGT_NATIVE_SNAPSHOT_LEASE=1), so the reuse status can be read without a Debug
     // renderer. A Debug renderer uses ucrtbased and cannot share file descriptors with the
     // Release runtime, so it fails at launch in a Release install.
-    if (!SnapshotLease::Requested() || !snapshot_upload_memo) {
+    if (!SnapshotLease::Requested() || !Ctx().snapshot_upload_memo) {
         return;
     }
     static auto last_lease_report = std::chrono::steady_clock::now();
@@ -26254,7 +26258,7 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
         return;
     }
     last_lease_report = now;
-    auto& cache = *snapshot_upload_memo;
+    auto& cache = *Ctx().snapshot_upload_memo;
 #ifdef _WIN32
     static bool module_notice_reported = false;
     SnapshotLease::FirstModuleNotice notice{};

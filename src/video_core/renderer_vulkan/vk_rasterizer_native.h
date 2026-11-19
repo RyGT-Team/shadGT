@@ -979,7 +979,6 @@ private:
     u64 per_frame_drop_frame = 0;    ///< FIX-GT7-122: the frame of the last drop
     /// NAT-150: what the last GuestBuffer bound (for the NAT-142 counters).
     enum class Bound : u8 { InPlace, Region, Mirror };
-    Bound last_bound = Bound::InPlace;
     /// OPT-003: what a guest range resolved to the last time (a region, a mirror, or imported
     /// guest memory read in place), valid while no region or mirror was made or dropped and no
     /// memory unmapped since (buffer_generation); a region or mirror with pages to copy in takes
@@ -1019,16 +1018,11 @@ private:
         }
     };
     static_assert(sizeof(BufferMemo) == 64);
-    std::array<BufferMemo, 16384> buffer_memos{}; ///< OPT-006: 2048 thrashed
     u64 buffer_generation = 0;
     u64 buffer_hard_generation = 0; ///< PERF-GT7-047: what the change log doesn't tell
     /// OPT-003: what the last lookup can be remembered as (set by GuestBufferLookup).
     enum class MemoKind : u8 { None, Region, Mirror, InPlace };
-    MemoKind memo_kind = MemoKind::None;
-    Region* memo_region = nullptr;
-    Mirror* memo_mirror = nullptr;
     /// OPT-004: the mirror the last GuestBuffer bound from (none when it bound anything else).
-    Mirror* last_mirror = nullptr;
     /// FIX-170 (diagnosis): SHADGT_NATIVE_SNAPSHOT_BELOW, 0 when off.
     static u64 SnapshotBelow();
     /// A copy of the range as it is now (NAT-106 zeros where the CPU can't read).
@@ -1056,7 +1050,6 @@ private:
     };
     using TextureMemo = TextureMemoOf<TextureMemoViews>;
     using JobTextureMemo = TextureMemoOf<4>; ///< OPT-010's, per job thread (thread-local)
-    std::array<TextureMemo, 16384> texture_memos{}; ///< OPT-006
     size_t TextureMemoSlot(const std::array<u64, 4>& raw_sharp, u32 memo_flags) const;
     std::atomic<u64> unmap_generation{0}; ///< (OPT-010: read by job threads)
     /// NAT-107: a guest range gathered on the GPU from the imported views holding it, into a
@@ -1089,7 +1082,7 @@ private:
         std::array<VAddr, 8> cmasks{};
         bool htile_meta = false; ///< the depth image has HTILE (FIX-156)
         Targets targets{};
-    } targets_memo;
+    };
     bool TargetsFromMemo(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline, Targets& out);
     bool ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline, Targets& out);
     bool PrepareUiTarget(Targets& targets, const GraphicsPipeline& pipeline);
@@ -1130,7 +1123,7 @@ private:
     void GpuTimeEnd(Stream& s, u64 tick);
     void GpuTimeCollect();
     GpuSegment* GpuSeg() {
-        auto* t = stream.gpu_timing.get();
+        auto* t = Ctx().stream.gpu_timing.get();
         return t && !t->segments.empty() ? &t->segments.back() : nullptr;
     }
     static constexpr u32 GpuTimeQueries = 1024;
@@ -1827,15 +1820,6 @@ private:
     std::atomic<u32> mapping_waiters{};
     void YieldToMappingChanges();
     struct SnapshotUploadMemo;
-    std::unique_ptr<SnapshotUploadMemo> snapshot_upload_memo; ///< guarded by mutex
-    Stream stream;
-    /// GT7-UW: the HUD draws over white, recorded in a list of their own that runs right after
-    /// the main one (which draws them over black): neither list switches between the two
-    /// pictures, so consecutive HUD draws stay in one pass without barriers between them.
-    Stream hud_stream;
-    /// DLSS-GT7-001: in a frame left as the game draws it, the HUD draws over black, in a list of
-    /// their own too (the main list then draws them into the display as the game does).
-    Stream hud_black_stream;
     static bool HudStreamOn();
     void BeginHudStream();
     void SpliceHudStream(u64 tick);
@@ -1843,7 +1827,41 @@ private:
     /// DLSS-GT7-001: the open batch of HUD draws runs (main list first, then the HUD lists).
     void CloseHudBatch();
     static bool HudBatchOn();
-    DrawBindings bindings;
+    /// FEAT-SGT-022 step 1: what a recorder thread keeps for itself. The two recorder threads of
+    /// the dual recorder each get one; until then there is one, so Ctx() is a plain member read.
+    /// Lists and their memos (the streams), the snapshot upload memo, the per-draw bindings
+    /// scratch, the buffer, texture and targets memos and GuestBuffer's out-parameters.
+    struct RecordContext {
+        RecordContext();
+        ~RecordContext();
+        Stream stream;
+        /// GT7-UW: the HUD draws over white, recorded in a list of their own that runs right
+        /// after the main one (which draws them over black): neither list switches between the
+        /// two pictures, so consecutive HUD draws stay in one pass without barriers between them.
+        Stream hud_stream;
+        /// DLSS-GT7-001: in a frame left as the game draws it, the HUD draws over black, in a list
+        /// of their own too (the main list then draws them into the display as the game does).
+        Stream hud_black_stream;
+        std::unique_ptr<SnapshotUploadMemo> snapshot_upload_memo;
+        DrawBindings bindings;
+        std::array<BufferMemo, 16384> buffer_memos{}; ///< OPT-006: 2048 thrashed
+        std::array<TextureMemo, 16384> texture_memos{}; ///< OPT-006
+        TargetsMemo targets_memo;
+        Bound last_bound = Bound::InPlace;
+        MemoKind memo_kind = MemoKind::None;
+        Region* memo_region = nullptr;
+        Mirror* memo_mirror = nullptr;
+        Mirror* last_mirror = nullptr;
+    };
+    /// A plain member, not behind a pointer: Ctx() then compiles to what the members did (a
+    /// unique_ptr adds a load on every access and keeps the members out of registers).
+    RecordContext main_record_context;
+    RecordContext& Ctx() {
+        return main_record_context;
+    }
+    const RecordContext& Ctx() const {
+        return main_record_context;
+    }
     u64 frame = 0;
     u64 timing_tick = 0; ///< OPT-001
     u64 ui_draws = 0;
@@ -1877,7 +1895,7 @@ private:
     }
     /// NAT-150: the counter for a binding of that kind, by what GuestBuffer bound.
     u32 BoundKind(u32 kind) const {
-        return last_bound == Bound::Mirror ? 5 : (last_bound == Bound::Region ? 6 : kind);
+        return Ctx().last_bound == Bound::Mirror ? 5 : (Ctx().last_bound == Bound::Region ? 6 : kind);
     }
 
     std::mutex chunk_mutex;

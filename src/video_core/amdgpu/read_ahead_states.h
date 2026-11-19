@@ -12,6 +12,8 @@
 #include <optional>
 #include <span>
 #include <unordered_set>
+#include <tsl/robin_set.h>
+#include "common/fast_hash.h"
 #include <utility>
 #include <vector>
 
@@ -213,7 +215,7 @@ private:
     u64 next_draw_sequence{}; // producer only
     std::atomic<u64> recorder_started{};
     // Command thread only.
-    std::unordered_set<u64> seen;
+    tsl::robin_set<u64, Common::IdentityHash> seen; ///< PERF-SGT-026: hashes already
     u64 seen_epoch{1};
     bool dedup_enabled{true};
     u64 misses_seen{};

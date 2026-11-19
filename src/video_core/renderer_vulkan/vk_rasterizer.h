@@ -15,6 +15,8 @@
 #include <chrono>
 #include <unordered_map>
 #include <unordered_set>
+#include <tsl/robin_map.h>
+#include "common/fast_hash.h"
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -521,7 +523,7 @@ private:
         return main_recorder_stages;
     }
     // FIX-077 (under the lookup lock): the identity each cache info was last seeded with.
-    std::unordered_map<const Shader::Info*, u64> seeded_infos;
+    tsl::robin_map<const Shader::Info*, u64, Common::PointerHash> seeded_infos; ///< PERF-SGT-026
     struct {
         u64 ahead;
         u64 compute_ahead; // PERF-055

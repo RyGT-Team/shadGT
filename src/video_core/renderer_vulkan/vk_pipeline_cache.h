@@ -27,6 +27,8 @@
 #include <unordered_set>
 #include <variant>
 #include <tsl/robin_map.h>
+#include <tsl/robin_set.h>
+#include "common/fast_hash.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
@@ -403,7 +405,7 @@ private:
     std::unordered_map<u64, RetranslatedProgram> else_scope_fixed;
     std::unordered_map<u64, u32> session_fix_marks;
     ShaderFixScanCache shader_fix_scans;
-    std::unordered_set<u64> else_scope_checked;
+    tsl::robin_set<u64, Common::IdentityHash> else_scope_checked; ///< PERF-SGT-026
     std::vector<std::unique_ptr<Program>> retired_programs;
     std::filesystem::path else_scope_fixed_path;
     void LoadElseScopeFixed();
@@ -475,7 +477,9 @@ private:
     } race_report;
     void ReportRaceMissing(std::chrono::steady_clock::time_point now);
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<GraphicsPipeline>> graphics_pipelines;
-    std::unordered_map<const Pipeline*, std::chrono::steady_clock::time_point> pipeline_last_use;
+    /// PERF-SGT-026: written for every draw's pipeline.
+    tsl::robin_map<const Pipeline*, std::chrono::steady_clock::time_point, Common::PointerHash>
+        pipeline_last_use;
     std::chrono::steady_clock::time_point retention_now{std::chrono::steady_clock::now()};
     std::chrono::steady_clock::time_point retention_last_scan{};
     /// NAT-031: what a key is computed in. The command and recorder threads use the cache's own

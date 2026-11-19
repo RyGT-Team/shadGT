@@ -9460,8 +9460,11 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
     }
     NoteSearch(hw_stage, SearchCalls); // DIAG-SGT-024
     if (regs_override) NoteSearch(hw_stage, SearchAhead);
-    if (program_cache.contains(params.hash)) pending_listings.erase(params.hash);
-    if (store_readers && !program_cache.contains(params.hash)) {
+    // PERF-SGT-026: the program cache is looked up once here (it was twice, and the listings
+    // erased from on every stage of every draw).
+    const bool program_known = program_cache.contains(params.hash);
+    if (program_known && !pending_listings.empty()) pending_listings.erase(params.hash);
+    if (store_readers && !program_known) {
         auto pending = pending_listings.find(params.hash);
         if (pending == pending_listings.end() && pending_listings.size() < 1024) {
             try { pending = pending_listings.emplace(params.hash, store_readers->List(params.hash).share()).first; }

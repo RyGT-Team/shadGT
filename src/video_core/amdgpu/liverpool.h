@@ -22,6 +22,8 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <tsl/robin_set.h>
+#include "common/fast_hash.h"
 #include <vector>
 #include <queue>
 
@@ -398,7 +400,7 @@ private:
     bool scan_blocked{}; // FIX-061: stopped at a REWIND the game has not published yet
     // PERF-022: draw packets and nested command buffers the read-ahead has already read in the
     // current submission; each is read once however often a read-ahead passes over it.
-    std::unordered_set<const void*> scanned_packets;
+    tsl::robin_set<const void*, Common::PointerHash> scanned_packets; ///< PERF-SGT-026
     bool ScanPackets(std::span<const u32> dcb, const std::function<bool(const Regs&)>& on_draw,
                      u32 depth, u32& draws_left, u32& builds_left, const u32** stopped_at);
 

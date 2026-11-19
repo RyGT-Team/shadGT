@@ -2215,6 +2215,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
             }
             continue;
         }
+#ifndef NDEBUG // PERF-SGT-025: a lock per upload, for a diagnosis
         {
             // WIDE-006 (diagnosis): a texture made of targets uploaded from guest memory.
             bool made_of_targets;
@@ -2229,6 +2230,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
                              info.size.height, int(entry->force_upload.load()));
             }
         }
+#endif
         trace.Next(2);
         if (upload_hook && entry->from_cpu) {
             upload_hook(*entry); // NAT-105: CPU writes from here on are seen

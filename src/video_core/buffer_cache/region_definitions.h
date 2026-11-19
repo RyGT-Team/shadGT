@@ -39,13 +39,16 @@ inline std::atomic<u64> g_gfx_submit_count{0};
 inline std::atomic<void (*)(u32)> g_upload_epoch_listener{nullptr};
 /// DIAG-112: epoch bumps by source line (index line + 8192 for vk_rasterizer.cpp).
 inline std::array<std::atomic<u32>, 16384> g_epoch_bump_sources{};
-inline void BumpUploadEpoch(std::source_location loc = std::source_location::current()) {
+inline void BumpUploadEpoch([[maybe_unused]] std::source_location loc =
+                                std::source_location::current()) {
+#ifdef SHADGT_DIAGNOSTICS // PERF-SGT-025: read only by DIAG-109's report
     {
         const std::string_view file = loc.file_name();
         const u32 line = loc.line() & 8191;
         g_epoch_bump_sources[line + (file.find("rasterizer") != std::string_view::npos ? 8192 : 0)]
             .fetch_add(1, std::memory_order_relaxed);
     }
+#endif
     const u32 epoch = g_upload_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
     Common::GetWorkCounters().upload_epochs.fetch_add(1, std::memory_order_relaxed);
     if (const auto listener = g_upload_epoch_listener.load(std::memory_order_acquire)) {

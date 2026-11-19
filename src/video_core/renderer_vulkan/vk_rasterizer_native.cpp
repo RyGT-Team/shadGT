@@ -1657,6 +1657,12 @@ struct RecordPartitionEndGuard {
 
 // DIAG-GT7-004: a piece of a dispatch's recorder time, on every dispatch (nothing when `total`
 // is null: the same code for a draw).
+#if defined(NDEBUG)
+// PERF-SGT-025: read only by the debug report, so nothing in Release.
+struct PartClock {
+    explicit PartClock(u64*) noexcept {}
+};
+#else
 struct PartClock {
     u64* total;
     std::chrono::steady_clock::time_point start{};
@@ -1673,6 +1679,7 @@ struct PartClock {
         }
     }
 };
+#endif
 
 u64 ChunkSize() {
     static const u64 size = NativeChunkBytes(std::getenv("SHADGT_NATIVE_CHUNK_MB"),
@@ -4767,6 +4774,7 @@ void NativeRenderer::FlushWritebacks() {
         return;
     }
     AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::WriteBacks};
+#ifndef NDEBUG // PERF-SGT-025: read only by the debug report
     struct Timed {
         std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
         u64& total;
@@ -4776,6 +4784,7 @@ void NativeRenderer::FlushWritebacks() {
                          .count();
         }
     } timed{.total = stats.writeback_ns}; // DIAG-188
+#endif
     Stream& s = Ctx().stream;
     auto* direct = r.buffer_cache.GetDirectMemory();
     const u64 alignment = r.instance.StorageMinAlignment();
@@ -7274,7 +7283,7 @@ void NativeRenderer::WatchOneOffs(const AmdGpu::Regs& regs, bool skipped) {
 // Vulkan yet (RECHERCHE-POSITIONS-ECHANTILLONS-PRO.md); a GPU with a 1x1 sample-location grid
 // (NVIDIA) can only take them if the four pixels of the quad ask for the same ones. One line for
 // each distinct setting (64 at most), with the pixel shader of its first draw.
-static void NoteSampleLocations(const AmdGpu::Regs& regs) {
+[[maybe_unused]] static void NoteSampleLocations(const AmdGpu::Regs& regs) {
     static const bool on = [] {
         const char* env = std::getenv("SHADGT_SAMPLE_LOCS_DIAG");
         return Libraries::Kernel::sceKernelIsNeoMode() != 0 && !(env && env[0] == '0');
@@ -7350,6 +7359,13 @@ inline u64 last_frame = ~u64{0};
 inline u32 frames = 0;
 } // namespace CheckerboardDiag
 
+#if defined(NDEBUG)
+// PERF-SGT-025: DIAG-GTS-509/510 took a lock per draw and per texture bind in Pro mode, for log
+// lines; Release builds leave them out.
+static constexpr bool CheckerboardDiagOn() {
+    return false;
+}
+#else
 static bool CheckerboardDiagOn() {
     static const bool on = [] {
         const char* env = std::getenv("SHADGT_SAMPLE_LOCS_DIAG");
@@ -7357,6 +7373,7 @@ static bool CheckerboardDiagOn() {
     }();
     return on;
 }
+#endif
 
 // DIAG-GTS-510 (replaces DIAG-GTS-509's draw lines): every draw into a 2-sample depth (the PS4 Pro
 // checkerboard's depth and whatever else draws there), one line for each distinct one (128 at
@@ -7365,7 +7382,7 @@ static bool CheckerboardDiagOn() {
 // (per-sample inputs, kill, Z or mask export, coverage to mask, alpha to mask), its colour targets
 // and their sample counts, the kind of positions it asks for (standard, alike, differ) and whether
 // the race runs. Its targets join the images whose readers are logged below.
-static void NoteCheckerboardDraw(const AmdGpu::Regs& regs, u64 frame) {
+[[maybe_unused]] static void NoteCheckerboardDraw(const AmdGpu::Regs& regs, u64 frame) {
     if (!CheckerboardDiagOn()) {
         return;
     }
@@ -7472,7 +7489,8 @@ inline std::array<std::atomic<u64>, Kinds> counts{};
 inline std::atomic<s64> last_ms{0};
 } // namespace TwoSampleCount
 
-static void CountTwoSampleDraw(const GraphicsPipeline& pipeline, SampleLocations::Why why) {
+[[maybe_unused]] static void CountTwoSampleDraw(const GraphicsPipeline& pipeline,
+                                                SampleLocations::Why why) {
     static const bool pro = Libraries::Kernel::sceKernelIsNeoMode() != 0;
     if (!pro || pipeline.RasterSamples() != 2 || !RytyRaceRunning()) {
         return;
@@ -15741,8 +15759,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
         return r.AcquireGraphicsPipeline(params, !indirect && !quad_list, &pipeline_owner);
     }();
+#ifndef NDEBUG // PERF-SGT-025: a lock and a key search per draw in Pro mode, for log lines
     NoteSampleLocations(regs); // DIAG-GTS-507
     NoteCheckerboardDraw(regs, frame); // DIAG-GTS-509
+#endif
     // PERF-GTS-493: in a race (from its countdown with GAME-006) no one-off draw waits (FIX-198,
     // FIX-GT7-121/135/153): looked up again without waiting, skipped if not ready, and watched.
     const bool one_off = !pipeline && DrawMustNotSkip(regs);
@@ -15924,6 +15944,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                  appearance.rim_brightness);
     }
     SyncUiReads(pipeline->GetStages());
+#ifndef NDEBUG // PERF-SGT-025: a lock and a set search per indirect draw, for log lines
     if (indirect) {
         // DIAG-162: the first kinds of indirect draws, by shaders and argument layout.
         static std::mutex seen_mutex;
@@ -15945,6 +15966,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                         indirect->instance_sgpr_offset);
         }
     }
+#endif
     Stream& s = Begin();
     // NAT-161: the arguments are looked up before the draw's other buffers, as DispatchIndirect
     // does: a region a later lookup makes takes theirs in and leaves it as it was, holding what
@@ -16485,7 +16507,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             std::memcpy(&b.push.buf_offsets[Shader::PushData::Sample0OffsetsByte], &word,
                         sizeof(word));
         }
+#ifndef NDEBUG // PERF-SGT-025: a clock read and shared counters per draw, for a log line
         CountTwoSampleDraw(*pipeline, why);
+#endif
     }
     struct DepthSnapshot {
         std::unique_ptr<Native::Rhi::Image> image;

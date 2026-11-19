@@ -284,8 +284,18 @@ static const char* ccb_task_name{"CCB_TASK"};
 
 class GpuWaitDiagnostics {
 public:
+    /// True every 5 s of a wait that keeps going round (its report, and the deferred fences
+    /// flushed). PERF-SGT-025: made for every wait packet, so no clock is read when it is made,
+    /// and in a wait only every 64th turn; the first 5 s count from the 64th turn.
     bool Ready() {
+        if ((++turns & 63) != 0) {
+            return false;
+        }
         const auto now = std::chrono::steady_clock::now();
+        if (next_report == std::chrono::steady_clock::time_point{}) {
+            next_report = now + std::chrono::seconds(5);
+            return false;
+        }
         if (now < next_report) {
             return false;
         }
@@ -294,8 +304,8 @@ public:
     }
 
 private:
-    std::chrono::steady_clock::time_point next_report =
-        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    u32 turns = 0;
+    std::chrono::steady_clock::time_point next_report{};
 };
 
 #define MAX_NAMES 56

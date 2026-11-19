@@ -30,6 +30,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include "ryty_gpu/native/kept_set_table.h"
+#include "ryty_gpu/native/recorder_binder.h"
+#include "ryty_gpu/native/ordered_timing.h"
 #include <vector>
 
 #include <boost/container/static_vector.hpp>
@@ -325,6 +327,9 @@ private:
         std::array<vk::ShaderEXT, 4> so_shaders{};
         BindingCommandMemo<vk::PipelineLayout, vk::DescriptorSet, Shader::PushData,
                            Shader::Backend::MaxDescriptorSets> binding_commands;
+        /// FEAT-SGT-022: binding_commands is to be forgotten at the next PushBindings (set by a
+        /// shader-object bind; the binder may be using binding_commands meanwhile).
+        bool binding_commands_stale = false;
         /// OPT-005: the vertex input layout, vertex buffers and index buffer last recorded in
         /// this list (the same ones are not recorded again).
         bool vertex_state_known = false;
@@ -1168,8 +1173,24 @@ private:
                      Shader::Backend::Bindings& binding, DrawBindings& b);
     void BindTextures(const Shader::Info& stage, const AmdGpu::Regs& regs,
                       Shader::Backend::Bindings& binding, DrawBindings& b);
+    /// Records the draw's push constants and descriptor binds; with the binder on
+    /// (FEAT-SGT-022), hands them to the binder thread and records a placeholder for them.
     void PushBindings(const Pipeline& pipeline, vk::PipelineBindPoint bind_point,
                       DrawBindings& b);
+    /// FEAT-SGT-022: what PushBindings reads of the recorder's state that later draws change,
+    /// as it was when the draw recorded its binds.
+    struct BindInputs {
+        u64 generation = 0;     ///< the regions', images', samplers' and mappings' generations
+        u64 pipeline_epoch = 0; ///< the list's pipeline bind epoch
+        bool invalidate = false; ///< a shader-object bind forgot the list's binds (FIX-GTS-420)
+        bool on_binder = false;
+        Shader::PushData push{};
+    };
+    BindInputs TakeBindInputs(Stream& s, const DrawBindings& b);
+    /// PushBindings' work, into `cmdbuf`, from `inputs` instead of the recorder's state.
+    void PushBindingsWith(const Pipeline& pipeline, vk::PipelineBindPoint bind_point,
+                          DrawBindings& b, Stream& s, const CmdBuf& cmdbuf,
+                          const BindInputs& inputs);
     /// A draw's vertex and index buffers: looked up before its pass starts (a lookup may gather
     /// on the GPU, outside rendering) and bound inside it.
     struct VertexIndexState {
@@ -1844,7 +1865,12 @@ private:
         /// of their own too (the main list then draws them into the display as the game does).
         Stream hud_black_stream;
         std::unique_ptr<SnapshotUploadMemo> snapshot_upload_memo;
-        DrawBindings bindings;
+        /// FEAT-SGT-022: the per-draw bindings scratch, one slot per draw whose binds the
+        /// binder may still be making (one slot is used while the binder is off).
+        static constexpr u32 BindingSlots = 8;
+        std::array<DrawBindings, BindingSlots> binding_slots;
+        std::array<u64, BindingSlots> binding_jobs{}; ///< each slot's last binder job
+        u32 binding_next = 0;
         std::array<BufferMemo, 16384> buffer_memos{}; ///< OPT-006: 2048 thrashed
         std::array<TextureMemo, 16384> texture_memos{}; ///< OPT-006
         TargetsMemo targets_memo;
@@ -1857,6 +1883,36 @@ private:
     /// A plain member, not behind a pointer: Ctx() then compiles to what the members did (a
     /// unique_ptr adds a load on every access and keeps the members out of registers).
     RecordContext main_record_context;
+    /// FEAT-SGT-022: the bindings scratch for the next draw or dispatch (a slot no binder job
+    /// still reads).
+    DrawBindings& NextBindings();
+    /// FEAT-SGT-022: one PushBindings for the binder thread.
+    struct BindJob {
+        const Pipeline* pipeline = nullptr;
+        vk::PipelineBindPoint bind_point{};
+        DrawBindings* bindings = nullptr;
+        Stream* stream = nullptr;
+        CmdBuf cmd{};
+        BindInputs inputs{};
+    };
+    static void RunBindJob(void* owner, BindJob& job, CommandRing& ring);
+    /// FEAT-SGT-022 (SHADGT_RECORDER_BINDER=1): the binder thread; null when off.
+    std::unique_ptr<Native::RecorderBinder<BindJob>> binder;
+    /// FEAT-SGT-022: waits until the binder made every bind handed to it (before the recorder
+    /// changes what its jobs read: splices, stream swaps, evictions, dropped samplers).
+    void DrainBinder() const {
+        if (!binder) return;
+        namespace OT = Native::OrderedTiming;
+        const std::uint64_t from = OT::Enabled() ? OT::Ticks() : 0;
+        binder->Drain();
+        if (OT::Enabled()) {
+            OT::NoteBinder(OT::BinderDrains);
+            OT::NoteBinder(OT::BinderWaitTicks, OT::Ticks() - from);
+        }
+    }
+    /// FEAT-SGT-022: 1 binder thread, 2 the same with a drain after every job (serial, to tell
+    /// a wrong hand-off from a race), 0 off.
+    int binder_mode = 0;
     RecordContext& Ctx() {
         return main_record_context;
     }

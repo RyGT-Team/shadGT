@@ -125,6 +125,9 @@ struct Totals {
     std::array<std::uint64_t, 8> runs{};
     std::array<std::uint64_t, 8> run_draws{};
     std::uint64_t run = 0;
+    /// FEAT-SGT-022: binder jobs, binds made on the recorder while it is on, drains, and the
+    /// ticks the recorder waited for it (for a job slot, a bindings slot or a drain).
+    std::array<std::uint64_t, 4> binder{};
     /// OPT-010 prepared draws, by outcome (see PreparedOutcome).
     std::array<std::uint64_t, 9> prepared{};
     /// Splices by the line that asked for them (the first 32 lines seen).
@@ -167,6 +170,14 @@ inline void NotePrepared(std::uint32_t outcome) {
 }
 
 /// A splice that ended a list: both recorders drain, a run of draws resolved ahead ends.
+enum BinderCount : std::uint8_t { BinderJobs, BinderInline, BinderDrains, BinderWaitTicks };
+
+inline void NoteBinder(BinderCount what, std::uint64_t n = 1) {
+    if (Enabled()) {
+        Local().binder[what] += n;
+    }
+}
+
 inline void NoteSplice(std::uint32_t line) {
     if (!Enabled()) {
         return;

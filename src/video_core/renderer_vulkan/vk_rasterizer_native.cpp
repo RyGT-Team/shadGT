@@ -2581,6 +2581,9 @@ static std::atomic<u64> g_lds_owned_epoch{1};
 static void NoteOwnedMapChange() { g_lds_owned_epoch.fetch_add(1, std::memory_order_acq_rel); }
 
 NativeRenderer::~NativeRenderer() {
+    if (binder) { // FEAT-SGT-022: every job made before anything its jobs use goes
+        binder->Drain();
+    }
     g_lds_owned_epoch.fetch_add(1, std::memory_order_acq_rel); // PERF-GT7-133
     auto expected_observer = one_off_observer;
     g_one_off_observer.compare_exchange_strong(expected_observer, {}, std::memory_order_acq_rel);
@@ -2593,6 +2596,10 @@ NativeRenderer::~NativeRenderer() {
         ApplyRingPriority(false);
         r.scheduler.Finish();
         r.scheduler.SyncCommandThread();
+    }
+    if (binder) { // FEAT-SGT-022: its placeholders replayed, nothing points at it any more
+        binder->WaitReplayed();
+        binder.reset();
     }
     scene_indirect_buffer.reset();scene_indirect_args.clear();
     if(SceneTrace::state.pool){const auto pool=SceneTrace::state.pool;const auto device=r.instance.GetDevice();r.scheduler.DeferOperation([device,pool]{device.destroyQueryPool(pool);});SceneTrace::state={};}
@@ -2824,6 +2831,7 @@ void NativeRenderer::SpliceStream(Stream& s, u64 tick) {
     if (!s.list) {
         return;
     }
+    DrainBinder(); // FEAT-SGT-022: its jobs use the list's pools and binds
     if (s.rendering) {
         s.cmd.endRendering();
         s.rendering = false;
@@ -3430,6 +3438,7 @@ u32 NativeRenderer::SamplerLimit() const {
 constexpr size_t SamplersAPass = 256;
 
 void NativeRenderer::RecycleSamplers() {
+    DrainBinder(); // FEAT-SGT-022: no set the binder keeps names a sampler dropped here
     // FIX-GTS-503 (sampler_mutex held; shadgt7's FIX-GT7-174/177, never pushed there). A sampler
     // per state, never destroyed, reached NVIDIA's 4000 within a long session, and FIX-GT7-002's
     // stand-in, the last sampler made, then served every new state to the end: Spa's trees as
@@ -4138,7 +4147,11 @@ void NativeRenderer::BindGraphics(Stream& s, const GraphicsPipeline& pipeline,
             return value == "keep" ? 0 : value == "change" ? 1 : 2;
         }();
         if (so_bindings == 2 || (so_bindings == 1 && !(known && shaders == pipeline.ShaderObjects()))) {
-            s.binding_commands.Invalidate();
+            if (binder) {
+                s.binding_commands_stale = true; // FEAT-SGT-022: the binder may be using them
+            } else {
+                s.binding_commands.Invalidate();
+            }
         }
         s.so_epoch = s.pipelines.InvalidationEpoch();
         s.so_known = true;
@@ -12697,9 +12710,16 @@ static bool LateBindingsOn() {
 // PERF-SGT-020: the recorder's last looked-up buffer sizes. Emptied when handles die: the
 // driver may give a new buffer of another size the same handle value.
 namespace {
+/// FEAT-SGT-022: bumped when handles die, so the binder thread's cache is emptied too.
+std::atomic<u64> g_buffer_size_epoch{0};
 struct BufferSizeCache {
     std::array<std::pair<u64, u64>, 64> entries{};
+    u64 epoch = 0;
     u64 Get(vk::Buffer buffer) {
+        if (const u64 now = g_buffer_size_epoch.load(std::memory_order_acquire); now != epoch) {
+            entries.fill({});
+            epoch = now;
+        }
         const u64 handle = u64(VkBuffer(buffer));
         auto& entry = entries[((handle >> 4) ^ (handle >> 11)) & 63];
         if (entry.first != handle) {
@@ -12724,9 +12744,9 @@ void NativeRenderer::LongSetsUpkeep() {
     if (!LongLivedSetsOn()) return;
     static thread_local std::vector<u64> dead;
     const bool some = Native::DeadHandles::Take(dead);
-    if (some) t_buffer_sizes.entries.fill({}); // PERF-SGT-020
+    if (some) g_buffer_size_epoch.fetch_add(1, std::memory_order_release); // PERF-SGT-020
     std::unique_lock<std::mutex> lock{long_sets_mutex, std::defer_lock};
-    if (ParallelRecordingRequested()) lock.lock();
+    if (ParallelRecordingRequested() || binder) lock.lock(); // FEAT-SGT-022: the binder's too
     if (some) DropLongSets(dead);
     if (long_sets.entries.Size() > 200000 || long_sets.unused_sets > 20000) FlushLongSets();
 }
@@ -13014,42 +13034,142 @@ void NativeRenderer::FlushLongSets() {
     ++long_sets.flushes;
 }
 
+static int RecorderBinderWanted() {
+    // FEAT-SGT-022 (SHADGT_RECORDER_BINDER=1): PushBindings on a thread of its own; =2 the same
+    // with a drain after every job. Not with parallel recording (its captures and pending
+    // updates are the recorder's) nor with the descriptor diagnostics, whose counters the
+    // recorder reports.
+    static const int wanted = [] {
+        const char* env = std::getenv("SHADGT_RECORDER_BINDER");
+        const int mode = env && (env[0] == '1' || env[0] == '2') ? env[0] - '0' : 0;
+        if (mode == 0) return 0;
+        const char* reuse_diag = std::getenv("SHADGT_DIAG_DESCRIPTOR_REUSE");
+        if (ParallelRecordingRequested() || DescriptorAllocDiagEnabled() ||
+            (reuse_diag && reuse_diag[0] == '1')) {
+            LOG_WARNING(Render_Vulkan, "FEAT-SGT-022: SHADGT_RECORDER_BINDER is ignored with "
+                                       "parallel recording or the descriptor diagnostics");
+            return 0;
+        }
+        return mode;
+    }();
+    return wanted;
+}
+
+NativeRenderer::DrawBindings& NativeRenderer::NextBindings() {
+    RecordContext& c = Ctx();
+    if (!binder) {
+        return c.binding_slots[0];
+    }
+    const u32 slot = c.binding_next++ % RecordContext::BindingSlots;
+    namespace OT = Native::OrderedTiming;
+    const u64 from = OT::Enabled() ? OT::Ticks() : 0;
+    binder->WaitDone(c.binding_jobs[slot]);
+    if (OT::Enabled()) OT::NoteBinder(OT::BinderWaitTicks, OT::Ticks() - from);
+    return c.binding_slots[slot];
+}
+
+NativeRenderer::BindInputs NativeRenderer::TakeBindInputs(Stream& s, const DrawBindings& b) {
+    BindInputs inputs;
+    inputs.generation = registry->Generation() + unmap_generation.load(std::memory_order_acquire) +
+                        buffer_generation +
+                        samplers_dropped.load(std::memory_order_acquire); // FIX-GTS-503
+    inputs.pipeline_epoch = s.pipelines.InvalidationEpoch();
+    inputs.invalidate = std::exchange(s.binding_commands_stale, false);
+    inputs.push = b.push;
+    return inputs;
+}
+
+void NativeRenderer::RunBindJob(void* owner, BindJob& job, CommandRing&) {
+    static_cast<NativeRenderer*>(owner)->PushBindingsWith(*job.pipeline, job.bind_point,
+                                                          *job.bindings, *job.stream, job.cmd,
+                                                          job.inputs);
+}
+
 void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoint bind_point,
                                   DrawBindings& b) {
+    LongSetsUpkeep();
+    Stream& s = Ctx().stream;
+    RecordContext& c = Ctx();
+    if (!binder && RecorderBinderWanted() != 0 && s.cmd.Ring()) {
+        binder = std::make_unique<Native::RecorderBinder<BindJob>>(this, &RunBindJob);
+        binder_mode = RecorderBinderWanted();
+        LOG_WARNING(Render_Vulkan, "FEAT-SGT-022: descriptor binds are made on a binder thread{}",
+                    binder_mode == 2 ? ", one at a time (SHADGT_RECORDER_BINDER=2)" : "");
+    }
+    namespace OT = Native::OrderedTiming;
+    // FEAT-SGT-022: the binds of a draw whose bindings sit in a slot go to the binder; the
+    // command thread replays them where this placeholder is. Others (prepared draws, parallel
+    // captures) are made here, after the binder's.
+    const bool in_slot = &b >= c.binding_slots.data() &&
+                         &b < c.binding_slots.data() + c.binding_slots.size();
+    if (binder && in_slot && !parallel_binding_capture && s.cmd.Ring()) {
+        const u64 from = OT::Enabled() ? OT::Ticks() : 0;
+        BindJob& job = binder->Next();
+        if (OT::Enabled()) OT::NoteBinder(OT::BinderWaitTicks, OT::Ticks() - from);
+        job.pipeline = &pipeline;
+        job.bind_point = bind_point;
+        job.bindings = &b;
+        job.stream = &s;
+        job.cmd = s.cmd.OnRing(&binder->Ring());
+        job.inputs = TakeBindInputs(s, b);
+        job.inputs.on_binder = true;
+        const u64 seq = binder->Push();
+        c.binding_jobs[&b - c.binding_slots.data()] = seq;
+        auto* const owner = binder.get();
+        s.cmd.Control([owner, seq](Scheduler& scheduler) {
+            owner->WaitDone(seq);
+            scheduler.ReplayFrom(owner->Ring(), owner->Ring().Replayed(), owner->End(seq));
+            owner->Replayed(seq);
+        });
+        OT::NoteBinder(OT::BinderJobs);
+        if (binder_mode == 2) DrainBinder();
+        return;
+    }
+    if (binder) {
+        DrainBinder();
+        OT::NoteBinder(OT::BinderInline);
+    }
+    PushBindingsWith(pipeline, bind_point, b, s, s.cmd, TakeBindInputs(s, b));
+}
+
+void NativeRenderer::PushBindingsWith(const Pipeline& pipeline, vk::PipelineBindPoint bind_point,
+                                      DrawBindings& b, Stream& s, const CmdBuf& cmdbuf,
+                                      const BindInputs& inputs) {
     // PERF-GTS-375 (SHADGT_LONG_LIVED_SETS=1, with SHADGT_DYNAMIC_BUFFER_OFFSETS=1): sets with
     // dynamic offsets are kept across lists. A list has about 40 draws, so its own cache reused
     // 18% of them; 93% match a set of the last 10 s (DIAG-GTS-373).
     static const bool long_sets_on = LongLivedSetsOn();
     // PERF-GTS-398: with parallel recording the table is the pass workers' too.
     static const bool long_sets_shared = ParallelRecordingRequested();
-    LongSetsUpkeep();
-    auto* pending_owner=FindParallelRuntime(this);
+    // FEAT-SGT-022: and the binder's (locked as it is shared, without changing what is kept).
+    const bool long_sets_locked = long_sets_shared || binder != nullptr;
+    auto* pending_owner = inputs.on_binder ? nullptr : FindParallelRuntime(this);
     if(!parallel_binding_capture && pending_owner)
         pending_owner->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::Serial);
     Native::SlowCallTrace<9> trace{t_timed, "descriptor-bindings",
         {"push-constants", "groups-keys", "push-descriptor", "hash-lookup", "allocate",
          "copy-writes", "update-descriptors", "store-key", "bind-set"}};
-    if (bind_point == vk::PipelineBindPoint::eGraphics) {
+    if (bind_point == vk::PipelineBindPoint::eGraphics && !inputs.on_binder) {
         trace.AccumulateInto(stats.bind_phase_ns, stats.bind_phase_calls); // DIAG-GTS-372
     }
-    Stream& s = Ctx().stream;
-    const CmdBuf cmdbuf{s.cmd};
     static const bool reuse_enabled = [] {
         const char* env = std::getenv("SHADGT_NATIVE_REUSE");
         return !(env && env[0] == '0');
     }();
     const bool reuse = reuse_enabled && !parallel_binding_capture;
+    if (inputs.invalidate) {
+        s.binding_commands.Invalidate(); // FIX-GTS-420, in the order the binds were asked for
+    }
     if (reuse) {
-        s.binding_commands.Prepare(pipeline.GetLayout(), u32(bind_point),
-            registry->Generation() + unmap_generation.load(std::memory_order_acquire) +
-                buffer_generation + samplers_dropped.load(std::memory_order_acquire), // FIX-GTS-503
-            s.pipelines.InvalidationEpoch());
+        s.binding_commands.Prepare(pipeline.GetLayout(), u32(bind_point), inputs.generation,
+                                   inputs.pipeline_epoch);
     }
     const auto stage_flags =
         pipeline.IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
-    if (!parallel_binding_capture && (!reuse || !s.binding_commands.SamePush(b.push))) {
-        cmdbuf.pushConstants(pipeline.GetLayout(), stage_flags, 0u, sizeof(b.push), &b.push);
-        if (reuse) s.binding_commands.NotePush(b.push);
+    if (!parallel_binding_capture && (!reuse || !s.binding_commands.SamePush(inputs.push))) {
+        cmdbuf.pushConstants(pipeline.GetLayout(), stage_flags, 0u, sizeof(inputs.push),
+                             &inputs.push);
+        if (reuse) s.binding_commands.NotePush(inputs.push);
     }
     if (b.writes.empty()) {
         return;
@@ -13335,7 +13455,7 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         // PERF-GTS-398: held from the lookup until the new set is in the table.
         std::unique_lock<std::mutex> long_lock{long_sets_mutex, std::defer_lock};
         if (long_lived) {
-            if (long_sets_shared) long_lock.lock();
+            if (long_sets_locked) long_lock.lock();
             if (const auto kept = long_sets.entries.Find(key_hash, key_check)) {
                 sets[index] = kept;
                 ++long_sets.hits;
@@ -16210,7 +16330,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     if (from_prepared) {
         Native::OrderedTiming::NotePrepared(Native::OrderedTiming::PreparedUsed);
     }
-    DrawBindings& b = from_prepared ? prepared->bindings : Ctx().bindings;
+    DrawBindings& b = from_prepared ? prepared->bindings : NextBindings();
     // GT7-UW: a HUD draw showing a small picture drawn with depth this frame (the race's maps).
     // DLSS-GT7-001: the same sign, without a HUD layer, tells the prototype a race is on.
     const auto note_race_hud = [&] {
@@ -18667,11 +18787,13 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
         if (hud_white_state && HudStreamOn() && !Ctx().stream.wrapped_list && !second_inline) {
             // GT7-UW: the same draw over white, in the HUD list (its state recorded there too).
+            DrainBinder(); // FEAT-SGT-022: its jobs point at the streams
             std::swap(Ctx().stream, Ctx().hud_stream);
             BeginHudStream();
             BeginRendering(*hud_white_state);
             bind_state();
             issue();
+            DrainBinder(); // FEAT-SGT-022: its jobs point at the streams
             std::swap(Ctx().stream, Ctx().hud_stream);
         } else if (hud_white_state) {
             // GT7-UW: the same draw again over white (the pipeline, bindings and dynamic state
@@ -18709,11 +18831,13 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             hud_black_state = batched_black; // bind_state sizes it for the HUD pictures
             for (const bool white : {false, true}) {
                 Stream& side = white ? Ctx().hud_stream : Ctx().hud_black_stream;
+                DrainBinder(); // FEAT-SGT-022
                 std::swap(Ctx().stream, side);
                 BeginHudStream();
                 BeginRendering(white ? *batched_white : *batched_black);
                 bind_state();
                 record_draw();
+                DrainBinder(); // FEAT-SGT-022
                 std::swap(Ctx().stream, side);
             }
             temporal.hud_batch_open = true;
@@ -21730,7 +21854,7 @@ void NativeRenderer::DispatchDirect() {
     SyncUiReads(pipeline->GetStages());
     Stream& s = Begin();
     const u64 work_before = s.resource_recording_serial;
-    DrawBindings& b = Ctx().bindings;
+    DrawBindings& b = NextBindings();
     std::optional<Native::OrderedTiming::Scope> bind_phase; // DIAG-SGT-023
     bind_phase.emplace(Native::OrderedTiming::BindPhase);
     b.Clear();
@@ -22148,7 +22272,7 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
-    DrawBindings& b = Ctx().bindings;
+    DrawBindings& b = NextBindings();
     b.Clear();
     b.push = UserData(regs);
     const u64 indirect_region_before = regions_taken_in;
@@ -23137,6 +23261,7 @@ void NativeRenderer::ProbeWatchedPictures() {
 }
 
 void NativeRenderer::EvictImages() {
+    DrainBinder(); // FEAT-SGT-022: no set the binder keeps names a view dropped here
     Native::SlowCallTrace<4> trace{true, "frame-retirement",
         {"completed-views", "cold-mirrors", "kept-textures", "cold-images"}};
     ProbeWatchedPictures(); // FIX-156 (diagnosis)
@@ -23997,6 +24122,7 @@ void NativeRenderer::Splice(std::source_location where) {
     if (!s.list) {
         return;
     }
+    DrainBinder(); // FEAT-SGT-022: its jobs use the list's pools and binds
     // DIAG-SGT-023: only a splice that ends a list drains (the submit callback after
     // ChunkFlushCheck's own splice finds none open).
     Native::OrderedTiming::NoteSplice(where.line());
@@ -25329,6 +25455,13 @@ static void ReportOrderedFraction(u64 frame) {
              ms(encode), 100.0 * double(encode) / all,
              ms(parallel + uncertain + ordered + barrier + resolve));
     const auto per_frame = [&](u64 n) { return double(n) / frames; };
+    if (t.binder[OT::BinderJobs] + t.binder[OT::BinderInline] != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "DIAG-SGT-023 binder a frame (FEAT-SGT-022): {:.0f} jobs, {:.0f} binds made on the "
+                 "recorder, {:.0f} drains; the recorder waited {:.2f} ms",
+                 per_frame(t.binder[OT::BinderJobs]), per_frame(t.binder[OT::BinderInline]),
+                 per_frame(t.binder[OT::BinderDrains]), ms(t.binder[OT::BinderWaitTicks]));
+    }
     LOG_INFO(Render_Vulkan,
              "DIAG-SGT-023 prepared draws a frame (OPT-010): found {:.1f}, none {:.1f}, used {:.1f}, "
              "rejected for pipeline {:.1f}, user data {:.1f}, unmap {:.1f}, images {:.1f}, buffers "

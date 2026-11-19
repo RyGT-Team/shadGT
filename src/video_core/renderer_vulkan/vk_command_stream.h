@@ -257,6 +257,26 @@ public:
         return ring != nullptr || direct;
     }
 
+    /// FEAT-SGT-022: the ring this records into (nullptr for a direct handle).
+    CommandRing* Ring() const noexcept {
+        return ring;
+    }
+
+    /// FEAT-SGT-022: the same command buffer (target or list slot), recorded into another ring
+    /// whose commands are replayed at a point of this one (a binder thread's ring).
+    CmdBuf OnRing(CommandRing* other) const noexcept {
+        CmdBuf copy = *this;
+        copy.ring = other;
+        return copy;
+    }
+
+    /// FEAT-SGT-022: a function the replaying thread runs at this point, with the scheduler.
+    template <typename F>
+    void Control(F&& fn) const {
+        ASSERT_MSG(ring, "FEAT-SGT-022: a control command needs a ring");
+        ring->RecordControl(std::forward<F>(fn));
+    }
+
     /// SO-001: commands recorded by a function of the command buffer (shader object binds).
     template <typename F>
     void Run(F&& fn) const {

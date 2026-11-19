@@ -1,3 +1,4 @@
+#include "ryty_gpu/native/ordered_timing.h"
 #include <exception>
 #include "ryty_gpu/native/cpu_stack_registry.h"
 #include "ryty_gpu/native/shadow.h"
@@ -90,6 +91,7 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 #include <fstream>
+#include <numeric>
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -2950,6 +2952,7 @@ static bool RecycleFrameTextures() {
 }
 
 Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bool render_target) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::MakeImage}; // DIAG-SGT-023
     constexpr u64 GuestLimit = u64{1} << 40;
     if (FaultAheadEnabled() && info.guest_size && info.guest_address < GuestLimit &&
         info.guest_size <= GuestLimit - info.guest_address) {
@@ -3828,6 +3831,7 @@ CmdBuf NativeRenderer::CmdOf(Native::Rhi::CommandList& list) const {
 }
 
 NativeRenderer::Stream& NativeRenderer::Begin() {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::Begin}; // DIAG-SGT-023
     // DLSS-GT7-001: work other than a HUD draw of the open batch runs after the batch.
     if (temporal.hud_batch_open && !temporal.display_draw_now) {
         CloseHudBatch();
@@ -4471,6 +4475,7 @@ void DiagNotePassEnd(std::source_location where) {
 #endif
 
 void NativeRenderer::GlobalBarrier([[maybe_unused]] std::source_location where) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::GlobalBarrier}; // DIAG-SGT-023
 #if !defined(NDEBUG)
     {
         std::scoped_lock lock{g_barrier_stats_mutex};
@@ -4584,6 +4589,7 @@ static bool NativeInplaceWritebackEnabled();
 static const std::vector<std::pair<VAddr, VAddr>>& NativeInplaceRanges();
 
 void NativeRenderer::WritebacksBefore(DrawBindings& b) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::WritebacksBefore}; // DIAG-SGT-023
     if (b.failed) return;
     if (b.gpu_writes.empty()) return;
     bool needs_region_writeback = false;
@@ -4739,6 +4745,7 @@ bool NativeRenderer::SendWritebacksDue() {
 }
 
 void NativeRenderer::FlushWritebacks() {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::FlushWritebacks}; // DIAG-SGT-023
     if (writebacks.empty() || !stream.list) {
         return;
     }
@@ -5135,6 +5142,7 @@ void NativeRenderer::FlushWritebacks() {
 }
 
 void NativeRenderer::PrepareImages(std::span<const Native::ImageEntry* const> bound) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::PrepareImages}; // DIAG-SGT-023
     AmdGpu::RecorderParts::Scope part{AmdGpu::RecorderParts::Part::Uploads}; // DIAG-GT7-005
     Native::SlowCallTrace<6> trace{t_timed, "prepare-images",
         {"pending-init-lock", "pending-upload-lock", "end-rendering", "initialize", "global-barrier", "uploads"}};
@@ -5481,6 +5489,7 @@ u64 RegionGrowSlack() {
 } // namespace
 
 NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool write) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::MakeRegion}; // DIAG-SGT-023
     auto* direct = r.buffer_cache.GetDirectMemory();
     // The new region takes in every region it overlaps (their GPU-written contents kept).
     VAddr begin = Common::AlignDown(address, 4096);
@@ -5653,6 +5662,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
 }
 
 void NativeRenderer::SortRegionWrites() {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::SortRegionWrites}; // DIAG-SGT-023
     if (!has_pending_region_writes.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
@@ -5832,6 +5842,7 @@ bool NativeRenderer::IsDynamic(VAddr begin, VAddr end, u64* blocked_granule, u64
 static thread_local u8 g_mirror_miss = 0;
 
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr address, u64 size) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::MirrorBuffer}; // DIAG-SGT-023
     g_mirror_miss = 0;
     static const bool enabled = [] {
         const char* env = std::getenv("SHADGT_NATIVE_MIRRORS");
@@ -5908,6 +5919,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr add
 }
 
 bool NativeRenderer::RefreshMirror(Mirror& mirror) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::RefreshMirror}; // DIAG-SGT-023
     { Native::CpuStackRegistry::Lease lease{Native::CpuStacks()};
       if (!lease.Allowed(mirror.begin, mirror.end)) return false; }
     if (mirror.dirty_pages.empty()) {
@@ -5960,6 +5972,7 @@ bool NativeRenderer::RefreshMirror(Mirror& mirror) {
 }
 
 void NativeRenderer::MakePendingMirrors() {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::MakePendingMirrors}; // DIAG-SGT-023
     if (pending_mirrors.empty() || !stream.list) {
         return;
     }
@@ -6250,6 +6263,7 @@ void NativeRenderer::MakePendingMirrors() {
 }
 
 void NativeRenderer::DropMirrors(VAddr address, u64 size, u32 diagnostic_reason) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::DropMirrors}; // DIAG-SGT-023
     for (auto it = FirstMirror(address); it != mirrors.end() && it->second.begin < address + size;) {
         if(diagnostic_reason!=~u32{0} && MirrorDiagnosticEnabled())
             NoteMirrorDiagnostic(diagnostic_reason,address,address+size,it->second.begin,it->second.end,unmap_generation.load());
@@ -6439,6 +6453,7 @@ bool NativeRenderer::PrepareRegionWritebackRange(WritebackPlan& plan,
 }
 
 void NativeRenderer::RecordRegionSnapshots(const std::shared_ptr<WritebackPlan>& owner) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::RegionPlan}; // DIAG-SGT-023
     auto& plan = *owner;
     if (plan.before.empty()) return;
     Stream& s = Begin();
@@ -6489,10 +6504,12 @@ bool NativeRenderer::RegionPlanValid(const WritebackPlan& plan) const {
 }
 
 void NativeRenderer::ValidateRegionPlan(const WritebackPlan& plan) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::RegionPlan}; // DIAG-SGT-023
     if (!RegionPlanValid(plan)) UNREACHABLE_MSG("native region changed after writeback preflight");
 }
 
 void NativeRenderer::ApplyRegionWritebackFallback(WritebackPlan& plan) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::RegionPlan}; // DIAG-SGT-023
     if (!plan.forget_pages.empty()) {
         std::scoped_lock lock{region_dirty_mutex};
         Native::ForgetWritebackPages(plan.forget_pages, [&](const auto& entry) {
@@ -6554,6 +6571,7 @@ void NativeRenderer::RecordRegionWriteback(const std::shared_ptr<WritebackPlan>&
 }
 
 void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::RefreshRegion}; // DIAG-SGT-023
     SortRegionWrites();
     auto& dirty = region.dirty_pages;
     if (dirty.empty() || size == 0) {
@@ -8164,6 +8182,7 @@ void NativeRenderer::NotePerFrameRegion(const Region& region) {
 }
 
 void NativeRenderer::DropDuePerFrameRegions() {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::PerFrameDrops}; // DIAG-SGT-023
     if (!per_frame_drop_due) {
         return;
     }
@@ -8703,6 +8722,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
 }
 
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr address, u64 size) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::SnapshotRange}; // DIAG-SGT-023
     // A snapshot of what the range holds now, in the list's upload memory (zeros where the CPU
     // can't read it: NAT-106).
     NATIVE_DIAGNOSTIC(++stats.copied_reads);
@@ -9040,6 +9060,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
 }
 
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GatherOnGpu(VAddr address, u64 size) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::GatherOnGpu}; // DIAG-SGT-023
     auto* direct = r.buffer_cache.GetDirectMemory();
     if (!direct || size > 256_MB || !direct->EnsureImported(address, size)) {
         return std::nullopt;
@@ -9475,6 +9496,7 @@ bool NativeRenderer::TargetsFromMemo(const AmdGpu::Regs& regs, const GraphicsPip
 
 bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline,
                                     Targets& out) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::Targets}; // DIAG-SGT-023
     static const bool reuse = [] {
         const char* env = std::getenv("SHADGT_NATIVE_REUSE");
         return !(env && env[0] == '0');
@@ -12694,6 +12716,7 @@ u64 BucketRange(vk::Buffer buffer, u64 offset, u64 range) {
 } // namespace
 
 void NativeRenderer::LongSetsUpkeep() {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::LongSetsUpkeep}; // DIAG-SGT-023
     if (!LongLivedSetsOn()) return;
     static thread_local std::vector<u64> dead;
     const bool some = Native::DeadHandles::Take(dead);
@@ -14392,6 +14415,7 @@ u64 NativeRenderer::WholeVersion(Native::ImageEntry& source) {
 }
 
 void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::RefreshSources}; // DIAG-SGT-023
     // NAT-111: only when one of its targets was drawn since the last time.
     const bool traced = Rasterizer::Traced(texture.info.guest_address, texture.info.guest_size);
     if (!texture.sources_dirty.exchange(false, std::memory_order_relaxed)) {
@@ -15052,6 +15076,7 @@ void NativeRenderer::DiagWrites(const Targets* targets, const DrawBindings& b) {
 }
 
 void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::NoteWrites}; // DIAG-SGT-023
     DiagWrites(targets, b);               // DIAG-178 (diagnosis)
     NoteProgramTextureWrites(targets, b); // DIAG-185 (diagnosis)
     if (WriteHistoryOn()) {
@@ -15251,6 +15276,7 @@ void NativeRenderer::YieldToMappingChanges() {
 }
 
 void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::DrawTotal}; // DIAG-SGT-023
     YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
     EnsureAheadArena(); // PERF-GTS-377
@@ -20917,6 +20943,7 @@ bool NativeRenderer::CommitPreparedVertices(PreparedDraw& p, const GraphicsPipel
                                             const AmdGpu::Regs& regs, bool is_indexed,
                                             u32 index_offset, bool quad_triangles,
                                             bool trusted) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::CommitPrepared}; // DIAG-SGT-023
     // (The ranges were checked with the bindings'.)
     const auto reject = [&] {
         NATIVE_DIAGNOSTIC(++stats.prepared_vertices_rejected);
@@ -20959,6 +20986,7 @@ bool NativeRenderer::CommitPreparedVertices(PreparedDraw& p, const GraphicsPipel
 
 bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pipeline,
                                     const AmdGpu::Regs& regs, bool trusted) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::CommitPrepared}; // DIAG-SGT-023
     Native::SlowCallTrace<8> trace{t_timed, "commit-prepared",
         {"stage-validation", "image-freshness", "sort-cpu-writes", "buffer-freshness",
          "refresh-regions", "upload-data", "image-rewrite-sources", "push-data"}};
@@ -21407,6 +21435,7 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
 }
 
 void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::ApplyRewrite}; // DIAG-SGT-023
     registry->QueueUploadForUse(entry);
     using Rewrite = Native::ImageEntry::Rewrite;
     if (entry.rewrite == Rewrite::None && !entry.stencil_clear_pending) {
@@ -21631,6 +21660,7 @@ bool NativeRenderer::MetaClearDispatch(const Shader::Info& cs) {
 }
 
 void NativeRenderer::DispatchDirect() {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::DispatchTotal}; // DIAG-SGT-023
     YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
     AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Dispatches};
@@ -22060,6 +22090,7 @@ void NativeRenderer::DispatchDirect() {
 }
 
 void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::DispatchTotal}; // DIAG-SGT-023
     YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
 #if !defined(NDEBUG)
@@ -22380,6 +22411,7 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
 }
 
 void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::FillCopyWrite}; // DIAG-SGT-023
     if (!is_gds) {
         NoteProgramTextureWrite(address, num_bytes, "fill"); // DIAG-185 (diagnosis)
         NoteHistory(address, num_bytes, 4, value);           // DIAG-187 (diagnosis)
@@ -22453,6 +22485,7 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
 }
 
 void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::FillCopyWrite}; // DIAG-SGT-023
     if (!dst_gds) {
         NoteProgramTextureWrite(dst, num_bytes, "copy"); // DIAG-185 (diagnosis)
         NoteHistory(dst, num_bytes, 5, src_gds ? 0 : src); // DIAG-187 (diagnosis)
@@ -22539,6 +22572,7 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
 }
 
 bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::FillCopyWrite}; // DIAG-SGT-023
     if (data.empty() || data.size() % 4 != 0 || data.size() > 65536 || address % 4 != 0) {
         return false;
     }
@@ -22598,6 +22632,7 @@ void NativeRenderer::CancelLinearDownloads(VAddr address, u64 size) {
 }
 
 void NativeRenderer::OnUnmap(VAddr address, u64 size) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::Mapping}; // DIAG-SGT-023
     // PERF-GTS-368: which part of an unmap waits (the guest-unmap trace has it as one phase).
     Native::SlowCallTrace<5> trace{true, "native-unmap",
         {"ui", "unwatch", "registry", "renderer-lock", "drop"}};
@@ -22704,6 +22739,7 @@ u32 NativeRenderer::DropRegionsOver(VAddr address, u64 size, u32 mirror_reason) 
 }
 
 void NativeRenderer::OnNewMapping(VAddr address, u64 size) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::Mapping}; // DIAG-SGT-023
     if (!size) return;
     mapping_waiters.fetch_add(1, std::memory_order_acq_rel); // PERF-GTS-368
     std::scoped_lock lock{mutex};
@@ -23926,6 +23962,7 @@ u32 NativeRenderer::ReadGds(u32 gds_offset) {
 }
 
 void NativeRenderer::Splice() {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::Splice}; // DIAG-SGT-023
     std::scoped_lock lock{mutex};
     AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Splices};
     Stream& s = stream;
@@ -24183,6 +24220,7 @@ const Native::ImageEntry* NativeRenderer::CropDisplay(const Native::ImageEntry& 
 std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCore::ImageInfo& info,
                                                                    vk::Format view_format,
                                                                    vk::Extent2D output_size) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::FindDisplay}; // DIAG-SGT-023
     std::scoped_lock lock{mutex};
     (void)A82CaptureAfterRace(); // Observe race even when target shader does not run.
     if (InPlaceSampled()) {
@@ -25152,7 +25190,76 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
 
 u32* DiagLdsReadCounters(); // vk_pipeline_cache.cpp
 
+// DIAG-SGT-023 (SHADGT_DIAG_ORDERED_FRACTION=1): every 5 s, the recorder's time per presented
+// frame split into what a two-thread recorder could run on both threads (parallel), what must
+// take turns in draw order (ordered), what needs both threads drained (barrier) and what could go
+// either way with more work (uncertain), with the sites that took the most.
+static void ReportOrderedFraction(u64 frame) {
+    namespace OT = Native::OrderedTiming;
+    if (!OT::Enabled()) {
+        return;
+    }
+    using clock = std::chrono::steady_clock;
+    static thread_local bool started = false;
+    static thread_local u64 last_frame = 0;
+    static thread_local u64 last_ticks = 0;
+    static thread_local clock::time_point last_time{};
+    const auto now = clock::now();
+    if (!started) {
+        started = true;
+        last_frame = frame;
+        last_ticks = OT::Ticks();
+        last_time = now;
+        OT::Local() = {};
+        return;
+    }
+    if (now - last_time < std::chrono::seconds{5}) {
+        return;
+    }
+    const u64 ticks = OT::Ticks();
+    const double ns_per_tick =
+        double(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last_time).count()) /
+        double(std::max<u64>(1, ticks - last_ticks));
+    const double frames = double(std::max<u64>(1, frame - last_frame));
+    OT::Totals& t = OT::Local();
+    const auto ms = [&](u64 value) { return double(value) * ns_per_tick / 1e6 / frames; };
+    const u64 parallel = t.kind[size_t(OT::Kind::Parallel)];
+    const u64 uncertain = t.kind[size_t(OT::Kind::Uncertain)];
+    const u64 ordered = t.kind[size_t(OT::Kind::Ordered)];
+    const u64 barrier = t.kind[size_t(OT::Kind::Barrier)];
+    const double all = double(std::max<u64>(1, parallel + uncertain + ordered + barrier));
+    std::array<u32, OT::SiteCount> order{};
+    std::iota(order.begin(), order.end(), 0u);
+    std::ranges::sort(order, [&](u32 a, u32 b) { return t.site[a] > t.site[b]; });
+    std::string top;
+    u32 listed = 0;
+    for (const u32 site : order) {
+        if (listed == 10 || t.site[site] == 0) {
+            break;
+        }
+        if (site == OT::DrawTotal || site == OT::DispatchTotal) {
+            continue;
+        }
+        top += fmt::format(" {} {:.2f};", OT::kName[site], ms(t.site[site]));
+        ++listed;
+    }
+    LOG_INFO(Render_Vulkan,
+             "DIAG-SGT-023: {:.0f} frames, {:.0f} draws and {:.0f} dispatches a frame; recorder ms a "
+             "frame {:.2f} = parallel {:.2f} + uncertain {:.2f} + ordered {:.2f} + barrier {:.2f}; "
+             "ordered {:.1f}%, ordered and barrier {:.1f}%, with uncertain {:.1f}%; draw and "
+             "dispatch time outside tagged sites {:.2f} ms; largest tagged sites (ms a frame):{}",
+             frames, double(t.draws) / frames, double(t.dispatches) / frames,
+             ms(parallel + uncertain + ordered + barrier), ms(parallel), ms(uncertain), ms(ordered),
+             ms(barrier), 100.0 * double(ordered) / all, 100.0 * double(ordered + barrier) / all,
+             100.0 * double(ordered + barrier + uncertain) / all, ms(parallel), top);
+    t = {};
+    last_frame = frame;
+    last_ticks = ticks;
+    last_time = now;
+}
+
 void NativeRenderer::Report() {
+    ReportOrderedFraction(frame); // DIAG-SGT-023
     if (u32* counters = DiagLdsReadCounters()) {
         // DIAG-GTS-459: every 10 s, each hull shader slot's emulated LDS reads and how many of
         // them read past the patch's own control points (the writer pass serves only those).

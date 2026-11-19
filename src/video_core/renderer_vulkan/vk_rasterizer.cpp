@@ -1,3 +1,4 @@
+#include "ryty_gpu/native/ordered_timing.h"
 #include "common/debug_environment.h"
 #include "common/game_title.h"
 #include "common/geometry_trace.h"
@@ -459,6 +460,7 @@ Rasterizer::SelectedPipelinePtr Rasterizer::SelectComputePipelineAhead() {
 }
 
 const ComputePipeline* Rasterizer::AcquireComputePipeline() {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::PipelineLookup}; // DIAG-SGT-023
     if (SelectsPipelinesAhead() && selected_pipeline && selected_pipeline->is_compute) {
         const auto* pipeline = selected_pipeline->compute;
         if (!pipeline) {
@@ -1288,6 +1290,7 @@ void Rasterizer::CountSharedLookups() {
 const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectParams& params,
                                                             bool selected_allowed,
                                                             std::shared_ptr<const void>* owner) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::PipelineLookup}; // DIAG-SGT-023
     if (owner) owner->reset();
     if (!SelectsPipelinesAhead()) {
         // A cached pipeline may still point at a per-race shadow. Reinstall a

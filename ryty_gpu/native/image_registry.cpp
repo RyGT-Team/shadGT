@@ -1,3 +1,4 @@
+#include "ryty_gpu/native/ordered_timing.h"
 #include <cstdio>
 namespace Vulkan {
 bool RytyWideScene(); // WIDE-001 (ryty_game_patch.cpp)
@@ -275,6 +276,7 @@ ImageRegistry::~ImageRegistry() = default;
 
 ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_target, u64 frame,
                                 bool create, bool exact_format) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::RegistryFind}; // DIAG-SGT-023
     const bool require_format = exact_format || (render_target && info.num_samples > 1);
 #ifndef NDEBUG
     ++stats.lookups;

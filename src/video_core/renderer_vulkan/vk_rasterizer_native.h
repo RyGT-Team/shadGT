@@ -13,6 +13,8 @@
 
 #pragma once
 #include "video_core/renderer_vulkan/pipeline_owner.h"
+#include "common/fast_hash.h"
+#include <tsl/robin_map.h>
 
 #include <array>
 #include <atomic>
@@ -1727,7 +1729,9 @@ private:
     std::shared_mutex buffer_map_mutex;
     struct PreparedShard {
         std::mutex mutex;
-        std::unordered_map<const void*, PreparedDraw*> draws;
+        /// PERF-SGT-034: a flat map (the node map's find and erase were about 2.5% of the GT7
+        /// recorder with prepared draws, the command thread looks each draw up too).
+        tsl::robin_map<const void*, PreparedDraw*, Common::PointerHash> draws;
     };
     std::array<PreparedShard, 64> prepared_shards;
     /// FIX-GTS-492: the command memory the game took back at the last end-of-pipe interrupts.

@@ -19842,16 +19842,17 @@ void NativeRenderer::RetirePreparedDraws(std::vector<Native::CommandRange>& rang
     u64 aged = 0;
     for (PreparedShard& shard : prepared_shards) {
         std::scoped_lock lock{shard.mutex};
-        std::erase_if(shard.draws, [&](const auto& entry) {
+        for (auto it = shard.draws.begin(); it != shard.draws.end();) {
             const bool retired =
-                Native::InCommandRanges(ranges, reinterpret_cast<u64>(entry.first));
-            if (!retired && !Native::PreparedDrawTooOld(entry.second->epoch, now)) {
-                return false;
+                Native::InCommandRanges(ranges, reinterpret_cast<u64>(it->first));
+            if (!retired && !Native::PreparedDrawTooOld(it->second->epoch, now)) {
+                ++it;
+                continue;
             }
             aged += !retired;
-            dropped.push_back(entry.second);
-            return true;
-        });
+            dropped.push_back(it->second);
+            it = shard.draws.erase(it);
+        }
     }
     prepared_retired.fetch_add(dropped.size() - aged, std::memory_order_relaxed);
     prepared_aged.fetch_add(aged, std::memory_order_relaxed);
@@ -19916,7 +19917,7 @@ bool NativeRenderer::HasPrepared(const void* packet) {
     }
     PreparedShard& shard = ShardFor(packet);
     std::scoped_lock lock{shard.mutex};
-    return shard.draws.contains(packet);
+    return shard.draws.count(packet) != 0;
 }
 
 const GraphicsPipeline* NativeRenderer::InstallPrepared(PreparedDraw& p) {
@@ -20388,7 +20389,7 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
                     refused = true; // FIX-GTS-492: never over one made for a later submission
                 } else {
                     dropped.push_back(it->second);
-                    it->second = p;
+                    it.value() = p;
                     prepared_replaced.fetch_add(1, std::memory_order_relaxed); // FIX-GTS-492
                     NATIVE_DIAGNOSTIC(++prepare_stats.replaced);
                 }

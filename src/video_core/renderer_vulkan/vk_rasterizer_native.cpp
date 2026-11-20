@@ -5512,16 +5512,32 @@ bool NativeRenderer::NothingToRead(const VideoCore::ImageInfo& info) {
     return !drawn;
 }
 
-NativeRenderer::Region* NativeRenderer::RegionOver(VAddr address, u64 size) {
-    auto it = regions.upper_bound(address);
-    if (it != regions.begin()) {
-        Region& region = std::prev(it)->second;
-        if (address < region.end) {
-            return &region;
-        }
+// PERF-SGT-046: RegionOver searched the region tree, about 8 scattered nodes deep with GT7's ~230
+// regions, and a buffer binding asks it up to four times: 3-4% of GT7's recorder in Pro mode
+// (Tokyo, nsys, 20-11). It now searches flat sorted copies of the regions' bounds, a few KB that
+// stay in cache, rebuilt after each change of the map (0-18 a 10 s in a race).
+void NativeRenderer::RebuildRegionIndex() {
+    region_begins.clear();
+    region_ends.clear();
+    region_ptrs.clear();
+    region_begins.reserve(regions.size());
+    region_ends.reserve(regions.size());
+    region_ptrs.reserve(regions.size());
+    for (auto& [begin, region] : regions) {
+        region_begins.push_back(region.begin);
+        region_ends.push_back(region.end);
+        region_ptrs.push_back(&region);
     }
-    if (it != regions.end() && it->second.begin < address + size) {
-        return &it->second;
+}
+
+NativeRenderer::Region* NativeRenderer::RegionOver(VAddr address, u64 size) {
+    const size_t i = size_t(std::upper_bound(region_begins.begin(), region_begins.end(), address) -
+                            region_begins.begin());
+    if (i != 0 && address < region_ends[i - 1]) {
+        return region_ptrs[i - 1];
+    }
+    if (i != region_begins.size() && region_begins[i] < address + size) {
+        return region_ptrs[i];
     }
     return nullptr;
 }
@@ -5610,6 +5626,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
                 ++regions_taken_in;
         }, RegionGrowSlack());
         NoteOwnedMapChange(); // PERF-GT7-133: regions may have been taken out
+        RebuildRegionIndex(); // PERF-SGT-046
         if (action == Native::RegionMergeDisposition::Preserve) return nullptr;
     }
     ++buffer_generation; // OPT-003: regions are taken in or made
@@ -5708,6 +5725,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
     std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
     NoteOwnedMapChange(); // PERF-GT7-133
     auto [it, inserted] = regions.emplace(begin, std::move(region));
+    RebuildRegionIndex(); // PERF-SGT-046
     return &it->second;
 }
 
@@ -5805,6 +5823,7 @@ void NativeRenderer::SortRegionWrites() {
                 std::unique_lock map_lock{buffer_map_mutex};
                 NoteOwnedMapChange(); // PERF-GT7-133
                 it = mirrors.erase(it); // freed once the GPU is done with it
+                RebuildMirrorIndex(); // PERF-SGT-046
                 continue;
             }
             for (VAddr page = from; page < to; page += 4096) {
@@ -5834,13 +5853,31 @@ std::map<VAddr, NativeRenderer::Mirror>::iterator NativeRenderer::FirstMirror(VA
     return it;
 }
 
+// PERF-SGT-046: as RegionOver, a search of flat sorted copies of the mirrors' bounds instead of
+// their tree (1.2-2.4% of GT7's recorder in Pro mode, 20-11).
+void NativeRenderer::RebuildMirrorIndex() {
+    mirror_begins.clear();
+    mirror_ends.clear();
+    mirror_ptrs.clear();
+    mirror_begins.reserve(mirrors.size());
+    mirror_ends.reserve(mirrors.size());
+    mirror_ptrs.reserve(mirrors.size());
+    for (auto& [begin, mirror] : mirrors) {
+        mirror_begins.push_back(mirror.begin);
+        mirror_ends.push_back(mirror.end);
+        mirror_ptrs.push_back(&mirror);
+    }
+}
+
 NativeRenderer::Mirror* NativeRenderer::MirrorHolding(VAddr address, u64 size) {
-    auto it = mirrors.upper_bound(address);
-    if (it == mirrors.begin()) {
+    const size_t i = size_t(std::upper_bound(mirror_begins.begin(), mirror_begins.end(), address) -
+                            mirror_begins.begin());
+    if (i == 0) {
         return nullptr;
     }
-    Mirror& mirror = std::prev(it)->second;
-    return address >= mirror.begin && address + size <= mirror.end ? &mirror : nullptr;
+    return address >= mirror_begins[i - 1] && address + size <= mirror_ends[i - 1]
+               ? mirror_ptrs[i - 1]
+               : nullptr;
 }
 
 void NativeRenderer::NoteMirrorDiagnostic(u32 reason,u64 requested_begin,u64 requested_end,
@@ -6220,6 +6257,7 @@ void NativeRenderer::MakePendingMirrors() {
                     ++it;
                 }
             }
+            RebuildMirrorIndex(); // PERF-SGT-046
         }
         if (mirror_bytes - taken + (end - begin) > budget) {
             NATIVE_DIAGNOSTIC(++stats.mirror_over_budget);
@@ -6291,6 +6329,7 @@ void NativeRenderer::MakePendingMirrors() {
                 NoteOwnedMapChange(); // PERF-GT7-133
                 it = mirrors.erase(it); // freed once the GPU is done with it
             }
+            RebuildMirrorIndex(); // PERF-SGT-046
         }
         buffer_log.Note(begin, end, true); // OPT-010 (PERF-GTS-405: with the mirrors it took in)
         // Copy commands were recorded under the source-view guard above;
@@ -6313,6 +6352,7 @@ void NativeRenderer::MakePendingMirrors() {
                                       .buffer = std::move(buffer),
                                       .dirty_pages = {},
                                       .used_frame = frame});
+        RebuildMirrorIndex(); // PERF-SGT-046
         copied = true;
     }
     if (copied) {
@@ -6332,6 +6372,7 @@ void NativeRenderer::DropMirrors(VAddr address, u64 size, u32 diagnostic_reason)
         std::unique_lock map_lock{buffer_map_mutex};
         NoteOwnedMapChange(); // PERF-GT7-133
         it = mirrors.erase(it); // freed once the GPU is done with it
+        RebuildMirrorIndex(); // PERF-SGT-046
     }
 }
 
@@ -23017,6 +23058,7 @@ u32 NativeRenderer::DropRegionsOver(VAddr address, u64 size, u32 mirror_reason) 
                 ++it;
             }
         }
+        if (dropped != 0) RebuildRegionIndex(); // PERF-SGT-046
     }
     const size_t mirrors_before = mirrors.size();
     DropMirrors(address, size, mirror_reason); // NAT-150

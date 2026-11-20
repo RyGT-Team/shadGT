@@ -439,9 +439,25 @@ s32 PS4_SYSV_ABI sceHttp2DeleteTemplate(s32 tmpl) {
 } // namespace Libraries::Http2
 
 namespace Libraries::Np::NpTrophy {
-void AddTrophyToQueue(const std::filesystem::path&, const std::string& trophyName,
+void AddTrophyToQueue(const std::filesystem::path& trophyIconPath, const std::string& trophyName,
                       const std::string_view& rarity) {
     LOG_INFO(Lib_NpTrophy, "Trophy unlocked: {} ({})", trophyName, rarity);
+    using ToastFn = void (*)(const char*, const char*, char);
+    static const ToastFn toast = [] {
+        HMODULE renderer = GetModuleHandleA("libSceVideoOut.prx");
+        const auto fn = renderer ? reinterpret_cast<ToastFn>(
+                                       GetProcAddress(renderer, "RytyTrophyToast"))
+                                 : nullptr;
+        if (!fn) {
+            LOG_WARNING(Lib_NpTrophy, "FEAT-GT7-186: the renderer has no RytyTrophyToast; no pop-up");
+        }
+        return fn;
+    }();
+    if (toast) {
+        const auto icon = trophyIconPath.u8string();
+        const std::string icon_utf8(icon.begin(), icon.end());
+        toast(trophyName.c_str(), icon_utf8.c_str(), rarity.empty() ? 'B' : rarity[0]);
+    }
 }
 } // namespace Libraries::Np::NpTrophy
 

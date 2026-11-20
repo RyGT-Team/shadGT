@@ -23,6 +23,8 @@
 #include <fstream>
 #include <mutex>
 #include <span>
+#include <tsl/robin_map.h>
+#include "common/fast_hash.h"
 #include <string>
 #include <unordered_map>
 
@@ -175,7 +177,9 @@ inline void NoteBind(u64 hash, std::span<const std::array<u32, 4>> entries,
         u64 reported_binds{};
         u64 reported_in_place{};
     };
-    thread_local std::unordered_map<u64, Local> local;
+    // PERF-SGT-033: a flat map with the shader hash as its own hash (it is one already); the
+    // node map's lookup was 1.2% of the GT7 recorder, once per bind of a direct-table shader.
+    thread_local tsl::robin_map<u64, Local, Common::IdentityHash> local;
     auto& mine = local[hash];
     ++mine.binds;
     const u32 count = static_cast<u32>(std::min<size_t>(entries.size(), MaxSlots));

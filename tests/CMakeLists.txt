@@ -32,6 +32,13 @@ target_compile_definitions(shadps4_push_data_layout_test PRIVATE NOMINMAX)
 target_link_libraries(shadps4_push_data_layout_test PRIVATE GTest::gtest_main fmt::fmt Boost::headers Vulkan::Headers)
 gtest_discover_tests(shadps4_push_data_layout_test)
 
+add_executable(shadgt_readback_pixels_test test_readback_pixels.cpp
+    ${CMAKE_SOURCE_DIR}/src/video_core/renderer_vulkan/readback_pixels.cpp)
+target_include_directories(shadgt_readback_pixels_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadgt_readback_pixels_test PRIVATE cxx_std_23)
+target_link_libraries(shadgt_readback_pixels_test PRIVATE GTest::gtest_main Vulkan::Headers)
+gtest_discover_tests(shadgt_readback_pixels_test)
+
 add_executable(shadps4_linear_image_download_test test_linear_image_download.cpp)
 target_include_directories(shadps4_linear_image_download_test PRIVATE ${CMAKE_SOURCE_DIR})
 target_compile_features(shadps4_linear_image_download_test PRIVATE cxx_std_23)

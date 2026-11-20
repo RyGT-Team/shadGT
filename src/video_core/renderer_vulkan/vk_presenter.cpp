@@ -24,6 +24,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/readback_pixels.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_ui_hires.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -479,64 +480,12 @@ static std::vector<std::filesystem::path> BuildScreenshotPaths(const ScreenshotK
     return paths;
 }
 
-static float PqToNits(const float encoded) {
-    // ST.2084 inverse EOTF
-    constexpr float m1 = 2610.0f / 16384.0f;
-    constexpr float m2 = 2523.0f / 32.0f;
-    constexpr float c1 = 3424.0f / 4096.0f;
-    constexpr float c2 = 2413.0f / 128.0f;
-    constexpr float c3 = 2392.0f / 128.0f;
-
-    const float v = std::clamp(encoded, 0.0f, 1.0f);
-    const float vp = std::pow(v, 1.0f / m2);
-    const float num = std::max(vp - c1, 0.0f);
-    const float den = std::max(c2 - c3 * vp, 1e-6f);
-    return 10000.0f * std::pow(num / den, 1.0f / m1);
-}
-
-static float ToneMapToSdrLinear(const float nits) {
-    // Map absolute HDR luminance into SDR [0,1], preserving 100-nit white.
-    constexpr float sdr_white_nits = 100.0f;
-    const float x = std::max(nits, 0.0f) / sdr_white_nits;
-    const float mapped = (2.0f * x) / (1.0f + x);
-    return std::clamp(mapped, 0.0f, 1.0f);
-}
-
-static float LinearToSrgb(const float linear) {
-    const float x = std::clamp(linear, 0.0f, 1.0f);
-    if (x <= 0.0031308f) {
-        return 12.92f * x;
-    }
-    return 1.055f * std::pow(x, 1.0f / 2.4f) - 0.055f;
-}
-
-static const std::array<float, 1024>& GetPqDecodeNitsLut() {
-    static const std::array<float, 1024> lut = [] {
-        std::array<float, 1024> values{};
-        for (size_t i = 0; i < values.size(); ++i) {
-            values[i] = PqToNits(static_cast<float>(i) / 1023.0f);
-        }
-        return values;
-    }();
-    return lut;
-}
-
-static const std::array<u8, 1024>& GetUnorm10ToU8Lut() {
-    static const std::array<u8, 1024> lut = [] {
-        std::array<u8, 1024> values{};
-        for (size_t i = 0; i < values.size(); ++i) {
-            values[i] = static_cast<u8>((i * 255u + 511u) / 1023u);
-        }
-        return values;
-    }();
-    return lut;
-}
-
 #ifdef RYTY_GPU
 // GTS-015, ryty_gpu/gts_replay_video.cpp
 extern "C" bool RytyReplayVideoWanted();
 extern "C" int RytyVideoExportState(int* seconds); // GTS-019
-extern "C" void RytyReplayVideoFrame(const u8* rgba, u32 width, u32 height);
+extern "C" void RytyReplayVideoFrame(const u8* pixels, u32 width, u32 height, vk::Format format,
+                                     bool hdr_encoded);
 #endif
 
 static void CopyImageToReadback(const vk::CommandBuffer& cmdbuf, const vk::Image image,
@@ -571,107 +520,12 @@ static bool ConvertReadbackToRgba8(const ScreenshotReadback& readback, std::vect
         std::span<const u8>{readback.buffer.mapped_data.data(), static_cast<size_t>(byte_size)};
     out_rgba.resize(static_cast<size_t>(byte_size));
 
-    switch (readback.format) {
-    case vk::Format::eR8G8B8A8Unorm:
-    case vk::Format::eR8G8B8A8Srgb:
-        std::memcpy(out_rgba.data(), src.data(), out_rgba.size());
-        for (u64 i = 0; i < pixel_count; ++i) {
-            out_rgba[static_cast<size_t>(i) * 4 + 3] = 255;
-        }
-        return true;
-    case vk::Format::eB8G8R8A8Unorm:
-    case vk::Format::eB8G8R8A8Srgb:
-        for (u64 i = 0; i < pixel_count; ++i) {
-            const size_t o = static_cast<size_t>(i) * 4;
-            out_rgba[o + 0] = src[o + 2];
-            out_rgba[o + 1] = src[o + 1];
-            out_rgba[o + 2] = src[o + 0];
-            out_rgba[o + 3] = 255;
-        }
-        return true;
-    case vk::Format::eA2R10G10B10UnormPack32: {
-        const auto& pq_decode_lut = GetPqDecodeNitsLut();
-        const auto& unorm10_to_u8 = GetUnorm10ToU8Lut();
-
-        for (u64 i = 0; i < pixel_count; ++i) {
-            const size_t o = static_cast<size_t>(i) * 4;
-            const u32 packed = static_cast<u32>(src[o + 0]) | (static_cast<u32>(src[o + 1]) << 8) |
-                               (static_cast<u32>(src[o + 2]) << 16) |
-                               (static_cast<u32>(src[o + 3]) << 24);
-            const u32 b = (packed >> 0) & 0x3FF;
-            const u32 g = (packed >> 10) & 0x3FF;
-            const u32 r = (packed >> 20) & 0x3FF;
-
-            if (readback.hdr_encoded) {
-                // Rec.2020 + PQ. Convert to SDR Rec.709 for PNG output.
-                const float r2020 = pq_decode_lut[r];
-                const float g2020 = pq_decode_lut[g];
-                const float b2020 = pq_decode_lut[b];
-
-                const float r709_nits = 1.6605f * r2020 - 0.5876f * g2020 - 0.0728f * b2020;
-                const float g709_nits = -0.1246f * r2020 + 1.1329f * g2020 - 0.0083f * b2020;
-                const float b709_nits = -0.0182f * r2020 - 0.1006f * g2020 + 1.1187f * b2020;
-
-                const float r_srgb = LinearToSrgb(ToneMapToSdrLinear(r709_nits));
-                const float g_srgb = LinearToSrgb(ToneMapToSdrLinear(g709_nits));
-                const float b_srgb = LinearToSrgb(ToneMapToSdrLinear(b709_nits));
-
-                out_rgba[o + 0] = static_cast<u8>(std::clamp(r_srgb, 0.0f, 1.0f) * 255.0f + 0.5f);
-                out_rgba[o + 1] = static_cast<u8>(std::clamp(g_srgb, 0.0f, 1.0f) * 255.0f + 0.5f);
-                out_rgba[o + 2] = static_cast<u8>(std::clamp(b_srgb, 0.0f, 1.0f) * 255.0f + 0.5f);
-            } else {
-                out_rgba[o + 0] = unorm10_to_u8[r];
-                out_rgba[o + 1] = unorm10_to_u8[g];
-                out_rgba[o + 2] = unorm10_to_u8[b];
-            }
-            out_rgba[o + 3] = 255;
-        }
-        return true;
-    }
-    case vk::Format::eA2B10G10R10UnormPack32: {
-        const auto& pq_decode_lut = GetPqDecodeNitsLut();
-        const auto& unorm10_to_u8 = GetUnorm10ToU8Lut();
-
-        for (u64 i = 0; i < pixel_count; ++i) {
-            const size_t o = static_cast<size_t>(i) * 4;
-            const u32 packed = static_cast<u32>(src[o + 0]) | (static_cast<u32>(src[o + 1]) << 8) |
-                               (static_cast<u32>(src[o + 2]) << 16) |
-                               (static_cast<u32>(src[o + 3]) << 24);
-            const u32 r = (packed >> 0) & 0x3FF;
-            const u32 g = (packed >> 10) & 0x3FF;
-            const u32 b = (packed >> 20) & 0x3FF;
-
-            if (readback.hdr_encoded) {
-                // HDR swapchain path is Rec.2020 + PQ. Convert to SDR Rec.709 for PNG output.
-                const float r2020 = pq_decode_lut[r];
-                const float g2020 = pq_decode_lut[g];
-                const float b2020 = pq_decode_lut[b];
-
-                const float r709_nits = 1.6605f * r2020 - 0.5876f * g2020 - 0.0728f * b2020;
-                const float g709_nits = -0.1246f * r2020 + 1.1329f * g2020 - 0.0083f * b2020;
-                const float b709_nits = -0.0182f * r2020 - 0.1006f * g2020 + 1.1187f * b2020;
-
-                const float r_srgb = LinearToSrgb(ToneMapToSdrLinear(r709_nits));
-                const float g_srgb = LinearToSrgb(ToneMapToSdrLinear(g709_nits));
-                const float b_srgb = LinearToSrgb(ToneMapToSdrLinear(b709_nits));
-
-                out_rgba[o + 0] = static_cast<u8>(std::clamp(r_srgb, 0.0f, 1.0f) * 255.0f + 0.5f);
-                out_rgba[o + 1] = static_cast<u8>(std::clamp(g_srgb, 0.0f, 1.0f) * 255.0f + 0.5f);
-                out_rgba[o + 2] = static_cast<u8>(std::clamp(b_srgb, 0.0f, 1.0f) * 255.0f + 0.5f);
-            } else {
-                out_rgba[o + 0] = unorm10_to_u8[r];
-                out_rgba[o + 1] = unorm10_to_u8[g];
-                out_rgba[o + 2] = unorm10_to_u8[b];
-            }
-            out_rgba[o + 3] = 255;
-        }
-        return true;
-    }
-    default:
-        LOG_WARNING(Render_Vulkan, "Unsupported screenshot format: {}",
-                    vk::to_string(readback.format));
+    if (!ConvertReadbackPixels(src, out_rgba, readback.format, readback.hdr_encoded,
+                               ReadbackOrder::Rgba)) {
+        LOG_WARNING(Render_Vulkan, "Unsupported screenshot format: {}", vk::to_string(readback.format));
         return false;
     }
+    return true;
 }
 
 static bool WritePng(const std::filesystem::path& path, const std::span<const u8> rgba,
@@ -2174,9 +2028,10 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
         // GTS-015: while a replay plays, each new game frame is copied for the replay video.
         if (RytyReplayVideoWanted() && is_game_frame && !is_reusing_frame &&
             !Libraries::SystemService::IsSplashVisible() && frame->width != 0 && frame->height != 0) {
+            // FIX-SGT-057: capture the packing and transfer of this frame, including across an HDR switch.
             auto& readback = video_readback.emplace(
                 instance, ScreenshotKind::WithOverlays, std::vector<std::filesystem::path>{},
-                frame->width, frame->height, swapchain.GetSurfaceFormat().format, swapchain.GetHDR());
+                frame->width, frame->height, frame->image_view_format, frame->is_hdr);
             const vk::ImageSubresourceRange whole{
                 .aspectMask = vk::ImageAspectFlagBits::eColor,
                 .baseMipLevel = 0,
@@ -2198,6 +2053,15 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
             cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
                                    vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, before_copy);
             CopyImageToReadback(cmdbuf, frame->image, vk::ImageLayout::eGeneral, readback);
+            const vk::BufferMemoryBarrier to_host{
+                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                .dstAccessMask = vk::AccessFlagBits::eHostRead,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .buffer = readback.buffer.Handle(),
+                .offset = 0,
+                .size = VK_WHOLE_SIZE,
+            };
             const vk::ImageMemoryBarrier after_copy{
                 .srcAccessMask = vk::AccessFlagBits::eTransferRead,
                 .dstAccessMask = vk::AccessFlagBits::eNone,
@@ -2209,7 +2073,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
                 .subresourceRange = whole,
             };
             cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                                   vk::PipelineStageFlagBits::eAllCommands, {}, {}, {}, after_copy);
+                                   vk::PipelineStageFlagBits::eAllCommands |
+                                       vk::PipelineStageFlagBits::eHost,
+                                   {}, {}, to_host, after_copy);
         }
 #endif
         bool swapchain_copied_for_screenshot = false;
@@ -2372,11 +2238,17 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
 
 #ifdef RYTY_GPU
     if (video_readback) {
-        scheduler.DeferPriorityOperation([readback = std::move(video_readback)]() {
-            std::vector<u8> rgba;
-            if (ConvertReadbackToRgba8(readback.value(), rgba)) {
-                RytyReplayVideoFrame(rgba.data(), readback->width, readback->height);
+        scheduler.DeferPriorityOperation([readback = std::move(video_readback)]() mutable {
+            const auto& pixels = readback->buffer.mapped_data;
+            const u64 byte_size = u64{readback->width} * readback->height * 4;
+            if (pixels.size() < byte_size) {
+                LOG_ERROR(Render_Vulkan, "Replay readback buffer too small (have {}, need {})",
+                          pixels.size(), byte_size);
+                return;
             }
+            readback->buffer.Invalidate(0, byte_size);
+            RytyReplayVideoFrame(pixels.data(), readback->width, readback->height,
+                                 readback->format, readback->hdr_encoded);
         });
     }
 #endif

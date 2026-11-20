@@ -49,15 +49,29 @@
 #include <vector>
 
 #include "common/types.h"
+#include "video_core/renderer_vulkan/readback_pixels.h"
 
 namespace {
 
 struct VideoFrame {
-    std::vector<u8> bgra;
+    std::vector<u8> pixels;
+    vk::Format format{};
+    bool hdr_encoded{};
     u32 width{};
     u32 height{};
     LONGLONG time{}; // 100 ns, steady clock
 };
+
+// FIX-SGT-057: convert on the encoding thread, once for both the clip and the saved replay.
+bool PrepareEncoderPixels(VideoFrame& frame) {
+    if (Vulkan::ConvertReadbackPixels(frame.pixels, frame.pixels, frame.format, frame.hdr_encoded,
+                                      Vulkan::ReadbackOrder::Bgra)) {
+        return true;
+    }
+    std::fprintf(stderr, "[patch] GTS-015: unsupported replay frame format %d\n",
+                 static_cast<int>(frame.format));
+    return false;
+}
 
 // The game's sound: 48 kHz 16-bit stereo PCM from Windows' process loopback (only this process,
 // not the other programs on the PC), stored as AAC.
@@ -221,7 +235,7 @@ public:
         buffer->Lock(&data, nullptr, nullptr);
         for (u32 y = 0; y < height; ++y) {
             std::memcpy(data + static_cast<size_t>(y) * width * 4,
-                        frame.bgra.data() + static_cast<size_t>(y) * frame.width * 4, width * 4);
+                        frame.pixels.data() + static_cast<size_t>(y) * frame.width * 4, width * 4);
         }
         buffer->Unlock();
         buffer->SetCurrentLength(size);
@@ -633,7 +647,7 @@ void Worker() {
         }
         const u32 width = frame.width & ~1u; // H.264 wants even sizes
         const u32 height = frame.height & ~1u;
-        if (width >= 16 && height >= 16) {
+        if (width >= 16 && height >= 16 && PrepareEncoderPixels(frame)) {
             if (!clip_folder.empty()) {
                 if (piece.IsOpen() &&
                     (piece.width != width || piece.height != height || frame.time - piece_start >= SegmentLength)) {
@@ -667,7 +681,7 @@ void Worker() {
         }
         std::scoped_lock lock{g_mutex};
         if (g_spare.size() < MaxQueuedFrames) {
-            g_spare.push_back(std::move(frame.bgra));
+            g_spare.push_back(std::move(frame.pixels));
         }
     }
 }
@@ -787,8 +801,9 @@ extern "C" int RytyVideoExportState(int* seconds) {
     return 0;
 }
 
-// From the presenter, once the copy of a new game frame is done. `rgba` is width*height RGBA8.
-extern "C" void RytyReplayVideoFrame(const u8* rgba, u32 width, u32 height) {
+// The GPU completion callback only copies the mapped pixels before the readback is released.
+extern "C" void RytyReplayVideoFrame(const u8* pixels, u32 width, u32 height, vk::Format format,
+                                     bool hdr_encoded) {
     if (!Enabled()) {
         return;
     }
@@ -806,18 +821,14 @@ extern "C" void RytyReplayVideoFrame(const u8* rgba, u32 width, u32 height) {
     }
     VideoFrame frame;
     if (!g_spare.empty()) {
-        frame.bgra = std::move(g_spare.back());
+        frame.pixels = std::move(g_spare.back());
         g_spare.pop_back();
     }
     lock.unlock();
-    const size_t pixels = static_cast<size_t>(width) * height;
-    frame.bgra.resize(pixels * 4);
-    for (size_t i = 0; i < pixels; ++i) { // RGBA -> BGRA
-        frame.bgra[i * 4 + 0] = rgba[i * 4 + 2];
-        frame.bgra[i * 4 + 1] = rgba[i * 4 + 1];
-        frame.bgra[i * 4 + 2] = rgba[i * 4 + 0];
-        frame.bgra[i * 4 + 3] = 255;
-    }
+    const size_t byte_size = static_cast<size_t>(width) * height * 4;
+    frame.pixels.assign(pixels, pixels + byte_size);
+    frame.format = format;
+    frame.hdr_encoded = hdr_encoded;
     frame.width = width;
     frame.height = height;
     frame.time = Now();

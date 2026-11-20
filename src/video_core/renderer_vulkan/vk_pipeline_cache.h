@@ -5,6 +5,8 @@
 #include "video_core/renderer_vulkan/shader_fix_scan_cache.h"
 
 #include <atomic>
+#include <cstdlib>
+#include <immintrin.h>
 #include <shared_mutex>
 #include <thread>
 
@@ -120,11 +122,19 @@ bool CompilationInProgress();
 /// NAT-031: the pipeline cache's lookup lock. The command and recorder threads take it
 /// exclusively (as before); game job threads looking pipelines up take it shared, and step aside
 /// while one of the threads above waits for it.
+///
+/// PERF-SGT-030 (SHADGT_LOOKUP_SPIN=0: as before): both sides spin a little before they sleep.
+/// With prepared draws on in GT7, the prepare workers' shared holds made the command thread block
+/// on this lock about 7,600 times a second (3.6 us on average) and wait about as long again to
+/// run once woken; the workers spent a tenth of their time in yield. A hold is a few
+/// microseconds, so a bounded spin (about 20 us) takes the lock without the sleep and the wake.
 class LookupLock {
 public:
     void lock() {
         writers_waiting.fetch_add(1, std::memory_order_acq_rel);
-        mutex.lock();
+        if (!SpinFor([this] { return mutex.try_lock(); })) {
+            mutex.lock();
+        }
         writers_waiting.fetch_sub(1, std::memory_order_acq_rel);
     }
     bool try_lock() {
@@ -134,16 +144,54 @@ public:
         mutex.unlock();
     }
     void lock_shared() {
-        while (writers_waiting.load(std::memory_order_acquire) != 0) {
-            std::this_thread::yield();
+        for (;;) {
+            if (writers_waiting.load(std::memory_order_acquire) != 0 &&
+                !SpinFor([this] {
+                    return writers_waiting.load(std::memory_order_acquire) == 0;
+                })) {
+                std::this_thread::yield();
+                continue;
+            }
+            if (SpinFor([this] { return mutex.try_lock_shared(); })) {
+                return;
+            }
+            if (writers_waiting.load(std::memory_order_acquire) == 0) {
+                mutex.lock_shared();
+                return;
+            }
         }
-        mutex.lock_shared();
     }
     void unlock_shared() {
         mutex.unlock_shared();
     }
 
 private:
+    static bool Spinning() {
+        static const bool on = [] {
+            const char* env = std::getenv("SHADGT_LOOKUP_SPIN");
+            return !(env && env[0] == '0');
+        }();
+        return on;
+    }
+    /// Polls `done` with pauses for about 20 us (about 1,500 pauses on current x86 cores);
+    /// whether it came true. Off (SHADGT_LOOKUP_SPIN=0): one poll.
+    template <typename Done>
+    static bool SpinFor(Done&& done) {
+        if (done()) {
+            return true;
+        }
+        if (!Spinning()) {
+            return false;
+        }
+        for (u32 turn = 1; turn <= 1536; ++turn) {
+            _mm_pause();
+            if (turn % 8 == 0 && done()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     std::shared_mutex mutex;
     std::atomic<u32> writers_waiting{0};
 };

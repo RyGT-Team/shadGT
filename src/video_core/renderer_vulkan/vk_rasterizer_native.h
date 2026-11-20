@@ -965,6 +965,8 @@ private:
     /// PERF-SGT-031: the first region that may overlap memory from `begin` on (regions never
     /// overlap, so the ones over a range follow it in order).
     std::map<VAddr, Region>::iterator FirstRegion(VAddr begin);
+    /// FIX-SGT-042: logs a CP copy or fill written in place under a region (8 lines at most).
+    void NoteInPlaceDma(VAddr address, u64 size, const char* what);
     /// The mirror holding all of the range, if any.
     Mirror* MirrorHolding(VAddr address, u64 size);
     bool IsDynamic(VAddr begin, VAddr end, u64* blocked_granule = nullptr, u64* blocked_age = nullptr);

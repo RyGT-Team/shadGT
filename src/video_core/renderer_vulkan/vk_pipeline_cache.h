@@ -353,6 +353,8 @@ private:
     static bool MenusWait();
     /// FIX-114: how long a draw may wait for its building pipeline before it is skipped.
     static std::chrono::microseconds QuickWait();
+    /// FIX-SGT-036: the wait for a released pipeline's rebuild in a race (budgeted).
+    static std::chrono::microseconds ReleasedRebuildWait();
     /// FIX-119: whether this draw's old-renderer (D10) pipeline is waited for.
     bool LegacyWaits() const;
     /// PB-1: SHADGT_REPLAY_TEST, see the constructor.

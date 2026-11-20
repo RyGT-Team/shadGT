@@ -4541,6 +4541,31 @@ std::chrono::microseconds PipelineCache::QuickWait() {
     return wait;
 }
 
+std::chrono::microseconds PipelineCache::ReleasedRebuildWait() {
+    // FIX-SGT-036: in a race, a draw whose pipeline was released (GT Sport's precompile keeps
+    // 1024 of ~8000) waits for its rebuild a little longer than for a new pipeline: almost all
+    // are driver-cache hits of a millisecond or two (1565 of 1582 at Alsace), and with the race's
+    // quick wait (1 ms a draw, 2 ms per 16 ms) many still missed it and popped in a frame late.
+    // SHADGT_RACE_REBUILD_WAIT_US a draw at most (3000), twice that per 16 ms window; a slower
+    // rebuild is skipped until it is built.
+    static const std::chrono::microseconds per_draw = [] {
+        const char* env = std::getenv("SHADGT_RACE_REBUILD_WAIT_US");
+        return std::chrono::microseconds{
+            env && *env ? std::max(0ll, std::strtoll(env, nullptr, 10)) : 3000ll};
+    }();
+    using namespace std::chrono;
+    static thread_local steady_clock::time_point window{};
+    static thread_local microseconds used{};
+    const auto now = steady_clock::now();
+    if (now - window > milliseconds{16}) {
+        window = now;
+        used = microseconds{0};
+    }
+    const auto wait = std::clamp(per_draw * 2 - used, microseconds{0}, per_draw);
+    used += wait;
+    return wait;
+}
+
 bool PipelineCache::MenusWait() {
     // Captures retain every producer, including intermediate lighting passes,
     // until their actual save job completes. Ordinary Keep Going menu frames
@@ -5718,7 +5743,9 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
         // from the old renderer's sessions, so it takes milliseconds).
         if (build && AsyncPipelines() && !LegacyWaits() && !WritesMemory(S().infos) &&
             !NeverSkipped(S().infos) && !MenusWait() &&
-            build->done.wait_for(QuickWait()) != std::future_status::ready) {
+            build->done.wait_for(released_graphics.contains(S().graphics_key)
+                                     ? ReleasedRebuildWait()
+                                     : QuickWait()) != std::future_status::ready) {
             build->async = true;
             pending_builds[S().graphics_key] = build;
             graphics_pipelines.erase(it);
@@ -7762,7 +7789,21 @@ u32 PipelineCache::NeverSkippedReason(
     // was rebuilt, and that scenery popped back in: GT7 on an 8 GB GPU went over the trim's
     // reserve in races (6437 of 7180 MiB), and 1945 pipelines were retired in one session. A
     // rebuild here is a driver-cache hit of a few ms. (FIX-GTS-504 before the merge of 11-17.)
-    if (!released_graphics.empty() && released_graphics.contains(S().graphics_key)) return 2;
+    // FIX-SGT-036 (SHADGT_RACE_REBUILD_WAIT=1: waits in races too, as before): not while a race
+    // runs. GT Sport's precompile keeps 1024 of its ~8000 stored pipelines and releases the rest
+    // at once (FIX-GTS-468), so a race asked for released ones all the time: 1582 waits at
+    // Alsace, the command thread (and the recorder behind it) held 1.35 s, up to 305 ms a draw.
+    // In a race such a rebuild goes on in the background like a new build, with a wait of its
+    // own (ReleasedRebuildWait): the ones that come from the driver cache in a millisecond or two
+    // land at once (1565 of those 1582), and a slow one is skipped until it is built.
+    static const bool race_rebuild_wait = [] {
+        const char* env = std::getenv("SHADGT_RACE_REBUILD_WAIT");
+        return env && env[0] == '1';
+    }();
+    if (!released_graphics.empty() && released_graphics.contains(S().graphics_key) &&
+        (race_rebuild_wait || !RaceNeverWaits())) {
+        return 2;
+    }
     if (RaceNeverWaits()) return 0; // PERF-GTS-493
     // shadgt7 FIX-198: a one-off target's draw past its bounded wait (SetForceWait) waits for its
     // pipeline. FIX-GTS-517: not one in its bounded wait (SetWaitForShaders, PERF-GT7-020): its

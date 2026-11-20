@@ -960,6 +960,9 @@ private:
     std::unordered_map<u64, u32> dynamic_strikes;
     /// The first mirror that may overlap memory from `begin` on.
     std::map<VAddr, Mirror>::iterator FirstMirror(VAddr begin);
+    /// PERF-SGT-031: the first region that may overlap memory from `begin` on (regions never
+    /// overlap, so the ones over a range follow it in order).
+    std::map<VAddr, Region>::iterator FirstRegion(VAddr begin);
     /// The mirror holding all of the range, if any.
     Mirror* MirrorHolding(VAddr address, u64 size);
     bool IsDynamic(VAddr begin, VAddr end, u64* blocked_granule = nullptr, u64* blocked_age = nullptr);

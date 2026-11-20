@@ -2441,7 +2441,9 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
                 // The texture can straddle several GPU-written regions and imported guest
                 // memory. Keep guest bytes in the gaps, but use the GPU's current bytes for
                 // every overlap. Reading the whole range from the import loses those writes.
-                for (auto& [base, region] : regions) {
+                for (auto it = FirstRegion(address); // PERF-SGT-031: the regions over it
+                     it != regions.end() && it->second.begin < address + size; ++it) {
+                    Region& region = it->second;
                     const VAddr begin = std::max(address, region.begin);
                     const VAddr end = std::min(address + size, region.end);
                     if (begin < end) {
@@ -2452,7 +2454,9 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
                                  Native::Rhi::ScopeTransfer,
                              Native::Rhi::ScopeTransfer);
                 trace.Next(8);
-                for (auto& [base, region] : regions) {
+                for (auto it = FirstRegion(address); // PERF-SGT-031
+                     it != regions.end() && it->second.begin < address + size; ++it) {
+                    Region& region = it->second;
                     const VAddr begin = std::max(address, region.begin);
                     const VAddr end = std::min(address + size, region.end);
                     if (begin < end) {
@@ -4880,7 +4884,25 @@ void NativeRenderer::FlushWritebacks() {
                     plan.scatter.push_back({part.buffer, part.range_offset, part.view_offset, part.size});
             }
             bool valid_linear_regions = true;
-            for (auto& [base, region] : regions) {
+            // PERF-SGT-031: only the regions over what is copied (the picture's range, or its
+            // rows when chunked), not every region, in the same order.
+            VAddr plan_lo = address, plan_hi = address + size;
+            if (chunked) {
+                const u64 texel_bytes = entry->info.num_bits / 8;
+                plan_lo = ~VAddr{0};
+                plan_hi = 0;
+                for (const auto& copy : plan.linear) {
+                    if (copy.height == 0) continue;
+                    const VAddr first = address + copy.range_offset;
+                    const VAddr last = first + u64(copy.height - 1) * copy.pitch * texel_bytes +
+                                       u64(copy.width) * texel_bytes;
+                    plan_lo = std::min(plan_lo, first);
+                    plan_hi = std::max(plan_hi, last);
+                }
+            }
+            for (auto it = plan_lo < plan_hi ? FirstRegion(plan_lo) : regions.end();
+                 it != regions.end() && it->second.begin < plan_hi; ++it) {
+                Region& region = it->second;
                 if (chunked) {
                     const u64 texel_bytes = entry->info.num_bits / 8;
                     for (const auto& copy : plan.linear) for (u32 row = 0; row < copy.height; ++row) {
@@ -5062,7 +5084,9 @@ void NativeRenderer::FlushWritebacks() {
                 for (const auto& copy : plan.linear) for (u32 row = 0; row < copy.height; ++row) {
                     const VAddr from = address + copy.range_offset + u64(row) * copy.pitch * texel_bytes;
                     const VAddr to = from + u64(copy.width) * texel_bytes;
-                    for (auto& [base, region] : regions) {
+                    for (auto it = FirstRegion(from); // PERF-SGT-031: was every region, each row
+                         it != regions.end() && it->second.begin < to; ++it) {
+                        Region& region = it->second;
                         const VAddr begin = std::max(from, region.begin), end = std::min(to, region.end);
                         for (VAddr page = Common::AlignDown(begin, 4096); begin < end && page < end; page += 4096) {
                             region.dirty_pages.push_back(page);
@@ -5122,7 +5146,9 @@ void NativeRenderer::FlushWritebacks() {
             // NAT-146: regions over the picture's memory copy it in before their next use.
             if (RegionOver(address, size)) {
                 std::scoped_lock lock{region_dirty_mutex};
-                for (auto& [base, region] : regions) {
+                for (auto it = FirstRegion(address); // PERF-SGT-031
+                     it != regions.end() && it->second.begin < address + size; ++it) {
+                    Region& region = it->second;
                     const VAddr from = std::max(address, region.begin);
                     const VAddr to = std::min(address + size, region.end);
                     for (VAddr page = Common::AlignDown(from, 4096); from < to && page < to; page += 4096) {
@@ -5792,6 +5818,14 @@ void NativeRenderer::SortRegionWrites() {
     if (mirror_writes.size() > 1'000'000) {
         mirror_writes.clear();
     }
+}
+
+std::map<VAddr, NativeRenderer::Region>::iterator NativeRenderer::FirstRegion(VAddr begin) {
+    auto it = regions.upper_bound(begin);
+    if (it != regions.begin() && std::prev(it)->second.end > begin) {
+        --it;
+    }
+    return it;
 }
 
 std::map<VAddr, NativeRenderer::Mirror>::iterator NativeRenderer::FirstMirror(VAddr begin) {
@@ -22804,7 +22838,9 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
     CmdBuf{s.cmd}.updateBuffer(found->first->Handle(), found->second, data.size(), data.data());
     registry->ForgetFills(address, data.size()); // FIX-GT7-036: the bytes are no longer the fill
     // NAT-146: a region over the range holds what the GPU reads there: it gets the bytes too.
-    for (auto& [base, region] : regions) {
+    for (auto it = FirstRegion(address); // PERF-SGT-031
+         it != regions.end() && it->second.begin < address + data.size(); ++it) {
+        Region& region = it->second;
         const VAddr begin = std::max<VAddr>(address, region.begin);
         const VAddr end = std::min<VAddr>(address + data.size(), region.end);
         if (begin < end) {

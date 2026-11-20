@@ -8648,11 +8648,9 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
             if (direct->EnsureImported(address, size)) {
                 found = direct->FindBuffer(address, size);
             }
-            // FIX-SGT-014: no view holds the whole binding (GT7's rain: 77-85 MB from
-            // 0x101d8d9490 through the culling block): one alias over it, not a region.
-            if (!found) {
-                found = direct->FindOrImportSpan(address, size);
-            }
+            // FIX-SGT-014's span views (one alias over a read no view holds) are gone (PERF-SGT-043):
+            // such a read takes a region, and FIX-SGT-042 keeps a region over the culling block
+            // from undoing the writes made there in place.
             if (found) {
                 Ctx().last_bound = Bound::InPlace;
                 if (write) {

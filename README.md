@@ -1,10 +1,27 @@
 <!-- SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project -->
 <!-- SPDX-License-Identifier: GPL-2.0-or-later -->
-# shadGT7
+# shadGT
 
 # About
 
-The GT7 branch adds native rendering and compatibility fixes, including wave64 translation
+shadGT, branch `ryty-gpu`, is the renderer of [RyGT](https://github.com/RyGT-Team/RyGTS): **one
+renderer for Gran Turismo Sport (CUSA03220) and Gran Turismo 7 (CUSA24769)**. The `ryty_gpu` target
+builds it as `libSceVideoOut.prx` (Gnm driver, PM4 processing, Vulkan), plus shadPS4's audio, NP
+and other libraries (`libSceAjm`, `libSceAudio3d`, `libSceNgs2`, `libSceZlib`, `libSceDiscMap`,
+`libSceScreenShot`, `libSceNpAuth`). RyGT's one runtime and one launcher load the same build for
+both games, from one folder.
+
+The renderer tells the games apart at run time: `SHADGT_GAME=gts` or `gt7`, as the launcher sets
+it, else the executable's name (`GT7.exe` is GT7). Each game's patches and defaults follow
+(GAME-001 to GAME-008); everything it writes is named after the game's serial: its settings
+`user\custom_configs\<serial>.json`, its `<serial>.RyGT.ini`, its shader stores and driver caches
+`shaders\<serial>*` (GAME-004/005). The game window takes the game's own `sce_sys\icon0.png`
+(FIX-SGT-037). shadgt7, the former GT7 renderer, is merged here; shared work is tagged SGT
+(`FIX-SGT-###`), work for one game GTS or GT7.
+
+## GT7
+
+GT7 adds native rendering and compatibility fixes, including wave64 translation
 that prevents overlapping crowd instance writes, and sparse texture uploads that preserve
 resident streamed mip levels. These fixes were verified at Deep Forest. A fix for flickering night shadows at Yas Marina
 (cached render targets reused after a memory remap) is included but not yet confirmed in game. Other tracks, updates,
@@ -14,7 +31,7 @@ and hardware may still have rendering errors or crashes.
 
 These come from dessierror's [wheel + ultrawide edition](https://gitlab.com/dessierror/rygt-7-online-build)
 (its `renderer` branch, cherry-picked). Each is switchable; the switches are environment variables,
-which the ryGT7 launcher sets from its options.
+which the RyGT launcher sets from GT7's options (and its Advanced page, per game).
 
 - Ultrawide (GT7-UW): with `GPU.aspect_ratio` wider than 16:9 in the game's custom config (or
   `SHADGT_ASPECT`), the scene is stretched over the window and the HUD is kept at 16:9 in the centre.
@@ -49,10 +66,12 @@ cmake --preset x64-Clang-Release -DSHADGT_RYTY_GPU=ON -DHAVE_ENDIAN_H=OFF
 cmake --build Build/x64-Clang-Release --target ryty_gpu --parallel 8
 ```
 
-This builds libSceVideoOut.prx. The companion runtime and packaging instructions are in
-[ryGT7 build-support](https://gitlab.com/rygt-team/rygt7/-/tree/main/build-support).
-The standalone shadGT emulator and historical GT Sport documentation remain inherited source;
-use the ryGT7 launcher to prepare and run GT7.
+This builds `libSceVideoOut.prx` and the other `libSce*.prx` listed above, for both games. They
+all go in the game folder's `libs`, replacing the runtime build's libraries of the same names (some
+of those are placeholders GT7 can't run on). The runtime, the launcher and the packaging are in
+[RyGTS](https://github.com/RyGT-Team/RyGTS) (branch `development`), whose release packages carry
+this renderer. The standalone shadGT emulator and historical GT Sport documentation remain inherited
+source; use the RyGT launcher (`RyGTLauncher.exe`) to set up and run either game.
 
 The wave64 guard regression test contains 512 synthetic checks and no dumped game shaders.
 With tests enabled, its CMake target is shadgt_wave64_guard_regression.

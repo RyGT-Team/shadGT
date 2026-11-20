@@ -22653,6 +22653,8 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
     ++s.commands;
 }
 
+static bool InPlaceDmaWritebackKept(); // FIX-SGT-042, below
+
 void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::FillCopyWrite}; // DIAG-SGT-023
     if (!is_gds) {
@@ -22691,9 +22693,12 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
     WritebacksBefore(address, num_bytes);
     SendWritebacksDue();                  // FIX-GT7-040
     const auto found = GuestBuffer(address, num_bytes, true);
+    // FIX-SGT-042: written in place (a listed range) while a region covers it.
+    const bool in_place = found && Ctx().last_bound == Bound::InPlace && !InPlaceDmaWritebackKept() &&
+                          RegionOver(address, num_bytes) != nullptr;
     WritebackPlan candidate;
     const std::pair<VAddr, u64> written{address, num_bytes};
-    if (!PrepareRegionWriteback(candidate, std::span{&written, 1}, false)) {
+    if (!in_place && !PrepareRegionWriteback(candidate, std::span{&written, 1}, false)) {
         ASSERT_MSG(false, "native region writeback preflight failed before fill");
         return;
     }
@@ -22709,6 +22714,19 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
         if (writeback) ApplyRegionWritebackFallback(*writeback);
         RetainRegionPlan(writeback);
         CmdBuf{s.cmd}.fillBuffer(found->first, found->second, num_bytes, value);
+        if (in_place) { // FIX-SGT-042: the regions over it get the value too
+            NoteInPlaceDma(address, num_bytes, "fill");
+            for (auto it = FirstRegion(address);
+                 it != regions.end() && it->second.begin < address + num_bytes; ++it) {
+                const VAddr begin = std::max<VAddr>(address, it->second.begin);
+                const VAddr end = std::min<VAddr>(address + num_bytes, it->second.end);
+                if (begin < end) {
+                    CmdBuf{s.cmd}.fillBuffer(
+                        vk::Buffer{Handle<VkBuffer_T>(it->second.buffer->NativeHandle())},
+                        begin - it->second.begin, end - begin, value);
+                }
+            }
+        }
         s.buffers_written = true;
         ++s.commands;
     } else {
@@ -22770,10 +22788,13 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
     const u64 before_destination = regions_taken_in;
     const auto dest = dst_gds ? std::optional{std::pair{gds_buffer, u64(dst)}}
                               : GuestBuffer(dst, num_bytes, true);
+    // FIX-SGT-042: written in place (a listed range) while a region covers it.
+    const bool in_place = !dst_gds && dest && Ctx().last_bound == Bound::InPlace &&
+                          !InPlaceDmaWritebackKept() && RegionOver(dst, num_bytes) != nullptr;
     if (!src_gds && regions_taken_in != before_destination) source = GuestBuffer(src, num_bytes, false);
     WritebackPlan candidate;
     const std::pair<VAddr, u64> written{dst, num_bytes};
-    if (!dst_gds && !PrepareRegionWriteback(candidate, std::span{&written, 1}, false)) {
+    if (!dst_gds && !in_place && !PrepareRegionWriteback(candidate, std::span{&written, 1}, false)) {
         ASSERT_MSG(false, "native region writeback preflight failed before copy");
         return;
     }
@@ -22792,6 +22813,22 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
                                  vk::BufferCopy{.srcOffset = source->second,
                                                 .dstOffset = dest->second,
                                                 .size = num_bytes});
+        if (in_place) { // FIX-SGT-042: the regions over it get the bytes too, from the same source
+            NoteInPlaceDma(dst, num_bytes, src_gds ? "GDS copy" : "copy");
+            for (auto it = FirstRegion(dst);
+                 it != regions.end() && it->second.begin < dst + num_bytes; ++it) {
+                const VAddr begin = std::max<VAddr>(dst, it->second.begin);
+                const VAddr end = std::min<VAddr>(dst + num_bytes, it->second.end);
+                if (begin < end) {
+                    CmdBuf{s.cmd}.copyBuffer(
+                        source->first,
+                        vk::Buffer{Handle<VkBuffer_T>(it->second.buffer->NativeHandle())},
+                        vk::BufferCopy{.srcOffset = source->second + (begin - dst),
+                                       .dstOffset = begin - it->second.begin,
+                                       .size = end - begin});
+                }
+            }
+        }
         s.buffers_written = true;
         ++s.commands;
     } else if (!dst_gds && !src_gds) {
@@ -22811,6 +22848,31 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
     if (!dst_gds) {
         RecordRegionWriteback(writeback);
         GpuWrote(dst, num_bytes, nullptr, true); // NAT-119
+    }
+}
+
+// FIX-SGT-042 (SHADGT_IN_PLACE_DMA_WRITEBACK=1: as before): a CP copy or fill whose destination
+// GuestBuffer bound in place (a listed in-place range, FIX-SGT-004) writes guest memory, yet
+// PrepareRegionWriteback(..., false) planned for it the FIX-GT7-034 write-back of a region over the
+// range, a plain copy of the region's bytes to guest memory after the write: it put the region's old
+// bytes back over what had just been written. GT7 copies its GPU culling's GDS counters to
+// 0x1020000d40 each frame; whenever a region covered that block (in the Tokyo rain, the one a 563 MB
+// unbounded read makes when FIX-SGT-014's span view refuses it) the CPU read old counters back and
+// objects flickered for the whole race. Such a write now plans no write-back and gives a region over
+// the range the same bytes, as InlineWrite does (NAT-146).
+static bool InPlaceDmaWritebackKept() {
+    static const bool kept = [] {
+        const char* env = std::getenv("SHADGT_IN_PLACE_DMA_WRITEBACK");
+        return env && env[0] == '1';
+    }();
+    return kept;
+}
+
+void NativeRenderer::NoteInPlaceDma(VAddr address, u64 size, const char* what) {
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+        LOG_WARNING(Render_Vulkan, "FIX-SGT-042: {} {:#x}+{:#x} written in place under a region: "
+                    "no write-back from the region, the region gets the bytes", what, address, size);
     }
 }
 

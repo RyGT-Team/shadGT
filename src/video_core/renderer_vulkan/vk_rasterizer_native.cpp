@@ -5795,6 +5795,19 @@ void NativeRenderer::SortRegionWrites() {
                 dynamic = false;
             }
 #endif
+            // PERF-SGT-055 (SHADGT_NATIVE_MIRROR_KEEP_WRITTEN=1, off by default): as FIX-184's
+            // diagnosis switch, in every build. A dropped mirror's range is read in place over PCIe
+            // for up to five minutes (PERF-GTS-386); keeping it and copying the pages the CPU wrote
+            // (about 1.3 MB a frame at Tokyo) cut GT7's GPU time in the rain pack from about 24 to
+            // 19.5 ms a frame and PCIe reads by 10-20%, for about 1.2 ms more CPU time a frame
+            // (more write faults) (Release, 2026-11-20).
+            static const bool keep_written = [] {
+                const char* env = std::getenv("SHADGT_NATIVE_MIRROR_KEEP_WRITTEN");
+                return env && env[0] == '1';
+            }();
+            if (dynamic && keep_written) {
+                dynamic = false;
+            }
             if (dynamic) {
                 if(mirror_diag)NoteMirrorDiagnostic(MirrorCpuDrop,begin,end,mirror.begin,mirror.end,unmap_generation.load(),blocked_granule,blocked_age);
                 mirror_bytes -= mirror.end - mirror.begin;

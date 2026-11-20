@@ -48,6 +48,7 @@
 #include "input/trigger_feedback.h"
 #include "ryty_gpu/ryty_dlssg.h"
 #include "core/file_format/psf.h"
+#include "common/ryty_param_sfo.h"
 #include "ryty_gpu/gt7_preset_options.h"
 #include "ryty_gpu/ryty_gt7_hdr_status.h"
 

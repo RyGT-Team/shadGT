@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <optional>
 #include <string_view>
 #include "common/assert.h"
 #include "common/elf_info.h"
@@ -24,6 +25,7 @@
 #include "ryty_gpu/ryty_diag.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #ifdef RYTY_GPU
+#include "common/ryty_param_sfo.h"
 #include "core/file_format/psf.h"
 #include "ryty_gpu/ryty_gt7_hdr_status.h"
 #endif
@@ -41,22 +43,27 @@ static bool GameSupportsHdr() {
     // the real title's HDR bit after the host has offered HDR; do not change Neo
     // or any other title attribute, or the SDR-only host path.
     if (presenter->IsHDRSupported()) {
-        static const bool supported = [&] {
+        static const bool mounted = Common::RytyMountedMetadataEnabled();
+        static const auto title_hdr = [&]() -> std::optional<bool> {
             PSF param_sfo;
             // FIX-GT7-146: GT7 only. Any other title with the HDR bit in its param.sfo (GT
             // Sport has HDR on a console) would be offered HDR10 with nothing of this path
             // tried on it.
-            if (param_sfo.Open(game_info.GetGameFolder() / "sce_sys" / "param.sfo") &&
-                param_sfo.GetString("TITLE_ID") == "CUSA24769") {
+            const auto path = mounted ? Common::RytyParamSfoPath()
+                                      : game_info.GetGameFolder() / "sce_sys" / "param.sfo";
+            if (param_sfo.Open(path) && param_sfo.GetString("TITLE_ID") == "CUSA24769") {
                 if (const auto attributes = param_sfo.GetInteger("ATTRIBUTE")) {
                     Common::PSFAttributes game_attributes{};
                     game_attributes.raw = static_cast<u32>(*attributes);
                     return game_attributes.support_hdr.Value() != 0;
                 }
             }
-            return game_info.GetPSFAttributes().support_hdr.Value() != 0;
+            return std::nullopt;
         }();
-        RytySetGt7HdrStatusCompatibility(supported);
+        // FIX-SGT-058: keep the existing capability fallback for other editions. Only the
+        // verified title and its own HDR bit may enable its status compatibility hook.
+        const bool supported = title_hdr.value_or(game_info.GetPSFAttributes().support_hdr.Value() != 0);
+        RytySetGt7HdrStatusCompatibility(mounted ? title_hdr.value_or(false) : supported);
         return supported;
     }
 #endif

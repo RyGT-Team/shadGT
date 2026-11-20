@@ -22,6 +22,19 @@ inline bool AmdPipelinePolicyEnabled(unsigned vendor_id) {
     }();
     return allowed && vendor_id == 0x1002;
 }
+// PERF-SGT-039 (MaxiRazorback's PERF-GTS-470, shadGT PR 36): on AMD, tessellated pipelines come from
+// libraries plus a fast link. FIX-057's whole builds (perf feature 80) are never reused from the
+// driver cache on an RX 7600 (51 of 51 repeats missed, 0.3-1.3 s each, every run), while the
+// libraries hit it (137 of 137 on a second run). FIX-057's memory growth came from link-time data,
+// which AMD-322 already leaves out (5.2-5.4 GB peak measured). SHADGT_AMD_WHOLE_TESSELLATION=1 builds
+// them whole again.
+inline bool AmdWholeTessellation() {
+    static const bool whole = [] {
+        const char* env=std::getenv("SHADGT_AMD_WHOLE_TESSELLATION");
+        return env && env[0]=='1';
+    }();
+    return whole;
+}
 // PERF-GTS-486: whole_prewarm is Instance::IsWholePrewarm() (SHADGT_PREWARM_WHOLE_PIPELINES,
 // by default on RDNA2 with whole-pipeline binaries).
 inline bool SharedPipelineLibrariesEnabled(bool supported, bool whole_prewarm, bool preloading) {

@@ -1232,7 +1232,7 @@ GraphicsPipeline::GraphicsPipeline(
     const auto compile_policy = amd_policy
         ? SharedPipelinePolicy::SelectAmd(
               SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(), instance.IsWholePrewarm(), preloading),
-              tessellated && (Common::PerfFeatureEnabled(80) || !Mr14SharedTessellationEnabled(false)))
+              tessellated && (AmdWholeTessellation() || !Mr14SharedTessellationEnabled(false)))
         : SharedPipelinePolicy::Select(
               SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(), instance.IsWholePrewarm(), preloading),
               tessellated && (Common::PerfFeatureEnabled(80) || !Mr14SharedTessellationEnabled(LinkTimeOptimization())),

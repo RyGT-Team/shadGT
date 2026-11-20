@@ -153,9 +153,9 @@ inline bool Enabled() {
 }
 
 /// WIDE-005: the race HUD in pieces. The 16:9 HUD is cut into regions (fractions of its width and
-/// height): the left column (standings, position, laps; the lap time at the bottom left) moves to
-/// the screen's left edge, the right column (map, lap times, course map) to its right edge, and
-/// the middle (timer, gauges, messages) stays.
+/// height): the left column (standings, position, laps) moves to the screen's left edge, the
+/// right column (map, lap times) to its right edge, and the middle (timer, messages) stays.
+/// WIDE-065: the bottom row (lap time, gauges, course map) stays in the 16:9 middle too.
 struct HudPiece {
     float u0, v0, u1, v1;
     int side; // -1 to the left edge, 0 stays, 1 to the right edge
@@ -164,9 +164,9 @@ struct HudPiece {
 // counter reach up to 73% between 27% and 72% of the width.
 constexpr std::array<HudPiece, 6> HudPieces{{
     {0.00f, 0.00f, 0.30f, 0.70f, -1}, // standings, position, laps
-    {0.00f, 0.70f, 0.17f, 1.00f, -1}, // lap time, bottom left
+    {0.00f, 0.70f, 0.17f, 1.00f, 0},  // lap time, bottom left (WIDE-065: stays)
     {0.70f, 0.00f, 1.00f, 0.70f, 1},  // map, lap times
-    {0.82f, 0.70f, 1.00f, 1.00f, 1},  // course map, brake balance (WIDE-040: was 0.80)
+    {0.82f, 0.70f, 1.00f, 1.00f, 0},  // course map, brake balance (WIDE-065: stays)
     {0.30f, 0.00f, 0.70f, 0.70f, 0},  // timer, messages
     {0.17f, 0.70f, 0.82f, 1.00f, 0},  // gauges, the overtake gauge (WIDE-040)
 }};

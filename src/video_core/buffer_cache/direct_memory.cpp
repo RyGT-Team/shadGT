@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "ryty_gpu/native/ordered_timing.h"
 #include <stop_token>
 #include "ryty_gpu/native/buffer_sizes.h"
 #include "ryty_gpu/native/descriptor_dead_handles.h"
@@ -271,6 +272,7 @@ std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr addr
 // spans the whole read (GuestArenaMapAlias stitches the pieces, FIX-RT-001).
 std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindOrImportSpan(VAddr address,
                                                                            u64 size) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::Import}; // DIAG-SGT-023
 #ifdef _WIN32
     static const bool enabled = [] {
         const char* env = std::getenv("SHADGT_LISTED_SPAN_VIEWS");
@@ -867,6 +869,7 @@ void DirectMemory::WarmImported(VAddr address, u64 size) {
 }
 
 bool DirectMemory::EnsureImported(VAddr address, u64 size) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::Import}; // DIAG-SGT-023
     Native::SlowCallTrace<9> trace{Native::trace_guest_hash_calls, "ensure-imported",
         {"pending-lock", "completion-query", "destroy-wrapper", "free-memory", "unmap-alias",
          "recent-cache", "view-mutex", "mapping-generation", "lookup-import"}};

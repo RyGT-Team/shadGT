@@ -22,6 +22,8 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <tsl/robin_set.h>
+#include "common/fast_hash.h"
 #include <vector>
 #include <queue>
 
@@ -398,7 +400,7 @@ private:
     bool scan_blocked{}; // FIX-061: stopped at a REWIND the game has not published yet
     // PERF-022: draw packets and nested command buffers the read-ahead has already read in the
     // current submission; each is read once however often a read-ahead passes over it.
-    std::unordered_set<const void*> scanned_packets;
+    tsl::robin_set<const void*, Common::PointerHash> scanned_packets; ///< PERF-SGT-026
     bool ScanPackets(std::span<const u32> dcb, const std::function<bool(const Regs&)>& on_draw,
                      u32 depth, u32& draws_left, u32& builds_left, const u32** stopped_at);
 
@@ -467,6 +469,23 @@ private:
     std::unordered_map<VAddr, PendingLabel> pending_labels;
     u64 label_jobs{};
     u64 waits_moved{};
+#ifndef NDEBUG
+    /// DIAG-SGT-027: how WAIT_REG_MEM waits that drain the recorder end, by queue (gfx, asc):
+    /// packets reaching the first drain; ended right after it by the label or by a recorded
+    /// fence; left for the loop; loop turns; turns with nothing handed to the recorder since
+    /// the last drain; of those, turns a recorded fence ended (a skipped drain would have
+    /// missed them); turns a queued label write would have satisfied.
+    struct WaitDrainTally {
+        u64 packets, label_first, fence_first, loops, turns, loop_drains, rechecks,
+            loop_end_label, loop_end_fence, idle_wait_us;
+    };
+    std::array<WaitDrainTally, 2> wait_drains{};
+#endif
+    /// PERF-SGT-028: the label each waiting compute queue waits on (by vqid + 1), and the label
+    /// writes decoded over it since its wait began (RecordLabelWrite, on this thread).
+    std::array<VAddr, 16> waited_labels{};
+    std::array<u64, 16> label_writes_over_wait{};
+    u32 waiting_queues = 0;
     // PERF-035: commands from other threads run on the recorder instead of after a drain.
     u64 commands_recorded{};
     // PERF-048: waits on labels another queue writes, found after letting it decode first.

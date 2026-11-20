@@ -1,3 +1,4 @@
+#include "ryty_gpu/native/ordered_timing.h"
 #include "common/debug_environment.h"
 #include "common/game_title.h"
 #include "common/geometry_trace.h"
@@ -459,6 +460,8 @@ Rasterizer::SelectedPipelinePtr Rasterizer::SelectComputePipelineAhead() {
 }
 
 const ComputePipeline* Rasterizer::AcquireComputePipeline() {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::PipelineLookup}; // DIAG-SGT-023
+    SelectedPipeline* const selected_pipeline = Rec().selected_pipeline;
     if (SelectsPipelinesAhead() && selected_pipeline && selected_pipeline->is_compute) {
         const auto* pipeline = selected_pipeline->compute;
         if (!pipeline) {
@@ -1060,7 +1063,7 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
 
 std::optional<std::pair<const VideoCore::Buffer*, u64>> Rasterizer::TakePlannedBuffer(
     VAddr address, u32 size, bool written, bool texel) {
-    auto* plan = buffer_plan;
+    auto* plan = Rec().buffer_plan;
     if (!plan || plan->next >= plan->entries.size()) {
         return std::nullopt;
     }
@@ -1120,10 +1123,11 @@ std::optional<std::pair<const VideoCore::Buffer*, u64>> Rasterizer::TakePlannedB
 Rasterizer::ShadowInfo& Rasterizer::ShadowOf(const Shader::Info* canonical,
                                               const Shader::Info* seed) {
     // PERF-065: most draws use the infos of the draws before them; the map is looked up once.
-    auto& cached = shadow_lookup[(reinterpret_cast<uintptr_t>(canonical) >> 6) %
-                                 shadow_lookup.size()];
+    RecorderStages& rec = Rec();
+    auto& cached = rec.shadow_lookup[(reinterpret_cast<uintptr_t>(canonical) >> 6) %
+                                     rec.shadow_lookup.size()];
     if (cached.first != canonical) {
-        cached = {canonical, &shadow_infos[canonical]};
+        cached = {canonical, &rec.shadow_infos[canonical]};
     }
     auto& shadow = *cached.second;
     // A cached info's identity never changes; a different one means the address was reused.
@@ -1288,6 +1292,7 @@ void Rasterizer::CountSharedLookups() {
 const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectParams& params,
                                                             bool selected_allowed,
                                                             std::shared_ptr<const void>* owner) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::PipelineLookup}; // DIAG-SGT-023
     if (owner) owner->reset();
     if (!SelectsPipelinesAhead()) {
         // A cached pipeline may still point at a per-race shadow. Reinstall a
@@ -1344,6 +1349,7 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
     }
 #endif
     // PERF-068: a quad list's selection holds both of its pipelines.
+    SelectedPipeline* const selected_pipeline = Rec().selected_pipeline;
     const bool quad_selection = selected_pipeline && selected_pipeline->is_quad_list;
     if (selected_pipeline && CanUseDrawSelection(
             selected_pipeline->indirect, quad_selection, selected_pipeline->vertex_sgpr_offset,
@@ -4303,9 +4309,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     ctx->bound_textures.clear();
     ctx->image_binding_base = 0; // PERF-121
 
-    if (buffer_plan && !buffer_plan->uploads.empty()) {
+    if (BufferPlan* const plan = Rec().buffer_plan; plan && !plan->uploads.empty()) {
         // PERF-067: the uploads the buffer stage prepared for this draw's buffers.
-        buffer_cache.RecordAheadUploads(buffer_plan->uploads);
+        buffer_cache.RecordAheadUploads(plan->uploads);
     }
 
     bool uses_dma = false;
@@ -4550,7 +4556,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         } else
         // MT-004: obtained ahead by the buffer stage when it planned this draw's vertex buffers.
         if (const auto planned =
-                buffer_plan && buffer_plan->vertices
+                Rec().buffer_plan && Rec().buffer_plan->vertices
                     ? TakePlannedBuffer(range.base_address, static_cast<u32>(size), false, false)
                     : std::nullopt) {
             std::tie(range.buffer, range.offset) = *planned;
@@ -4619,7 +4625,7 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
     // MT-005: obtained ahead by the buffer stage when it planned this draw's index buffer.
-    const auto planned = buffer_plan && buffer_plan->index
+    const auto planned = Rec().buffer_plan && Rec().buffer_plan->index
                              ? TakePlannedBuffer(index_address, index_buffer_size, false, false)
                              : std::nullopt;
     static const bool direct_indices = [] { // D6: SHADGT_DIRECT_IB=0 turns it off

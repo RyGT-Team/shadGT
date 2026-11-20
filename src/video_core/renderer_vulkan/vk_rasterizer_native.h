@@ -13,6 +13,8 @@
 
 #pragma once
 #include "video_core/renderer_vulkan/pipeline_owner.h"
+#include "common/fast_hash.h"
+#include <tsl/robin_map.h>
 
 #include <array>
 #include <atomic>
@@ -30,6 +32,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include "ryty_gpu/native/kept_set_table.h"
+#include "ryty_gpu/native/recorder_binder.h"
+#include "ryty_gpu/native/ordered_timing.h"
 #include <vector>
 
 #include <boost/container/static_vector.hpp>
@@ -142,7 +146,8 @@ public:
 
     /// Ends the command list recorded so far and runs it in the scheduler's current command
     /// buffer (called before anything else is recorded there or it is submitted).
-    void Splice();
+    /// DIAG-SGT-023: `where` names the most frequent callers.
+    void Splice(std::source_location where = std::source_location::current());
 
     /// The picture at a display buffer, for the presenter (none when nothing drew there).
     struct Display {
@@ -324,6 +329,9 @@ private:
         std::array<vk::ShaderEXT, 4> so_shaders{};
         BindingCommandMemo<vk::PipelineLayout, vk::DescriptorSet, Shader::PushData,
                            Shader::Backend::MaxDescriptorSets> binding_commands;
+        /// FEAT-SGT-022: binding_commands is to be forgotten at the next PushBindings (set by a
+        /// shader-object bind; the binder may be using binding_commands meanwhile).
+        bool binding_commands_stale = false;
         /// OPT-005: the vertex input layout, vertex buffers and index buffer last recorded in
         /// this list (the same ones are not recorded again).
         bool vertex_state_known = false;
@@ -954,6 +962,9 @@ private:
     std::unordered_map<u64, u32> dynamic_strikes;
     /// The first mirror that may overlap memory from `begin` on.
     std::map<VAddr, Mirror>::iterator FirstMirror(VAddr begin);
+    /// PERF-SGT-031: the first region that may overlap memory from `begin` on (regions never
+    /// overlap, so the ones over a range follow it in order).
+    std::map<VAddr, Region>::iterator FirstRegion(VAddr begin);
     /// The mirror holding all of the range, if any.
     Mirror* MirrorHolding(VAddr address, u64 size);
     bool IsDynamic(VAddr begin, VAddr end, u64* blocked_granule = nullptr, u64* blocked_age = nullptr);
@@ -979,7 +990,6 @@ private:
     u64 per_frame_drop_frame = 0;    ///< FIX-GT7-122: the frame of the last drop
     /// NAT-150: what the last GuestBuffer bound (for the NAT-142 counters).
     enum class Bound : u8 { InPlace, Region, Mirror };
-    Bound last_bound = Bound::InPlace;
     /// OPT-003: what a guest range resolved to the last time (a region, a mirror, or imported
     /// guest memory read in place), valid while no region or mirror was made or dropped and no
     /// memory unmapped since (buffer_generation); a region or mirror with pages to copy in takes
@@ -1019,16 +1029,11 @@ private:
         }
     };
     static_assert(sizeof(BufferMemo) == 64);
-    std::array<BufferMemo, 16384> buffer_memos{}; ///< OPT-006: 2048 thrashed
     u64 buffer_generation = 0;
     u64 buffer_hard_generation = 0; ///< PERF-GT7-047: what the change log doesn't tell
     /// OPT-003: what the last lookup can be remembered as (set by GuestBufferLookup).
     enum class MemoKind : u8 { None, Region, Mirror, InPlace };
-    MemoKind memo_kind = MemoKind::None;
-    Region* memo_region = nullptr;
-    Mirror* memo_mirror = nullptr;
     /// OPT-004: the mirror the last GuestBuffer bound from (none when it bound anything else).
-    Mirror* last_mirror = nullptr;
     /// FIX-170 (diagnosis): SHADGT_NATIVE_SNAPSHOT_BELOW, 0 when off.
     static u64 SnapshotBelow();
     /// A copy of the range as it is now (NAT-106 zeros where the CPU can't read).
@@ -1056,7 +1061,6 @@ private:
     };
     using TextureMemo = TextureMemoOf<TextureMemoViews>;
     using JobTextureMemo = TextureMemoOf<4>; ///< OPT-010's, per job thread (thread-local)
-    std::array<TextureMemo, 16384> texture_memos{}; ///< OPT-006
     size_t TextureMemoSlot(const std::array<u64, 4>& raw_sharp, u32 memo_flags) const;
     std::atomic<u64> unmap_generation{0}; ///< (OPT-010: read by job threads)
     /// NAT-107: a guest range gathered on the GPU from the imported views holding it, into a
@@ -1089,7 +1093,7 @@ private:
         std::array<VAddr, 8> cmasks{};
         bool htile_meta = false; ///< the depth image has HTILE (FIX-156)
         Targets targets{};
-    } targets_memo;
+    };
     bool TargetsFromMemo(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline, Targets& out);
     bool ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline, Targets& out);
     bool PrepareUiTarget(Targets& targets, const GraphicsPipeline& pipeline);
@@ -1130,7 +1134,7 @@ private:
     void GpuTimeEnd(Stream& s, u64 tick);
     void GpuTimeCollect();
     GpuSegment* GpuSeg() {
-        auto* t = stream.gpu_timing.get();
+        auto* t = Ctx().stream.gpu_timing.get();
         return t && !t->segments.empty() ? &t->segments.back() : nullptr;
     }
     static constexpr u32 GpuTimeQueries = 1024;
@@ -1174,8 +1178,24 @@ private:
                      Shader::Backend::Bindings& binding, DrawBindings& b);
     void BindTextures(const Shader::Info& stage, const AmdGpu::Regs& regs,
                       Shader::Backend::Bindings& binding, DrawBindings& b);
+    /// Records the draw's push constants and descriptor binds; with the binder on
+    /// (FEAT-SGT-022), hands them to the binder thread and records a placeholder for them.
     void PushBindings(const Pipeline& pipeline, vk::PipelineBindPoint bind_point,
                       DrawBindings& b);
+    /// FEAT-SGT-022: what PushBindings reads of the recorder's state that later draws change,
+    /// as it was when the draw recorded its binds.
+    struct BindInputs {
+        u64 generation = 0;     ///< the regions', images', samplers' and mappings' generations
+        u64 pipeline_epoch = 0; ///< the list's pipeline bind epoch
+        bool invalidate = false; ///< a shader-object bind forgot the list's binds (FIX-GTS-420)
+        bool on_binder = false;
+        Shader::PushData push{};
+    };
+    BindInputs TakeBindInputs(Stream& s, const DrawBindings& b);
+    /// PushBindings' work, into `cmdbuf`, from `inputs` instead of the recorder's state.
+    void PushBindingsWith(const Pipeline& pipeline, vk::PipelineBindPoint bind_point,
+                          DrawBindings& b, Stream& s, const CmdBuf& cmdbuf,
+                          const BindInputs& inputs);
     /// A draw's vertex and index buffers: looked up before its pass starts (a lookup may gather
     /// on the GPU, outside rendering) and bound inside it.
     struct VertexIndexState {
@@ -1540,6 +1560,9 @@ private:
     struct PreparedDraw {
         const void* packet = nullptr;
         u32 epoch = 0;
+        /// FEAT-SGT-022: the last binder job binding from this draw's bindings (0: none); the
+        /// draw is given back only once that job has run.
+        u64 binder_job = 0;
         const GraphicsPipeline* pipeline = nullptr;
         std::shared_ptr<const void> pipeline_keepalive;
         std::atomic<std::shared_ptr<void>> ahead_descriptor_lease;
@@ -1706,7 +1729,9 @@ private:
     std::shared_mutex buffer_map_mutex;
     struct PreparedShard {
         std::mutex mutex;
-        std::unordered_map<const void*, PreparedDraw*> draws;
+        /// PERF-SGT-034: a flat map (the node map's find and erase were about 2.5% of the GT7
+        /// recorder with prepared draws, the command thread looks each draw up too).
+        tsl::robin_map<const void*, PreparedDraw*, Common::PointerHash> draws;
     };
     std::array<PreparedShard, 64> prepared_shards;
     /// FIX-GTS-492: the command memory the game took back at the last end-of-pipe interrupts.
@@ -1746,6 +1771,11 @@ private:
     /// been recorded (Splice, after the coordinator was drained).
     std::vector<PreparedDraw*> late_bound_prepared;
     std::vector<PreparedDraw*> late_bound_done; ///< recorded: given back at the next draw
+    /// FEAT-SGT-022 (recorder): prepared draws whose binds the binder still makes, and the
+    /// prepared draw the current draw binds from.
+    std::vector<PreparedDraw*> binder_held;
+    PreparedDraw* binding_prepared = nullptr;
+    void ReleaseBinderHeld();
     /// FIX-GTS-393: the recorder, for parallel recording: whether `info` (buffer info
     /// `info_index` of the prepared draw) binds bytes of the arena that hold until the GPU ran
     /// the list being recorded (their segments are marked for it again).
@@ -1827,15 +1857,6 @@ private:
     std::atomic<u32> mapping_waiters{};
     void YieldToMappingChanges();
     struct SnapshotUploadMemo;
-    std::unique_ptr<SnapshotUploadMemo> snapshot_upload_memo; ///< guarded by mutex
-    Stream stream;
-    /// GT7-UW: the HUD draws over white, recorded in a list of their own that runs right after
-    /// the main one (which draws them over black): neither list switches between the two
-    /// pictures, so consecutive HUD draws stay in one pass without barriers between them.
-    Stream hud_stream;
-    /// DLSS-GT7-001: in a frame left as the game draws it, the HUD draws over black, in a list of
-    /// their own too (the main list then draws them into the display as the game does).
-    Stream hud_black_stream;
     static bool HudStreamOn();
     void BeginHudStream();
     void SpliceHudStream(u64 tick);
@@ -1843,7 +1864,76 @@ private:
     /// DLSS-GT7-001: the open batch of HUD draws runs (main list first, then the HUD lists).
     void CloseHudBatch();
     static bool HudBatchOn();
-    DrawBindings bindings;
+    /// FEAT-SGT-022 step 1: what a recorder thread keeps for itself. The two recorder threads of
+    /// the dual recorder each get one; until then there is one, so Ctx() is a plain member read.
+    /// Lists and their memos (the streams), the snapshot upload memo, the per-draw bindings
+    /// scratch, the buffer, texture and targets memos and GuestBuffer's out-parameters.
+    struct RecordContext {
+        RecordContext();
+        ~RecordContext();
+        Stream stream;
+        /// GT7-UW: the HUD draws over white, recorded in a list of their own that runs right
+        /// after the main one (which draws them over black): neither list switches between the
+        /// two pictures, so consecutive HUD draws stay in one pass without barriers between them.
+        Stream hud_stream;
+        /// DLSS-GT7-001: in a frame left as the game draws it, the HUD draws over black, in a list
+        /// of their own too (the main list then draws them into the display as the game does).
+        Stream hud_black_stream;
+        std::unique_ptr<SnapshotUploadMemo> snapshot_upload_memo;
+        /// FEAT-SGT-022: the per-draw bindings scratch, one slot per draw whose binds the
+        /// binder may still be making (one slot is used while the binder is off).
+        static constexpr u32 BindingSlots = 8;
+        std::array<DrawBindings, BindingSlots> binding_slots;
+        std::array<u64, BindingSlots> binding_jobs{}; ///< each slot's last binder job
+        u32 binding_next = 0;
+        std::array<BufferMemo, 16384> buffer_memos{}; ///< OPT-006: 2048 thrashed
+        std::array<TextureMemo, 16384> texture_memos{}; ///< OPT-006
+        TargetsMemo targets_memo;
+        Bound last_bound = Bound::InPlace;
+        MemoKind memo_kind = MemoKind::None;
+        Region* memo_region = nullptr;
+        Mirror* memo_mirror = nullptr;
+        Mirror* last_mirror = nullptr;
+    };
+    /// A plain member, not behind a pointer: Ctx() then compiles to what the members did (a
+    /// unique_ptr adds a load on every access and keeps the members out of registers).
+    RecordContext main_record_context;
+    /// FEAT-SGT-022: the bindings scratch for the next draw or dispatch (a slot no binder job
+    /// still reads).
+    DrawBindings& NextBindings();
+    /// FEAT-SGT-022: one PushBindings for the binder thread.
+    struct BindJob {
+        const Pipeline* pipeline = nullptr;
+        vk::PipelineBindPoint bind_point{};
+        DrawBindings* bindings = nullptr;
+        Stream* stream = nullptr;
+        CmdBuf cmd{};
+        BindInputs inputs{};
+    };
+    static void RunBindJob(void* owner, BindJob& job, CommandRing& ring);
+    /// FEAT-SGT-022 (SHADGT_RECORDER_BINDER=1): the binder thread; null when off.
+    std::unique_ptr<Native::RecorderBinder<BindJob>> binder;
+    /// FEAT-SGT-022: waits until the binder made every bind handed to it (before the recorder
+    /// changes what its jobs read: splices, stream swaps, evictions, dropped samplers).
+    void DrainBinder() const {
+        if (!binder) return;
+        namespace OT = Native::OrderedTiming;
+        const std::uint64_t from = OT::Enabled() ? OT::Ticks() : 0;
+        binder->Drain();
+        if (OT::Enabled()) {
+            OT::NoteBinder(OT::BinderDrains);
+            OT::NoteBinder(OT::BinderWaitTicks, OT::Ticks() - from);
+        }
+    }
+    /// FEAT-SGT-022: 1 binder thread, 2 the same with a drain after every job (serial, to tell
+    /// a wrong hand-off from a race), 0 off.
+    int binder_mode = 0;
+    RecordContext& Ctx() {
+        return main_record_context;
+    }
+    const RecordContext& Ctx() const {
+        return main_record_context;
+    }
     u64 frame = 0;
     u64 timing_tick = 0; ///< OPT-001
     u64 ui_draws = 0;
@@ -1877,7 +1967,7 @@ private:
     }
     /// NAT-150: the counter for a binding of that kind, by what GuestBuffer bound.
     u32 BoundKind(u32 kind) const {
-        return last_bound == Bound::Mirror ? 5 : (last_bound == Bound::Region ? 6 : kind);
+        return Ctx().last_bound == Bound::Mirror ? 5 : (Ctx().last_bound == Bound::Region ? 6 : kind);
     }
 
     std::mutex chunk_mutex;

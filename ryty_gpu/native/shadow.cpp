@@ -1153,7 +1153,9 @@ void PrepareWorker(u32 index) {
             g_queue.pop_front();
         }
         if (g_epoch.load(std::memory_order_relaxed) - item.epoch > 1) {
+#ifndef NDEBUG
             ++g_dropped_late;
+#endif
             GiveBack(std::move(item.job.state));
             continue;
         }
@@ -1165,12 +1167,14 @@ void PrepareWorker(u32 index) {
             GiveBack(std::move(t_free_states.back()));
             t_free_states.pop_back();
         }
+#ifndef NDEBUG // PERF-SGT-025: a clock read per job, for a report
         if (index == 0 && std::chrono::steady_clock::now() >= next_report) {
             next_report += std::chrono::seconds(10);
             LOG_INFO(Lib_GnmDriver, "GT7-PREP workers (10 s): {} jobs queued, {} dropped as late, "
                      "most queued {}", g_queued.exchange(0), g_dropped_late.exchange(0),
                      g_max_queue.exchange(0));
         }
+#endif
     }
 }
 
@@ -1200,10 +1204,14 @@ void ShadowJobDecode() {
             queued = g_queue.size();
         }
         g_queue_cv.notify_one();
+#ifndef NDEBUG // PERF-SGT-025: shared counters per game job, for the report above
         ++g_queued;
         u64 most = g_max_queue.load(std::memory_order_relaxed);
         while (queued > most && !g_max_queue.compare_exchange_weak(most, queued)) {
         }
+#else
+        static_cast<void>(queued);
+#endif
         t_ended = Job{};
         return;
     }

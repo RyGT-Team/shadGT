@@ -265,7 +265,9 @@ bool IsGt7(u8* exe_base) {
 u64 PS4_SYSV_ABI Gt7JobBeginHook(u64 job, u64 b, u64 c, u64 d, u64 e, u64 f) {
     const u64 context = job ? *reinterpret_cast<const u64*>(job) : 0;
     const u64 result = g_job_begin(job, b, c, d, e, f);
+#ifndef NDEBUG // PERF-SGT-025: as JobBeginHook's; read only by the debug reporter
     g_jobs.fetch_add(1, std::memory_order_relaxed);
+#endif
     if (ShadowEnabled() && context != 0) {
         if (g_tls_ok.load(std::memory_order_relaxed) &&
             CurrentPglContext() != reinterpret_cast<u8*>(context) &&

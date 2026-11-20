@@ -73,7 +73,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const WriteSets& writ
 
 std::string Pipeline::GetDebugString() const {
     std::string stage_desc;
-    for (const auto& stage : stages) {
+    for (const auto& stage : canonical_stages) {
         if (stage) {
             const auto shader_name = PipelineCache::GetShaderName(stage->hw_stage, stage->pgm_hash);
             if (stage_desc.empty()) {

@@ -565,25 +565,46 @@ AreaAnswer LookupArea(VAddr virtual_addr, VAddr limit) {
 static AreaAnswer LookupAreaWalk(VAddr virtual_addr, VAddr limit) {
     auto& cache = GetAreaCache();
     const bool caching = cache.enabled.load(std::memory_order_acquire);
-    // Most lookups land in the interval the thread looked at last: that answer is used again
+    // Most lookups land in an interval the thread looked at lately: that answer is used again
     // without the lock while no change was reported since (draws bind runs of nearby buffers).
+    // PERF-SGT-035: the last 8 intervals, not just the last one. A GT7 draw's buffers sit in a
+    // few areas in turn, and the misses' lock and map search were about 3.7% of the recorder.
     struct Memo {
         VAddr start;
         AreaCache::Interval interval;
         u64 version;
     };
-    thread_local Memo memo{};
+    constexpr u32 MemoSlots = 8;
+    thread_local std::array<Memo, MemoSlots> memos{};
+    thread_local u32 memo_next = 0;
     const u64 version = cache.version.load(std::memory_order_acquire);
-    if (caching && memo.interval.end != 0 && memo.version == version &&
-        memo.start <= virtual_addr && virtual_addr < memo.interval.end) {
-        const auto& known = memo.interval;
-        if (!known.mapped) {
-            return {0, true};
-        }
-        if (known.complete || known.end >= limit) {
-            return {known.end, known.complete, known.exec, known.views, known.readable};
+    if (caching) {
+        for (const Memo& m : memos) {
+            if (m.interval.end == 0 || m.version != version || virtual_addr < m.start ||
+                virtual_addr >= m.interval.end) {
+                continue;
+            }
+            const auto& known = m.interval;
+            if (!known.mapped) {
+                return {0, true};
+            }
+            if (known.complete || known.end >= limit) {
+                return {known.end, known.complete, known.exec, known.views, known.readable};
+            }
+            break; // the interval holding the address: it doesn't reach the limit, walk on
         }
     }
+    // A slot for an answer: the one already holding the interval's start, else the next in turn.
+    const auto remember = [&](VAddr at, const AreaCache::Interval& interval) {
+        for (Memo& m : memos) {
+            if (m.interval.end != 0 && m.start == at) {
+                m = {at, interval, version};
+                return;
+            }
+        }
+        memos[memo_next] = {at, interval, version};
+        memo_next = (memo_next + 1) % MemoSlots;
+    };
 #ifndef NDEBUG
     g_area_stats.lookups.fetch_add(1, std::memory_order_relaxed);
     ReportAreaStats();
@@ -601,7 +622,7 @@ static AreaAnswer LookupAreaWalk(VAddr virtual_addr, VAddr limit) {
         generation = cache.generation;
         ReleaseSRWLockShared(&cache.lock);
         if (found.end != 0) {
-            memo = {start, found, version};
+            remember(start, found);
         }
         if (found.end != 0 && !found.mapped) {
 #ifndef NDEBUG
@@ -637,7 +658,7 @@ static AreaAnswer LookupAreaWalk(VAddr virtual_addr, VAddr limit) {
                 const AreaCache::Interval unmapped{start + info.RegionSize, false, true, false,
                                                    false, false};
                 StoreInterval(start, unmapped, generation);
-                memo = {start, unmapped, version};
+                remember(start, unmapped);
             }
             return {0, true};
         }
@@ -652,7 +673,7 @@ static AreaAnswer LookupAreaWalk(VAddr virtual_addr, VAddr limit) {
         const AreaCache::Interval walked{answer.end,  true,         area_end_seen,
                                          answer.exec, answer.views, answer.readable};
         StoreInterval(start, walked, generation);
-        memo = {start, walked, version};
+        remember(start, walked);
     }
     return {answer.end, area_end_seen || answer.end >= limit, answer.exec, answer.views,
             answer.readable};

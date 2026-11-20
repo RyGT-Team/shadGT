@@ -15,6 +15,8 @@
 #include <chrono>
 #include <unordered_map>
 #include <unordered_set>
+#include <tsl/robin_map.h>
+#include "common/fast_hash.h"
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -206,11 +208,13 @@ public:
     void OrderBuffersAhead(const SelectedPipeline& selected, BufferPlan& plan);
     /// PERF-067 (recorder): around the draw the plan was made for.
     void SetBufferPlan(BufferPlan* plan) {
-        if (!plan && buffer_plan && buffer_plan->seq) {
+        BufferPlan*& current = Rec().buffer_plan;
+        if (!plan && current && current->seq) {
             // MT-007: this job's writes are registered now.
-            recorded_seq.store(buffer_plan->seq, std::memory_order_release);
+            // FEAT-SGT-022 step 3: an ordered-post step (two recorders must not move it back).
+            recorded_seq.store(current->seq, std::memory_order_release);
         }
-        buffer_plan = plan;
+        current = plan;
     }
 
     /// PERF-063 (recorder): the capture of the job being recorded, or null.
@@ -226,7 +230,7 @@ public:
     }
     /// PERF-047: on the recorder thread, around the draw it selected the pipeline for.
     void SetSelectedPipeline(SelectedPipeline* selected) {
-        selected_pipeline = selected;
+        Rec().selected_pipeline = selected;
     }
     /// PERF-056: a used selection goes back for reuse with its vectors' capacity.
     void RecycleSelectedPipeline(SelectedPipelinePtr selected) {
@@ -502,12 +506,24 @@ private:
         u64 identity{};
         std::array<u32, Shader::NUM_USER_DATA_REGS> user_data{};
     };
-    std::unordered_map<const Shader::Info*, ShadowInfo> shadow_infos;
-    // PERF-065: the last shadow found for a canonical info, direct-mapped by its address.
-    std::array<std::pair<const Shader::Info*, ShadowInfo*>, 512> shadow_lookup{};
+    /// FEAT-SGT-022 step 2: what one recorder thread installs and reads for the draw it records.
+    /// Its own shadow infos, so two recorders binding the same shader never write one copy.
+    struct RecorderStages {
+        std::unordered_map<const Shader::Info*, ShadowInfo> shadow_infos;
+        // PERF-065: the last shadow found for a canonical info, direct-mapped by its address.
+        std::array<std::pair<const Shader::Info*, ShadowInfo*>, 512> shadow_lookup{};
+        SelectedPipeline* selected_pipeline{}; ///< PERF-047
+        BufferPlan* buffer_plan{};             ///< PERF-067
+    };
+    RecorderStages main_recorder_stages;
+    RecorderStages& Rec() {
+        return main_recorder_stages;
+    }
+    const RecorderStages& Rec() const {
+        return main_recorder_stages;
+    }
     // FIX-077 (under the lookup lock): the identity each cache info was last seeded with.
-    std::unordered_map<const Shader::Info*, u64> seeded_infos;
-    SelectedPipeline* selected_pipeline{};
+    tsl::robin_map<const Shader::Info*, u64, Common::PointerHash> seeded_infos; ///< PERF-SGT-026
     struct {
         u64 ahead;
         u64 compute_ahead; // PERF-055
@@ -525,8 +541,6 @@ private:
     const char* capture_failure{};
     std::vector<std::pair<VAddr, u64>> capture_writes; // PERF-070
     std::atomic<u64> guards_dropped{};
-    // PERF-067
-    BufferPlan* buffer_plan{};
     /// MT-007 (buffer stage thread): ranges the planned jobs not recorded yet write. A later
     /// job's read over one is left to the recorder, so the stage does not wait after them.
     struct PendingWrite {

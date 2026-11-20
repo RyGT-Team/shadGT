@@ -30,6 +30,7 @@ struct GraphicsPipeline {
     const auto& GetParallelStageSummary() const { return parallel_stage_summary; }
     int GetLayout() const { return 13; }
     void SetStageInfos(std::span<const Shader::Info*, MaxShaderStages> infos);
+    void SetCanonicalStage(u32 stage, const Shader::Info* info) { stages[stage] = info; canonical_stages[stage] = info; }
 };
 #include "admission-stage-build.inc"
 static bool direct_enabled;

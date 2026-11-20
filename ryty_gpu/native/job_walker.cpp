@@ -185,6 +185,13 @@ u64 ReadablePrefix(const void* address, u64 size) {
 }
 
 bool Readable(const void* address, size_t size) {
+    // FIX-SGT-029: a range that wraps past the top of the address space is never readable. The
+    // granule walk below took such a range as readable (its last granule came out below its
+    // first): LogFailedWalk read the words before a bad stop pointer (0xa) at 0xff..fa and
+    // crashed GT7 with prepared draws on.
+    if (size != 0 && reinterpret_cast<u64>(address) > ~u64{0} - (size - 1)) {
+        return false;
+    }
     if (size == 0 || RangeKnownReadable(reinterpret_cast<u64>(address), size)) {
         return true;
     }

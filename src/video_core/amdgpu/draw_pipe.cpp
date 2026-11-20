@@ -457,11 +457,15 @@ void DrawPipe::Drain() {
         return;
     }
     ++stats.drains_that_waited;
-    const auto start = std::chrono::steady_clock::now();
+#ifndef NDEBUG
+    const auto start = std::chrono::steady_clock::now(); // PERF-SGT-025: the report's only
+#endif
     const u64 target = pushed;
     done_cv.wait(lk, [this, target] { return finished >= target && !recorder_callback_running; });
     exclusive = true;
+#ifndef NDEBUG
     stats.drain_wait_us += MicrosecondsSince(start);
+#endif
 }
 
 void DrawPipe::PushUrgent(Work&& work) {
@@ -600,17 +604,22 @@ void DrawPipe::Run(std::stop_token stop) {
             }
             if (queue.empty()) {
                 recorder_waiting = true;
-                const auto idle_from = std::chrono::steady_clock::now();
+#ifndef NDEBUG
+                const auto idle_from = std::chrono::steady_clock::now(); // DIAG-114
+#endif
                 work_cv.wait(lk, [&] {
                     return !queue.empty() || (!urgent.empty() && !exclusive) ||
                            stop.stop_requested();
                 });
                 recorder_waiting = false;
+#ifndef NDEBUG
+                // DIAG-114 (PERF-SGT-025: read only by debug reports, so not in Release)
                 const auto idle_to = std::chrono::steady_clock::now();
                 if (idle_to - idle_from > std::chrono::microseconds{50}) {
                     std::scoped_lock idle_lk{idle_mutex};
                     idle_ring[idle_next++ % idle_ring.size()] = {idle_from, idle_to};
                 }
+#endif
             }
             if (queue.empty()) {
                 if (!urgent.empty() && !stop.stop_requested()) {
@@ -626,7 +635,9 @@ void DrawPipe::Run(std::stop_token stop) {
             }
         }
         Common::UpdateCoreOwner(1, true); // PERF-GT7-048
-        const auto start = std::chrono::steady_clock::now();
+#ifndef NDEBUG
+        const auto start = std::chrono::steady_clock::now(); // PERF-SGT-025: the report's only
+#endif
         u64 ran = 0;
         Common::Nvtx::Scope nvtx{"recording"}; // DIAG-056
         RecorderParts::Running running;        // DIAG-GT7-005
@@ -655,9 +666,12 @@ void DrawPipe::Run(std::stop_token stop) {
             }
             work();
             ++ran;
+#ifndef NDEBUG
+            // PERF-088 (PERF-SGT-025: a processor-number call per job, for a report only)
             if (const int fast = Common::CurrentCoreIsFast(); fast >= 0) {
                 ++core_jobs[fast];
             }
+#endif
             const u64 done = finished_jobs.fetch_add(1) + 1;
             if (const u64 target = stage_wait_target.load();
                 target != 0 && done >= target) {
@@ -666,6 +680,7 @@ void DrawPipe::Run(std::stop_token stop) {
             }
             RunUrgent();
         }
+#ifndef NDEBUG
         if (const auto now = std::chrono::steady_clock::now();
             now - core_since >= std::chrono::seconds{10} && core_jobs[0] + core_jobs[1] != 0) {
             LOG_WARNING(Render, "PERF-088: recorder jobs in 10 s: {} on fast cores, {} on slow cores",
@@ -673,9 +688,12 @@ void DrawPipe::Run(std::stop_token stop) {
             core_jobs = {};
             core_since = now;
         }
+#endif
         std::scoped_lock lk{mutex};
         finished += ran;
+#ifndef NDEBUG
         stats.recorder_busy_us += MicrosecondsSince(start);
+#endif
         done_cv.notify_all();
     }
 }

@@ -41,7 +41,9 @@ public:
         const ComputePipeline* compute{};
         std::array<SelectedStage, Shader::MaxStageTypes> stages{{SelectedStage{{1}, {11, 12}}}};
     } selection;
-    Selection* selected_pipeline{&selection};
+    using SelectedPipeline = Selection;
+    struct { Selection* selected_pipeline; } rec{&selection}; // FEAT-SGT-022 step 2
+    auto& Rec() { return rec; }
     Cache pipeline_cache;
     bool in_race{true}, pipelined{true}, read_capture{}, reject_selected{};
     unsigned copies{}, validated_installs{}, current_installs{};
@@ -109,7 +111,7 @@ int main(int argc, char** argv) {
     // Existing no-selection and cache-miss fallback behavior remains intact.
     {
         ComputePipeline current{5}; Rasterizer r;
-        r.selected_pipeline = nullptr; r.pipeline_cache.current = &current; r.in_race = false;
+        r.Rec().selected_pipeline = nullptr; r.pipeline_cache.current = &current; r.in_race = false;
         Check(r.AcquireComputePipelineCandidate() == &current && Current(current), "no selection fallback");
         r.pipeline_cache.current = nullptr;
         Check(r.AcquireComputePipelineCandidate() == nullptr, "current lookup miss still skips safely");

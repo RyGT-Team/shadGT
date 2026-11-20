@@ -481,6 +481,11 @@ public:
     /// MT-002: the command thread replays worker_ring's commands [start, end) at this point of
     /// the main ring (it waits for the worker to have recorded them). Main-ring thread only.
     void RecordChunk(CommandRing* worker_ring, u64 start, u64 end);
+    /// FEAT-SGT-022: on the command thread, replays [start, end) of another ring here (from a
+    /// control command recorded before that ring's end was known: the recorder's binder).
+    void ReplayFrom(CommandRing& other_ring, u64 start, u64 end) {
+        ReplayChunk(other_ring, start, end);
+    }
 
     /// Returns the current command buffer tick.
     [[nodiscard]] u64 CurrentTick() const noexcept {

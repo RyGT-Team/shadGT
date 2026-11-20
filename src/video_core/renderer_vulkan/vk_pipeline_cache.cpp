@@ -107,6 +107,51 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "ryty_gpu/ryty_diag.h"
 
+namespace {
+// DIAG-SGT-024 (diagnostics builds): how program searches are decided, by stage group (pixel,
+// other graphics, compute), logged every 5 s: the memo's replays, the last match's packed and
+// full checks, the loop over permutations and the specializations it builds.
+enum SearchCount : unsigned {
+    SearchCalls, SearchAhead, SearchMemo, SearchLastTried, SearchLastPacked, SearchLastSpec,
+    SearchLoop, SearchLoopSpecs, SearchLoopMatched, SearchNone, SearchCountKinds,
+};
+#ifdef SHADGT_DIAGNOSTICS
+std::array<std::array<std::atomic<u64>, SearchCountKinds>, 3> g_search_counts{};
+std::atomic<long long> g_search_report{0};
+void NoteSearch(Shader::HwStage hw_stage, SearchCount what) {
+    const size_t group = hw_stage == Shader::HwStage::Fragment ? 0
+                         : hw_stage == Shader::HwStage::Compute ? 2 : 1;
+    g_search_counts[group][what].fetch_add(1, std::memory_order_relaxed);
+    if (what != SearchCalls) return;
+    const long long now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    long long last = g_search_report.load(std::memory_order_relaxed);
+    if (last == 0) {
+        g_search_report.compare_exchange_strong(last, now);
+        return;
+    }
+    if (now - last < 5 || !g_search_report.compare_exchange_strong(last, now)) return;
+    static constexpr std::array<const char*, 3> group_names{"pixel", "other graphics", "compute"};
+    std::string text;
+    for (size_t g = 0; g < 3; ++g) {
+        std::array<u64, SearchCountKinds> c{};
+        for (size_t k = 0; k < SearchCountKinds; ++k) c[k] = g_search_counts[g][k].exchange(0);
+        if (c[SearchCalls] == 0) continue;
+        text += fmt::format(" {}: {} searches ({} read-ahead), memo {}, last match tried {} "
+                            "(packed {}, full {}), loop {} ({} specializations built, {} matched), "
+                            "none {};",
+                            group_names[g], c[SearchCalls], c[SearchAhead], c[SearchMemo],
+                            c[SearchLastTried], c[SearchLastPacked], c[SearchLastSpec],
+                            c[SearchLoop], c[SearchLoopSpecs], c[SearchLoopMatched],
+                            c[SearchNone]);
+    }
+    LOG_INFO(Render_Vulkan, "DIAG-SGT-024 program searches in {} s:{}", now - last, text);
+}
+#else
+inline void NoteSearch(Shader::HwStage, SearchCount) {}
+#endif
+} // namespace
+
 namespace Shader::Optimization {
 extern thread_local std::span<const u32> g_diag_compiling_code;
 extern thread_local u64 g_diag_compiling_hash;
@@ -4496,6 +4541,31 @@ std::chrono::microseconds PipelineCache::QuickWait() {
     return wait;
 }
 
+std::chrono::microseconds PipelineCache::ReleasedRebuildWait() {
+    // FIX-SGT-036: in a race, a draw whose pipeline was released (GT Sport's precompile keeps
+    // 1024 of ~8000) waits for its rebuild a little longer than for a new pipeline: almost all
+    // are driver-cache hits of a millisecond or two (1565 of 1582 at Alsace), and with the race's
+    // quick wait (1 ms a draw, 2 ms per 16 ms) many still missed it and popped in a frame late.
+    // SHADGT_RACE_REBUILD_WAIT_US a draw at most (3000), twice that per 16 ms window; a slower
+    // rebuild is skipped until it is built.
+    static const std::chrono::microseconds per_draw = [] {
+        const char* env = std::getenv("SHADGT_RACE_REBUILD_WAIT_US");
+        return std::chrono::microseconds{
+            env && *env ? std::max(0ll, std::strtoll(env, nullptr, 10)) : 3000ll};
+    }();
+    using namespace std::chrono;
+    static thread_local steady_clock::time_point window{};
+    static thread_local microseconds used{};
+    const auto now = steady_clock::now();
+    if (now - window > milliseconds{16}) {
+        window = now;
+        used = microseconds{0};
+    }
+    const auto wait = std::clamp(per_draw * 2 - used, microseconds{0}, per_draw);
+    used += wait;
+    return wait;
+}
+
 bool PipelineCache::MenusWait() {
     // Captures retain every producer, including intermediate lighting passes,
     // until their actual save job completes. Ordinary Keep Going menu frames
@@ -5673,7 +5743,9 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
         // from the old renderer's sessions, so it takes milliseconds).
         if (build && AsyncPipelines() && !LegacyWaits() && !WritesMemory(S().infos) &&
             !NeverSkipped(S().infos) && !MenusWait() &&
-            build->done.wait_for(QuickWait()) != std::future_status::ready) {
+            build->done.wait_for(released_graphics.contains(S().graphics_key)
+                                     ? ReleasedRebuildWait()
+                                     : QuickWait()) != std::future_status::ready) {
             build->async = true;
             pending_builds[S().graphics_key] = build;
             graphics_pipelines.erase(it);
@@ -7717,7 +7789,21 @@ u32 PipelineCache::NeverSkippedReason(
     // was rebuilt, and that scenery popped back in: GT7 on an 8 GB GPU went over the trim's
     // reserve in races (6437 of 7180 MiB), and 1945 pipelines were retired in one session. A
     // rebuild here is a driver-cache hit of a few ms. (FIX-GTS-504 before the merge of 11-17.)
-    if (!released_graphics.empty() && released_graphics.contains(S().graphics_key)) return 2;
+    // FIX-SGT-036 (SHADGT_RACE_REBUILD_WAIT=1: waits in races too, as before): not while a race
+    // runs. GT Sport's precompile keeps 1024 of its ~8000 stored pipelines and releases the rest
+    // at once (FIX-GTS-468), so a race asked for released ones all the time: 1582 waits at
+    // Alsace, the command thread (and the recorder behind it) held 1.35 s, up to 305 ms a draw.
+    // In a race such a rebuild goes on in the background like a new build, with a wait of its
+    // own (ReleasedRebuildWait): the ones that come from the driver cache in a millisecond or two
+    // land at once (1565 of those 1582), and a slow one is skipped until it is built.
+    static const bool race_rebuild_wait = [] {
+        const char* env = std::getenv("SHADGT_RACE_REBUILD_WAIT");
+        return env && env[0] == '1';
+    }();
+    if (!released_graphics.empty() && released_graphics.contains(S().graphics_key) &&
+        (race_rebuild_wait || !RaceNeverWaits())) {
+        return 2;
+    }
     if (RaceNeverWaits()) return 0; // PERF-GTS-493
     // shadgt7 FIX-198: a one-off target's draw past its bounded wait (SetForceWait) waits for its
     // pipeline. FIX-GTS-517: not one in its bounded wait (SetWaitForShaders, PERF-GT7-020): its
@@ -9413,8 +9499,13 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
     if (t_lookup_only) {
         return GetProgramForJob(hw_stage, params, runtime_info, binding); // NAT-031
     }
-    if (program_cache.contains(params.hash)) pending_listings.erase(params.hash);
-    if (store_readers && !program_cache.contains(params.hash)) {
+    NoteSearch(hw_stage, SearchCalls); // DIAG-SGT-024
+    if (regs_override) NoteSearch(hw_stage, SearchAhead);
+    // PERF-SGT-026: the program cache is looked up once here (it was twice, and the listings
+    // erased from on every stage of every draw).
+    const bool program_known = program_cache.contains(params.hash);
+    if (program_known && !pending_listings.empty()) pending_listings.erase(params.hash);
+    if (store_readers && !program_known) {
         auto pending = pending_listings.find(params.hash);
         if (pending == pending_listings.end() && pending_listings.size() < 1024) {
             try { pending = pending_listings.emplace(params.hash, store_readers->List(params.hash).share()).first; }
@@ -9630,6 +9721,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
                        memo.modules_size == program->modules.size() &&
                        memo.runtime_info == runtime_info && memo.start == binding &&
                        std::ranges::equal(memo.user_data, params.user_data);
+    if (memo_usable) NoteSearch(hw_stage, SearchMemo); // DIAG-SGT-024
     const auto start_binding = binding;
     boost::container::small_vector<std::vector<u32>, 4> flats;
     // Leaves the memo's replay: the buffers of the permutations before `end` were the memo's.
@@ -9648,6 +9740,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         last_match < program->modules.size()) {
         auto& permutation = program->modules[last_match];
         if (permutation.info && !permutation.stored) {
+            NoteSearch(hw_stage, SearchLastTried); // DIAG-SGT-024
             auto& info = *permutation.info;
             info.pgm_base = params.Base();
             info.user_data = params.user_data;
@@ -9665,10 +9758,12 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
                                fetch == permutation.spec.fetch_shader_data;
             }
             bool matched = packed_match && fast_mode == 1;
+            if (matched) NoteSearch(hw_stage, SearchLastPacked); // DIAG-SGT-024
             if (!matched) {
                 Common::PhaseTimer spec_timer{Common::Phase::SelSpec};
                 const auto current_spec = TryMatchingSpecialization(info, runtime_info, profile, binding);
                 matched = current_spec && permutation.spec == *current_spec;
+                if (matched) NoteSearch(hw_stage, SearchLastSpec); // DIAG-SGT-024
                 if (packed_match && !matched) {
                     LOG_ERROR(Render_Vulkan, "PERF-GT7-058 packed specialization mismatch: {:#x}", params.hash);
                 }
@@ -9692,6 +9787,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         }
     }
     bool tess_checked = false;
+    NoteSearch(hw_stage, SearchLoop); // DIAG-SGT-024
     for (size_t perm_idx = 0; perm_idx < program->modules.size(); ++perm_idx) {
         auto& permutation = program->modules[perm_idx];
         if (!permutation.info) {
@@ -9733,6 +9829,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
             ++diag_memo;
         } else {
             std::optional<Common::PhaseTimer> spec_timer{std::in_place, Common::Phase::SelSpec};
+            NoteSearch(hw_stage, SearchLoopSpecs); // DIAG-SGT-024
             const auto spec = TryMatchingSpecialization(info, runtime_info, profile, binding);
             spec_timer.reset();
             if (!spec) {
@@ -9748,12 +9845,14 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
                     spec_miss_reasons.push_back(reason);
                 }
             }
+#ifdef SHADGT_DIAGNOSTICS // PERF-SGT-025: a string built per rejected permutation, for a log
             if (!matches && program->modules.size() >= 4 && mismatch_reasons.size() < 600) {
                 u32 index{};
                 const char* reason = permutation.spec.FirstDifference(*spec, index);
                 mismatch_reasons +=
                     fmt::format(" {}:{}[{}]", perm_idx, reason ? reason : "none", index);
             }
+#endif
         }
         // Newly active resources must match the compiled specialization; inactive ones can reuse
         // it.
@@ -9785,6 +9884,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
             memo.flats.assign(flats.begin(), flats.end());
         }
         last_match = perm_idx; // R7
+        if (!memo_usable) NoteSearch(hw_stage, SearchLoopMatched); // DIAG-SGT-024
         if (!memo_usable && SpecFastMode()) RecordSpecInputs(permutation, info, runtime_info, binding);
         if (!info.attribute_flags_known && IsTessEmulatedDraw()) {
             RecoverAttributeFlags(info, permutation.spec, params, runtime_info, perm_idx);
@@ -9796,6 +9896,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         return std::make_tuple(&info, permutation.module, HashCombine(params.hash, perm_idx));
     }
     match_timer.reset();
+    NoteSearch(hw_stage, SearchNone); // DIAG-SGT-024: no permutation matched
     // A queued state owns registers, but not the guest resources they point to. Reuse
     // known permutations for read-ahead; let the actual draw translate a new one.
     if (regs_override && !ReadAheadNewShadersEnabled()) {
@@ -10273,7 +10374,8 @@ void PipelineCache::ReleasePrewarmModules() {
     std::unordered_set<const Shader::Info*> in_use;
     const auto add = [&](const auto& pipeline) {
         if (!pipeline) return;
-        for (const auto* stage : pipeline->GetStages()) {
+        // FEAT-SGT-022 step 2: the cache's infos; the draw stages may be a recorder's copies.
+        for (const auto* stage : pipeline->CanonicalStages()) {
             if (stage) in_use.insert(stage);
         }
     };

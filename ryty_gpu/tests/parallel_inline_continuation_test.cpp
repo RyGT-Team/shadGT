@@ -35,6 +35,7 @@ struct ParallelRuntime {
 };
 struct NativeRenderer {
  struct Stream {bool rendering=true;RenderState render{};int list=1,cmd=2,dynamic=0;struct {std::array<int,2> handles{0,88};} pipelines;bool vertex_state_known=true;} stream;
+ NativeRenderer& Ctx(){return *this;} // FEAT-SGT-022 RecordContext
  struct R {struct Instance {int GetDevice(){return 0;}} instance;struct Scheduler {u64 tick=4;u64 CurrentTick(){return tick;}} scheduler;bool FrameDumpActive(){return dump;}} r;
  ParallelRuntime runtime;bool ContinueSmallParallelPass(const RenderState&,u32,bool);
 };

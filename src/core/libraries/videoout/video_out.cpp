@@ -443,8 +443,13 @@ s32 PS4_SYSV_ABI sceVideoOutGetDeviceCapabilityInfo(
     s32 handle, SceVideoOutDeviceCapabilityInfo* pDeviceCapabilityInfo) {
     pDeviceCapabilityInfo->capability = 0;
     const bool hdr_available = presenter->IsHDRSupported();
-    LOG_INFO(Lib_VideoOut, "HDR: capability query (swapchain HDR {}, game flag {})", hdr_available,
-             Common::ElfInfo::Instance().GetPSFAttributes().support_hdr.Value());
+    // PERF-SGT-025: logged when the answer changes, not at each query (GT7's job threads ask
+    // about 500 times a second).
+    static std::atomic<int> logged_hdr{-1};
+    if (logged_hdr.exchange(int(hdr_available), std::memory_order_relaxed) != int(hdr_available)) {
+        LOG_INFO(Lib_VideoOut, "HDR: capability query (swapchain HDR {}, game flag {})",
+                 hdr_available, Common::ElfInfo::Instance().GetPSFAttributes().support_hdr.Value());
+    }
 #ifdef RYTY_GPU
     if (!hdr_available && Common::IsGt7()) {
         RytySetGt7HdrStatusCompatibility(false);

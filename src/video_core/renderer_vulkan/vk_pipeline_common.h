@@ -23,6 +23,12 @@ struct PushData;
 
 namespace Vulkan {
 
+/// FEAT-SGT-022 step 2: how many recorder threads keep their own draw stages in a pipeline, and
+/// the slot this thread installs and reads them in. 0 on the one recorder today and on every
+/// thread that records nothing (those read what slot 0 holds, as they read `stages` before).
+inline constexpr u32 MaxRecorders = 2;
+inline constinit thread_local u32 t_recorder_slot = 0;
+
 /// FIX-GT7-101: a pipeline (or library) the driver failed to create is created again after a
 /// pause (0.2 s, doubling, six times) instead of ending the game at once. On a first GT7 race
 /// load up to 21 large compiles ran at once and the process committed 9.6 GB; players reported
@@ -80,6 +86,7 @@ public:
 
     auto GetStages() const {
         static_assert(static_cast<u32>(Shader::SwStage::Compute) == Shader::MaxStageTypes - 1);
+        const auto& stages = draw_stages[t_recorder_slot].infos;
         if (is_compute) {
             return std::span{stages.cend() - 1, stages.cend()};
         } else {
@@ -88,7 +95,7 @@ public:
     }
 
     const Shader::Info& GetStage(Shader::SwStage stage) const noexcept {
-        return *stages[u32(stage)];
+        return *draw_stages[t_recorder_slot].infos[u32(stage)];
     }
 
     /// PERF-047: the pipeline cache's infos the pipeline was made from (stages may point at the
@@ -96,9 +103,10 @@ public:
     const std::array<const Shader::Info*, Shader::MaxStageTypes>& CanonicalStages() const {
         return canonical_stages;
     }
-    /// PERF-047: the infos the draw being recorded binds through (the recorder thread only).
+    /// PERF-047: the infos the draw being recorded binds through (a recorder thread, in its
+    /// slot; FEAT-SGT-022).
     void SetDrawStages(const std::array<const Shader::Info*, Shader::MaxStageTypes>& infos) const {
-        stages = infos;
+        draw_stages[t_recorder_slot].infos = infos;
     }
 
     bool IsCompute() const {
@@ -141,7 +149,18 @@ protected:
     /// between them).
     std::array<vk::UniqueDescriptorSetLayout, Shader::Backend::MaxDescriptorSets> desc_layouts;
     std::array<vk::DescriptorSetLayout, Shader::Backend::MaxDescriptorSets> set_layouts{};
-    mutable std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
+    /// The pipeline cache's info of a stage, in every recorder's slot until a draw installs its own.
+    void SetCanonicalStage(u32 stage, const Shader::Info* info) {
+        canonical_stages[stage] = info;
+        for (auto& slot : draw_stages) {
+            slot.infos[stage] = info;
+        }
+    }
+    /// FEAT-SGT-022 step 2: one line each, so two recorders installing never share one.
+    struct alignas(64) DrawStages {
+        std::array<const Shader::Info*, Shader::MaxStageTypes> infos{};
+    };
+    mutable std::array<DrawStages, MaxRecorders> draw_stages{};
     std::array<const Shader::Info*, Shader::MaxStageTypes> canonical_stages{};
     u32 push_set = NoPushSet;
     std::array<u8, Shader::Backend::MaxDescriptorSets> set_dynamic_buffers{}; ///< PERF-GTS-374

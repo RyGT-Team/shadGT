@@ -744,8 +744,12 @@ std::string BufferCache::DescribeRecentReadbacks(VAddr address, u64 size) {
 }
 
 // DIAG-053: GPU data written back into guest memory over a recent command buffer.
-static void NoteWritebackOverCommands(AmdGpu::Liverpool* liverpool, const char* writer,
-                                      VAddr address, u64 size) {
+static void NoteWritebackOverCommands([[maybe_unused]] AmdGpu::Liverpool* liverpool,
+                                      [[maybe_unused]] const char* writer,
+                                      [[maybe_unused]] VAddr address, [[maybe_unused]] u64 size) {
+#if defined(NDEBUG)
+    return; // PERF-SGT-025: a scan of 256 command buffers per write-back, for log lines
+#else
     if (!liverpool) {
         return;
     }
@@ -761,6 +765,7 @@ static void NoteWritebackOverCommands(AmdGpu::Liverpool* liverpool, const char* 
                     writer, address, size, cmd->address, cmd->size,
                     liverpool->CmdBufferSequence() - cmd->sequence);
     }
+#endif
 }
 
 void BufferCache::CompleteAsyncReadbacks(

@@ -40,9 +40,8 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
                                  SerializationSupport& sdata)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache, true},
       compute_key{compute_key_} {
-    auto& info = stages[int(Shader::SwStage::Compute)];
-    info = &info_;
-    canonical_stages[int(Shader::SwStage::Compute)] = &info_;
+    SetCanonicalStage(u32(Shader::SwStage::Compute), &info_);
+    const Shader::Info* const info = &info_;
     const auto debug_str = GetDebugString();
 
     const u32 required_subgroup = RequiredSubgroup(instance);

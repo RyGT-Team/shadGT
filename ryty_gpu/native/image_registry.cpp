@@ -1,3 +1,4 @@
+#include "ryty_gpu/native/ordered_timing.h"
 #include <cstdio>
 namespace Vulkan {
 bool RytyWideScene(); // WIDE-001 (ryty_game_patch.cpp)
@@ -275,6 +276,7 @@ ImageRegistry::~ImageRegistry() = default;
 
 ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_target, u64 frame,
                                 bool create, bool exact_format) {
+    Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::RegistryFind}; // DIAG-SGT-023
     const bool require_format = exact_format || (render_target && info.num_samples > 1);
 #ifndef NDEBUG
     ++stats.lookups;
@@ -2213,6 +2215,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
             }
             continue;
         }
+#ifndef NDEBUG // PERF-SGT-025: a lock per upload, for a diagnosis
         {
             // WIDE-006 (diagnosis): a texture made of targets uploaded from guest memory.
             bool made_of_targets;
@@ -2227,6 +2230,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
                              info.size.height, int(entry->force_upload.load()));
             }
         }
+#endif
         trace.Next(2);
         if (upload_hook && entry->from_cpu) {
             upload_hook(*entry); // NAT-105: CPU writes from here on are seen

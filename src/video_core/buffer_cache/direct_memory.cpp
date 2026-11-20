@@ -270,6 +270,9 @@ std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr addr
 // region, which copied the culling block. Its reader saw that copy while the culling passes wrote
 // the block in place, and the road went dark for single frames (DIAG-SGT-013). The alias here
 // spans the whole read (GuestArenaMapAlias stitches the pieces, FIX-RT-001).
+// FIX-SGT-041: in GT7's PS4 Pro mode the same read is 602 MB (0x1016603260+0x259fcda0, Tokyo in
+// rain), over the old 256 MiB cap; it fell back to a 702 MiB region over the culling block and
+// the occlusion bug came back. Span views now reach 1 GiB.
 std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindOrImportSpan(VAddr address,
                                                                            u64 size) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::Import}; // DIAG-SGT-023
@@ -280,6 +283,7 @@ std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindOrImportSpan(VAdd
     }();
     if (!enabled || size == 0 || address > UINT64_MAX - size) return std::nullopt;
     constexpr u64 Granularity = 64 * 1024; // MapViewOfFile3 pieces (FIX-RT-001)
+    constexpr u64 MaxSpan = 1ull << 30;     // FIX-SGT-041 (256 MiB before)
     const VAddr want_end = address + size;
     std::scoped_lock lk{mutex};
     for (const auto& [key, span] : span_views) {
@@ -305,7 +309,7 @@ std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindOrImportSpan(VAdd
     const auto started = std::chrono::steady_clock::now();
     VAddr base = address & ~(Granularity - 1);
     VAddr end = (want_end + Granularity - 1) & ~(Granularity - 1);
-    if (end - base > 256ull << 20) return refuse("over 256 MiB");
+    if (end - base > MaxSpan) return refuse("over 1 GiB");
     // A smaller span view at the same start (the read grew: 77 then 85 MB in one race) is
     // retired like an unmapped one and replaced.
     const auto retire_at = [&](VAddr at) {
@@ -321,7 +325,7 @@ std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindOrImportSpan(VAdd
     // its alias. Importing pins the memory: tens to hundreds of ms on the recorder for this size.
     VAddr padded_end = end;
     {
-        const VAddr target = std::min<VAddr>(base + (256ull << 20), end + (32ull << 20));
+        const VAddr target = std::min<VAddr>(base + MaxSpan, end + (32ull << 20));
         VAddr hi = end;
         for (int step = 0; step < 64 && hi < target; ++step) {
             const VAddr more = GuestViewEnd(hi, target - hi);

@@ -74,7 +74,7 @@ public:
     /// FIX-SGT-014: one imported buffer over the whole range when no view holds it, for reads
     /// that must stay in guest memory (they overlap a listed in-place range). A separate alias
     /// (span view) is made and kept until an unmap meets it; it has no page-table entries. Up
-    /// to 256 MiB each, 32 in all.
+    /// to 1 GiB each (FIX-SGT-041; 256 MiB before), 32 in all.
     std::optional<std::pair<const Buffer*, u64>> FindOrImportSpan(VAddr address, u64 size);
 
     /// NAT-107: the imported views holding [address, address + size) in order:

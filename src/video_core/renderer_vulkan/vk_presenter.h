@@ -41,6 +41,7 @@ struct Frame {
     VmaAllocation allocation;
     vk::Image image;
     vk::ImageView image_view;
+    vk::Format image_view_format{vk::Format::eUndefined};
     vk::Fence present_done;
     vk::Semaphore ready_semaphore;
     u64 ready_tick;

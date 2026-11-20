@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <iterator>
 #include <fstream>
 #include <mutex>
 #include <string>
@@ -108,13 +110,41 @@ std::string WindowTitle() {
     return "Gran Turismo 7";
 }
 
+// FIX-SGT-037: the window's icon is the game's own sce_sys\icon0.png, found as /app0 is: app0\<serial>
+// (or app0) next to the exe, then the update= and game= folders of <serial>.RyGT.ini (FEAT-GTS-259:
+// the game is read from those, so the file is usually not next to the exe). Empty when none is found:
+// SetIcon then gives the built-in one (GAME-001).
+std::vector<u8> GameIconPng() {
+    const auto root = Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path();
+    std::vector<std::filesystem::path> folders{Common::App0Folder(root)};
+    std::ifstream ini(Common::RygtIniPath(root));
+    std::string game, update, line;
+    while (std::getline(ini, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("update=", 0) == 0) update = line.substr(7);
+        else if (line.rfind("game=", 0) == 0) game = line.substr(5);
+    }
+    if (!update.empty()) folders.emplace_back(std::u8string(update.begin(), update.end())); // UTF-8, as the launcher writes it
+    if (!game.empty()) folders.emplace_back(std::u8string(game.begin(), game.end()));
+    for (const auto& folder : folders) {
+        std::error_code error;
+        const auto icon = folder / "sce_sys" / "icon0.png";
+        if (!std::filesystem::is_regular_file(icon, error)) continue;
+        std::ifstream file(icon, std::ios::binary);
+        std::vector<u8> png((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        if (!png.empty()) return png;
+    }
+    return {};
+}
+
 void RunWindowThread() {
     auto* controllers = Common::Singleton<Input::GameControllers>::Instance();
     static const std::string window_title = WindowTitle();
     static Frontend::WindowSDL window(EmulatorSettings.GetWindowWidth(),
                                       EmulatorSettings.GetWindowHeight(), controllers,
                                       window_title);
-    window.SetIcon({}); // the game's icon (GAME-001): shadGT's Gran Turismo Sport one or ryGT7's
+    // FIX-SGT-037: the game's own icon0.png; without it the built-in one (GAME-001).
+    window.SetIcon(GameIconPng());
     {
         std::scoped_lock lock{g_window_mutex};
         g_window = &window;

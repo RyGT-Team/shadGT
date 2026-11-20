@@ -10445,10 +10445,12 @@ void PipelineCache::ReleasePrewarmModules() {
 
 // FIX-GTS-468: how many precompiled pipelines no draw used stay built after the precompile
 // (SHADGT_PRECOMPILE_KEEP; the most recently used ones, as the precompile builds those first).
+// PERF-SGT-040: 2048 by default (1024 before), so fewer of a session's pipelines are released and
+// rebuilt from the driver's cache when a draw needs them again.
 static u64 PrecompileKeep() {
     static const u64 keep = [] {
         const char* env = std::getenv("SHADGT_PRECOMPILE_KEEP");
-        if (!env || !*env) return u64{1024};
+        if (!env || !*env) return u64{2048};
         const long long value = std::strtoll(env, nullptr, 10);
         return value < 0 ? ~u64{0} : u64(value);
     }();

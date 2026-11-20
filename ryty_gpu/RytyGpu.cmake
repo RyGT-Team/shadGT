@@ -137,7 +137,7 @@ ryty_add_library(ryty_gpu libSceVideoOut
         # FIX-074: shadGT's static red-zone patching, applied to the converted game code.
         ryty_gpu/ryty_red_zone.cpp
         ryty_gpu/ryty_game_patch.cpp
-        # GTS-010: Scapes and photo mode pictures exported as PNG to the Pictures folder.
+        # GTS-010: Scapes and photo mode PJXR pictures exported as PNG to Photos.
         ryty_gpu/gts_photo_export.cpp
         ryty_gpu/gts_file_share.cpp
         ryty_gpu/gts_replay_video.cpp

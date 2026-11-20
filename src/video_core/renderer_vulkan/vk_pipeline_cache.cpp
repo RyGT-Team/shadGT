@@ -370,6 +370,7 @@ bool RytyRaceStartSignal(); // GAME-006
 bool RytyGtsProjectHooks(); // FIX-GT7-140
 bool RytyGtsMenuCaptureCanContinue();
 bool RytyGtsMenuCaptureAvailable();
+bool RytyGtsPhotoCaptureRunning(); // FIX-SGT-049
 #endif
 
 // PERF-310: in a race, shader translations and pipeline builds run below the game's priority.
@@ -4578,10 +4579,21 @@ bool PipelineCache::MenusWait() {
         return true;
     }();
     (void)logged;
+    const bool photo = RytyGtsPhotoCaptureRunning(); // FIX-SGT-049
+#ifdef SHADGT_DIAGNOSTICS
+    // A line where a photo starts and where it ends, among the waits it causes (DIAG-GTS-515
+    // counts them as "capture or menu policy").
+    static std::atomic<bool> photo_was{false};
+    if (photo_was.load(std::memory_order_relaxed) != photo &&
+        photo_was.exchange(photo, std::memory_order_relaxed) != photo) {
+        LOG_WARNING(Render_Vulkan, "FIX-SGT-049: GT Sport photo capture {}: {}", photo ? "begins" : "ends",
+                    photo ? "every draw and dispatch waits for its pipeline" : "menus as before");
+    }
+#endif
     // FIX-GT7-140: without GT Sport's project hook (GT7) shadgt7's rule applies, see the policy.
     return Native::MenuCompileMustWait(CompileMode(), RytyGtsInRace(),
                                        RytyGtsMenuCaptureAvailable(), RytyGtsMenuCaptureCanContinue(),
-                                       RytyGtsProjectHooks());
+                                       RytyGtsProjectHooks(), photo);
 #else
     return false;
 #endif

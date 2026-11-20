@@ -7,6 +7,18 @@
 
 using Native::MenuCaptureCompileGuard;
 
+TEST(MenuCompilePolicy, RaceAndScapesShareThePhotoEditor) {
+    for (const auto origin : {"race_replay", "scapes"}) {
+        EXPECT_FALSE(Native::PhotoEditorAfterProject(origin, false));
+        EXPECT_TRUE(Native::PhotoEditorAfterProject("photo", false));
+        EXPECT_TRUE(Native::PhotoEditorAfterProject("gallery", true));
+        EXPECT_FALSE(Native::PhotoEditorAfterProject(origin, true));
+    }
+    EXPECT_FALSE(Native::PhotoEditorAfterProject("gallery", false));
+    EXPECT_FALSE(Native::PhotoEditorAfterProject("race_single", true));
+    EXPECT_FALSE(Native::PhotoEditorAfterProject("play_photo", true));
+}
+
 TEST(MenuCompilePolicy, KeepGoingMenusRequireVerifiedIdleCaptureHooks) {
     for (unsigned mode = 0; mode != 3; ++mode) {
         EXPECT_TRUE(Native::MenuCompileMustWait(mode, false, false, false));
@@ -16,6 +28,29 @@ TEST(MenuCompilePolicy, KeepGoingMenusRequireVerifiedIdleCaptureHooks) {
         EXPECT_TRUE(Native::MenuCompileMustWait(mode, false, true, false));
         EXPECT_TRUE(Native::MenuCompileMustWait(mode, true, true, false));
     }
+}
+
+// FIX-SGT-049: while GT Sport renders a photo every draw waits, in every mode and state.
+TEST(MenuCompilePolicy, PhotoCaptureAlwaysWaits) {
+    for (unsigned mode = 0; mode != 3; ++mode) {
+        for (const bool in_race : {false, true}) {
+            for (const bool hooks : {false, true}) {
+                for (const bool idle : {false, true}) {
+                    for (const bool project_hooks : {false, true}) {
+                        EXPECT_TRUE(Native::MenuCompileMustWait(mode, in_race, hooks, idle,
+                                                                project_hooks, true));
+                        EXPECT_EQ(Native::MenuCompileMustWait(mode, in_race, hooks, idle,
+                                                              project_hooks, false),
+                                  Native::MenuCompileMustWait(mode, in_race, hooks, idle,
+                                                              project_hooks));
+                    }
+                }
+            }
+        }
+    }
+    // Keep going in the photo editor with idle icon hooks: only the photo itself waits.
+    EXPECT_FALSE(Native::MenuCompileMustWait(2, false, true, true, true, false));
+    EXPECT_TRUE(Native::MenuCompileMustWait(2, false, true, true, true, true));
 }
 
 // FIX-GT7-140: without GT Sport's project hook (GT7) shadgt7's rule: keep going never waits.

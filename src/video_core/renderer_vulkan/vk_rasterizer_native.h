@@ -1870,6 +1870,18 @@ private:
     /// OPT-010: regions and mirrors are added and removed under it (exclusive); job threads
     /// look regions up under it (shared).
     std::shared_mutex buffer_map_mutex;
+    /// FEAT-SGT-079 step 22: what a prepared draw points at (regions, mirrors, pictures, samplers)
+    /// stays while recorder B holds this shared, over a draw it records without `mutex`. Whatever
+    /// drops them takes it exclusively, with the generation bumps B re-checks (BPinWrite). Taken
+    /// before buffer_map_mutex; B never waits for `mutex` while holding it.
+    std::shared_mutex b_pin;
+    struct BPinWrite {
+        explicit BPinWrite(NativeRenderer& renderer);
+        ~BPinWrite();
+        BPinWrite(const BPinWrite&) = delete;
+        BPinWrite& operator=(const BPinWrite&) = delete;
+        NativeRenderer* held = nullptr; ///< null when this thread already held it
+    };
     struct PreparedShard {
         std::mutex mutex;
         /// PERF-SGT-034: a flat map (the node map's find and erase were about 2.5% of the GT7

@@ -387,6 +387,9 @@ inline bool OnRecorderBThread() {
 }
 /// DIAG-SGT-089: this thread's draw is in its encode side (DIAG-SGT-023) (diagnostics builds, overlap on).
 inline thread_local bool t_draw_in_record = false;
+/// FEAT-SGT-079 step 22: recorder B is in a draw the recorder readied (its would-be unlocked
+/// window). With SHADGT_DIAG_B_TOUCH=2 the trap counts only there.
+inline thread_local bool t_b_window = false;
 /// DIAG-SGT-089 (diagnostics builds, SHADGT_DIAG_SUBMITS=1 and SHADGT_DIAG_B_TOUCH=1): B's thread reached a renderer
 /// entry point that may touch shared state, counted by name, phase and caller: what B's draws need
 /// before they can record without the renderer's lock.
@@ -394,7 +397,12 @@ inline thread_local bool t_draw_in_record = false;
     do {                                                                                           \
         if constexpr (Common::DiagnosticsBuilt) {                                                  \
             static const bool b_touch_on = ::Common::DiagEnv("SHADGT_DIAG_B_TOUCH") != nullptr;   \
-            if (b_touch_on && ::Vulkan::OnRecorderBThread()) {                                     \
+            static const bool b_touch_window = [] {                                             \
+                const char* env = ::Common::DiagEnv("SHADGT_DIAG_B_TOUCH");                        \
+                return env && env[0] == '2';                                                       \
+            }();                                                                                   \
+            if (b_touch_on && ::Vulkan::OnRecorderBThread() &&                                     \
+                (!b_touch_window || ::Vulkan::t_b_window)) {                                       \
                 ::Vulkan::NoteSubmitSite(::Vulkan::t_draw_in_record ? "B touch in encode: " name   \
                                                                     : "B touch before encode: " name, \
                                          std::source_location::current());                         \

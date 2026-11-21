@@ -3504,6 +3504,7 @@ void NativeRenderer::RecycleSamplers() {
     // SamplersAPass at most: the first pass of a session finds everything the table took to fill,
     // and this runs under the lock every sampler lookup takes. What is left keeps its old epoch
     // and goes with the next passes.
+    const BPinWrite pin{*this}; // FEAT-SGT-079 step 22: the erases and samplers_dropped together
     std::vector<const SamplerEntry*> gone;
     gone.reserve(SamplersAPass);
     for (auto it = samplers.begin(); it != samplers.end() && gone.size() < SamplersAPass;) {
@@ -4346,6 +4347,7 @@ void NativeRenderer::FlushLdsReaders(u32) {
 }
 
 void NativeRenderer::EndRendering(u32 reason, [[maybe_unused]] std::source_location where) {
+    SHADGT_B_TOUCH("EndRendering"); // FEAT-SGT-079 step 22
     if (!Ctx().stream.lds_readers.empty()) FlushLdsReaders(reason);
     RecordPartitionClock end_partition{t_record_partition_end};
     auto* sidecar=FindParallelRuntime(this);
@@ -4456,6 +4458,7 @@ bool NativeRenderer::ContinueSmallParallelPass(const RenderState& target,u32 rea
 }
 
 void NativeRenderer::BeginRendering(const RenderState& state) {
+    SHADGT_B_TOUCH("BeginRendering"); // FEAT-SGT-079 step 22
     Stream& s = Ctx().stream;
     if (s.rendering && s.render == state) {
         return;
@@ -6505,8 +6508,24 @@ void NativeRenderer::MakePendingMirrors() {
     }
 }
 
+// FEAT-SGT-079 step 22: b_pin exclusively, once per thread (the drops nest: OnUnmap ->
+// DropRegionsOver -> DropMirrors).
+static thread_local bool t_b_pin_written = false;
+NativeRenderer::BPinWrite::BPinWrite(NativeRenderer& renderer) {
+    if (t_b_pin_written) return;
+    renderer.b_pin.lock();
+    t_b_pin_written = true;
+    held = &renderer;
+}
+NativeRenderer::BPinWrite::~BPinWrite() {
+    if (!held) return;
+    t_b_pin_written = false;
+    held->b_pin.unlock();
+}
+
 void NativeRenderer::DropMirrors(VAddr address, u64 size, u32 diagnostic_reason) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::DropMirrors}; // DIAG-SGT-023
+    const BPinWrite pin{*this}; // FEAT-SGT-079 step 22
     for (auto it = FirstMirror(address); it != mirrors.end() && it->second.begin < address + size;) {
         if(diagnostic_reason!=~u32{0} && MirrorDiagnosticEnabled())
             NoteMirrorDiagnostic(diagnostic_reason,address,address+size,it->second.begin,it->second.end,unmap_generation.load());
@@ -16620,6 +16639,17 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         Common::DiagnosticsBuilt && (PassDiagOn() || BindCommitMode() != 0 || PassAuditOn()) ? this : nullptr;
     const PassItemTimer pass_timer{timed_pass, timed_pass ? std::chrono::steady_clock::now()
                                                           : std::chrono::steady_clock::time_point{}};
+    struct BWindow { // FEAT-SGT-079 step 22 (the window closes with the draw)
+        bool open = false;
+        ~BWindow() {
+            if (open) t_b_window = false;
+        }
+    } b_window;
+    if (OnRecorderBThread()) {
+        const auto* queued = r.liverpool->RunningQueuedDraw();
+        b_window.open = queued && queued->overlap_ready == 1;
+        t_b_window = b_window.open;
+    }
     EnsureAheadArena(); // PERF-GTS-377
     struct StreamUnwindGuard {
         NativeRenderer& renderer;
@@ -16920,6 +16950,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                                                      : Native::OrderedTiming::PreparedMissing);
     }
     if (!late_bound_done.empty()) { // PERF-GTS-398
+        SHADGT_B_TOUCH("late_bound_done"); // FEAT-SGT-079 step 22
         for (PreparedDraw* done : late_bound_done) FreePrepared(done);
         late_bound_done.clear();
     }
@@ -17664,6 +17695,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
     }
     DrawBindings& b = from_prepared ? prepared->bindings : NextBindings();
+    SHADGT_B_TOUCH("binding_prepared"); // FEAT-SGT-079 step 22
     binding_prepared = from_prepared ? prepared : nullptr; // FEAT-SGT-022: its binds may go to the binder
     // GT7-UW: a HUD draw showing a small picture drawn with depth this frame (the race's maps).
     // DLSS-GT7-001: the same sign, without a HUD layer, tells the prototype a race is on.
@@ -19528,7 +19560,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     }
     const u32 index_count = vi->index_count;
     const CmdBuf cmdbuf{s.cmd};
-    retired_pipeline_owners.Hold(pipeline_owner);
+    SHADGT_B_TOUCH("retired_pipeline_owners"); retired_pipeline_owners.Hold(pipeline_owner);
     {
         PhaseClock part{stats.record_ns[4]};
         if (!parallel_draw) BindGraphics(s, *pipeline, pipeline_owner);
@@ -19717,7 +19749,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         // WIDE-008/031/060: the draw is split from its preparation, so the 32:9 paths can
         // issue it with their own viewports and scissors (several times for a split HUD element).
         const auto prepare_draw = [&] {
-        retired_pipeline_owners.Hold(pipeline_owner);
+        SHADGT_B_TOUCH("retired_pipeline_owners"); retired_pipeline_owners.Hold(pipeline_owner);
         if (depth_snapshot) {
             // Preparation may splice after the copy. Retain the image again in
             // the actual draw stream immediately before recording its read.
@@ -20190,7 +20222,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         SceneTrace::GpuEnd(s.cmd);
         }
     }
-    retired_pipeline_owners.Hold(pipeline_owner);
+    SHADGT_B_TOUCH("retired_pipeline_owners"); retired_pipeline_owners.Hold(pipeline_owner);
     {
         PhaseClock part{stats.record_ns[7]};
         NoteWrites(&targets, b);
@@ -25193,6 +25225,7 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
     mapping_waiters.fetch_add(1, std::memory_order_acq_rel); // PERF-GTS-368
     std::scoped_lock lock{mutex};
     mapping_waiters.fetch_sub(1, std::memory_order_acq_rel);
+    const BPinWrite pin{*this}; // FEAT-SGT-079 step 22: the drops and the generations together
     trace.Next(4);
     CancelLinearDownloads(address, size);
     if (FaultAheadEnabled() && size != 0) {
@@ -25208,6 +25241,7 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
 u32 NativeRenderer::DropRegionsOver(VAddr address, u64 size, u32 mirror_reason) {
     // NAT-146, FIX-GT7-086: regions over the range go (the device frees their buffers once the
     // GPU is done with them), and the mirrors over it. With `mutex` held. Returns how many.
+    const BPinWrite pin{*this}; // FEAT-SGT-079 step 22
     u32 dropped = 0;
     {
         std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
@@ -25259,6 +25293,7 @@ void NativeRenderer::OnNewMapping(VAddr address, u64 size) {
     mapping_waiters.fetch_add(1, std::memory_order_acq_rel); // PERF-GTS-368
     std::scoped_lock lock{mutex};
     mapping_waiters.fetch_sub(1, std::memory_order_acq_rel);
+    const BPinWrite pin{*this}; // FEAT-SGT-079 step 22: the dirty pages, drops and generations
     CancelLinearDownloads(address, size);
     std::optional<std::vector<Native::MappingRefreshRange>> plan;
     std::unordered_set<VAddr> prepared_pages;
@@ -26060,6 +26095,7 @@ void NativeRenderer::EvictImages() {
             it = owners.empty() ? stencil_owners.erase(it) : std::next(it);
         }
     };
+    const BPinWrite pin{*this}; // FEAT-SGT-079 step 22: pictures go only here
     registry->Evict(frame - KeepFrames, on_evict, [&](Native::ImageEntry& entry) {
         return kept_textures.contains(&entry) || keep(entry) || keep_new_texture(entry);
     }, 16);

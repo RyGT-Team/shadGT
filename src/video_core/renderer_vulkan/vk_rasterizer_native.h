@@ -669,6 +669,13 @@ private:
         bool dirty_sorted = true;
     };
     std::map<VAddr, Region> regions; ///< by begin; guarded by mutex
+    /// PERF-SGT-046: `regions` as flat sorted arrays for RegionOver (about 230 regions in a GT7
+    /// race fit in L1; the tree's nodes are scattered). Rebuilt after every change of `regions`,
+    /// with buffer_map_mutex held exclusively.
+    std::vector<VAddr> region_begins;
+    std::vector<VAddr> region_ends;
+    std::vector<Region*> region_ptrs;
+    void RebuildRegionIndex();
     u64 regions_taken_in{}; ///< recorder: incremented whenever region storage is replaced
     std::mutex region_dirty_mutex;   ///< pending_region_writes (CPU write faults: any thread)
     std::vector<std::pair<VAddr, VAddr>> pending_region_writes;
@@ -950,6 +957,12 @@ private:
         u64 frame = 0; ///< when last considered
     };
     std::map<VAddr, Mirror> mirrors; ///< by begin; guarded by mutex
+    /// PERF-SGT-046: `mirrors` as flat sorted arrays for MirrorHolding (about 100 in a GT7 race),
+    /// rebuilt after every change of `mirrors`.
+    std::vector<VAddr> mirror_begins;
+    std::vector<VAddr> mirror_ends;
+    std::vector<Mirror*> mirror_ptrs;
+    void RebuildMirrorIndex();
     u64 mirror_bytes = 0;
     std::unordered_map<VAddr, MirrorCandidate> mirror_candidates; ///< by page of the range start
     std::vector<std::pair<VAddr, VAddr>> pending_mirrors;          ///< made at a list's start

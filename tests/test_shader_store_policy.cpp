@@ -7,8 +7,55 @@
 #include <vector>
 #include <gtest/gtest.h>
 #include "shader_recompiler/lane_read_policy.h"
+#include "video_core/shader_store_file.h"
 #include "video_core/shader_store_policy.h"
 #include "video_core/renderer_vulkan/shader_fix_scan_cache.h"
+#ifdef _WIN32
+#include <io.h>
+#endif
+
+TEST(ShaderStorePolicy, FailedPublicationPreservesOldBlobAndAllowsRetry) {
+    const auto dir = std::filesystem::temp_directory_path() /
+        ("ryty-blob-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    ASSERT_TRUE(std::filesystem::create_directory(dir));
+    const auto blob = dir / "program.spv";
+    const auto complete = [](std::FILE* file) { return std::fputs("previous", file) >= 0; };
+    ASSERT_FALSE(Storage::PublishShaderBlob(blob, complete));
+    const auto disk_full = [](std::FILE* file) {
+        EXPECT_EQ(std::fwrite("partial", 1, 7, file), 7u);
+        errno = ENOSPC;
+        return false;
+    };
+    EXPECT_EQ(Storage::PublishShaderBlob(blob, disk_full), std::errc::no_space_on_device);
+    std::string contents;
+    std::getline(std::ifstream(blob), contents);
+    EXPECT_EQ(contents, "previous");
+    EXPECT_EQ(Storage::PublishShaderBlob(dir / "new.spv", disk_full), std::errc::no_space_on_device);
+    EXPECT_EQ(std::distance(std::filesystem::directory_iterator(dir), {}), 1);
+#ifdef _WIN32
+    // Force the CRT's final buffer flush to fail, after fwrite has reported success.
+    char buffer[1024];
+    const auto late_error = Storage::PublishShaderBlob(blob, [&](std::FILE* file) {
+        EXPECT_EQ(std::setvbuf(file, buffer, _IOFBF, sizeof(buffer)), 0);
+        EXPECT_EQ(std::fwrite("buffered", 1, 8, file), 8u);
+        auto* reader = _wfopen(blob.c_str(), L"rb");
+        if (!reader) return false;
+        EXPECT_EQ(_dup2(_fileno(reader), _fileno(file)), 0);
+        std::fclose(reader);
+        return true;
+    });
+    EXPECT_TRUE(late_error);
+    std::getline(std::ifstream(blob), contents);
+    EXPECT_EQ(contents, "previous");
+#endif
+    ASSERT_FALSE(Storage::PublishShaderBlob(blob, [](std::FILE* file) {
+        return std::fputs("replacement", file) >= 0;
+    }));
+    std::getline(std::ifstream(blob), contents);
+    EXPECT_EQ(contents, "replacement");
+    std::filesystem::remove(blob);
+    std::filesystem::remove(dir);
+}
 
 TEST(ShaderStorePolicy, ProgramFixScansAreReusedAndComputeScansAreLazy) {
     Vulkan::ShaderFixScanCache cache;

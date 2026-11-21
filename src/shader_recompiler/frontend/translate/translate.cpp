@@ -181,6 +181,13 @@ void Translator::EmitPrologue(IR::Block* first_block) {
                 if (profile.supports_amd_shader_explicit_vertex_parameter ||
                     profile.supports_fragment_shader_barycentric) {
                     ir.SetVectorReg(IR::VectorReg(vreg), ir.GetAttribute(attrib, comp));
+                } else if (attrib == IR::Attribute::BaryCoordPullModel && comp == 2) {
+                    // 1/W needs no barycentrics: the backend reads FragCoord.w.
+                    ir.SetVectorReg(IR::VectorReg(vreg), ir.GetAttribute(attrib, comp));
+                } else {
+                    // No barycentrics: I = J = 0 at this pixel, matching V_INTERP_MOV_F32's
+                    // per-pixel P0/P10/P20 fallback.
+                    ir.SetVectorReg(IR::VectorReg(vreg), ir.Imm32(0.0f));
                 }
             });
         const auto addr_flags = runtime_info.hw.fs.addr_flags;

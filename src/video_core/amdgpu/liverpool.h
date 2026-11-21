@@ -524,6 +524,7 @@ private:
         Common::UniqueFunction<void> work;
         std::vector<std::shared_ptr<QueuedDraw>> catch_up; ///< the recorder's draws since B's last
         std::shared_ptr<QueuedDraw> draw;
+        s64 pushed_ns = 0; ///< DIAG-SGT-091
     };
     std::deque<OverlapJob> overlap_queue;
     std::mutex overlap_mutex;
@@ -533,12 +534,26 @@ private:
     std::vector<std::shared_ptr<QueuedDraw>> overlap_since_b; ///< recorder thread
     bool overlap_outstanding = false;                          ///< recorder thread
     u64 overlap_pass_tag = 0;                                  ///< recorder thread
-    void RecorderBSync();
+    /// DIAG-SGT-091: why (0 chunk start, 1 a job outside B's pass, 2 the recorder's ordered work
+    /// (step 23), 3 the recorder going to sleep, 4 a draw kept at the hand-over, 5 other).
+    void RecorderBSync(int cause = 5);
     /// DIAG-SGT-088 (diagnostics builds): what overlap costs, on the recorder.
     struct {
         s64 since = 0, sync_wait = 0, prepare = 0, handoff = 0, commit = 0;
         u64 syncs = 0, jobs = 0, kept = 0;
+        // DIAG-SGT-091: syncs and their waits by cause; B's jobs left at a sync; from B's last
+        // job done to the recorder going on; the recorder's ordered-work checks (step 23).
+        std::array<u64, 6> cause_syncs{};
+        std::array<s64, 6> cause_wait{};
+        u64 left_jobs = 0, left_syncs = 0;
+        s64 wake_after_done = 0;
+        s64 ordered_check = 0;
+        u64 ordered_checks = 0;
     } overlap_cost;
+    /// DIAG-SGT-091 (B's thread): its jobs' time queued (pushed to started), catching up its
+    /// registers, running; its time waiting for work; when it finished its last job.
+    std::atomic<s64> b_queued_ns{0}, b_catchup_ns{0}, b_run_ns{0}, b_idle_ns{0}, b_done_at{0};
+    std::atomic<u64> b_jobs_run{0};
     void ReportOverlapCost();
     void RecorderBOverlapLoop();
     u32 push_draw_in_pass = 0;

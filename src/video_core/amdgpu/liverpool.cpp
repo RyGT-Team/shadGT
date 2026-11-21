@@ -657,7 +657,7 @@ void Liverpool::StartDrawPipe() {
         recorder_tid = gettid();
 #endif
     }, DrawPipe::DefaultMaxPending, [this] {
-        RecorderBSync(); // FEAT-SGT-079 step 19: B's handed work, before the recorder sleeps
+        RecorderBSync(3); // FEAT-SGT-079 step 19: B's handed work, before the recorder sleeps
         // A held label may be the very thing the guest waits for before
         // publishing its next command buffer. Submit it before the recorder
         // sleeps instead of requiring another draw or EOP to trigger a flush.
@@ -673,7 +673,7 @@ void Liverpool::StartDrawPipe() {
         draw_pipe->before_job = [this](u64 tag, const void* info) {
             if (!overlap_outstanding) return;
             if (tag == 0 || tag != overlap_pass_tag) {
-                RecorderBSync();
+                RecorderBSync(1);
                 return;
             }
 #ifdef RYTY_GPU
@@ -683,11 +683,18 @@ void Liverpool::StartDrawPipe() {
             const auto* qd = static_cast<const QueuedDraw*>(info);
             if (qd && qd->to_b) return; // B's (the hand-over checks it)
             auto* native = rasterizer ? rasterizer->Native() : nullptr;
-            if (!native || !qd || qd->compute || !native->RecorderAOrderedFree(qd->packet)) {
+            s64 check_from = 0;
+            if constexpr (Common::DiagnosticsBuilt) check_from = OverlapNowNs(); // DIAG-SGT-091
+            const bool free = native && qd && !qd->compute && native->RecorderAOrderedFree(qd->packet);
+            if constexpr (Common::DiagnosticsBuilt) {
+                overlap_cost.ordered_check += OverlapNowNs() - check_from;
+                ++overlap_cost.ordered_checks;
+            }
+            if (!free) {
                 if constexpr (Common::DiagnosticsBuilt) {
                     ::Vulkan::NoteSubmitSite("A draw with ordered work: B synced", {});
                 }
-                RecorderBSync();
+                RecorderBSync(2);
             }
 #endif
         };
@@ -1536,7 +1543,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
                 const bool chunk_start =
                     !overlap_outstanding || !overlap_since_b.empty() || overlap_pass_tag != qd->tag;
                 if (chunk_start) {
-                    RecorderBSync();
+                    RecorderBSync(0);
                 }
                 s64 prepare_from = 0;
                 if constexpr (Common::DiagnosticsBuilt) prepare_from = cost_now();
@@ -1567,7 +1574,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
                     native && (qd->overlap_ready == 2 ||
                                (qd->overlap_ready == 0 && !native->RecorderBPrepareForB(qd->packet)));
                 if (keep) {
-                    RecorderBSync();
+                    RecorderBSync(4);
                     if constexpr (Common::DiagnosticsBuilt) ++overlap_cost.kept;
                     qd->to_b = false;
                     inner();
@@ -1581,7 +1588,8 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
                 }
                 {
                     std::scoped_lock lk{overlap_mutex};
-                    overlap_queue.push_back({std::move(inner), std::move(overlap_since_b), qd});
+                    overlap_queue.push_back({std::move(inner), std::move(overlap_since_b), qd,
+                                             Common::DiagnosticsBuilt ? OverlapNowNs() : 0});
                     ++overlap_pushed;
                     if (RecorderBOverlap() == 1) overlap_go = overlap_pushed;
                 }
@@ -2151,7 +2159,34 @@ void Liverpool::ReportOverlapCost() {
     const auto per_draw = [&](u32 t, u32 p) {
         return locked_draws[t] ? double(locked[t][p]) / 1e3 / double(locked_draws[t]) : 0.0;
     };
-    LOG_INFO(Render, "DIAG-SGT-089: in Draw with the renderer's lock: the recorder {} draws, "
+    {
+        const auto& oc = overlap_cost;
+        const auto ms = [&](s64 ns) { return double(ns) / 1e6 / secs; };
+        const u64 jobs_run = b_jobs_run.exchange(0, std::memory_order_relaxed);
+        const s64 queued = b_queued_ns.exchange(0, std::memory_order_relaxed);
+        const s64 catchup = b_catchup_ns.exchange(0, std::memory_order_relaxed);
+        const s64 run = b_run_ns.exchange(0, std::memory_order_relaxed);
+        const s64 idle = b_idle_ns.exchange(0, std::memory_order_relaxed);
+        LOG_INFO(Render, "DIAG-SGT-091: syncs (count, wait ms/s) by cause: chunk start {} {:.1f}, "
+                 "job outside B's pass {} {:.1f}, recorder's ordered work {} {:.1f}, recorder "
+                 "sleeps {} {:.1f}, draw kept {} {:.1f}, other {} {:.1f}; syncs with B's jobs left "
+                 "{} ({:.1f} jobs each), B's last job done to the recorder on {:.1f} us each; the "
+                 "recorder's ordered-work checks {} ({:.2f} us each, {:.1f} ms/s); B: {} jobs, "
+                 "queued {:.1f} us, catch-up {:.2f} us, run {:.2f} us each, idle {:.1f} ms/s",
+                 oc.cause_syncs[0], ms(oc.cause_wait[0]), oc.cause_syncs[1], ms(oc.cause_wait[1]),
+                 oc.cause_syncs[2], ms(oc.cause_wait[2]), oc.cause_syncs[3], ms(oc.cause_wait[3]),
+                 oc.cause_syncs[4], ms(oc.cause_wait[4]), oc.cause_syncs[5], ms(oc.cause_wait[5]),
+                 oc.left_syncs, oc.left_syncs ? double(oc.left_jobs) / oc.left_syncs : 0.0,
+                 oc.left_syncs ? double(oc.wake_after_done) / 1e3 / oc.left_syncs : 0.0,
+                 oc.ordered_checks,
+                 oc.ordered_checks ? double(oc.ordered_check) / 1e3 / oc.ordered_checks : 0.0,
+                 ms(oc.ordered_check), jobs_run,
+                 jobs_run ? double(queued) / 1e3 / jobs_run : 0.0,
+                 jobs_run ? double(catchup) / 1e3 / jobs_run : 0.0,
+                 jobs_run ? double(run) / 1e3 / jobs_run : 0.0, ms(idle));
+    }
+    LOG_INFO(Render, "DIAG-SGT-089: in Draw (B: with the lock, or holding b_pin when it encodes "
+             "without it): the recorder {} draws, "
              "{:.1f} ms/s before the encode side + {:.1f} ms/s in it ({:.2f} + {:.2f} us a draw), "
              "waiting for the lock while B holds work {:.1f} ms/s; B {} draws, {:.1f} + {:.1f} "
              "ms/s ({:.2f} + {:.2f} us a draw)",
@@ -2176,6 +2211,7 @@ int Liverpool::RecorderBOverlap() {
 void Liverpool::RecorderBOverlapLoop() {
     while (true) {
         OverlapJob job;
+        const s64 idle_from = Common::DiagnosticsBuilt ? OverlapNowNs() : 0; // DIAG-SGT-091
         {
             std::unique_lock lk{overlap_mutex};
             overlap_cv.wait(lk, [this] {
@@ -2187,14 +2223,29 @@ void Liverpool::RecorderBOverlapLoop() {
             job = std::move(overlap_queue.front());
             overlap_queue.pop_front();
         }
+        s64 started = 0;
+        if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-091
+            started = OverlapNowNs();
+            b_idle_ns.fetch_add(started - idle_from, std::memory_order_relaxed);
+            if (job.pushed_ns) b_queued_ns.fetch_add(started - job.pushed_ns, std::memory_order_relaxed);
+        }
         for (const auto& draw : job.catch_up) {
             RecorderBApply(*draw);
         }
+        s64 caught_up = 0;
+        if constexpr (Common::DiagnosticsBuilt) caught_up = OverlapNowNs();
         try {
             job.work();
         } catch (...) {
             std::scoped_lock lk{overlap_mutex};
             baton_error = std::current_exception();
+        }
+        if constexpr (Common::DiagnosticsBuilt) {
+            const s64 now = OverlapNowNs();
+            b_catchup_ns.fetch_add(caught_up - started, std::memory_order_relaxed);
+            b_run_ns.fetch_add(now - caught_up, std::memory_order_relaxed);
+            b_jobs_run.fetch_add(1, std::memory_order_relaxed);
+            b_done_at.store(now, std::memory_order_release);
         }
         overlap_done.fetch_add(1, std::memory_order_acq_rel);
         overlap_done.notify_all();
@@ -2203,7 +2254,7 @@ void Liverpool::RecorderBOverlapLoop() {
 
 // The recorder: B records everything it was handed, then its list goes into the command order
 // (ahead of the recorder's open list, which is spliced later).
-void Liverpool::RecorderBSync() {
+void Liverpool::RecorderBSync(int cause) {
     if (!overlap_outstanding) return;
     s64 cost_from = 0;
     if constexpr (Common::DiagnosticsBuilt) {
@@ -2218,9 +2269,21 @@ void Liverpool::RecorderBSync() {
         target = overlap_pushed;
     }
     overlap_cv.notify_one();
+    const u64 left = target - std::min(target, overlap_done.load(std::memory_order_acquire));
     for (u64 done = overlap_done.load(std::memory_order_acquire); done < target;
          done = overlap_done.load(std::memory_order_acquire)) {
         overlap_done.wait(done, std::memory_order_acquire);
+    }
+    if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-091
+        const s64 now = OverlapNowNs();
+        const u32 c = u32(std::clamp(cause, 0, 5));
+        ++overlap_cost.cause_syncs[c];
+        overlap_cost.cause_wait[c] += now - cost_from;
+        if (left) {
+            overlap_cost.left_jobs += left;
+            ++overlap_cost.left_syncs;
+            overlap_cost.wake_after_done += now - b_done_at.load(std::memory_order_acquire);
+        }
     }
     if (baton_error) std::rethrow_exception(std::exchange(baton_error, nullptr));
     overlap_outstanding = false;

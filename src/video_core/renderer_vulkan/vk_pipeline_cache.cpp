@@ -2917,12 +2917,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             // turns it on unless SHADGT_PREWARM=0, so GTSport.exe runs without a launcher.
             const char* prewarm = std::getenv("SHADGT_PREWARM");
 #ifdef RYTY_GPU
-            // PERF-098: GPU.precompile_shaders (on by default) unless the variable says otherwise.
-            // TITLE-001: not on GT7 unless the variable asks for it.
+            // PERF-098: GPU.precompile_shaders unless the variable says otherwise, for both games
+            // (PERF-GT7-137: GT7 no longer has its own "off"; the title-screen device loss that
+            // kept it off went with FIX-GT7-187).
             const bool prewarm_on =
-                prewarm ? prewarm[0] != '0'
-                        : VideoCore::CurrentTitleDefaults().stored_pipelines_prebuilt &&
-                              EmulatorSettings.IsPrecompileShaders();
+                prewarm ? prewarm[0] != '0' : EmulatorSettings.IsPrecompileShaders();
 #else
             const bool prewarm_on = prewarm && prewarm[0] == '1';
 #endif
@@ -7945,7 +7944,7 @@ void PipelineCache::ReportSkippedBuilds(std::chrono::steady_clock::time_point no
     // DIAG-GT7-012 (port): the builds draws are skipped for, every 2 s while there are any. In a
     // GT7 race on a new track ~4,000 draws a second were skipped for three minutes (the catch-up
     // never ended) while a few builds finished in 2 s, often none. Here, not in ReportPrewarm,
-    // which runs only with the background prewarm (off for GT7, TITLE-001).
+    // which runs only with the background prewarm (GPU.precompile_shaders).
     if (now - skipped_builds_reported < std::chrono::seconds{2}) {
         return;
     }

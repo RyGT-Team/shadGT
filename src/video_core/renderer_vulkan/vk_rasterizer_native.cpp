@@ -2992,6 +2992,11 @@ static bool ListedInPlace(VAddr address, u64 size);
 bool NativeRenderer::WantedPicturesOn() { // PERF-SGT-093 (2: in arm 1 of the 2 s A/B)
     static const int mode = [] {
         const char* env = std::getenv("SHADGT_PREPARE_WANTED_PICTURES");
+        // Off while recorder B overlaps the recorder: it drew glitches there (a texture's first
+        // upload then goes to whichever recorder reaches it first), even made only while B held
+        // nothing. The user's runs: overlap with it on, glitches; off, like B off.
+        const char* overlap = std::getenv("SHADGT_RECORDER_B_OVERLAP");
+        if (overlap && (overlap[0] == '1' || overlap[0] == '2')) return 0;
         if (!env || !*env) return 1; // on by default (two A/B drives: +3.1-3.2% EOPs, trail -0.5 ms)
         return env[0] == '1' || env[0] == '2' ? env[0] - '0' : 0;
     }();
@@ -16675,7 +16680,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     RecorderBDeal(false, r.liverpool->DrawRegs()); // FEAT-SGT-079
     // PERF-SGT-093: the per-frame textures the job threads missed are made now, by the recorder,
     // in GPU order (before the draws that sample them; the job threads find them from here on).
-    if (has_wanted_pictures.load(std::memory_order_acquire) && !OnRecorderBThread()) {
+    // Not while recorder B holds work: making a picture touches the pictures over its memory,
+    // which B's handed draws may bind (as the recorder's missing-picture lookups, step 23).
+    if (has_wanted_pictures.load(std::memory_order_acquire) && !OnRecorderBThread() &&
+        !b_outstanding.load(std::memory_order_acquire)) {
         std::unordered_map<VAddr, VideoCore::ImageInfo> wanted;
         {
             std::scoped_lock wanted_lock{wanted_mutex};

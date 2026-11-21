@@ -23182,7 +23182,13 @@ bool NativeRenderer::RecorderAOrderedFree(const void* packet) {
         if (!exists) return no("A ordered: a picture B also looks up");
         if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("A ordered: shared lookup, made already", {});
     }
-    if (!p->in_place.empty()) return no("A ordered: in place");
+    // FEAT-SGT-079 step 29 (SHADGT_RECORDER_B_STEP23_INPLACE=0, diagnosis): the recorder's draw
+    // with ranges read in place goes ahead beside B (B reads such ranges from guest memory).
+    static const bool inplace_syncs = [] { // the user's run with them free: like B off
+        const char* env = std::getenv("SHADGT_RECORDER_B_STEP23_INPLACE");
+        return env && env[0] == '1';
+    }();
+    if (inplace_syncs && !p->in_place.empty()) return no("A ordered: in place");
     if (device->PendingImageInit()) return no("A ordered: pending init (any)");
     if (registry->HasPendingUploads()) return no("A ordered: pending upload (any)");
     if (BWindowWritesPending(*p)) return no("A ordered: CPU writes pending");

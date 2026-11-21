@@ -5827,9 +5827,15 @@ void NativeRenderer::SortRegionWrites() {
             // (about 1.3 MB a frame at Tokyo) cut GT7's GPU time in the rain pack from about 24 to
             // 19.5 ms a frame and PCIe reads by 10-20%, for about 1.2 ms more CPU time a frame
             // (more write faults) (Release, 2026-11-20).
+            // PERF-GT7-193: on by default in GT7. Release, nsys, Tokyo rain pack: 43.7 fps against
+            // 40.1-40.9 with it off, the GPU's time a frame about 17.2 ms against 20.8. In GT Sport
+            // it cost: 50.2 against 55.8 fps at the same spot, GPU time a frame up from 9.7 to
+            // 10.8 ms and the game's own threads about one core busier (the write faults); it stays
+            // off there. SHADGT_NATIVE_MIRROR_KEEP_WRITTEN=0 or 1 overrides it in either game.
             static const bool keep_written = [] {
                 const char* env = std::getenv("SHADGT_NATIVE_MIRROR_KEEP_WRITTEN");
-                return env && env[0] == '1';
+                if (env && *env) return env[0] == '1';
+                return Common::IsGt7();
             }();
             if (dynamic && keep_written) {
                 dynamic = false;

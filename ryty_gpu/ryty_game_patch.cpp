@@ -43,6 +43,7 @@
 #include "ryty_gpu/native/entry_hook.h"
 #include "ryty_gpu/native/menu_snapshot_session.h"
 #include "ryty_gpu/native/menu_capture_compile_guard.h"
+#include "ryty_gpu/native/menu_compile_policy.h"
 #include "ryty_gpu/native/scene_history_origin.h"
 #include "input/telemetry_haptics_output.h"
 #include "input/trigger_feedback.h"
@@ -642,6 +643,9 @@ std::atomic<bool> g_project_hooks{false}; // FIX-GT7-140: the GTS-003 script-rea
 std::atomic<bool> g_race_session{false};
 // WIDE-059: the replay's photo mode is open (photo, with gallery loaded along).
 std::atomic<bool> g_photo_mode{false};
+// FIX-SGT-049: the Scapes editor's stage object, learnt at its takePhoto command; forgotten when
+// photo mode ends (the stage goes with the editor). See InstallPhotoCaptureWatch.
+std::atomic<u64> g_photo_stage{0};
 std::atomic<int> g_menu_screen{0}; // WIDE-020: 1 main menu, 2 Home, 3 livery editor
 
 // WIDE-013: the cameras the race's own screens create (the pre-race screen's overhead view) take
@@ -697,7 +701,7 @@ void NoteProjectScript(const u8* data, s64 read) {
     name = name.substr(0, name.find('/'));
     static constexpr std::string_view menus[] = {
         "gtmode", "arcade", "campaign", "garage", "brand_central", "gallery", "livery2",
-        "photo", "play_photo", "option", "ps_store", "car_select", "course_select",
+        "photo", "scapes", "play_photo", "option", "ps_store", "car_select", "course_select",
         "event_setting", "preview", "car_preview", "online", "boot", "demo"};
     // "race" itself is the races' shared script, which the game also loads at boot (before the
     // gift car's thumbnail is drawn); a race runs one of the race_* projects.
@@ -715,8 +719,11 @@ void NoteProjectScript(const u8* data, s64 read) {
     const bool session = race || (g_race_session.load(std::memory_order_relaxed) &&
                                   std::find(std::begin(race_pages), std::end(race_pages), name) !=
                                       std::end(race_pages));
-    g_photo_mode.store(name == "photo" || (name == "gallery" && g_photo_mode.load()),
-                       std::memory_order_relaxed); // WIDE-059
+    const bool photo_mode = Native::PhotoEditorAfterProject(name, g_photo_mode.load());
+    g_photo_mode.store(photo_mode, std::memory_order_relaxed); // WIDE-059
+    if (!photo_mode) {
+        g_photo_stage.store(0, std::memory_order_relaxed); // FIX-SGT-049
+    }
     if (g_race_session.exchange(session) != session) {
         std::fprintf(stderr, "[patch] WIDE-015 %.*s: %s\n", static_cast<int>(name.size()),
                      name.data(), session ? "race screens (wide)" : "menus");
@@ -3159,6 +3166,82 @@ void InstallScopedMenuCompiles(u8* base) {
                  g_scoped_menu_compiles ? "ready" : "unavailable; retaining menu waits");
 }
 
+// FIX-SGT-049: while GT Sport renders a photo, every draw and dispatch waits for its pipeline
+// (Native::MenuCompileMustWait): with cold shaders some were skipped and the first photo was
+// saved black, or with its channels mixed up. The game counts each photo in at its takePhoto
+// command and out once the picture is encoded or its files are written, in two places:
+// - A replay's photo mode, the framework's command (0x621860): lock inc [framework + 0x82e1c]
+//   at 0x621d16, lock dec at 0x624df0 in the notification that encodes the JPEG XR; the script's
+//   isUnderPhotoRendering reads the same count. The framework object is the first word of the
+//   handle the game stores at 0x2bf5e48 when it starts (0x606ba1).
+// - The Scapes editor, its stage's own command (0x6a2f80): three lock inc [stage + 0xc18] at
+//   0x6a3256/64/72 (picture, preview, data), one lock dec per file written at 0x6a42ca. That
+//   command is reached through a table filled at start, so its entry is hooked to learn the
+//   stage, [[this] + 8], kept while photo mode lasts (the stage goes with the editor).
+// Anything in doubt reads "no photo": other code bytes leave that watch off, a count out of range
+// is not a photo, and a race never reads them (photos are taken in the photo project, out of
+// races). A count the game never brings back keeps the editor waiting for new pipelines, as every
+// menu did before the scoped capture guard, until photo mode ends (Scapes) or for good (replay
+// photo mode); races are not affected. SHADGT_PHOTO_PIPELINE_WAIT=0: off.
+std::atomic<const u8*> g_photo_handle_slot{nullptr};
+using StagePhotoFn = void(PS4_SYSV_ABI*)(u64, u64);
+StagePhotoFn g_stage_take_photo{};
+
+void PS4_SYSV_ABI StageTakePhoto(u64 self, u64 args) {
+    u64 owner = 0, stage = 0;
+    if (self &&
+        Core::RytyMemory::GuardedCopy(&owner, reinterpret_cast<const void*>(self), sizeof(owner)) &&
+        owner &&
+        Core::RytyMemory::GuardedCopy(&stage, reinterpret_cast<const void*>(owner + 8), sizeof(stage)) &&
+        stage && g_photo_stage.exchange(stage, std::memory_order_relaxed) != stage) {
+#ifdef SHADGT_DIAGNOSTICS
+        std::fprintf(stderr, "[patch] FIX-SGT-049 Scapes photo: stage %llx\n",
+                     static_cast<unsigned long long>(stage));
+#endif
+    }
+    g_stage_take_photo(self, args);
+}
+
+void InstallPhotoCaptureWatch(u8* base) {
+    const char* enabled = std::getenv("SHADGT_PHOTO_PIPELINE_WAIT");
+    const bool gts = Common::CurrentGameSerial() == "CUSA03220";
+    if (enabled && enabled[0] == '0') {
+        if (gts) std::fprintf(stderr, "[patch] FIX-SGT-049 photo capture wait off (SHADGT_PHOTO_PIPELINE_WAIT=0)\n");
+        return;
+    }
+    const auto matches = [&](u64 rva, std::span<const u8> expected) {
+        std::array<u8, 16> actual{};
+        return expected.size() <= actual.size() &&
+               Core::RytyMemory::GuardedCopy(actual.data(), base + rva, expected.size()) &&
+               std::equal(expected.begin(), expected.end(), actual.begin());
+    };
+    constexpr u8 store_handle[]{0x4c, 0x89, 0x35, 0xa0, 0xf2, 0x5e, 0x02}; // mov [rip+..], r14
+    constexpr u8 count_in[]{0xf0, 0xff, 0x80, 0x1c, 0x2e, 0x08, 0x00};      // lock inc [rax+0x82e1c]
+    constexpr u8 count_out[]{0xf0, 0xff, 0x88, 0x1c, 0x2e, 0x08, 0x00};     // lock dec [rax+0x82e1c]
+    if (matches(0x606ba1, store_handle) && matches(0x621d16, count_in) &&
+        matches(0x624df0, count_out)) {
+        g_photo_handle_slot.store(base + 0x606ba8 + 0x25ef2a0, std::memory_order_release); // 0x2bf5e48
+    }
+    constexpr u8 prologue[]{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
+    constexpr u8 stage_owner[]{0x48, 0x8b, 0x07, 0x48, 0x8b, 0x48, 0x08};  // mov rax,[rdi]; mov rcx,[rax+8]
+    constexpr u8 stage_in[]{0xf0, 0xff, 0x80, 0x18, 0x0c, 0x00, 0x00};     // lock inc [rax+0xc18]
+    constexpr u8 stage_out[]{0xf0, 0xff, 0x88, 0x18, 0x0c, 0x00, 0x00};    // lock dec [rax+0xc18]
+    if (matches(0x6a2f80, prologue) && matches(0x6a2fa3, stage_owner) &&
+        matches(0x6a3256, stage_in) && matches(0x6a3264, stage_in) &&
+        matches(0x6a3272, stage_in) && matches(0x6a42ca, stage_out)) {
+        Native::NearCode code{base};
+        g_stage_take_photo = reinterpret_cast<StagePhotoFn>(Native::HookEntry(
+            code, base, 0x6a2f80 - Native::kEbootToExe, prologue,
+            reinterpret_cast<void*>(&StageTakePhoto), "Scapes photo command"));
+    }
+    const bool replay = g_photo_handle_slot.load(std::memory_order_relaxed) != nullptr;
+    const bool scapes = g_stage_take_photo != nullptr;
+    if (gts || replay || scapes) {
+        std::fprintf(stderr, "[patch] FIX-SGT-049 photo capture wait: replay photo mode %s, Scapes %s\n",
+                     replay ? "ready" : "off (unknown code)", scapes ? "ready" : "off (unknown code)");
+    }
+}
+
 // Diagnostic comparison: keep output/UI at 1080p while the allocator experiment
 // supplies 540p scene targets. This scoped helper already supports separate scene
 // scale inputs; its default 1:1 scale otherwise expands scene logical viewports.
@@ -4219,6 +4302,7 @@ void Install(u8* base) {
 void RytyApplyGamePatches() {
     InstallPhotoExport();
     InstallScopedMenuCompiles(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallPhotoCaptureWatch(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // FIX-SGT-049
     InstallFileShareDelete();
     InstallRetailBuild(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallExperimentalSceneViewport(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
@@ -4294,6 +4378,38 @@ bool RytyGtsMenuCaptureCanContinue() {
 }
 bool RytyGtsMenuCaptureAvailable() {
     return g_scoped_menu_compiles;
+}
+// FIX-SGT-049: GT Sport is rendering a photo (see InstallPhotoCaptureWatch).
+bool RytyGtsPhotoCaptureRunning() {
+    if (g_in_race.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    const auto count_at = [](u64 address, s32 most) {
+        s32 count = 0;
+        return Core::RytyMemory::GuardedCopy(&count, reinterpret_cast<const void*>(address),
+                                             sizeof(count)) && count >= 1 && count <= most;
+    };
+    // Scapes: three files a photo, at most four photos queued.
+    if (const u64 stage = g_photo_stage.load(std::memory_order_relaxed);
+        stage != 0 && g_photo_mode.load(std::memory_order_relaxed) && count_at(stage + 0xc18, 12)) {
+        return true;
+    }
+    // A replay's photo mode: one count a photo.
+    const u8* const slot = g_photo_handle_slot.load(std::memory_order_acquire);
+    u64 handle = 0, framework = 0;
+    if (!slot || !Core::RytyMemory::GuardedCopy(&handle, slot, sizeof(handle)) || handle == 0 ||
+        !Core::RytyMemory::GuardedCopy(&framework, reinterpret_cast<const void*>(handle),
+                                       sizeof(framework)) || framework == 0) {
+        return false;
+    }
+#ifdef SHADGT_DIAGNOSTICS
+    static std::atomic<u64> framework_seen{0};
+    if (framework_seen.exchange(framework, std::memory_order_relaxed) != framework) {
+        std::fprintf(stderr, "[patch] FIX-SGT-049 replay photo mode: framework %llx\n",
+                     static_cast<unsigned long long>(framework));
+    }
+#endif
+    return count_at(framework + 0x82e1c, 8);
 }
 bool RytyGtsMenuSnapshotsAllowed() {
     return g_snapshot_session_ready && g_snapshot_session.Idle() && !RytyGtsInRace();

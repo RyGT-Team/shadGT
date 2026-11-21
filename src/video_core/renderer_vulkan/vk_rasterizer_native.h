@@ -793,6 +793,8 @@ private:
     std::vector<OneOffHit> one_off_hits; ///< of the last DrawMustNotSkip
     /// FIX-GT7-135: the last DrawMustNotSkip waits for a never-drawn level of a texture.
     bool one_off_texture_level = false;
+    /// FIX-SGT-049: the editor needs the first colour draw into this new or freshly filled photo target.
+    bool one_off_photo_output = false;
     /// FIX-GT7-153: the last DrawMustNotSkip's depth target is a circuit's shadow map (see
     /// kept_shadow_map.h): its draw waits, without a deadline when `first` (the map not drawn
     /// within the last frames) or out of play.

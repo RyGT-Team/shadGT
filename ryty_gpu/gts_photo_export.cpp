@@ -1,18 +1,17 @@
 // GTS-010: photo export. GT Sport saves Scapes and photo mode pictures to
 // download0\APP_DATA\photo as "PJXR" files: a header with the picture size, a tile grid (3x3) and
 // each tile's offset, every tile an ordinary JPEG XR image. A background thread watches that
-// folder and writes each new photo as a PNG to the user's Pictures folder
-// (Pictures\Gran Turismo Sport), decoded with Windows' own JPEG XR codec (WIC). Photos already
-// there when the game starts are left alone, as are the "_t" previews.
+// folder and writes each new photo as a PNG to Photos beside the game, decoded with Windows'
+// own JPEG XR codec (WIC). Existing photos and "_t" previews are left in the gallery.
 // On unless SHADGT_PHOTO_EXPORT=0 or "photo_export": false in the game's config.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <shlobj.h>
+#include <share.h>
 #include <wincodec.h>
 
 #include <algorithm>
-#include <atomic>
+#include <array>
 #include <cmath>
 #include <chrono>
 #include <cstdint>
@@ -20,10 +19,12 @@
 #include <cstring>
 #include <filesystem>
 #include <map>
-#include <set>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "common/game_title.h"
 
 bool ConfigFlag(const char* key, bool fallback); // ryty_game_patch.cpp
 
@@ -96,7 +97,7 @@ bool DecodePhoto(IWICImagingFactory* factory, const std::vector<std::uint8_t>& d
         }
         // GTS-010b: Scapes and photo mode save HDR tiles (48bppRGBHalf, linear scRGB, highlights
         // far above 1.0). A plain conversion to 8 bits clips them; those are read as floats and
-        // tone-mapped (ACES fit) before the sRGB encode.
+        // tone-mapped with the measured photo-mode curve below.
         WICPixelFormatGUID source_format{};
         frame->GetPixelFormat(&source_format);
         const bool hdr = IsEqualGUID(source_format, GUID_WICPixelFormat48bppRGBHalf) ||
@@ -113,7 +114,11 @@ bool DecodePhoto(IWICImagingFactory* factory, const std::vector<std::uint8_t>& d
             return false;
         }
         UINT tile_w = 0, tile_h = 0;
-        converter->GetSize(&tile_w, &tile_h);
+        if (FAILED(converter->GetSize(&tile_w, &tile_h)) || tile_w == 0 || tile_h == 0 ||
+            tile_w > width || tile_h > height ||
+            std::uint64_t(tile_w) * tile_h > UINT_MAX / (hdr ? 16u : 4u)) {
+            return false;
+        }
         // Tiles go row by row, left to right; a column's x comes from the first row's widths,
         // a row's y from the first column's heights.
         const std::uint32_t r = i / cols, c = i % cols;
@@ -191,28 +196,34 @@ bool WritePng(IWICImagingFactory* factory, const fs::path& path, std::uint32_t w
     return true;
 }
 
-fs::path OutputFolder() {
-    PWSTR pictures = nullptr;
-    fs::path folder;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Pictures, 0, nullptr, &pictures))) {
-        folder = fs::path{pictures} / L"Gran Turismo Sport";
-    }
-    CoTaskMemFree(pictures);
-    return folder;
-}
-
-fs::path UniqueName(const fs::path& folder, const fs::file_time_type& when) {
+// Publish a complete PNG in the same Photos folder as the gallery's native export.
+// MoveFileW cannot overwrite a picture, including one exported by another process.
+bool PublishPng(IWICImagingFactory* factory, const fs::path& folder, fs::file_time_type when,
+                UINT width, UINT height, std::vector<std::uint8_t>& pixels, fs::path& target) {
     const auto system = std::chrono::clock_cast<std::chrono::system_clock>(when);
     const std::time_t t = std::chrono::system_clock::to_time_t(system);
     std::tm local{};
-    localtime_s(&local, &t);
-    wchar_t stamp[64];
-    std::wcsftime(stamp, 64, L"GT Sport %Y-%m-%d %H-%M-%S", &local);
-    fs::path path = folder / (std::wstring{stamp} + L".png");
-    for (int n = 2; fs::exists(path); ++n) {
-        path = folder / (std::wstring{stamp} + L" (" + std::to_wstring(n) + L").png");
+    wchar_t stamp[32]{};
+    if (localtime_s(&local, &t) != 0 ||
+        !std::wcsftime(stamp, std::size(stamp), L"%Y-%m-%d %H-%M-%S", &local)) {
+        return false;
     }
-    return path;
+    std::error_code ec;
+    fs::create_directories(folder, ec);
+    wchar_t temp[MAX_PATH]{};
+    if (ec || !GetTempFileNameW(folder.c_str(), L"pht", 0, temp)) return false;
+    if (WritePng(factory, temp, width, height, pixels)) {
+        for (unsigned copy = 1; copy <= 999; ++copy) {
+            std::wstring stem{stamp};
+            if (copy > 1) stem += L" (" + std::to_wstring(copy) + L")";
+            target = folder / (stem + L".png");
+            if (MoveFileW(temp, target.c_str())) return true;
+            const DWORD error = GetLastError();
+            if (error != ERROR_ALREADY_EXISTS && error != ERROR_FILE_EXISTS) break;
+        }
+    }
+    DeleteFileW(temp);
+    return false;
 }
 
 bool IsPhoto(const fs::path& path) {
@@ -223,7 +234,33 @@ bool IsPhoto(const fs::path& path) {
            name.find(L"_t.") == std::wstring::npos;
 }
 
-void Watch(fs::path source) {
+struct PhotoRevision {
+    std::uintmax_t size;
+    fs::file_time_type modified;
+    bool operator==(const PhotoRevision&) const = default;
+};
+
+bool ExportPhoto(IWICImagingFactory* factory, const fs::path& path, const PhotoRevision& revision,
+                 const fs::path& folder) {
+    // The final names normally arrive by rename. Refuse a writer still holding the file.
+    std::unique_ptr<std::FILE, decltype(&std::fclose)> file(
+        _wfsopen(path.c_str(), L"rb", _SH_DENYWR), std::fclose);
+    if (!file || revision.size == 0 || revision.size > UINT32_MAX) return false;
+    std::vector<std::uint8_t> data(revision.size);
+    if (std::fread(data.data(), 1, data.size(), file.get()) != data.size() ||
+        std::fgetc(file.get()) != EOF || std::ferror(file.get())) return false;
+    file.reset();
+    std::vector<std::uint8_t> pixels;
+    UINT width = 0, height = 0;
+    fs::path target;
+    if (!DecodePhoto(factory, data, width, height, pixels) ||
+        !PublishPng(factory, folder, revision.modified, width, height, pixels, target)) return false;
+    std::fprintf(stderr, "[patch] GTS-010 photo %ls -> %ls (%ux%u)\n",
+                 path.filename().c_str(), target.c_str(), width, height);
+    return true;
+}
+
+void Watch(fs::path root, std::string serial) {
     if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
         return;
     }
@@ -233,55 +270,56 @@ void Watch(fs::path source) {
         std::fprintf(stderr, "[patch] GTS-010: no Windows imaging codecs, photo export off\n");
         return;
     }
-    const fs::path folder = OutputFolder();
-    if (folder.empty()) {
-        std::fprintf(stderr, "[patch] GTS-010: no Pictures folder, photo export off\n");
-        return;
-    }
+    const fs::path folder = root / L"Photos";
     std::fprintf(stderr, "[patch] GTS-010 photo export to %ls\n", folder.c_str());
-    std::set<fs::path> done;
-    std::map<fs::path, std::uintmax_t> growing; // size at the last look
-    std::error_code ec;
-    for (const auto& entry : fs::directory_iterator(source, ec)) {
-        done.insert(entry.path()); // already there at start: not exported
-    }
+    // FIX-SGT-049: libc can keep the legacy download0 on a mixed install or after a
+    // failed migration. Observe both possible stores, including ones created after boot.
+    const fs::path photos = fs::path(L"download0") / L"APP_DATA" / L"photo";
+    const std::array sources{root / L"user" / L"savedata" / serial / photos, root / photos};
+    using Clock = std::chrono::steady_clock;
+    struct Status {
+        PhotoRevision revision;
+        Clock::time_point next;
+        std::chrono::seconds delay{2};
+    };
+    std::map<fs::path, Status> seen;
+    bool startup = true;
     for (;;) {
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-        for (const auto& entry : fs::directory_iterator(source, ec)) {
-            const fs::path path = entry.path();
-            if (done.contains(path) || !IsPhoto(path)) {
-                continue;
-            }
-            const std::uintmax_t size = fs::file_size(path, ec);
-            if (ec || size == 0) {
-                continue;
-            }
-            // Written completely once its size holds for one look.
-            auto last = growing.find(path);
-            if (last == growing.end() || last->second != size) {
-                growing[path] = size;
-                continue;
-            }
-            growing.erase(path);
-            done.insert(path);
-            std::vector<std::uint8_t> data(size);
-            if (std::FILE* f = _wfopen(path.c_str(), L"rb")) {
-                data.resize(std::fread(data.data(), 1, data.size(), f));
-                std::fclose(f);
-            }
-            std::uint32_t width = 0, height = 0;
-            std::vector<std::uint8_t> pixels;
-            fs::create_directories(folder, ec);
-            const fs::path target = UniqueName(folder, fs::last_write_time(path, ec));
-            if (DecodePhoto(factory.p, data, width, height, pixels) &&
-                WritePng(factory.p, target, width, height, pixels)) {
-                std::fprintf(stderr, "[patch] GTS-010 photo %ls -> %ls (%ux%u)\n",
-                             path.filename().c_str(), target.filename().c_str(), width, height);
-            } else {
-                std::fprintf(stderr, "[patch] GTS-010 photo %ls could not be converted\n",
-                             path.filename().c_str());
+        for (const auto& source : sources) {
+            std::error_code ec;
+            for (fs::directory_iterator it(source, ec), end; it != end; it.increment(ec)) {
+                const fs::path& path = it->path();
+                if (!IsPhoto(path) || !it->is_regular_file(ec)) continue;
+                const auto size = it->file_size(ec);
+                if (ec) continue;
+                const auto modified = it->last_write_time(ec);
+                if (ec) continue;
+                const PhotoRevision revision{size, modified};
+                const auto now = Clock::now();
+                const Status initial{revision, startup ? Clock::time_point::max() : now};
+                auto& status = seen.try_emplace(path, initial).first->second;
+                if (status.revision != revision) status = initial;
+                if (now < status.next) continue;
+                bool exported = false;
+                try {
+                    exported = ExportPhoto(factory.p, path, revision, folder);
+                } catch (const std::bad_alloc&) {
+                    // Leave the original in the gallery and try again when memory is available.
+                }
+                if (exported) {
+                    status.next = Clock::time_point::max();
+                } else {
+                    if (status.delay == std::chrono::seconds(2)) {
+                        std::fprintf(stderr, "[patch] photo %ls: export failed, will retry\n",
+                                     path.filename().c_str());
+                    }
+                    status.next = Clock::now() + status.delay;
+                    status.delay = std::min(status.delay * 2, std::chrono::seconds(60));
+                }
             }
         }
+        startup = false;
+        std::this_thread::sleep_for(std::chrono::seconds(2));
     }
 }
 
@@ -299,7 +337,5 @@ void InstallPhotoExport() {
     if (length == 0 || length >= MAX_PATH) {
         return;
     }
-    const fs::path source =
-        fs::path{exe}.parent_path() / L"download0" / L"APP_DATA" / L"photo";
-    std::thread(Watch, source).detach();
+    std::thread(Watch, fs::path{exe}.parent_path(), std::string(Common::CurrentGameSerial())).detach();
 }

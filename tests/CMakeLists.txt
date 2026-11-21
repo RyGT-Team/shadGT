@@ -31,6 +31,18 @@ target_include_directories(native_kept_set_users_test PRIVATE ${CMAKE_SOURCE_DIR
 target_compile_features(native_kept_set_users_test PRIVATE cxx_std_20)
 target_link_libraries(native_kept_set_users_test PRIVATE GTest::gtest_main)
 gtest_discover_tests(native_kept_set_users_test)
+
+if(WIN32)
+    add_executable(shadgt_photo_export_probe tools/photo_export_probe.cpp
+        ${CMAKE_SOURCE_DIR}/ryty_gpu/gts_photo_export.cpp)
+    target_include_directories(shadgt_photo_export_probe PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_features(shadgt_photo_export_probe PRIVATE cxx_std_23)
+    target_compile_definitions(shadgt_photo_export_probe PRIVATE NOMINMAX)
+    target_link_libraries(shadgt_photo_export_probe PRIVATE ole32 windowscodecs uuid)
+    add_test(NAME photo_gallery_export COMMAND powershell.exe -NoProfile -NonInteractive -File
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_photo_export.ps1 $<TARGET_FILE:shadgt_photo_export_probe>)
+endif()
+
 add_executable(shadps4_push_data_layout_test test_push_data_layout.cpp)
 target_include_directories(shadps4_push_data_layout_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(shadps4_push_data_layout_test PRIVATE cxx_std_23)

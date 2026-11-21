@@ -7998,6 +7998,7 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
     };
     one_off_hits.clear(); // DIAG-GT7-008
     one_off_texture_level = false; // FIX-GT7-135
+    one_off_photo_output = false;
     one_off_kept_shadow = false;   // FIX-GT7-153
     one_off_kept_shadow_first = false;
     bool target_recent = false; // FIX-GT7-153: the frame window as drawn_lately read it, last call
@@ -8019,7 +8020,15 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
     // frames, and a 1.36 s one where FIX-GT7-121 knew the kind as harmful and the wait had no
     // bound. In play another layout at the address counts again, as before; a draw skipped into a
     // layout no picture has still leaves its target empty (in Draw), which kept the photos clean.
-    const bool same_layout = same_layout_on && !g_game_in_play.load(std::memory_order_relaxed);
+    // FIX-SGT-049: a cold photo capture skipped both the full image and its preview.
+    // Both photo editors reuse render-target memory. A previously drawn layout at the same
+    // address or a fast editor frame does not make this first write safe to skip.
+    static const bool wait_photo = [] {
+        const char* value = std::getenv("SHADGT_PHOTO_PIPELINE_WAIT");
+        return !(value && value[0] == '0');
+    }();
+    const bool photo = wait_photo && RytyGtsPhotoMode() && !RytyGtsInRace();
+    const bool same_layout = same_layout_on && (photo || !g_game_in_play.load(std::memory_order_relaxed));
     const VideoCore::ImageInfo* layout = nullptr;
     // FIX-GT7-135: a colour target never drawn into that is a level (1 and up) of a texture the
     // game samples is drawn once, when the game builds the texture's levels: skipped, the level
@@ -8058,6 +8067,11 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
                             address, layout->pitch, layout->num_bits, u32(layout->tile_mode), frame,
                             n + 1);
             }
+        }
+        if (photo && target_cb >= 0 &&
+            (!entry || entry->write_version.load(std::memory_order_relaxed) == 0)) {
+            one_off_photo_output = true;
+            return false;
         }
         if (!entry) {
             note(0);
@@ -8104,6 +8118,7 @@ bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
             return !(env && env[0] == '0');
         }();
         if (after_fill && registry->FilledWhole(address, entry->info.guest_size)) {
+            one_off_photo_output = photo && target_cb >= 0;
             static std::atomic<u32> fill_logged{};
             if (const u32 n = fill_logged++; n < 64 || n % 500 == 0) {
                 LOG_WARNING(Render_Vulkan,
@@ -15907,7 +15922,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     const bool kept_shadow_wait =
         must_wait && one_off_kept_shadow && (one_off_kept_shadow_first || !in_play);
     const bool harmful_wait =
-        must_wait && (OneOffKnownHarmful() || kept_shadow_wait || (one_off_texture_level && !in_play));
+        must_wait && (one_off_photo_output || OneOffKnownHarmful() || kept_shadow_wait ||
+                      (one_off_texture_level && !in_play));
     if (must_wait && (harmful_wait || OneOffBudgetLeft())) {
         // FIX-198: drawn once its pipeline is built (see DrawMustNotSkip).
         PhaseClock clock{stats.phase_ns[0]};

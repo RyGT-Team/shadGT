@@ -141,11 +141,31 @@ std::filesystem::path TrophyProgressFile(s64 user_id, const std::string& np_comm
         return legacy;
     }
     const s64 folder = TrophyUserFolder(user_id);
-    auto dir = std::filesystem::current_path() / "_sd" / "trophies_progress";
+    const auto root = std::filesystem::current_path();
+    auto dir = root / "user" / "savedata" / std::string(Common::CurrentGameSerial()) / "_sd" /
+               "trophies_progress";
+    auto old_dir = root / "_sd" / "trophies_progress";
     if (folder != 1000) {
         dir /= std::to_string(folder);
+        old_dir /= std::to_string(folder);
     }
-    return dir / (np_comm_id + ".xml");
+    const auto file = dir / (np_comm_id + ".xml");
+    const auto old_file = old_dir / (np_comm_id + ".xml");
+    std::error_code error;
+    if (!std::filesystem::exists(file, error) &&
+        std::filesystem::is_regular_file(old_file, error)) {
+        std::filesystem::create_directories(dir, error);
+        std::error_code copy_error;
+        std::filesystem::copy_file(old_file, file, copy_error);
+        if (copy_error) {
+            LOG_ERROR(Lib_NpTrophy, "FEAT-GT7-189 fail: could not copy {} to {}: {}",
+                      U8(old_file), U8(file), copy_error.message());
+        } else {
+            LOG_INFO(Lib_NpTrophy, "FEAT-GT7-189 ok: trophy progress copied from {} to {}",
+                     U8(old_file), U8(file));
+        }
+    }
+    return file;
 }
 
 void PrepareTrophies(const std::string& np_comm_id, u32 service_label,

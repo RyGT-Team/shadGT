@@ -700,7 +700,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|RYGT_SCE_SYS_LAYERS|flag|Runtime|on|0 = off (only the app0 top folder's sce_sys); read at start (std::getenv)|The game's sce_sys files (npbind.dat, trophy files, pic1.png) are read through the same folders the game sees as /app0: the app0 top folder, then the update folder, then the base game folder (FIX-GT7-175). 0 restores the app0-only lookup, which finds no trophies when Set up did not link the game's files there.",
     "RYGTSW1|RYGT_TROPHY_TOAST|flag|Trophies|on|0 = off|Shows the PS5-style trophy pop-up (top right, with the grade's sound) when a trophy unlocks; 0 hides it (unlocks are still logged and saved).",
     "RYGTSW1|RYGT_TROPHY_TOAST_TEST|string|Trophies|off|1 = a Gold demo; B, S, G or P = a demo of that grade|Shows one demo trophy pop-up 5 s after the game starts, to check its look and sound without unlocking anything.",
-    "RYGTSW1|RYGT_TROPHY_PROGRESS_SD|flag|Trophies|on|0 = old place|Keeps trophy progress next to the saves in _sd\\trophies_progress (copied once from user\\home\\<1000+slot>\\trophy, which stays as a backup); 0 uses the old user\\home place.",
+    "RYGTSW1|RYGT_TROPHY_PROGRESS_SD|flag|Trophies|on|0 = old place|Keeps trophy progress next to the saves in user\\savedata\\<serial>\\_sd\\trophies_progress (copied once from the old _sd\\trophies_progress or user\\home\\<1000+slot>\\trophy, which stay as a backup); 0 uses the old user\\home place.",
     "RYGTSW1|RYGT_TROPHY_KEY_FILE|string|Trophies|set by the launcher|path of a file with the 32 hex digit trophy key|The launcher passes the user's trophy key in a temporary file so the game's trophy files can be extracted (FEAT-GT7-185). The key is never logged.",
 };
 

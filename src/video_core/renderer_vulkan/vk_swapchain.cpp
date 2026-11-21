@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -15,6 +16,19 @@
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
 namespace Vulkan {
+
+// FIX-SGT-068: a presentation provider may impose a deadline on its internal image acquisition.
+static bool RecoverSwapchainTimeout(vk::Result result, const char* operation) {
+    if (result != vk::Result::eTimeout) {
+        return false;
+    }
+    const char* setting = std::getenv("SHADGT_SWAPCHAIN_TIMEOUT_RECOVERY");
+    if (setting && setting[0] == '0' && setting[1] == '\0') {
+        return false;
+    }
+    LOG_WARNING(Render_Vulkan, "Swapchain {} timed out; recreating the swapchain", operation);
+    return true;
+}
 
 static constexpr vk::SurfaceFormatKHR SURFACE_FORMAT_HDR = {
     .format = vk::Format::eA2B10G10R10UnormPack32,
@@ -111,6 +125,7 @@ void Swapchain::Create(u32 width_, u32 height_) {
 
     SetupImages();
     RefreshSemaphores();
+    frame_index = 0; // FIX-SGT-068: the replacement can have fewer images and a fresh semaphore ring.
 }
 
 #ifdef RYTY_GPU
@@ -175,6 +190,9 @@ void Swapchain::RecreateSurface() {
 }
 
 bool Swapchain::AcquireNextImage() {
+    if (needs_recreation) {
+        return false;
+    }
     vk::Device device = instance.GetDevice();
 #ifdef RYTY_GPU
     vk::Result result =
@@ -189,6 +207,10 @@ bool Swapchain::AcquireNextImage() {
                                    image_acquired[frame_index], VK_NULL_HANDLE, &image_index);
 #endif
 
+    if (RecoverSwapchainTimeout(result, "acquisition")) {
+        needs_recreation = true;
+        return false;
+    }
     switch (result) {
     case vk::Result::eSuccess:
         break;
@@ -222,17 +244,23 @@ bool Swapchain::Present(u64 anti_lag_frame) {
     };
 
     instance.AntiLagPresent(anti_lag_frame); // PERF-210
+    // The raw-result overload also returns provider-specific statuses in debug builds.
 #ifdef RYTY_GPU
     RytyDlssG::PresentStart();
     auto result = framegen.Active() ? framegen.Present(instance.GetPresentQueue(), present_info)
-                                    : instance.GetPresentQueue().presentKHR(present_info);
+                                    : instance.GetPresentQueue().presentKHR(&present_info);
     RytyDlssG::PresentEnd();
 #else
-    auto result = instance.GetPresentQueue().presentKHR(present_info);
+    auto result = instance.GetPresentQueue().presentKHR(&present_info);
 #endif
     // FIX-218: a lost surface or exclusive fullscreen (Alt+Tab) recreates the swapchain too,
     // instead of stopping the game; a lost surface is replaced as well.
-    if (result == vk::Result::eErrorSurfaceLostKHR) {
+    if (RecoverSwapchainTimeout(result, "presentation")) {
+        // FIX-SGT-068: Streamline can time out acquiring its real image inside presentKHR,
+        // even with generation suspended. Retire this chain and its binary semaphores
+        // under the presenter's submit lock. The wait on present_ready may be unconsumed.
+        needs_recreation = true;
+    } else if (result == vk::Result::eErrorSurfaceLostKHR) {
         surface_lost = true;
         needs_recreation = true;
     } else if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR ||

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <thread>
@@ -67,7 +68,13 @@ void assert_fail_impl() {
 #endif
     std::this_thread::sleep_for(std::chrono::milliseconds{200});
     Common::Log::Flush();
+#if defined(RYTY_GPU) && defined(_WIN32)
+    // FIX-SGT-065: Ryty's normal Shutdown exits with zero. Keep its fast termination
+    // (driver detach can deadlock) but report this fatal assertion to the parent process.
+    TerminateProcess(GetCurrentProcess(), EXIT_FAILURE);
+#else
     Common::Singleton<Core::Emulator>::Instance()->Shutdown();
+#endif
     Crash();
 }
 

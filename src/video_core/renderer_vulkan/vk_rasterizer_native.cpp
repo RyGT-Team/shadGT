@@ -107,6 +107,7 @@
 #include <string_view>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <fmt/ranges.h>
 #include <magic_enum/magic_enum.hpp>
@@ -133,6 +134,7 @@
 #include "core/libraries/kernel/process.h"
 #include "core/debug_state.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/skipped_picture_read.h"
 #include "core/guest_hash.h"
 #include "core/memory.h"
 #include "ryty_gpu/native/committed_pages.h"
@@ -3390,7 +3392,15 @@ vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& original,
     const u64 extra = (is_depth ? 1u : 0u) | (custom ? u64(border.Address()) << 1 : 0) |
                       (explicit_lod ? u64{1} << 63 : 0);
     const u64 recycle_epoch = sampler_epoch.load(std::memory_order_acquire);
-    if (NextMemoEnabled()) {
+    // PERF-SGT-047 (SHADGT_SAMPLER_CACHE=0: only with SHADGT_NATIVE_NEXT=1, as before): on by
+    // itself. Without it every sampler took MakeSampler's hash, memo and lock: SamplerFor was
+    // 2.3% of GT7's recorder (Pro mode, Tokyo, nsys, 20-11), 0.6% with this cache. The rest of
+    // SHADGT_NATIVE_NEXT stays off: its memo-slot hash cost more than XXH3 there (1.9% vs 0.9%).
+    static const bool cache_on = [] {
+        const char* env = std::getenv("SHADGT_SAMPLER_CACHE");
+        return env && env[0] == '0' ? NextMemoEnabled() : true;
+    }();
+    if (cache_on) {
         cache = &cached[MemoHash(raw.data(), raw.size(), extra) & (cached.size() - 1)];
         if (cache->sampler && cache->owner == this &&
             cache->epoch == sampler_cache_epoch.load(std::memory_order_acquire) &&
@@ -5512,16 +5522,32 @@ bool NativeRenderer::NothingToRead(const VideoCore::ImageInfo& info) {
     return !drawn;
 }
 
-NativeRenderer::Region* NativeRenderer::RegionOver(VAddr address, u64 size) {
-    auto it = regions.upper_bound(address);
-    if (it != regions.begin()) {
-        Region& region = std::prev(it)->second;
-        if (address < region.end) {
-            return &region;
-        }
+// PERF-SGT-046: RegionOver searched the region tree, about 8 scattered nodes deep with GT7's ~230
+// regions, and a buffer binding asks it up to four times: 3-4% of GT7's recorder in Pro mode
+// (Tokyo, nsys, 20-11). It now searches flat sorted copies of the regions' bounds, a few KB that
+// stay in cache, rebuilt after each change of the map (0-18 a 10 s in a race).
+void NativeRenderer::RebuildRegionIndex() {
+    region_begins.clear();
+    region_ends.clear();
+    region_ptrs.clear();
+    region_begins.reserve(regions.size());
+    region_ends.reserve(regions.size());
+    region_ptrs.reserve(regions.size());
+    for (auto& [begin, region] : regions) {
+        region_begins.push_back(region.begin);
+        region_ends.push_back(region.end);
+        region_ptrs.push_back(&region);
     }
-    if (it != regions.end() && it->second.begin < address + size) {
-        return &it->second;
+}
+
+NativeRenderer::Region* NativeRenderer::RegionOver(VAddr address, u64 size) {
+    const size_t i = size_t(std::upper_bound(region_begins.begin(), region_begins.end(), address) -
+                            region_begins.begin());
+    if (i != 0 && address < region_ends[i - 1]) {
+        return region_ptrs[i - 1];
+    }
+    if (i != region_begins.size() && region_begins[i] < address + size) {
+        return region_ptrs[i];
     }
     return nullptr;
 }
@@ -5610,6 +5636,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
                 ++regions_taken_in;
         }, RegionGrowSlack());
         NoteOwnedMapChange(); // PERF-GT7-133: regions may have been taken out
+        RebuildRegionIndex(); // PERF-SGT-046
         if (action == Native::RegionMergeDisposition::Preserve) return nullptr;
     }
     ++buffer_generation; // OPT-003: regions are taken in or made
@@ -5708,6 +5735,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
     std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
     NoteOwnedMapChange(); // PERF-GT7-133
     auto [it, inserted] = regions.emplace(begin, std::move(region));
+    RebuildRegionIndex(); // PERF-SGT-046
     return &it->second;
 }
 
@@ -5795,6 +5823,19 @@ void NativeRenderer::SortRegionWrites() {
                 dynamic = false;
             }
 #endif
+            // PERF-SGT-055 (SHADGT_NATIVE_MIRROR_KEEP_WRITTEN=1, off by default): as FIX-184's
+            // diagnosis switch, in every build. A dropped mirror's range is read in place over PCIe
+            // for up to five minutes (PERF-GTS-386); keeping it and copying the pages the CPU wrote
+            // (about 1.3 MB a frame at Tokyo) cut GT7's GPU time in the rain pack from about 24 to
+            // 19.5 ms a frame and PCIe reads by 10-20%, for about 1.2 ms more CPU time a frame
+            // (more write faults) (Release, 2026-11-20).
+            static const bool keep_written = [] {
+                const char* env = std::getenv("SHADGT_NATIVE_MIRROR_KEEP_WRITTEN");
+                return env && env[0] == '1';
+            }();
+            if (dynamic && keep_written) {
+                dynamic = false;
+            }
             if (dynamic) {
                 if(mirror_diag)NoteMirrorDiagnostic(MirrorCpuDrop,begin,end,mirror.begin,mirror.end,unmap_generation.load(),blocked_granule,blocked_age);
                 mirror_bytes -= mirror.end - mirror.begin;
@@ -5805,6 +5846,7 @@ void NativeRenderer::SortRegionWrites() {
                 std::unique_lock map_lock{buffer_map_mutex};
                 NoteOwnedMapChange(); // PERF-GT7-133
                 it = mirrors.erase(it); // freed once the GPU is done with it
+                RebuildMirrorIndex(); // PERF-SGT-046
                 continue;
             }
             for (VAddr page = from; page < to; page += 4096) {
@@ -5834,13 +5876,31 @@ std::map<VAddr, NativeRenderer::Mirror>::iterator NativeRenderer::FirstMirror(VA
     return it;
 }
 
+// PERF-SGT-046: as RegionOver, a search of flat sorted copies of the mirrors' bounds instead of
+// their tree (1.2-2.4% of GT7's recorder in Pro mode, 20-11).
+void NativeRenderer::RebuildMirrorIndex() {
+    mirror_begins.clear();
+    mirror_ends.clear();
+    mirror_ptrs.clear();
+    mirror_begins.reserve(mirrors.size());
+    mirror_ends.reserve(mirrors.size());
+    mirror_ptrs.reserve(mirrors.size());
+    for (auto& [begin, mirror] : mirrors) {
+        mirror_begins.push_back(mirror.begin);
+        mirror_ends.push_back(mirror.end);
+        mirror_ptrs.push_back(&mirror);
+    }
+}
+
 NativeRenderer::Mirror* NativeRenderer::MirrorHolding(VAddr address, u64 size) {
-    auto it = mirrors.upper_bound(address);
-    if (it == mirrors.begin()) {
+    const size_t i = size_t(std::upper_bound(mirror_begins.begin(), mirror_begins.end(), address) -
+                            mirror_begins.begin());
+    if (i == 0) {
         return nullptr;
     }
-    Mirror& mirror = std::prev(it)->second;
-    return address >= mirror.begin && address + size <= mirror.end ? &mirror : nullptr;
+    return address >= mirror_begins[i - 1] && address + size <= mirror_ends[i - 1]
+               ? mirror_ptrs[i - 1]
+               : nullptr;
 }
 
 void NativeRenderer::NoteMirrorDiagnostic(u32 reason,u64 requested_begin,u64 requested_end,
@@ -5997,17 +6057,27 @@ bool NativeRenderer::RefreshMirror(Mirror& mirror) {
     const vk::Buffer dst{Handle<VkBuffer_T>(mirror.buffer->NativeHandle())};
     std::ranges::sort(pages);
     pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
-    for (const VAddr page : pages) {
-        if (page < mirror.begin || page >= mirror.end) {
+    // PERF-SGT-055: consecutive pages are copied and watched again as one run (one ForEachPart and
+    // one WatchPages each), not page by page: with CPU-written mirrors kept, about 330 pages a frame
+    // came through here and WatchPages' protection changes were 2% of GT7's recorder.
+    for (size_t i = 0; i < pages.size();) {
+        const VAddr run_begin = pages[i];
+        if (run_begin < mirror.begin || run_begin >= mirror.end) {
+            ++i;
             continue;
         }
-        direct->ForEachPart(page, std::min<u64>(4096, mirror.end - page),
+        size_t j = i + 1;
+        while (j < pages.size() && pages[j] == pages[j - 1] + 4096 && pages[j] < mirror.end) {
+            ++j;
+        }
+        const VAddr run_end = std::min<VAddr>(pages[j - 1] + 4096, mirror.end);
+        direct->ForEachPart(run_begin, run_end - run_begin,
                             [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset,
                                 u64 bytes) {
                                 s.cmd.copyBuffer(view.Handle(), dst,
                                                  vk::BufferCopy{.srcOffset = view_offset,
-                                                                .dstOffset = page - mirror.begin +
-                                                                             offset,
+                                                                .dstOffset = run_begin -
+                                                                             mirror.begin + offset,
                                                                 .size = bytes});
                             });
         {
@@ -6017,12 +6087,14 @@ bool NativeRenderer::RefreshMirror(Mirror& mirror) {
                 s.buffers_written = true;
                 return false;
             }
-            WatchPages(page, std::min<u64>(4096, mirror.end - page));
+            WatchPages(run_begin, run_end - run_begin);
         }
-        const u64 g = (page - mirror.begin) / MirrorGranule; // FIX-176
-        if (g < mirror.hashes.size()) {
-            mirror.hashes[g] = 0;
+        for (u64 g = (run_begin - mirror.begin) / MirrorGranule;
+             g <= (run_end - 1 - mirror.begin) / MirrorGranule && g < mirror.hashes.size();
+             ++g) {
+            mirror.hashes[g] = 0; // FIX-176
         }
+        i = j;
     }
     s.buffers_written = true;
     NATIVE_DIAGNOSTIC(stats.mirror_refresh_pages += pages.size());
@@ -6220,6 +6292,7 @@ void NativeRenderer::MakePendingMirrors() {
                     ++it;
                 }
             }
+            RebuildMirrorIndex(); // PERF-SGT-046
         }
         if (mirror_bytes - taken + (end - begin) > budget) {
             NATIVE_DIAGNOSTIC(++stats.mirror_over_budget);
@@ -6291,6 +6364,7 @@ void NativeRenderer::MakePendingMirrors() {
                 NoteOwnedMapChange(); // PERF-GT7-133
                 it = mirrors.erase(it); // freed once the GPU is done with it
             }
+            RebuildMirrorIndex(); // PERF-SGT-046
         }
         buffer_log.Note(begin, end, true); // OPT-010 (PERF-GTS-405: with the mirrors it took in)
         // Copy commands were recorded under the source-view guard above;
@@ -6313,6 +6387,7 @@ void NativeRenderer::MakePendingMirrors() {
                                       .buffer = std::move(buffer),
                                       .dirty_pages = {},
                                       .used_frame = frame});
+        RebuildMirrorIndex(); // PERF-SGT-046
         copied = true;
     }
     if (copied) {
@@ -6332,6 +6407,7 @@ void NativeRenderer::DropMirrors(VAddr address, u64 size, u32 diagnostic_reason)
         std::unique_lock map_lock{buffer_map_mutex};
         NoteOwnedMapChange(); // PERF-GT7-133
         it = mirrors.erase(it); // freed once the GPU is done with it
+        RebuildMirrorIndex(); // PERF-SGT-046
     }
 }
 
@@ -7270,6 +7346,34 @@ void NativeRenderer::SaveOneOffKinds(bool wait) {
         write();
     } else {
         std::thread(std::move(write)).detach(); // a cold file open costs the recorder ~5 ms
+    }
+}
+
+void NativeRenderer::NoteSkippedReads(const DrawBindings& b, const Shader::Info* reader) {
+    // FIX-SGT-048 (skipped_picture_read.h): a picture this draw or dispatch samples, whose draws
+    // in this frame were all skipped for want of their pipeline, holds an older frame whole. From
+    // then on a skipped draw into it moves its pipeline's build to the front of the queue (Draw).
+    if (!PipelineCache::SkippedReadFirst()) {
+        return;
+    }
+    for (const auto* sampled : b.sampled) {
+        if (!sampled || !SkippedPictureRead::ReadsOnlySkipped(
+                            sampled->skipped_frame.load(std::memory_order_relaxed),
+                            sampled->written_frame.load(std::memory_order_relaxed), frame)) {
+            continue;
+        }
+        auto* entry = const_cast<Native::ImageEntry*>(sampled);
+        if (entry->read_after_skip.exchange(true, std::memory_order_relaxed)) {
+            continue;
+        }
+        static std::atomic<u32> logged{};
+        if (const u32 n = logged++; n < 64 || n % 500 == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-SGT-048: shader {:#x} reads {:#x} {}x{}, whose draws were all skipped "
+                        "in this frame (frame {}): their pipelines go first from now on ({} so far)",
+                        reader ? reader->pgm_hash : 0, entry->info.guest_address,
+                        entry->info.size.width, entry->info.size.height, frame, n + 1);
+        }
     }
 }
 
@@ -13020,21 +13124,11 @@ bool NativeRenderer::StoreLongSet(u64 hash, u64 check, vk::DescriptorSetLayout l
         return false;
     }
     long_sets.entries.Insert(hash, check, u64(VkDescriptorSetLayout(layout)), set);
-    // PERF-GTS-378: a list per handle. In a multimap every set's entry for a handle they all
-    // hold (the ahead upload arena, a sampler) was inserted after a walk over that handle's
-    // other entries: up to 1.8 us a draw once the constants all came from one buffer. The
-    // arena lives as long as the renderer and is left out.
-    const u64 arena_handle = u64(VkBuffer(ahead_arena.handle));
-    for (const u64 handle : handles) {
-        if (handle == 0 || handle == arena_handle) continue;
-        auto& list = long_sets.users[handle];
-        if (list.size() > 2 * long_sets.entries.Size() + 4096) {
-            std::erase_if(list, [&](const auto& key) {
-                return !long_sets.entries.Find(key.first, key.second);
-            });
-        }
-        list.emplace_back(hash, check);
-    }
+    // PERF-GTS-378: a list per handle (a multimap walked a handle they all hold at each insert).
+    // FIX-SGT-044: the set goes once into each distinct handle's list, and a list is thinned by
+    // ids and serials (Native::KeptSetUsers), so a pass always removes more than half of it.
+    // The ahead upload arena lives as long as the renderer and is left out.
+    long_sets.users.Add(hash, check, handles, u64(VkBuffer(ahead_arena.handle)));
     ++long_sets.made;
     return true;
 }
@@ -13056,15 +13150,13 @@ bool NativeRenderer::HoldsDroppedSampler(std::span<const u64> handles) {
 void NativeRenderer::DropLongSets(std::span<const u64> dead_handles) {
     for (const u64 handle : dead_handles) {
         long_sets.dead_ring[long_sets.dead_count++ % long_sets.dead_ring.size()] = handle; // PERF-GTS-398
-        const auto found = long_sets.users.find(handle);
-        if (found == long_sets.users.end()) continue;
         // The open list may have bound the set: it is written again only after the GPU ran it.
         const u64 tick = r.scheduler.CurrentTick() + 1;
-        for (const auto& key : found->second) {
+        const bool had_sets = long_sets.users.Drop(handle, [&](u64 hash, u64 check) {
             vk::DescriptorSet set{};
             u64 layout = 0;
-            if (!long_sets.entries.Erase(key.first, key.second, set, layout)) {
-                continue;
+            if (!long_sets.entries.Erase(hash, check, set, layout)) {
+                return;
             }
             ++long_sets.dropped;
             // DIAG-SGT-019: by what was destroyed (the sets are empty with the switch off)
@@ -13075,9 +13167,8 @@ void NativeRenderer::DropLongSets(std::span<const u64> dead_handles) {
             } else {
                 long_sets.retired.push_back({tick, layout, set});
             }
-        }
-        long_sets.users.erase(found);
-        long_sets.spare.erase(handle); // sets of a layout that goes
+        });
+        if (had_sets) long_sets.spare.erase(handle); // sets of a layout that goes
     }
 }
 
@@ -13092,7 +13183,7 @@ void NativeRenderer::FlushLongSets() {
     }
     long_sets.pools.clear();
     long_sets.entries.Clear();
-    long_sets.users.clear();
+    long_sets.users.Clear();
     long_sets.retired.clear();
     long_sets.spare.clear();
     long_sets.unused_sets = 0;
@@ -15921,7 +16012,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             const char* env = std::getenv("SHADGT_NATIVE_ONE_OFF_LAYOUT");
             return !(env && env[0] == '0');
         }();
-        if (empty_target && regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Disable) {
+        // FIX-SGT-048: each existing picture the draw writes notes the skip; if one was read in a
+        // frame whose draws into it were all skipped, the pipeline is looked up again below.
+        const bool skipped_read_first = PipelineCache::SkippedReadFirst();
+        bool promote = false;
+        if ((empty_target || skipped_read_first) &&
+            regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Disable) {
             for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
                 const auto& col_buf = regs.color_buffers[cb];
                 if (!col_buf || regs.color_target_mask.GetMask(cb) == 0) {
@@ -15930,13 +16026,21 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 const VideoCore::TextureCache::ImageDesc desc{col_buf,
                                                               r.liverpool->DrawCbExtent(cb)};
                 const auto& info = desc.info;
-                if (info.num_samples != 1 ||
-                    registry->FindExisting(col_buf.Address(), [&](const Native::ImageEntry& e) {
-                        return !e.from_cpu && e.image != nullptr && e.info.pitch == info.pitch &&
-                               e.info.num_bits == info.num_bits &&
-                               e.info.tile_mode == info.tile_mode &&
-                               e.info.num_samples == info.num_samples;
-                    })) {
+                Native::ImageEntry* const existing =
+                    info.num_samples != 1
+                        ? nullptr
+                        : registry->FindExisting(col_buf.Address(), [&](const Native::ImageEntry& e) {
+                              return !e.from_cpu && e.image != nullptr &&
+                                     e.info.pitch == info.pitch &&
+                                     e.info.num_bits == info.num_bits &&
+                                     e.info.tile_mode == info.tile_mode &&
+                                     e.info.num_samples == info.num_samples;
+                          });
+                if (existing && skipped_read_first) {
+                    existing->skipped_frame.store(frame, std::memory_order_relaxed);
+                    promote |= existing->read_after_skip.load(std::memory_order_relaxed);
+                }
+                if (!empty_target || info.num_samples != 1 || existing) {
                     continue;
                 }
                 Native::ImageEntry* const made = registry->Find(info, true, frame);
@@ -15954,6 +16058,49 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                                 "FIX-GT7-131: a draw into {:#x} {}x{} skipped without its pipeline: "
                                 "its target starts empty (frame {}, {} so far)",
                                 col_buf.Address(), info.size.width, info.size.height, frame, n + 1);
+                }
+            }
+        }
+        if (promote) {
+            // FIX-SGT-048: the lookup moves what the draw waits for to the front of its queue
+            // (the listing of its stored shaders, their translation, or its pipeline build) and
+            // waits for nothing; the draw stays skipped this frame and draws at a later one.
+            const char* stop = nullptr;
+            u64 stop_hash = 0;
+            bool found = false;
+            {
+                PipelineCache::PromoteSkippedScope promote_scope;
+                std::unique_lock lock{r.pipeline_cache.LookupMutex()};
+                found = r.pipeline_cache.GetGraphicsPipelineUnlocked(params, lock) != nullptr;
+                stop = PipelineCache::PromoteStop();
+                stop_hash = PipelineCache::PromoteHash();
+            }
+            if constexpr (Common::DiagnosticsBuilt) {
+                // Where the lookup stopped, once per program and step (diagnostics builds only).
+                u64 ps_hash = 0;
+                if (regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Fragment))) {
+                    if (const auto* pgm = regs.ProgramForStage(u32(Shader::HwStage::Fragment));
+                        pgm && pgm->Address<u32*>()) {
+                        ps_hash = AmdGpu::GetParams(*pgm).hash;
+                    }
+                }
+                static std::mutex promoted_mutex;
+                static std::unordered_set<u64> promoted_seen;
+                const char* const what = found ? "found built" : stop ? stop : "another step";
+                bool first = false;
+                {
+                    std::scoped_lock seen_lock{promoted_mutex};
+                    first = promoted_seen.size() < 512 &&
+                            promoted_seen
+                                .insert(ps_hash ^ (std::hash<std::string_view>{}(what) << 1))
+                                .second;
+                }
+                if (first) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-SGT-048: a skipped draw of ps {:#x} into a picture read "
+                                "stale: its lookup stopped at {} ({:#x}), moved to the front "
+                                "(frame {})",
+                                ps_hash, what, stop_hash, frame);
                 }
             }
         }
@@ -16451,6 +16598,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
+    NoteSkippedReads(b, pipeline->GetStages()[u32(Shader::SwStage::Fragment)]); // FIX-SGT-048
     static thread_local VertexIndexState vertex_index;
     const VertexIndexState* vi = &vertex_index;
     {
@@ -21972,6 +22120,7 @@ void NativeRenderer::DispatchDirect() {
         NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
+    NoteSkippedReads(b, &pipeline->GetStage(Shader::SwStage::Compute)); // FIX-SGT-048
     ReadFillShader(pipeline->GetStage(Shader::SwStage::Compute), b); // NAT-120
     const bool image_work = device->PendingImageInit() || registry->HasPendingUploads();
 #if !defined(NDEBUG)
@@ -22388,6 +22537,7 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
+    NoteSkippedReads(b, &pipeline->GetStage(Shader::SwStage::Compute)); // FIX-SGT-048
     if (regions_taken_in != indirect_region_before) {
         args = GuestBuffer(address + offset, std::max<u32>(size, 12), false);
         if (!args) {
@@ -23033,6 +23183,7 @@ u32 NativeRenderer::DropRegionsOver(VAddr address, u64 size, u32 mirror_reason) 
                 ++it;
             }
         }
+        if (dropped != 0) RebuildRegionIndex(); // PERF-SGT-046
     }
     const size_t mirrors_before = mirrors.size();
     DropMirrors(address, size, mirror_reason); // NAT-150
@@ -25689,6 +25840,21 @@ void NativeRenderer::Report() {
                      samplers.size(), retired_samplers.size(), SamplerLimit(), counts[0],
                      counts[1], counts[2], counts[3]);
             sampler_report = counts;
+        }
+    }
+    static std::chrono::steady_clock::time_point users_last{};
+    if (std::chrono::steady_clock::now() - users_last >= std::chrono::seconds{10}) {
+        // FIX-SGT-044: the kept sets' handle lists, when a list was thinned (every build). Not
+        // under sampler_mutex: StoreLongSet takes that one inside long_sets_mutex.
+        users_last = std::chrono::steady_clock::now();
+        std::scoped_lock long_lock{long_sets_mutex};
+        const auto thinned = long_sets.users.TakeStats();
+        if (thinned.passes != 0) {
+            LOG_INFO(Render_Vulkan,
+                     "FIX-SGT-044 (10 s): kept sets' handle lists thinned {} times, {} entries "
+                     "looked at, {} stale ones removed, longest list {}; {} sets kept",
+                     thinned.passes, thinned.scanned, thinned.removed, thinned.longest,
+                     long_sets.users.Kept());
         }
     }
 #if !defined(NDEBUG)

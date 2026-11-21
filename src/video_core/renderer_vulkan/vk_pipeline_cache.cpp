@@ -9,6 +9,7 @@
 #include "video_core/renderer_vulkan/draw_preparation_options.h"
 #include "video_core/renderer_vulkan/compile_cpu_batch.h"
 #include "video_core/renderer_vulkan/stale_pipeline_builds.h"
+#include "video_core/renderer_vulkan/skipped_picture_read.h"
 #include "video_core/renderer_vulkan/read_ahead_budget.h"
 #include "video_core/renderer_vulkan/speculative_key.h"
 #include "shader_recompiler/direct_learning.h"
@@ -1092,6 +1093,7 @@ public:
                 Common::SetCurrentThreadName(fmt::format("shadGT:ShaderStore{}", index).c_str());
             }) {}
     std::future<StoredListing> List(u64 hash) { return readers.List(hash); }
+    bool Prioritize(u64 hash) { return readers.Prioritize(hash); } // FIX-SGT-048
 private:
     ShaderStoreReaders<StoredListing> readers;
 };
@@ -1331,6 +1333,8 @@ struct PipelineCache::PipelineBuild {
     // A worker claims the build once; cancellation claims an unstarted job without compiling.
     std::atomic<bool> started{};
     std::atomic<bool> bumped{};
+    // FIX-SGT-048: queued once more at the front (PromoteSkippedBuild).
+    std::atomic<bool> promoted{};
     std::atomic<u64> skips{};
     std::atomic<s64> last_skip_ms{};
     // The cached infos the copies were made from; the pipeline points at them once built.
@@ -3531,6 +3535,11 @@ void PipelineCache::FinishBuild(PipelineBuild& build) {
 }
 
 void PipelineCache::NoteAsyncSkip(const std::shared_ptr<PipelineBuild>& build, bool again) {
+    if (t_promote_skipped) {
+        // FIX-SGT-048: every skip of a draw whose build is pending comes through here.
+        PromoteSkippedBuild(build);
+        t_promote_stop = "its pipeline build";
+    }
     catch_up_skips.fetch_add(1, std::memory_order_relaxed);
     build->skips.fetch_add(1, std::memory_order_relaxed);
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
@@ -3546,6 +3555,35 @@ void PipelineCache::NoteAsyncSkip(const std::shared_ptr<PipelineBuild>& build, b
             std::erase(on_screen, build);
             build->bumped.store(false, std::memory_order_release);
         }
+    }
+}
+
+bool PipelineCache::SkippedReadFirst() {
+    // FIX-SGT-048: see skipped_picture_read.h. SHADGT_SKIPPED_READ_FIRST=0: as before.
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_SKIPPED_READ_FIRST");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+void PipelineCache::PromoteSkippedBuild(const std::shared_ptr<PipelineBuild>& build) {
+    // FIX-SGT-048: a draw into a picture read while all its draws were skipped. Its build goes
+    // to the front of the queue, once. Not `urgent`: that would also build it above normal
+    // priority (FinishBuild), and in a race the compiles stay below the game's threads. The job
+    // left in its old place finds it started and does nothing (FinishBuild's claim).
+    if (!build_workers || !SkippedPictureRead::ClaimPromotion(*build)) {
+        return;
+    }
+    QueueBuild(build, BuildQueue::Kind::Urgent);
+    static std::atomic<u32> logged{};
+    if (const u32 n = logged++; n < 64 || n % 500 == 0) {
+        const auto* fragment = build->infos[u32(Shader::SwStage::Fragment)];
+        const auto* vertex = build->infos[u32(Shader::SwStage::Vertex)];
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-SGT-048: pipeline of vs {:#x} ps {:#x} moved to the front of the build "
+                    "queue: its draws were skipped and their picture read ({} so far)",
+                    vertex ? vertex->pgm_hash : 0, fragment ? fragment->pgm_hash : 0, n + 1);
     }
 }
 
@@ -8804,7 +8842,9 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
     for (const auto& [queued_hash, queued_jobs] : translate_jobs) {
         for (const auto& queued : queued_jobs) outstanding += !queued->done;
     }
-    if (outstanding >= 8) return false;
+    // FIX-SGT-048: a promoted draw's translation (see PromoteTranslations) is queued past the cap;
+    // there are only a few of them.
+    if (outstanding >= 8 && !(t_promote_skipped && !speculative)) return false;
     auto job = std::make_shared<TranslateJob>(runtime_info);
     job->required = !speculative;
     job->hw_stage = hw_stage;
@@ -9085,6 +9125,25 @@ void PipelineCache::NoteRequiredTranslations(u64 hash, HwStage hw_stage, SwStage
             std::ranges::find(unlocked_translations, job) == unlocked_translations.end()) {
             translate_workers->Prioritize(job);
             unlocked_translations.push_back(job);
+        }
+    }
+}
+
+void PipelineCache::PromoteTranslations(u64 hash, HwStage hw_stage, SwStage sw_stage,
+                                        const Shader::RuntimeInfo& runtime_info,
+                                        const Shader::Backend::Bindings& binding) {
+    // FIX-SGT-048: as NoteRequiredTranslations, without the wait: the draw stays skipped.
+    t_promote_stop = "the translation of its shaders";
+    t_promote_hash = hash;
+    const auto it = translate_jobs.find(hash);
+    if (it == translate_jobs.end()) {
+        t_promote_stop = "the translation of its shaders (not queued)";
+        return;
+    }
+    for (const auto& job : it->second) {
+        if (!job->done.load() &&
+            MatchesTranslationRequest(*job, hw_stage, sw_stage, runtime_info, binding)) {
+            translate_workers->Prioritize(job);
         }
     }
 }
@@ -9527,6 +9586,11 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
             const bool skip = SkipTranslationWait(sw_stage, params);
             const bool may_skip = regs_override != nullptr || defer_misses || skip;
             if (may_skip && pending->second.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
+                if (t_promote_skipped && !regs_override) { // FIX-SGT-048
+                    store_readers->Prioritize(params.hash);
+                    t_promote_stop = "the listing of its stored translations";
+                    t_promote_hash = params.hash;
+                }
                 if (!regs_override) { deferred_miss = true; translation_skipped |= skip; }
                 else if (RetryBlockedReadAhead()) read_ahead_blocked = true;
                 return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
@@ -9986,12 +10050,17 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
             // on. No key without it: the state is skipped for now. SHD-005: a stage's bindings
             // no longer follow from the stages before it, so a race queues every missing stage
             // of the draw at once and skips it.
-            if (!S().stage_deferred || skip_wait || unlocked ||
+            // FIX-SGT-048: a promoted draw's translation is queued as a required one (first in
+            // the queue, never dropped as too old) and moved to the front; nothing waits for it.
+            const bool promote = t_promote_skipped && !read_ahead && !unlocked;
+            if (!S().stage_deferred || skip_wait || unlocked || promote ||
                 (read_ahead && RetryBlockedReadAhead())) {
                 S().stage_deferred = true;
-                QueueTranslation(hw_stage, sw_stage, params, runtime_info, binding, !unlocked);
+                QueueTranslation(hw_stage, sw_stage, params, runtime_info, binding,
+                                 !unlocked && !promote);
             }
             if (unlocked) NoteRequiredTranslations(params.hash, hw_stage, sw_stage, runtime_info, binding);
+            if (promote) PromoteTranslations(params.hash, hw_stage, sw_stage, runtime_info, binding);
             if (!read_ahead) {
                 deferred_miss = true;
                 translation_skipped |= skip_wait;

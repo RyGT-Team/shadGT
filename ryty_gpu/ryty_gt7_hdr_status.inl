@@ -49,11 +49,19 @@ void Install(u8* base) {
         return;
     }
     PSF sfo;
-    const auto path = std::filesystem::path(Common::RytyExeDirW()) / "app0" / "sce_sys" / "param.sfo";
+    // Rooted at the exe's folder: Install runs in DllMain, before the runtime sets the working
+    // directory, so current_path() can be another folder there (VideoOut's lookup runs later).
+    const auto path = Common::RytyMountedMetadataEnabled()
+        ? Common::RytyParamSfoPath(std::filesystem::path(Common::RytyExeDirW()))
+        : std::filesystem::path(Common::RytyExeDirW()) / "app0" / "sce_sys" / "param.sfo";
     // FIX-GT7-146: the title only. APP_VER does not name the build (a 1.71 game installed over
     // its 1.00 base says 01.00, the same game dumped merged says 01.71): the bytes checked
     // below do.
-    if (!sfo.Open(path) || sfo.GetString("TITLE_ID") != "CUSA24769") {
+    if (!sfo.Open(path)) {
+        std::fprintf(stderr, "HDRSTATUS: mounted param.sfo unavailable; not applied\n");
+        return;
+    }
+    if (sfo.GetString("TITLE_ID") != "CUSA24769") {
         std::fprintf(stderr, "HDRSTATUS: title not CUSA24769; not applied\n");
         return;
     }

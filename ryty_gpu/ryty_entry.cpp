@@ -378,15 +378,27 @@ void DrawCompileNotice() {
     draw->AddText(at, IM_COL32(255, 255, 255, 235), text);
 }
 
-// What the watermark says: the game and this renderer's revision. Empty in a tagged release, or
-// with SHADGT_WATERMARK=0.
+// FEAT-SGT-045: the renderer's build type, so a screenshot says whether it shows a Release build
+// or one with diagnostics (RelWithDebInfo, slower) or a Debug one.
+constexpr const char* BuildType() {
+#if defined(_DEBUG)
+    return "Debug";
+#elif defined(SHADGT_DIAGNOSTICS)
+    return "Diagnostics";
+#else
+    return "Release";
+#endif
+}
+
+// What the watermark says: the game, this renderer's revision and its build type. Empty in a
+// tagged release, or with SHADGT_WATERMARK=0.
 std::string BuildWatermark() {
     const char* env = std::getenv("SHADGT_WATERMARK");
     if (Common::g_is_release || (env && env[0] == '0')) {
         return {};
     }
     if (!Common::IsGt7()) {
-        return fmt::format("GT Sport | {}", Common::g_scm_desc);
+        return fmt::format("GT Sport | {} | {}", Common::g_scm_desc, BuildType());
     }
     // GT7: the revision, after the prerelease's name when this is that prerelease's renderer
     // (manifest.json beside the exe has its commit; a test renderer copied into a release leaves
@@ -402,10 +414,11 @@ std::string BuildWatermark() {
         if (manifest.contains("name") && manifest["name"].is_string() &&
             manifest.contains(commit) && manifest.at(commit).is_string() &&
             revision.contains(manifest.at(commit).get<std::string>().substr(0, 7))) {
-            return fmt::format("{} | {}", manifest["name"].get<std::string>(), revision);
+            return fmt::format("{} | {} | {}", manifest["name"].get<std::string>(), revision,
+                               BuildType());
         }
     }
-    return fmt::format("GT7 | {}", revision);
+    return fmt::format("GT7 | {} | {}", revision, BuildType());
 }
 
 std::string g_watermark;

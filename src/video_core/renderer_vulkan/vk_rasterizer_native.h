@@ -32,6 +32,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include "ryty_gpu/native/kept_set_table.h"
+#include "ryty_gpu/native/kept_set_users.h"
 #include "ryty_gpu/native/recorder_binder.h"
 #include "ryty_gpu/native/ordered_timing.h"
 #include <vector>
@@ -595,9 +596,8 @@ private:
             vk::DescriptorSet set;
         };
         Native::KeptSetTable<vk::DescriptorSet> entries;                ///< by 128-bit key hash
-        /// handle -> the key hashes of the sets that hold it (and of sets since dropped: a
-        /// list is thinned when it is much longer than the table)
-        std::unordered_map<u64, std::vector<std::pair<u64, u64>>> users;
+        /// FIX-SGT-044: handle -> the kept sets that hold it (DropLongSets).
+        Native::KeptSetUsers users;
         std::deque<Retired> retired;
         std::unordered_map<u64, std::vector<vk::DescriptorSet>> spare;  ///< by layout
         std::vector<vk::DescriptorPool> pools;
@@ -669,6 +669,13 @@ private:
         bool dirty_sorted = true;
     };
     std::map<VAddr, Region> regions; ///< by begin; guarded by mutex
+    /// PERF-SGT-046: `regions` as flat sorted arrays for RegionOver (about 230 regions in a GT7
+    /// race fit in L1; the tree's nodes are scattered). Rebuilt after every change of `regions`,
+    /// with buffer_map_mutex held exclusively.
+    std::vector<VAddr> region_begins;
+    std::vector<VAddr> region_ends;
+    std::vector<Region*> region_ptrs;
+    void RebuildRegionIndex();
     u64 regions_taken_in{}; ///< recorder: incremented whenever region storage is replaced
     std::mutex region_dirty_mutex;   ///< pending_region_writes (CPU write faults: any thread)
     std::vector<std::pair<VAddr, VAddr>> pending_region_writes;
@@ -757,6 +764,9 @@ private:
     static bool OneOffDiagAll(); ///< SHADGT_DIAG_ONE_OFF_REDRAW=1: draws with their pipeline too
     /// After a FIX-198 wait (or a draw PERF-GT7-023 skipped instead): from one_off_hits.
     void WatchOneOffs(const AmdGpu::Regs& regs, bool skipped);
+    /// FIX-SGT-048: notes the pictures a draw or dispatch reads in a frame whose draws into them
+    /// were all skipped (their skipped draws' pipelines are built first from then on).
+    void NoteSkippedReads(const DrawBindings& b, const Shader::Info* reader);
     void CheckOneOffs();     ///< each frame
     /// PERF-GTS-493: one-off pictures skipped in a race and not drawn since (end-of-race report).
     void NoteRaceMissing(const AmdGpu::Regs& regs);
@@ -952,6 +962,12 @@ private:
         u64 frame = 0; ///< when last considered
     };
     std::map<VAddr, Mirror> mirrors; ///< by begin; guarded by mutex
+    /// PERF-SGT-046: `mirrors` as flat sorted arrays for MirrorHolding (about 100 in a GT7 race),
+    /// rebuilt after every change of `mirrors`.
+    std::vector<VAddr> mirror_begins;
+    std::vector<VAddr> mirror_ends;
+    std::vector<Mirror*> mirror_ptrs;
+    void RebuildMirrorIndex();
     u64 mirror_bytes = 0;
     std::unordered_map<VAddr, MirrorCandidate> mirror_candidates; ///< by page of the range start
     std::vector<std::pair<VAddr, VAddr>> pending_mirrors;          ///< made at a list's start

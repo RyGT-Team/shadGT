@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
+#include <algorithm>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -32,6 +33,16 @@ public:
         { std::scoped_lock lock{mutex}; queue.push_back(std::move(job)); }
         cv.notify_one();
         return result;
+    }
+    /// FIX-SGT-048: the queued listing of `hash` goes to the front of the queue; false when
+    /// none is queued (taken by a reader already, or never asked for).
+    bool Prioritize(u64 hash) {
+        std::scoped_lock lock{mutex};
+        const auto found = std::find_if(queue.begin(), queue.end(),
+                                        [hash](const Job& job) { return job.hash == hash; });
+        if (found == queue.end()) return false;
+        std::rotate(queue.begin(), found, std::next(found));
+        return true;
     }
 private:
     struct Job { u64 hash{}; std::promise<Listing> promise; };

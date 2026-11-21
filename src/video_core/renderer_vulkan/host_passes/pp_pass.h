@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <span>
 
 #include "common/types.h"
@@ -57,7 +58,7 @@ public:
     /// the game's picture, which is chance).
     static constexpr vk::Format HdrFrameFormat = vk::Format::eA2B10G10R10UnormPack32;
 
-    void Create(vk::Device device, vk::Format surface_format);
+    void Create(vk::Device device, vk::PhysicalDevice physical_device);
     /// GT7-UW: the buffer the HUD layout goes to the shader in.
     void CreateHudBuffer(VmaAllocator allocator);
 
@@ -68,8 +69,15 @@ public:
                 std::span<const HudWidget> hud_widgets = {});
 
 private:
-    vk::UniquePipeline pipeline{};
-    vk::UniquePipeline hdr_pipeline{}; // FIX-GT7-145: for HdrFrameFormat
+    struct OutputPipeline {
+        vk::Format format;
+        vk::UniquePipeline pipeline{};
+    };
+    std::array<OutputPipeline, 3> output_pipelines{{
+        {vk::Format::eR8G8B8A8Unorm},
+        {vk::Format::eB8G8R8A8Unorm},
+        {HdrFrameFormat},
+    }};
     vk::UniquePipelineLayout pipeline_layout{};
     vk::UniqueDescriptorSetLayout desc_set_layout{};
     vk::UniqueSampler sampler{};

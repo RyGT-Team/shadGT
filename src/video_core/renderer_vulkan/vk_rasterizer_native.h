@@ -239,6 +239,8 @@ public:
     /// FEAT-SGT-079 step 26 (with `mutex`): the ranges of the pictures B's handed draws had not
     /// found when they were prepared (B looks them up at its commit); cleared when B's work is in.
     std::vector<std::pair<VAddr, VAddr>> b_missing_ranges;
+    /// DIAG-SGT-092 (with `mutex`): the pictures B's handed draws bind; cleared with the ranges.
+    std::unordered_set<const Native::ImageEntry*> b_pictures;
     void SetRecorderBOutstanding(bool on) {
         b_outstanding.store(on, std::memory_order_release);
         g_b_outstanding.store(on, std::memory_order_release);

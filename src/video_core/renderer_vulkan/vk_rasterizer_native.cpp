@@ -23063,6 +23063,13 @@ bool NativeRenderer::RecorderBPrepareForB(const void* packet, bool splice) {
         Begin();
         PrepareImages(p->bindings);
     }
+    if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-092
+        for (const auto* list : {&p->bindings.sampled, &p->bindings.stored}) {
+            for (const auto* e : *list) {
+                if (e) b_pictures.insert(e);
+            }
+        }
+    }
     for (const auto& missing : p->missing_pictures) { // step 26
         b_missing_ranges.emplace_back(missing.info.guest_address,
                                       missing.info.guest_address +
@@ -23154,6 +23161,7 @@ bool NativeRenderer::RecorderAOrderedFree(const void* packet) {
 void NativeRenderer::RecorderBCommit() {
     std::scoped_lock lock{mutex};
     b_missing_ranges.clear(); // step 26: B's handed draws are all recorded
+    b_pictures.clear();       // DIAG-SGT-092
     if (!b_record_context.stream.list) return;
     RecordContext* const was = current_context;
     current_context = &b_record_context; // this thread splices B's list (B is idle)
@@ -23749,9 +23757,41 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     // then treats them as the others. The keys were made without their views.
     if (!p.missing_pictures.empty()) {
         for (const auto& missing : p.missing_pictures) {
+            // DIAG-SGT-092: what the recorder's missing-picture lookups do while B holds work.
+            const bool trap = Common::DiagnosticsBuilt && !OnRecorderBThread() &&
+                              b_outstanding.load(std::memory_order_acquire);
+            const u64 made_before =
+                trap ? registry->GetStats().created_textures.load(std::memory_order_relaxed) : 0;
             Native::ImageEntry* const entry = registry->Find(missing.info, false, frame);
             if (!entry) {
                 return reject(3); // the recorder's own lookups bind what there is
+            }
+            if (trap) {
+                const bool made =
+                    registry->GetStats().created_textures.load(std::memory_order_relaxed) != made_before;
+                const VAddr mb = missing.info.guest_address;
+                const VAddr me = mb + std::max<u64>(missing.info.guest_size, 1);
+                bool shared = b_pictures.contains(entry);
+                for (const auto& [bb, be] : b_missing_ranges) shared = shared || (mb < be && bb < me);
+                for (const auto* e : b_pictures) { // the same memory as one of B's pictures
+                    const VAddr eb = e->info.guest_address;
+                    shared = shared || (mb < eb + std::max<u64>(e->info.guest_size, 1) && eb < me);
+                }
+                NoteSubmitSite(made ? (shared ? "A missing (B holds work): made, shared"
+                                              : "A missing (B holds work): made, not shared")
+                                    : (shared ? "A missing (B holds work): found, shared"
+                                              : "A missing (B holds work): found, not shared"),
+                               {});
+                if (shared) { // what its commit is about to do to it
+                    using Rewrite = Native::ImageEntry::Rewrite;
+                    if (entry->rewrite != Rewrite::None) NoteSubmitSite("A missing shared: rewrite", {});
+                    if (entry->stencil_clear_pending) NoteSubmitSite("A missing shared: stencil clear", {});
+                    if (entry->sources_dirty.load(std::memory_order_relaxed)) NoteSubmitSite("A missing shared: sources", {});
+                    if (entry->needs_upload.load(std::memory_order_acquire)) NoteSubmitSite("A missing shared: upload", {});
+                    if (entry->from_cpu) NoteSubmitSite("A missing shared: CPU picture", {});
+                    else NoteSubmitSite("A missing shared: GPU picture", {});
+                    if (!b_pictures.contains(entry)) NoteSubmitSite("A missing shared: other picture, same memory", {});
+                }
             }
             const auto fallback = static_cast<Shader::MipStorageFallbackMode>(missing.fallback);
             for (u32 i = 0; i < missing.bindings; ++i) {

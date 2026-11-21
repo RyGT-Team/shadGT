@@ -81,6 +81,7 @@
 #include "video_core/renderer_vulkan/scene_region_scale.h"
 #include "video_core/renderer_vulkan/upload_chunk_tail.h"
 #include "ryty_gpu/native/whole_layer_clear.h"
+#include "ryty_gpu/native/volume_fill.h"
 #include "video_core/renderer_vulkan/native_chunk_policy.h"
 #include "video_core/renderer_vulkan/upload_chunk_cache.h"
 #include "video_core/renderer_vulkan/native_ring_policy.h"
@@ -14592,6 +14593,18 @@ void NativeRenderer::WrittenSubresources(const Native::ImageEntry* entry, u64 at
 #endif
     const u64 previous = written->write_version.load(std::memory_order_relaxed);
     const u64 version = at != 0 ? at : ++write_clock;
+    // FIX-SGT-072: if a volume fill ran out of memory and a draw has since written the
+    // image, retrying the older prefix would overwrite the new draw.
+    if (written->rewrite == Native::ImageEntry::Rewrite::Clear &&
+        written->info.props.is_volume && written->rewrite_bytes < written->info.guest_size &&
+        written->rewrite_clock < version) {
+        written->rewrite = Native::ImageEntry::Rewrite::None;
+        // FIX-SGT-072 (review): a remembered fill put back for that retry ends with it. Nothing
+        // was recorded for it, so no GPU work is left to wait for.
+        if (auto claim = registry->ClaimRememberedFill(*written); claim.receipt) {
+            claim.receipt->Complete();
+        }
+    }
     written->write_version.store(version, std::memory_order_relaxed);
     // FIX-198: the frames it was drawn in.
     if (const u64 last = written->written_frame.load(std::memory_order_relaxed); last != frame) {
@@ -21817,7 +21830,7 @@ const Native::Rhi::Buffer* NativeRenderer::PatternBuffer(u32 lo, u32 hi, u64 byt
 }
 
 bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 rows,
-                               u32 first_layers) {
+                               u32 first_layers, bool* out_of_memory) {
     // NAT-132/134: a picture filled with the pattern (two dwords, repeated), as memory holds it
     // after a fill: copied in from a buffer holding it (any format: every texel is the pattern's
     // bytes). `rows` != 0: only those rows of the first mip and layer (NAT-124), or of its first
@@ -21836,49 +21849,69 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
     const auto& desc = entry.image->Desc();
     const u32 layers = desc.dim == Native::Rhi::ImageDim::D3 ? 1u : std::max(desc.layers, 1u);
     const u32 depth = desc.dim == Native::Rhi::ImageDim::D3 ? std::max(desc.depth, 1u) : 1u;
-    const u32 mips = rows ? 1u : std::max(desc.mips, 1u);
-    const u32 height0 = rows ? std::min(rows, desc.height) : desc.height;
-    // FIX-GT7-187: a partial fill (`rows`) of a 3D picture counted one layer in `bytes` and
-    // copied the picture's whole depth: GT7's 120x67x128 volume read 4,116,480 bytes from a
-    // pattern buffer of 1 MB (32,160 bytes counted, times 128 slices). Reading past the buffer
-    // is harmless while what follows it in video memory is alive, and loses the device (device
-    // fault, write invalid, on GT7's title screen and in races while pipelines build) once it
-    // was freed; the slices past the buffer got whatever memory held. Found with the Vulkan
-    // validation layers (VUID-vkCmdCopyBufferToImage-pRegions-00171). A 3D picture's partial
-    // fill now covers `first_layers` slices, as a layered picture's covers its first layers.
-    const bool volume = desc.dim == Native::Rhi::ImageDim::D3;
-    const u32 row_layers = std::clamp(first_layers, 1u, volume ? depth : layers);
-    const u64 bytes = u64(desc.width) * height0 * texel * (rows ? row_layers : layers * depth);
+    const auto aspect = info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
+                                            : vk::ImageAspectFlagBits::eColor;
+    boost::container::small_vector<vk::BufferImageCopy, 16> copies;
+    u64 bytes = 0;
+    if (desc.dim == Native::Rhi::ImageDim::D3 && entry.rewrite_bytes < info.guest_size) {
+        // FIX-SGT-072: a guest prefix may end between slices, rows, or texels.
+        // Pitched copies keep the lo/hi pattern in phase across padding.
+        static const bool direct = [] {
+            const char* env = std::getenv("SHADGT_NATIVE_VOLUME_FILL");
+            return !(env && env[0] == '0');
+        }();
+        const auto& mip = info.mips_layout[0];
+        const u32 pitch = mip.pitch ? mip.pitch : info.pitch;
+        const u32 height = mip.height ? mip.height : info.size.height;
+        const u64 written = entry.rewrite_bytes;
+        if (!direct || info.props.is_tiled ||
+            desc.width != info.size.width || desc.height != info.size.height ||
+            desc.depth != info.size.depth ||
+            mip.offset || (desc.mips > 1 && written > mip.size)) {
+            return false;
+        }
+        const auto plan = Native::PlanLinearVolumeFill(desc.width, desc.height, desc.depth,
+                                                       pitch, height, texel, written);
+        if (!plan) return false;
+        if (!plan->count) return true;
+        for (const auto& region : std::span{plan->regions}.first(plan->count)) {
+            if (info.props.is_depth && region.offset % 4) return false;
+            copies.push_back(vk::BufferImageCopy{
+                .bufferOffset = region.offset, .bufferRowLength = pitch, .bufferImageHeight = height,
+                .imageSubresource{.aspectMask = aspect, .layerCount = 1},
+                .imageOffset{0, static_cast<s32>(region.y), static_cast<s32>(region.z)},
+                .imageExtent{region.width, region.height, region.depth},
+            });
+        }
+        bytes = plan->buffer_bytes;
+    } else {
+        const u32 row_layers = rows ? std::clamp(first_layers, 1u, layers) : layers;
+        const u32 height0 = rows ? std::min(rows, desc.height) : desc.height;
+        const u32 mips = rows ? 1u : std::max(desc.mips, 1u);
+        bytes = u64(desc.width) * height0 * texel * row_layers * depth;
+        for (u32 m = 0; m < mips; ++m) {
+            const u32 w = std::max(desc.width >> m, 1u);
+            const u32 h = std::max(height0 >> m, 1u);
+            copies.push_back(vk::BufferImageCopy{
+                .bufferRowLength = w, .bufferImageHeight = h,
+                .imageSubresource{.aspectMask = aspect, .mipLevel = m, .layerCount = row_layers},
+                .imageExtent{w, h, std::max(depth >> m, 1u)},
+            });
+        }
+    }
     if (info.props.is_bgr_packed_float) {
         lo = VideoCore::PackedFloatToVulkan(lo);
         hi = VideoCore::PackedFloatToVulkan(hi);
     }
+    // FIX-GT7-187: a failed grow can return the old buffer. Check the end of the last copy.
     const Native::Rhi::Buffer* pattern = PatternBuffer(lo, hi, bytes);
     if (!pattern || pattern->Size() < bytes) {
+        if (out_of_memory) *out_of_memory = true;
         return false;
     }
     Stream& s = Begin();
     GlobalBarrier(); // the work before is done with the picture
     const vk::Buffer buffer{Handle<VkBuffer_T>(pattern->NativeHandle())};
-    boost::container::small_vector<vk::BufferImageCopy, 16> copies;
-    for (u32 m = 0; m < mips; ++m) {
-        const u32 w = std::max(desc.width >> m, 1u);
-        const u32 h = rows ? height0 : std::max(desc.height >> m, 1u);
-        // FIX-GT7-187: the slices counted in `bytes`, not the whole depth.
-        const u32 d = rows && volume ? row_layers : std::max(depth >> m, 1u);
-        copies.push_back(vk::BufferImageCopy{
-            .bufferOffset = 0,
-            .bufferRowLength = w,
-            .bufferImageHeight = h,
-            .imageSubresource{.aspectMask = info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
-                                                                : vk::ImageAspectFlagBits::eColor,
-                              .mipLevel = m,
-                              .baseArrayLayer = 0,
-                              .layerCount = rows && !volume ? row_layers : layers},
-            .imageOffset = {0, 0, 0},
-            .imageExtent = {w, h, d},
-        });
-    }
     s.cmd.copyBufferToImage(buffer, vk::Image{Handle<VkImage_T>(entry.image->NativeHandle())},
                             vk::ImageLayout::eGeneral,
                             vk::ArrayProxy<const vk::BufferImageCopy>(
@@ -21896,8 +21929,20 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
     if (entry.rewrite == Rewrite::None && !entry.stencil_clear_pending) {
         return;
     }
+    // FIX-SGT-072 (review): after an attempt that failed for lack of memory in this frame, a
+    // partial 3D fill waits for a later one (a failed allocation can take milliseconds).
+    if (entry.volume_fill_failed_frame == frame && entry.rewrite == Rewrite::Clear &&
+        !entry.stencil_clear_pending && entry.rewrite_bytes < entry.info.guest_size &&
+        entry.image && entry.image->Desc().dim == Native::Rhi::ImageDim::D3) {
+        return;
+    }
     auto claim = registry->ClaimRememberedFill(entry);
+    bool fill_pending = false; // FIX-SGT-072 (review): the fill is tried again at the next use
     const auto retire_claim = [&] {
+        if (fill_pending) {
+            registry->ReturnRememberedFill(entry, claim); // its receipt waits for that attempt
+            return;
+        }
         // Attach after recording: PatternBuffer/GlobalBarrier can splice while
         // preparing the clear, so an earlier stream is not its completion tick.
         if (claim.receipt) Begin().remembered_fill_receipts.push_back(std::move(claim.receipt));
@@ -21951,7 +21996,48 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
             color_zero = true;
         }
     }
-    if (rewrite == Rewrite::Clear && partial) {
+    if (partial && entry.image && entry.image->Desc().dim == Native::Rhi::ImageDim::D3) {
+        // FIX-SGT-072 (review): only a fill that failed for lack of memory is tried again, at
+        // the picture's next use in a later frame, VolumeFillAttempts times in a row; any other
+        // failure drops it, as before.
+        constexpr u8 VolumeFillAttempts = 3;
+        bool out_of_memory = false;
+        bool filled = FillImage(entry, lo, hi, 0, 1, &out_of_memory);
+        if (!filled && !out_of_memory && info.num_samples == 1) {
+            // Checked and allocated before the barrier: a rejected attempt splits no pass.
+            using PartialFill = Native::ImageRegistry::PartialFill;
+            const u64 written = entry.rewrite_bytes;
+            const auto ready = registry->PreparePartialVolumeFill(entry, written);
+            const auto* pattern = ready == PartialFill::Ready ? PatternBuffer(lo, hi, written)
+                                                              : nullptr;
+            if (pattern && pattern->Size() >= written) {
+                Stream& s = Begin();
+                GlobalBarrier();
+                filled = registry->RecordPartialVolumeFill(*s.list, entry, *pattern, written);
+                if (filled) {
+                    s.pipelines.Invalidate(); // the tiler binds its own pipeline and descriptors
+                    ForgetBindings(s);
+                    Written(&entry, entry.rewrite_clock);
+                    s.buffers_written = true;
+                    ++s.commands;
+                }
+            } else {
+                out_of_memory = ready != PartialFill::Ineligible;
+            }
+        }
+        if (filled || !out_of_memory) {
+            entry.volume_fill_failures = 0;
+        } else {
+            entry.volume_fill_failed_frame = frame;
+            fill_pending = ++entry.volume_fill_failures < VolumeFillAttempts;
+            if (fill_pending) {
+                entry.rewrite = Rewrite::Clear;
+            } else {
+                entry.volume_fill_failures = 0; // dropped, as before
+            }
+        }
+        if (filled) NATIVE_DIAGNOSTIC(++stats.rewrite_partial);
+    } else if (partial) {
         // NAT-124: a fill of the first bytes only: those rows of the first mip and layer.
         const u32 texel = info.props.is_depth ? 4u : std::max(info.num_bits / 8, 1u);
         const u64 row_bytes = u64(std::max(info.pitch, info.size.width)) * texel;
@@ -21973,14 +22059,7 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
             info.props.is_volume, Native::WholeLayerPatternSafe(lo, hi, image_texel, layer_stride)) : 0;
         const bool filled_layers = whole_layers && FillImage(entry, lo, hi, image->Desc().height,
                                                               whole_layers);
-        // FIX-GT7-187: a 3D picture: the whole slices the fill covers (at least one).
-        u32 slices = 1;
-        if (image && image->Desc().dim == Native::Rhi::ImageDim::D3 && rows == info.size.height) {
-            const u64 slice_bytes = row_bytes * info.size.height;
-            slices = u32(std::clamp<u64>(slice_bytes ? entry.rewrite_bytes / slice_bytes : 1, 1,
-                                         std::max(image->Desc().depth, 1u)));
-        }
-        if (filled_layers || (rows != 0 && FillImage(entry, lo, hi, rows, slices))) {
+        if (filled_layers || (rows != 0 && FillImage(entry, lo, hi, rows))) {
             NATIVE_DIAGNOSTIC(++stats.rewrite_partial);
         }
     } else if (rewrite == Rewrite::Clear && !depth_value && !color_zero) {

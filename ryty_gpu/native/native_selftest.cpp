@@ -1533,6 +1533,75 @@ bool RunSmallCpuDeferredUploadCase(Rhi::Device& device, Rhi::Fence& fence, u64& 
     return true;
 }
 
+bool RunPartialVolumeFillCase(Rhi::Device& device, Rhi::Fence& fence, u64& tick,
+                              AmdGpu::TileMode mode, u16 levels, std::string& log) {
+    auto info = MakeInfo(mode, 128, 64, levels, 0x7000'0000'0000ULL);
+    info.type = AmdGpu::ImageType::Color3D;
+    info.size.depth = 8;
+    info.props.is_volume = true;
+    info.UpdateSize();
+    const u32 size = info.guest_size;
+    // Either half a slice plus a slice, or three bytes of the first texel in mip 1.
+    const u32 written = levels == 1 ? 48 * 1024 : info.mips_layout[1].offset + 3;
+    const auto buffer = [&](u32 usage, Rhi::MemoryKind memory) {
+        return device.CreateBuffer({.size = size, .usage = usage, .memory = memory});
+    };
+    const u32 transfer = Rhi::BufferUsageTransferSrc | Rhi::BufferUsageTransferDst;
+    auto live = buffer(transfer, Rhi::MemoryKind::DeviceLocal);
+    auto guest = buffer(transfer | Rhi::BufferUsageStorage, Rhi::MemoryKind::DeviceLocal);
+    auto pattern = buffer(transfer, Rhi::MemoryKind::DeviceLocal);
+    auto before = buffer(transfer, Rhi::MemoryKind::Readback);
+    auto after = buffer(transfer, Rhi::MemoryKind::Readback);
+    if (!live || !guest || !pattern || !before || !after || !before->Mapped() || !after->Mapped())
+        return false;
+
+    ImageRegistry registry{device};
+    registry.SetUploadSource([&](const ImageEntry&, Rhi::CommandList&) {
+        ImageRegistry::UploadSource source;
+        source.buffer = guest.get();
+        source.guest_writes_tracked = true;
+        return source;
+    });
+    auto* entry = registry.Find(info, true, 1);
+    if (!entry || !entry->image) return false;
+    entry->write_version.store(1);
+    constexpr u32 word = 0x12345678;
+    const auto bytes = std::bit_cast<std::array<u8, 4>>(word);
+    auto* list = device.AcquireCommandList();
+    list->Begin();
+    list->FillBuffer(live.get(), 0, size / 2, 0x78432101);
+    list->FillBuffer(live.get(), size / 2, size / 2, 0xaf432101);
+    list->FillBuffer(guest.get(), 0, size, 0xeeeeeeee);
+    list->FillBuffer(pattern.get(), 0, size, word);
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+    list->CopyBuffer(pattern.get(), 0, guest.get(), 0, written);
+    list->CopyBufferToImage(live.get(), entry->image.get(), MipCopies(info));
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer | Rhi::ScopeCompute);
+    if (!registry.RecordDownload(*list, *entry, *before)) return false;
+    list->Barrier(Rhi::ScopeTransfer | Rhi::ScopeCompute, Rhi::ScopeTransfer | Rhi::ScopeCompute);
+    if (!registry.RecordPartialVolumeFill(*list, *entry, *pattern, written)) return false;
+    list->Barrier(Rhi::ScopeTransfer | Rhi::ScopeCompute, Rhi::ScopeTransfer | Rhi::ScopeCompute);
+    if (!registry.RecordDownload(*list, *entry, *after)) return false;
+    list->Barrier(Rhi::ScopeTransfer | Rhi::ScopeCompute, Rhi::ScopeHost);
+    list->End();
+    Rhi::CommandList* lists[]{list};
+    device.GraphicsQueue().Submit(lists, {}, {&fence, ++tick});
+    if (!fence.Wait(tick, 10'000'000'000ULL)) return false;
+    before->Invalidate();
+    after->Invalidate();
+    const auto* initial = before->Mapped();
+    const auto* output = after->Mapped();
+    if (std::count(initial, initial + size, 0x78) != size / 8 ||
+        std::count(initial, initial + size, 0xaf) != size / 8) return false;
+    u32 wrong_prefix = 0;
+    u32 wrong_suffix = 0;
+    for (u32 i = 0; i < written; ++i) wrong_prefix += output[i] != bytes[i % 4];
+    for (u32 i = written; i < size; ++i) wrong_suffix += output[i] != initial[i];
+    log += fmt::format("partial volume mode={} levels={} size={} prefix={} prefix_errors={} suffix_errors={}\n",
+                       u32(mode), levels, size, written, wrong_prefix, wrong_suffix);
+    return wrong_prefix == 0 && wrong_suffix == 0;
+}
+
 bool RunImageSelfTest(std::string& log) {
     std::string error;
     auto device = Rhi::CreateStandaloneVulkanDevice(&error);
@@ -1543,6 +1612,12 @@ bool RunImageSelfTest(std::string& log) {
     auto fence = device->CreateFence(0);
     u64 tick = 0;
     bool ok = true;
+    for (const auto mode : {AmdGpu::TileMode::DisplayLinearAligned, AmdGpu::TileMode::Thin1DThin,
+                            AmdGpu::TileMode::Thin3DThin, AmdGpu::TileMode::Thick3DThick}) {
+        for (const u16 levels : {1, 2}) {
+            ok = RunPartialVolumeFillCase(*device, *fence, tick, mode, levels, log) && ok;
+        }
+    }
     ok = RunWholeLayerClearCase(*device, *fence, tick, log) && ok;
     ok = RunAsyncMirrorCase(*device,*fence,tick,log) && ok;
     ok = RunLargeCpuWritebackCase(*device, *fence, tick, log) && ok;

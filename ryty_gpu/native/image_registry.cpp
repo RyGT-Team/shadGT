@@ -1497,6 +1497,13 @@ ImageRegistry::FillClaim ImageRegistry::ClaimRememberedFill(ImageEntry& entry) {
     return {!entry.remembered_fill_invalid, entry.remembered_fill_receipt};
 }
 
+void ImageRegistry::ReturnRememberedFill(ImageEntry& entry, FillClaim& claim) {
+    if (!claim.receipt) return;
+    std::scoped_lock lock{recent_fills_mutex};
+    entry.remembered_fill_pending = true;
+    claim.receipt.reset();
+}
+
 void ImageRegistry::Invalidate(VAddr address, u64 size, Stale why) {
     std::scoped_lock fill_lock{recent_fills_mutex};
     recent_fills.Forget(address, size);
@@ -2626,6 +2633,89 @@ void ImageRegistry::FinishDownloads(Rhi::CommandList& list, DownloadBatch& batch
     batch.copied = false;
 }
 
+// PERF-314: the entry owns its scratch buffers until the GPU finishes its last use.
+bool ImageRegistry::PrepareTilingScratch(ImageEntry& entry, bool convert) {
+    const u64 size = entry.info.guest_size;
+    const auto prepare = [&](std::unique_ptr<Rhi::Buffer>& buffer) {
+        if (!buffer || buffer->Size() < size) {
+            auto larger = device.CreateBuffer({.size = size,
+                .usage = Rhi::BufferUsageStorage | Rhi::BufferUsageTransferSrc |
+                         Rhi::BufferUsageTransferDst,
+                .memory = Rhi::MemoryKind::DeviceLocal});
+            if (!larger) return false;
+            buffer = std::move(larger);
+        }
+        return buffer->Size() >= size;
+    };
+    if (!prepare(entry.download_linear)) return false;
+    if (!convert) return true;
+    if (!entry.download_params) entry.download_params = TilingParamsBuffer(entry.info);
+    return entry.download_params && prepare(entry.download_tiled);
+}
+
+static void DispatchImageTiling(Rhi::CommandList& list, const ImageEntry& entry,
+                                const Rhi::Pipeline& pipeline) {
+    const u64 size = entry.info.guest_size;
+    list.BindPipeline(&pipeline);
+    const std::array<Rhi::Binding, 3> bindings{{
+        {.slot = 0, .type = Rhi::BindingType::StorageBuffer,
+         .buffer = entry.download_tiled.get(), .size = size},
+        {.slot = 1, .type = Rhi::BindingType::StorageBuffer,
+         .buffer = entry.download_linear.get(), .size = size},
+        {.slot = 2, .type = Rhi::BindingType::UniformBuffer, .buffer = entry.download_params.get(),
+         .size = sizeof(TilingParams)},
+    }};
+    list.PushBindings(bindings);
+    list.Dispatch(static_cast<u32>(VideoCore::NativeTilingGroups(size, entry.info.num_bits / 8)), 1, 1);
+}
+
+ImageRegistry::PartialFill ImageRegistry::PreparePartialVolumeFill(ImageEntry& entry,
+                                                                   u64 written) {
+    const auto& info = entry.info;
+    if (!entry.image || !written || written >= info.guest_size) return PartialFill::Ineligible;
+    const auto& desc = entry.image->Desc();
+    if (desc.dim != Rhi::ImageDim::D3 || info.num_samples != 1 || !info.props.is_volume ||
+        desc.width != info.size.width || desc.height != info.size.height ||
+        desc.depth != info.size.depth || info.resources.layers != 1 || !info.resources.levels ||
+        info.resources.levels > std::min<size_t>(desc.mips, info.mips_layout.size()))
+        return PartialFill::Ineligible;
+    const bool convert = info.props.is_tiled || info.props.is_bgr_packed_float;
+    // A pipeline that could not be made stays null in the cache.
+    if (convert && (!TilingPipeline(info, true) || !TilingPipeline(info, false)))
+        return PartialFill::Ineligible;
+    return PrepareTilingScratch(entry, convert) ? PartialFill::Ready : PartialFill::OutOfMemory;
+}
+
+// FIX-SGT-072: only the image may still hold the suffix written by earlier draws. Patch its
+// guest-layout bytes on the GPU, then use the same conversion as ordinary image uploads.
+bool ImageRegistry::RecordPartialVolumeFill(Rhi::CommandList& list, ImageEntry& entry,
+                                            const Rhi::Buffer& pattern, u64 written) {
+    if (written > pattern.Size() || PreparePartialVolumeFill(entry, written) != PartialFill::Ready)
+        return false;
+    const auto& info = entry.info;
+    const bool convert = info.props.is_tiled || info.props.is_bgr_packed_float;
+    const auto* tile = convert ? TilingPipeline(info, true) : nullptr;
+    const auto* untile = convert ? TilingPipeline(info, false) : nullptr;
+    const auto copies = MipCopies(info);
+    auto* linear = entry.download_linear.get();
+    list.CopyImageToBuffer(entry.image.get(), linear, copies);
+    if (convert) {
+        list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeCompute);
+        DispatchImageTiling(list, entry, *tile);
+    }
+    list.Barrier(convert ? Rhi::ScopeCompute : Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+    list.CopyBuffer(&pattern, 0, convert ? entry.download_tiled.get() : linear, 0, written);
+    if (convert) {
+        list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeCompute);
+        DispatchImageTiling(list, entry, *untile);
+    }
+    list.Barrier(convert ? Rhi::ScopeCompute : Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+    list.CopyBufferToImage(linear, entry.image.get(), copies);
+    // Also orders this fill's reads of the scratch buffers before the next one's writes.
+    list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeCompute | Rhi::ScopeTransfer);
+    return true;
+}
+
 bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, const Rhi::Buffer& out,
                                    u64 out_offset, DownloadBatch* batch) {
     const VideoCore::ImageInfo& info = entry.info;
@@ -2677,46 +2767,15 @@ bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, co
                                   .groups = static_cast<u32>(VideoCore::NativeTilingGroups(size, info.num_bits / 8))});
         return true;
     }
-    // PERF-314: GT Sport writes the same small pictures back thousands of times a second; making
-    // three buffers for each write-back was most of the recorder's time in write-backs. The
-    // picture's buffers are reused: its size and tiling never change, and every write-back is
-    // recorded on the one queue, ordered after the last by the barriers below. Freed with the
-    // entry (after the GPU is done with them, as before).
-    if (!entry.download_params) {
-        entry.download_params = TilingParamsBuffer(info);
-    }
-    if (!entry.download_linear || entry.download_linear->Size() < size) {
-        entry.download_linear = device.CreateBuffer({.size = size,
-                                                     .usage = Rhi::BufferUsageStorage |
-                                                              Rhi::BufferUsageTransferDst,
-                                                     .memory = Rhi::MemoryKind::DeviceLocal});
-    }
-    if (!entry.download_tiled || entry.download_tiled->Size() < size) {
-        entry.download_tiled = device.CreateBuffer({.size = size,
-                                                     .usage = Rhi::BufferUsageStorage |
-                                                              Rhi::BufferUsageTransferSrc |
-                                                              Rhi::BufferUsageTransferDst,
-                                                    .memory = Rhi::MemoryKind::DeviceLocal});
-    }
-    Rhi::Buffer* params_buffer = entry.download_params.get();
-    Rhi::Buffer* linear = entry.download_linear.get();
-    Rhi::Buffer* tiled = entry.download_tiled.get();
-    if (!tile || !params_buffer || !linear || !tiled) {
+    if (!tile || !PrepareTilingScratch(entry, true)) {
         return false;
     }
+    auto* linear = entry.download_linear.get();
+    auto* tiled = entry.download_tiled.get();
     list.CopyImageToBuffer(entry.image.get(), linear, MipCopies(info));
     if (info.props.is_bgr_packed_float) list.CopyBuffer(&out, out_offset, tiled, 0, size);
     list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeCompute);
-    list.BindPipeline(tile);
-    const std::array<Rhi::Binding, 3> bindings{{
-        {.slot = 0, .type = Rhi::BindingType::StorageBuffer, .buffer = tiled, .offset = 0,
-         .size = size},
-        {.slot = 1, .type = Rhi::BindingType::StorageBuffer, .buffer = linear, .size = size},
-        {.slot = 2, .type = Rhi::BindingType::UniformBuffer, .buffer = params_buffer,
-         .size = sizeof(TilingParams)},
-    }};
-    list.PushBindings(bindings);
-    list.Dispatch(static_cast<u32>(VideoCore::NativeTilingGroups(size, info.num_bits / 8)), 1, 1);
+    DispatchImageTiling(list, entry, *tile);
     list.Barrier(Rhi::ScopeCompute, Rhi::ScopeTransfer);
     list.CopyBuffer(tiled, 0, &out, out_offset, size);
     // Also orders this write-back's reads of the scratch buffers before the next one's writes.

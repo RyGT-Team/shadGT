@@ -286,6 +286,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_NATIVE_CHUNK_MB|int|Memory & VRAM|64 for GT Sport, 1 for GT7|megabytes, 1-64; invalid = 1|Size of the native recorder's upload chunks in MB. Larger chunks mean fewer allocations but more memory.",
     "RYGTSW1|SHADGT_NATIVE_CHUNK_TRIM|flag|Memory & VRAM|on|0 = off|Frees idle upload chunks every 150 frames. 0 keeps them (more memory).",
     "RYGTSW1|SHADGT_NATIVE_FILL_PATTERNS|int|Memory & VRAM|64|count; 0 = every pattern keeps its buffer|How many fill-pattern buffers are kept (max 256 MB); fixed 1.5 GB VRAM leak (FIX-GT7-123).",
+    "RYGTSW1|SHADGT_NATIVE_VOLUME_FILL|flag|Memory & VRAM|on|1 = direct copies, 0 = use scratch|Fill a linear 3D image directly when its written prefix covers whole texels (FIX-SGT-072).",
     "RYGTSW1|SHADGT_NATIVE_INPLACE_EXTRA|string|Memory & VRAM|208000000+800000 when SHADGT_NATIVE_INPLACE_RANGES is set|'<hex addr>+<hex size>,...'; empty = none|Extra in-place ranges after the listed ones (GT7 per-frame tail, FIX-GT7-029). Empty means none.",
     "RYGTSW1|SHADGT_NATIVE_INPLACE_FROM|hex|Memory & VRAM|f000000000|hex guest address; ffffffffffffffff = every written range gets a region|Guest address above which GPU-written buffers stay in guest memory for CPU readback (FIX-150).",
     "RYGTSW1|SHADGT_NATIVE_INPLACE_RANGES|string|Memory & VRAM|unset (none; GT7's launcher sets it)|'<hex addr>+<hex size>,...'|Guest ranges (GT7 per-frame memory) whose GPU writes stay in guest memory. Normally set by the launcher.",

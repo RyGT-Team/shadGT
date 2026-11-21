@@ -10191,6 +10191,10 @@ bool NativeRenderer::QueueCommit(CommitKind kind, void* target, VAddr address, u
 
 void NativeRenderer::NoteCommitWork(CommitKind kind) {
     if constexpr (Common::DiagnosticsBuilt) {
+        if (OnRecorderBThread()) { // DIAG-SGT-084
+            b_run_flags |= 1;
+            b_draw_kinds |= 1u << u32(kind);
+        }
         auto& d = CommitDiag();
         ++d.work[d.arm][size_t(kind)];
         AuditCount(Ctx().commit.binding ? AuditContentBind : AuditContentElse); // DIAG-SGT-075
@@ -17443,9 +17447,18 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     bool buffer_freshness_certified = false;
     u64 buffer_freshness_seq = 0;
     if (prepared && widen_flat) a_prepared_why = DiagText("A: widened");
+    if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-084
+        if (OnRecorderBThread()) {
+            ++b_run_draws;
+            if (!prepared || widen_flat) b_run_flags |= 2;
+        }
+    }
     if (prepared && !widen_flat) {
         PhaseClock clock{stats.phase_ns[2]};
         from_prepared = CommitPrepared(*prepared, *pipeline, regs, trusted);
+        if constexpr (Common::DiagnosticsBuilt) {
+            if (OnRecorderBThread()) b_run_flags |= from_prepared ? 0 : 2; // DIAG-SGT-084
+        }
         if (from_prepared) {
             buffer_freshness_seq = buffer_log.Seq();
             buffer_freshness_certified = true;
@@ -22605,10 +22618,154 @@ void NativeRenderer::RecorderBDryRun(u64 key) {
 // list, so lists run in recording order and at most one is open (the submit callback's splice
 // then takes it). This checks that B's context records draws as the main one does: its own
 // streams, pipelines and dynamic state, bindings scratch and memos.
+void NativeRenderer::NoteBDrawEnd() {
+    if constexpr (Common::DiagnosticsBuilt) {
+        if (!b_draw_open) return;
+        b_draw_open = false;
+        static constexpr std::array<const char*, size_t(CommitKind::Count)> names{
+            "B draw ordered: region", "B draw ordered: mirror", "B draw ordered: rewrite",
+            "B draw ordered: depth twin", "B draw ordered: sources"};
+        NoteSubmitSite(b_draw_kinds ? "B draw with ordered work" : "B draw without ordered work", {});
+        for (u32 k = 0; k < names.size(); ++k) {
+            if (b_draw_kinds & (1u << k)) NoteSubmitSite(names[k], {});
+        }
+        if (b_draw_kinds && b_pass_first_dirty < 0) b_pass_first_dirty = s32(b_pass_draw);
+        b_draw_kinds = 0;
+        ++b_pass_draw;
+    }
+}
+
+void NativeRenderer::NoteBPassEnd() {
+    if constexpr (Common::DiagnosticsBuilt) {
+        NoteBDrawEnd();
+        if (b_pass_draw == 0) return;
+        const s32 f = b_pass_first_dirty;
+        NoteSubmitSite(f < 0 ? "B pass: no ordered work" : f == 0 ? "B pass: ordered work at draw 0"
+                       : f < 4 ? "B pass: first ordered work at draws 1-3"
+                       : f < 16 ? "B pass: first ordered work at draws 4-15"
+                                : "B pass: first ordered work at draw 16+", {});
+        for (u32 i = 0; i < b_pass_draw; ++i) {
+            NoteSubmitSite(f < 0 ? "B draw in a pass without ordered work"
+                           : s32(i) < f ? "B draw before its pass's first ordered work"
+                                        : "B draw at or after its pass's first ordered work", {});
+        }
+        b_pass_draw = 0;
+        b_pass_first_dirty = -1;
+    }
+}
+
+void NativeRenderer::NoteBRunEnd() {
+    if constexpr (Common::DiagnosticsBuilt) {
+        NoteBPassEnd();
+        b_pass_key = 0;
+        if (!b_run_open) return;
+        b_run_open = false;
+        const u32 f = b_run_flags;
+        NoteSubmitSite(f == 0 ? "B run clean" : (f & 4) ? "B run: dispatch"
+                       : (f & 2) ? "B run: draw without prepared" : "B run: ordered content only", {});
+        if (f & 1) NoteSubmitSite("B run: has ordered content", {});
+        for (u32 i = 0; i < b_run_draws; ++i) {
+            NoteSubmitSite(f == 0 ? "B draw in a clean run" : "B draw in another run", {});
+        }
+    }
+}
+
+bool NativeRenderer::RecorderBCanTake(const void* packet, bool hoist) {
+    std::scoped_lock lock{mutex};
+    const auto keep = [&](const char* why) {
+        if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite(why, {});
+        return false;
+    };
+    if (!packet) return keep("B draw kept by A: no packet");
+    PreparedDraw* p = nullptr;
+    {
+        PreparedShard& shard = ShardFor(packet);
+        std::scoped_lock shard_lock{shard.mutex};
+        if (const auto it = shard.draws.find(packet); it != shard.draws.end()) p = it->second;
+    }
+    if (!p) return keep("B draw kept by A: no prepared draw");
+    // Its pointers (regions, mirrors, pictures) hold only while nothing they point at went: the
+    // checks CommitPrepared makes first, before any of them is read.
+    const auto still_holds = [&] {
+        return p->unmap_gen == unmap_generation.load(std::memory_order_acquire) &&
+               p->sampler_drops == samplers_dropped.load(std::memory_order_acquire) &&
+               registry->UntouchedHolding(p->image_generation, p->image_ranges, p->picture_ranges) &&
+               PreparedBuffersUntouched(*p, p->buffer_seq);
+    };
+    if (!still_holds()) return keep("B draw kept by A: prepared draw no longer holds");
+    SortRegionWrites(); // the CPU writes up to here, in the command order (the recorder's)
+    if (!PreparedBuffersUntouched(*p, p->buffer_seq)) {
+        return keep("B draw kept by A: prepared draw no longer holds");
+    }
+    if (hoist) { // FEAT-SGT-079 step 16: the draw's ordered work, here, by the recorder
+        u32 did = 0;
+        for (Mirror* m : p->mirrors) {
+            if (m && !m->dirty_pages.empty()) {
+                if (!RefreshMirror(*m)) return keep("B draw kept by A: mirror refresh failed");
+                ++did;
+            }
+        }
+        for (const auto& use : p->regions) {
+            if (use.region && !use.region->dirty_pages.empty()) {
+                RefreshRegion(*use.region, use.address, use.size);
+                ++did;
+            }
+        }
+        for (const auto* stored : p->bindings.stored) {
+            auto& entry = *const_cast<Native::ImageEntry*>(stored);
+            ApplyRewrite(entry);
+            SyncDepthTwin(entry);
+        }
+        for (const auto* sampled : p->bindings.sampled) {
+            auto& entry = *const_cast<Native::ImageEntry*>(sampled);
+            if (entry.from_cpu) registry->LayersRewritten(entry, frame);
+            ApplyRewrite(entry);
+            SyncDepthTwin(entry);
+            RefreshSources(entry);
+        }
+        if constexpr (Common::DiagnosticsBuilt) {
+            if (did) NoteSubmitSite("B draw: refreshes hoisted to A", {});
+        }
+        // The refreshes may have dropped a mirror or region the draw holds: B's commit then
+        // refuses the prepared draw, so the draw stays the recorder's.
+        if (!still_holds()) return keep("B draw kept by A: changed while hoisting");
+    }
+    for (const auto& use : p->regions) { // the pages the draw reads only (as RefreshRegion)
+        if (!use.region || use.region->dirty_pages.empty()) continue;
+        const VAddr begin = Common::AlignDown(std::max(use.address, use.region->begin), 4096);
+        const VAddr end = std::min(use.region->end, use.address + use.size);
+        for (const VAddr page : use.region->dirty_pages) {
+            if (page >= begin && page < end) return keep("B draw kept by A: region");
+        }
+    }
+    for (const Mirror* m : p->mirrors) {
+        if (m && !m->dirty_pages.empty()) return keep("B draw kept by A: mirror");
+    }
+    using Rewrite = Native::ImageEntry::Rewrite;
+    const auto picture_ok = [](const Native::ImageEntry* e) {
+        return !e || (e->rewrite == Rewrite::None && !e->stencil_clear_pending &&
+                      !e->sources_dirty.load(std::memory_order_relaxed));
+    };
+    for (const auto* e : p->bindings.sampled) {
+        if (!picture_ok(e)) return keep("B draw kept by A: picture");
+    }
+    for (const auto* e : p->bindings.stored) {
+        if (!picture_ok(e)) return keep("B draw kept by A: picture");
+    }
+    if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B draw given to B", {});
+    return true;
+}
+
 void NativeRenderer::RecorderBEnter() {
     std::scoped_lock lock{mutex};
     if (current_context != &main_record_context) {
         return;
+    }
+    if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-084
+        NoteBRunEnd();
+        b_run_flags = 0;
+        b_run_draws = 0;
+        b_run_open = true;
     }
     if (Ctx().stream.list) {
         Splice();
@@ -22629,6 +22786,17 @@ void NativeRenderer::RecorderBDeal(bool dispatch, const AmdGpu::Regs& regs) {
     if (!dispatch) {
         key = XXH3_64bits(&regs.color_buffers, sizeof(regs.color_buffers));
         key = XXH3_64bits_withSeed(&regs.depth_buffer, sizeof(regs.depth_buffer), key) | 2;
+    }
+    if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-084: B's draws and passes
+        if (OnRecorderBThread()) {
+            if (key != b_pass_key) {
+                NoteBPassEnd();
+                b_pass_key = key;
+            } else {
+                NoteBDrawEnd();
+            }
+            b_draw_open = true;
+        }
     }
     auto& d = b_deal;
     if (d.frame != frame) {
@@ -22654,6 +22822,9 @@ void NativeRenderer::RecorderBDeal(bool dispatch, const AmdGpu::Regs& regs) {
         if (want == &main_record_context && RecorderBMode() == 3) {
             RecorderBDryRun(key);
         }
+    }
+    if constexpr (Common::DiagnosticsBuilt) {
+        if (want == &main_record_context) NoteBRunEnd(); // DIAG-SGT-084
     }
     if (Ctx().stream.list) {
         Splice();
@@ -23501,6 +23672,9 @@ void NativeRenderer::DispatchDirect() {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::DispatchTotal}; // DIAG-SGT-023
     YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
+    if constexpr (Common::DiagnosticsBuilt) {
+        if (OnRecorderBThread()) b_run_flags |= 4; // DIAG-SGT-084
+    }
     if constexpr (Common::DiagnosticsBuilt) PassDiagBegin(false); // DIAG-SGT-061
     if constexpr (Common::DiagnosticsBuilt) PassAuditBegin(false); // DIAG-SGT-075
     BindCommitPassBegin(false); // PERF-SGT-062

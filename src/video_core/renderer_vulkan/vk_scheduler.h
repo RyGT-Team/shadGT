@@ -381,7 +381,10 @@ std::atomic<int>& SubmitAbArm();
 /// SHADGT_DIAG_SUBMITS=1) counts, by caller, what it does on the main command ring or to the
 /// command order (splices, flushes), which it must stop doing before it records beside A.
 void MarkRecorderBThread();
-bool OnRecorderBThread();
+inline thread_local bool t_on_recorder_b = false; ///< FEAT-SGT-079: set by MarkRecorderBThread
+inline bool OnRecorderBThread() {
+    return t_on_recorder_b;
+}
 void NoteRecorderBMain(const char* what, const std::source_location& loc);
 /// DIAG-SGT-074: when the command thread submitted a tick to the queue (0: not known), for the
 /// split of the EOP tail into our submit and the GPU's run. Diagnostics builds only.

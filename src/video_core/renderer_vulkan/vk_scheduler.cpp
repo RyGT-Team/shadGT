@@ -447,18 +447,12 @@ s64 TickSubmittedNs(u64 tick) {
     return g_tick_submit_ns[tick % g_tick_submit_ns.size()].load(std::memory_order_relaxed);
 }
 
-namespace {
-thread_local bool t_recorder_b = false; // FEAT-SGT-079
-}
 void MarkRecorderBThread() {
-    t_recorder_b = true;
-}
-bool OnRecorderBThread() {
-    return t_recorder_b;
+    t_on_recorder_b = true; // FEAT-SGT-079
 }
 void NoteRecorderBMain(const char* what, const std::source_location& loc) {
     if constexpr (Common::DiagnosticsBuilt) {
-        if (t_recorder_b) NoteSubmitSite(what, loc);
+        if (t_on_recorder_b) NoteSubmitSite(what, loc);
     }
 }
 
@@ -472,10 +466,12 @@ std::atomic<int>& SubmitAbArm() {
         const char* recorder_b = std::getenv("SHADGT_RECORDER_B"); // FEAT-SGT-079
         const char* prefetch = std::getenv("SHADGT_PREPARED_PREFETCH"); // PERF-SGT-081
         const char* b_ring = std::getenv("SHADGT_RECORDER_B_RING");      // FEAT-SGT-079
+        const char* b_first = std::getenv("SHADGT_RECORDER_B_FIRST_A");  // FEAT-SGT-079
         return (select && select[0] == '2') || (wait && wait[0] == '2') ||
                (recorder_b && (recorder_b[0] == '2' || recorder_b[0] == '6' ||
                                recorder_b[0] == '8')) ||
                (prefetch && prefetch[0] == '2') || (b_ring && b_ring[0] == '2') ||
+               (b_first && (b_first[0] == '2' || b_first[0] == '4' || b_first[0] == '6')) ||
                Common::DiagEnv("SHADGT_DIAG_FENCE_BATCH_AB") != nullptr ||
                Common::DiagEnv("SHADGT_DIAG_FEED_GPU_AB") != nullptr ||
                Common::DiagEnv("SHADGT_DIAG_PARALLEL_AB") != nullptr ||

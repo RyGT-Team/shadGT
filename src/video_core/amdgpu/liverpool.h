@@ -475,6 +475,15 @@ public:
 
 private:
     static void RecorderBPause();
+    static bool RecorderBFirstToA(); ///< FEAT-SGT-079 step 13
+    static bool RecorderBHoist();    ///< FEAT-SGT-079 step 16
+    static s64 OverlapNowNs();
+    void NoteOverlap(s64 from, s64 to); ///< DIAG-SGT-085
+    bool b_overlap_a_ran = false;
+    struct {
+        s64 since = 0, last_end = 0, run = 0, b = 0, a = 0, save = 0;
+        u64 pairs = 0;
+    } b_overlap;
     void RecorderBApply(const QueuedDraw& draw);
     void RecorderBThread(std::stop_token stop);
     void RecorderBBatonThread();

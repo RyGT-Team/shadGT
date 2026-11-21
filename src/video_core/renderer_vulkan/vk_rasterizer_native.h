@@ -218,6 +218,13 @@ public:
     /// its own context is the current one, it splices its open list and makes B's current, so
     /// that B's thread never splices (the command order is the recorder's).
     void RecorderBEnter();
+    /// FEAT-SGT-079 step 14: the recorder, before it hands one of B's draws to B's thread: whether
+    /// B can record it without ordered work (its prepared draw's regions and mirrors hold no CPU
+    /// writes, its pictures no pending rewrite, stencil clear or dirty sources). Else the
+    /// recorder keeps the draw, at its place in the command order.
+    /// FEAT-SGT-079 step 16 (`hoist`): the recorder first does the draw's ordered work itself, at
+    /// this point of the command order (as CommitPrepared's ordered part does), then checks.
+    bool RecorderBCanTake(const void* packet, bool hoist = false);
     /// FIX-GTS-492: whether a prepared draw ends with the command memory it was made from
     /// (SHADGT_PREPARED_LIFETIME=0: it stays until a draw takes it, as before).
     static bool PreparedLifetimeOn();
@@ -2040,6 +2047,22 @@ private:
         u64 key = 0;
         u64 switches = 0, b_draws = 0, draws = 0; // diagnostics
     } b_deal;
+    /// DIAG-SGT-084 (diagnostics builds): what B's open run did that it could not throw away
+    /// and leave to the recorder: 1 ordered content work (refreshes, rewrites), 2 a draw without
+    /// its prepared draw, 4 a dispatch; b_run_open while a run is B's.
+    u32 b_run_flags = 0;
+    /// DIAG-SGT-084, per draw of B's: the kinds of ordered work the open draw did (a bit per
+    /// CommitKind), its index in its pass, the pass's first draw with ordered work (-1: none).
+    u32 b_draw_kinds = 0;
+    bool b_draw_open = false;
+    u32 b_pass_draw = 0;
+    s32 b_pass_first_dirty = -1;
+    u64 b_pass_key = 0;
+    void NoteBDrawEnd();
+    void NoteBPassEnd();
+    u32 b_run_draws = 0;
+    bool b_run_open = false;
+    void NoteBRunEnd();
     /// FEAT-SGT-079: at a draw's or dispatch's start, before anything is recorded for it: the
     /// context its run of passes is dealt to (a hand-over splices the open list first).
     void RecorderBDeal(bool dispatch, const AmdGpu::Regs& regs);
@@ -2067,7 +2090,7 @@ private:
     /// producer, and its placeholders replay in its jobs' order from its context's lists.
     std::array<std::unique_ptr<Native::RecorderBinder<BindJob>>, 2> binders;
     u8 ContextIndex() const {
-        return current_context == &b_record_context ? 1 : 0;
+        return &Ctx() == &b_record_context ? 1 : 0;
     }
     Native::RecorderBinder<BindJob>* CtxBinder() const {
         return binders[ContextIndex()].get();
@@ -2093,11 +2116,14 @@ private:
     /// FEAT-SGT-022: 1 binder thread, 2 the same with a drain after every job (serial, to tell
     /// a wrong hand-off from a race), 0 off.
     int binder_mode = 0;
+    // FEAT-SGT-079 step 11: the current context is the thread's: recorder B's thread always
+    // records into B's; `current_context` is the recorder's (A's) thread's, which it points at
+    // B's while B has the run (and splices B's list from there at the hand-back).
     RecordContext& Ctx() {
-        return *current_context;
+        return OnRecorderBThread() ? b_record_context : *current_context;
     }
     const RecordContext& Ctx() const {
-        return *current_context;
+        return OnRecorderBThread() ? b_record_context : *current_context;
     }
     u64 frame = 0;
     u64 timing_tick = 0; ///< OPT-001

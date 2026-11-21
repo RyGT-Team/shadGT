@@ -1317,12 +1317,21 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
             tag = XXH3_64bits(&regs.color_buffers, sizeof(regs.color_buffers));
             tag = XXH3_64bits_withSeed(&regs.depth_buffer, sizeof(regs.depth_buffer), tag) | 2;
         }
-        if (tag != push_key) {
+        const bool pass_start = tag != push_key;
+        if (pass_start) {
             ++push_pass;
             push_key = tag;
         }
         queued_draw->tag = tag;
-        queued_draw->to_b = (push_pass / 4) % 2 == 1;
+        // FEAT-SGT-079 step 12: dispatches stay with the recorder (39% of B's runs held one).
+        queued_draw->to_b = !compute && (push_pass / 4) % 2 == 1;
+        // FEAT-SGT-079 step 13 (SHADGT_RECORDER_B_FIRST_A=1; 2: in arm 1 of the 2 s A/B): the
+        // first draw of each of B's passes is the recorder's. A pass brings the pictures it
+        // samples up to date at its first draw (rewrites, sources: 37% of B's passes, against
+        // 2% later in the pass), which is ordered work B cannot do ahead.
+        if (pass_start && queued_draw->to_b && RecorderBFirstToA()) {
+            queued_draw->to_b = false;
+        }
         queued_draw->pushed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                      std::chrono::steady_clock::now().time_since_epoch())
                                      .count();
@@ -1370,7 +1379,9 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
             reinterpret_cast<std::uintptr_t>(sel->pipeline),
             reinterpret_cast<std::uintptr_t>(sel->compute), indirect_selected, bool(staged));
 #endif
-        auto& state = *recorder;
+        // FEAT-SGT-079 step 15: on B's thread, B's registers only (the recorder applies the
+        // delta to its own when the job comes back to it).
+        auto& state = b_state && recorder_state == b_state.get() ? *b_state : *recorder;
         RegsDelta<Regs::NumRegs>::Apply(queued_draw && delta.empty() ? queued_draw->delta : delta,
                                         std::span<u32, Regs::NumRegs>{state.regs.reg_array});
         if (cs) {
@@ -1378,8 +1389,11 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         }
         state.cb_extent = cb_extent;
         state.db_extent = db_extent;
-        if (expected) {
+        if (expected && &state == recorder.get()) { // not on B's thread (FEAT-SGT-079)
             VerifyRecorderRegs(*expected);
+        }
+        if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-085: the recorder ran a job of its own
+            if (!b_state || recorder_state != b_state.get()) b_overlap_a_ran = true;
         }
         rasterizer->SetSelectedPipeline(sel.get());
         rasterizer->SetDrawEpoch(sel && !indirect_selected ? decode_epoch : 0);
@@ -1420,16 +1434,54 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         // FEAT-SGT-079 step 5: B's jobs run on recorder B's thread while the recorder waits.
         const u64 tag = job.Tag();
         const void* const info = job.Info();
-        job = DrawPipe::Work{[this, inner = std::move(job)]() mutable {
+        job = DrawPipe::Work{[this, inner = std::move(job), qd = queued_draw]() mutable {
             if (RecorderBMode() == 6 && ::Vulkan::SubmitAbArm().load(std::memory_order_relaxed) == 0) {
                 inner();
                 return;
             }
             auto run = [&inner] { inner(); };
 #ifdef RYTY_GPU
-            if (auto* native = rasterizer->Native()) native->RecorderBEnter(); // FEAT-SGT-079
+            if (auto* native = rasterizer->Native()) {
+                // FEAT-SGT-079 step 14: a draw that needs ordered work stays the recorder's.
+                const bool hoist = RecorderBHoist();
+                if ((hoist || RecorderBFirstToA()) && !native->RecorderBCanTake(qd->packet, hoist)) {
+                    qd->to_b = false;
+                    inner();
+                    return;
+                }
+                native->RecorderBEnter(); // FEAT-SGT-079
+            }
 #endif
+            s64 b_job_from = 0;
+            if constexpr (Common::DiagnosticsBuilt) b_job_from = OverlapNowNs(); // DIAG-SGT-085
             RunOnRecorderB(run);
+            if constexpr (Common::DiagnosticsBuilt) NoteOverlap(b_job_from, OverlapNowNs());
+            // FEAT-SGT-079 step 15: the recorder's registers take the job's delta too, in order.
+            RegsDelta<Regs::NumRegs>::Apply(qd->delta,
+                                            std::span<u32, Regs::NumRegs>{recorder->regs.reg_array});
+            if (qd->cs) recorder->cs = *qd->cs;
+            recorder->cb_extent = qd->cb_extent;
+            recorder->db_extent = qd->db_extent;
+            if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-083: B's registers are A's
+                static u32 checked = 0;
+                if (b_state && (++checked & 255) == 0) {
+                    const auto& a_regs = recorder->regs.reg_array;
+                    const auto& b_regs = b_state->regs.reg_array;
+                    if (a_regs != b_regs) {
+                        static std::atomic<u32> logged{0};
+                        u32 first = 0;
+                        while (first < Regs::NumRegs && a_regs[first] == b_regs[first]) ++first;
+                        if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                            LOG_WARNING(Render, "DIAG-SGT-083: recorder B's registers differ "
+                                        "from the recorder's (first at {:#x}: {:#x} against {:#x})",
+                                        first, b_regs[first], a_regs[first]);
+                        }
+                    } else if (checked == 256 * 64) {
+                        LOG_INFO(Render, "DIAG-SGT-083: recorder B's registers match the "
+                                 "recorder's after B's jobs (64 checks)");
+                    }
+                }
+            }
         }};
         job.SetTag(tag);
         job.SetInfo(info);
@@ -1835,6 +1887,72 @@ int Liverpool::RecorderBMode() {
     return mode;
 }
 
+s64 Liverpool::OverlapNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// DIAG-SGT-085 (diagnostics builds, SHADGT_DIAG_EOP_LATENCY=1): under the baton, how much A and B
+// could overlap. A run of B's (its jobs between two jobs of the recorder's) could run beside the
+// recorder's work that follows it, up to the next run of B's: the smaller of the two is what
+// overlapping that pair would save at most. The recorder's segment is wall time (it includes the
+// recorder waiting for work), so the sum is an upper bound.
+void Liverpool::NoteOverlap(s64 from, s64 to) {
+    auto& o = b_overlap;
+    if (o.since == 0) o.since = from;
+    if (b_overlap_a_ran) { // a segment of the recorder's ended: the last run of B's pairs with it
+        b_overlap_a_ran = false;
+        if (o.last_end != 0) {
+            const s64 a_seg = from - o.last_end;
+            o.b += o.run;
+            o.a += a_seg;
+            o.save += std::min(o.run, a_seg);
+            ++o.pairs;
+        }
+        o.run = 0;
+    }
+    o.run += to - from;
+    o.last_end = to;
+    if (to - o.since >= 5'000'000'000 && o.pairs != 0) {
+        const double secs = double(to - o.since) / 1e9;
+        LOG_INFO(Render, "DIAG-SGT-085: overlap bound in {:.1f} s: {} pairs; B runs {:.1f} ms/s, the "
+                 "recorder's segments after them {:.1f} ms/s, the smaller of each pair summed "
+                 "{:.1f} ms/s",
+                 secs, o.pairs, double(o.b) / 1e6 / secs, double(o.a) / 1e6 / secs,
+                 double(o.save) / 1e6 / secs);
+        o.b = o.a = o.save = 0;
+        o.pairs = 0;
+        o.since = to;
+    }
+}
+
+// SHADGT_RECORDER_B_FIRST_A: 1 the first draw of each of B's passes is the recorder's (step 13);
+// 2 that in arm 1 of the 2 s A/B; 3 B keeps it and the recorder does its ordered work at the
+// hand-over (step 16, the hoist); 4 the hoist in arm 1 and step 13 in arm 0; 5 both (the first
+// draw is the recorder's: its targets' rewrites; the others' work is hoisted); 6 5 in arm 1 and
+// 1 in arm 0.
+static int RecorderBFirstMode() {
+    static const int mode = [] {
+        const char* env = std::getenv("SHADGT_RECORDER_B_FIRST_A");
+        return env && env[0] >= '1' && env[0] <= '6' ? env[0] - '0' : 0;
+    }();
+    return mode;
+}
+
+bool Liverpool::RecorderBFirstToA() {
+    const int mode = RecorderBFirstMode();
+    const int arm = ::Vulkan::SubmitAbArm().load(std::memory_order_relaxed);
+    return mode == 1 || (mode == 2 && arm == 1) || (mode == 4 && arm == 0) || mode == 5 ||
+           mode == 6;
+}
+
+bool Liverpool::RecorderBHoist() {
+    const int mode = RecorderBFirstMode();
+    const int arm = ::Vulkan::SubmitAbArm().load(std::memory_order_relaxed);
+    return mode == 3 || mode == 5 || ((mode == 4 || mode == 6) && arm == 1);
+}
+
 void Liverpool::RecorderBPause() {
     _mm_pause();
 }
@@ -1846,7 +1964,9 @@ void Liverpool::RecorderBBatonThread() {
     Common::SetCurrentThreadName("shadGT:GpuRecorderB");
     VideoCore::BufferCache::MarkRecorderThread();
     Common::GuestClock::MarkGpuCommandThread();
-    recorder_state = recorder.get();
+    // FEAT-SGT-079 step 11: B's own registers, brought up to each job in push order (every
+    // job's delta is applied to them as it runs, RecorderBApply), not the recorder's.
+    recorder_state = b_state ? b_state.get() : recorder.get();
     Common::PreferPerformanceCores(); // as the recorder (PERF-088)
 #ifdef RYTY_GPU
     Common::NativeThreadPriority native_priority;

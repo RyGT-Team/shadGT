@@ -654,6 +654,11 @@ public:
     CompletedResourceWorker completed_resources;
     std::mutex pools_mutex;
     std::unordered_map<std::thread::id, std::unique_ptr<ThreadPool>> pools;
+    /// FEAT-SGT-079: deferred lists of command rings other than the first one asked for (a
+    /// second recorder's ring), one pool each: a ring has one producer, who keeps its pool's
+    /// books, and the one command thread replaying every ring makes their command buffers.
+    std::unordered_map<const void*, std::unique_ptr<ThreadPool>> deferred_pools;
+    const void* first_deferred_ring = nullptr;
     // New images go from UNDEFINED to GENERAL in a command buffer submitted before the next list.
     std::mutex init_mutex;
     vk::CommandPool init_pool;
@@ -861,6 +866,14 @@ VulkanDevice::~VulkanDevice() {
         if (stats.allocationCount == 0) vmaDestroyPool(allocator, upload_reserve);
     }
     for (auto& [id, pool] : pools) {
+        for (auto& list : pool->all) {
+            if (list->descriptor_pool) {
+                device.destroyDescriptorPool(list->descriptor_pool);
+            }
+        }
+        device.destroyCommandPool(pool->pool);
+    }
+    for (auto& [ring, pool] : deferred_pools) { // FEAT-SGT-079
         for (auto& list : pool->all) {
             if (list->descriptor_pool) {
                 device.destroyDescriptorPool(list->descriptor_pool);
@@ -1877,7 +1890,10 @@ CommandList* VulkanDevice::AcquireDeferredCommandList(void* command_ring) {
     ThreadPool* pool;
     {
         std::scoped_lock lock{pools_mutex};
-        auto& slot = pools[std::thread::id{}];
+        // FEAT-SGT-079: the first ring keeps the pool it always had; another ring gets its own.
+        if (!first_deferred_ring) first_deferred_ring = command_ring;
+        auto& slot = command_ring == first_deferred_ring ? pools[std::thread::id{}]
+                                                         : deferred_pools[command_ring];
         if (!slot) {
             slot = std::make_unique<ThreadPool>();
             const auto [result, command_pool] = device.createCommandPool(vk::CommandPoolCreateInfo{

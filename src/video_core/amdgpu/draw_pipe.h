@@ -127,6 +127,20 @@ public:
     /// PERF-067: the same, with the job's kind and the work the buffer stage does for it first
     /// (only with the stage on; otherwise `prepare` is dropped and the recorder does it all).
     void Push(Work&& work, JobKind kind, Prepare&& prepare = {}, Work&& order = {});
+    /// PERF-SGT-077 (SHADGT_SELECT_STAGE): the same, with `select` run first, in push order:
+    /// on the select thread when the stage is on (and in its arm), otherwise here before pushing.
+    /// `hint`: where `select` leaves what the job reads first (PERF-GT7-126's prefetch hint).
+    void PushSelected(Work&& select, Work&& work, const void* const* hint = nullptr);
+
+    /// PERF-SGT-077: whether the select stage thread runs (SHADGT_SELECT_STAGE=1, or =2 in turns).
+    bool HasSelectStage() const noexcept {
+        return select_enabled;
+    }
+    bool OnSelectThread() const {
+        return select_enabled && std::this_thread::get_id() == select_id.load(std::memory_order_acquire);
+    }
+    /// PERF-SGT-077: runs first on the select thread (thread name, clocks, thread-local state).
+    static inline void (*select_init)() = nullptr;
 
     /// DIAG-114: the recorder's recent waits for work (longer than 50 us).
     struct Idle {
@@ -183,12 +197,29 @@ public:
         return finished_jobs.load(std::memory_order_acquire);
     }
 
+    /// FEAT-SGT-079: recorder thread only: the tags of the jobs after the one running, in order
+    /// (its batch's rest, then the queue), at most `max`.
+    void PeekTags(std::vector<u64>& out, size_t max);
+    /// FEAT-SGT-079: the same, with each job's info pointer (valid until the job has run).
+    void PeekJobs(std::vector<std::pair<u64, const void*>>& out, size_t max);
+
     bool OnRecorderThread() const {
-        return std::this_thread::get_id() == recorder_id.load(std::memory_order_acquire);
+        const auto id = std::this_thread::get_id();
+        return id == recorder_id.load(std::memory_order_acquire) ||
+               id == baton_id.load(std::memory_order_acquire); // FEAT-SGT-079
     }
 
     std::thread::id RecorderThreadId() const {
         return recorder_id.load(std::memory_order_acquire);
+    }
+
+    /// FEAT-SGT-079 step 5: recorder B's thread, which runs jobs for the recorder while the
+    /// recorder waits (the baton): it counts as the recorder thread.
+    void SetBatonThread(std::thread::id id) {
+        baton_id.store(id, std::memory_order_release);
+    }
+    std::thread::id BatonThreadId() const {
+        return baton_id.load(std::memory_order_acquire);
     }
 
     struct Stats {
@@ -259,6 +290,25 @@ private:
     std::condition_variable stage_wait_cv;
     std::atomic<u64> stage_wait_target{};
     std::jthread stage;
+    // PERF-SGT-077: the select stage. Every job pushed while it holds jobs goes through it, so
+    // the recorder gets them in push order; `select_inflight` counts queued and running ones.
+    struct SelectJob {
+        Work select;
+        Work run;
+        const void* const* hint = nullptr;
+    };
+    void RunSelect(std::stop_token stop);
+    bool SelectHere(); ///< command thread: whether this push's selection runs on the select thread
+    bool select_enabled{};
+    int select_mode{}; ///< 1 on, 2 on and off in turns every 2 s (DIAG-SGT-076's arm)
+    std::jthread select_thread;
+    std::atomic<std::thread::id> select_id{};
+    std::mutex select_mutex;
+    std::condition_variable_any select_cv;
+    std::condition_variable select_space_cv;
+    std::deque<SelectJob> select_queue;
+    std::atomic<u64> select_inflight{};
+    bool select_waiting{}; ///< under select_mutex: the select thread sleeps on select_cv
 
     std::mutex mutex;
     std::condition_variable_any work_cv;
@@ -278,10 +328,17 @@ private:
     bool recorder_waiting{};
     const size_t max_pending;
     std::atomic<std::thread::id> recorder_id{};
+    std::atomic<std::thread::id> baton_id{}; // FEAT-SGT-079
+public:
+    /// FEAT-SGT-079 step 19: called on the recorder thread before each job, with its tag (set
+    /// before the recorder starts; the late B mode syncs recorder B there).
+    std::function<void(u64)> before_job;
+private:
     std::function<void()> thread_init;
     const std::function<void()> idle_hook; // D5
     Stats stats{};
     std::jthread recorder;
+    std::deque<Work>* running_batch = nullptr; // FEAT-SGT-079: the recorder's batch (its thread)
     std::mutex idle_mutex; // DIAG-114
     std::array<Idle, 512> idle_ring{};
     u32 idle_next{};

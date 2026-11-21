@@ -30,6 +30,7 @@
 #include "common/perf_monitor.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
+#include <immintrin.h> // FEAT-SGT-079: _mm_pause
 #include "common/native_thread_priority.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -103,7 +104,165 @@ static s64 NowNs() {
 static void CheckIbAtDecode(const u32* data, u32 dwords, u64 decoding); // DIAG-062
 static std::atomic<u64> g_eop_submit{0}; // DIAG-066: submission of the last EOP signaled
 static std::atomic<u64> g_eop_count{0};
+// DIAG-SGT-074 (SHADGT_DIAG_EOP_LATENCY=1, diagnostics builds): is the frame gated by our latency?
+// SubmitGfx stamps each graphics submission; an EOP interrupt signaled for submission N measures
+// N's submit-to-signal time; the next submission after a signal measures the game's reaction.
+// Every 5 s: counts, averages and maxima, and the submissions between two signals.
+static bool EopLatencyDiag() {
+    if constexpr (!Common::DiagnosticsBuilt) {
+        return false;
+    } else {
+        static const bool on = Common::DiagEnv("SHADGT_DIAG_EOP_LATENCY") != nullptr;
+        return on;
+    }
+}
+static std::array<std::atomic<s64>, 1024> g_submit_ns{}; // by submission number
+// By submission number: when the command processor decoded its EOP (0) and when the recorder
+// reached it (1); with the submit and the signal, the chain's three parts.
+static std::array<std::array<std::atomic<s64>, 1024>, 2> g_eop_stage_ns{};
+// The scheduler tick the EOP's work went into (noted when the recorder reached it): its submit
+// splits the tail into our part (reached -> submitted) and the GPU's (submitted -> signal).
+static std::array<std::atomic<u64>, 1024> g_eop_tick{};
+static std::array<std::array<s64, 3>, 2> g_arm_tail{}; // by arm: count, to submit, to signal
+// DIAG-SGT-080: the command processor's idle sleeps (no queue had work), split by whether a game
+// submission was still undecoded when it slept (its EOP not decoded yet): then decode waited for
+// the game, not for us.
+static std::atomic<s64> g_last_submit_ns{0}, g_last_decoded_ns{0};
+static std::atomic<s64> g_cp_idle_ns{0}, g_cp_idle_open_ns{0}, g_cp_idle_sleeps{0},
+    g_cp_idle_open_sleeps{0};
+static std::atomic<s64> g_lat_last_eop_ns{0};
+static std::mutex g_lat_mutex;
+static u64 g_lat_eops = 0, g_lat_submits = 0, g_lat_reactions = 0, g_lat_split = 0;
+static s64 g_lat_sum = 0, g_lat_max = 0, g_react_sum = 0, g_react_max = 0, g_lat_since = 0;
+static std::array<s64, 3> g_part_sum{}, g_part_max{};
+// The same split by the arm of an A/B in turns (SubmitAbArm), when one runs.
+static std::array<u64, 2> g_arm_split{};
+static std::array<std::array<s64, 4>, 2> g_arm_sum{}; // the three parts, then submit -> signal
+static void NoteEopStage(u64 submit, int stage) {
+    if (!EopLatencyDiag() || submit == 0) return;
+    const s64 now = NowNs();
+    g_eop_stage_ns[stage][submit % 1024].store(now, std::memory_order_relaxed);
+    if (stage == 0) g_last_decoded_ns.store(now, std::memory_order_relaxed); // DIAG-SGT-080
+}
+static void ReportEopLatency(s64 now) {
+    if (g_lat_since == 0) {
+        g_lat_since = now;
+        return;
+    }
+    if (now - g_lat_since < 5'000'000'000) return;
+    LOG_INFO(Render, "DIAG-SGT-074: in 5 s: {} graphics submits, {} EOP interrupts ({:.1f} submits "
+                     "each); submit to EOP signal avg {:.2f} ms max {:.2f} ms; EOP signal to the "
+                     "next submit ({} times) avg {:.2f} ms max {:.2f} ms",
+             g_lat_submits, g_lat_eops,
+             g_lat_eops ? double(g_lat_submits) / double(g_lat_eops) : 0.0,
+             g_lat_eops ? double(g_lat_sum) / double(g_lat_eops) / 1e6 : 0.0, g_lat_max / 1e6,
+             g_lat_reactions,
+             g_lat_reactions ? double(g_react_sum) / double(g_lat_reactions) / 1e6 : 0.0,
+             g_react_max / 1e6);
+    if (g_lat_split) {
+        const auto avg = [](s64 sum) { return double(sum) / double(g_lat_split) / 1e6; };
+        LOG_INFO(Render, "DIAG-SGT-074: submit to EOP split ({} EOPs): submit -> decoded avg "
+                         "{:.2f} max {:.2f} ms; decoded -> recorder reached it avg {:.2f} max "
+                         "{:.2f} ms; recorder -> signal (GPU tail and fence) avg {:.2f} max {:.2f} ms",
+                 g_lat_split, avg(g_part_sum[0]), g_part_max[0] / 1e6, avg(g_part_sum[1]),
+                 g_part_max[1] / 1e6, avg(g_part_sum[2]), g_part_max[2] / 1e6);
+    }
+    if (g_arm_split[0] && g_arm_split[1]) {
+        std::string arms;
+        for (int a = 0; a < 2; ++a) {
+            const auto avg = [&](int k) { return double(g_arm_sum[a][k]) / double(g_arm_split[a]) / 1e6; };
+            arms += fmt::format(" [{}: {} EOPs, submit -> signal {:.2f} ms: decode {:.2f}, recorder "
+                                "trail {:.2f}, tail {:.2f}]",
+                                a ? "B" : "A", g_arm_split[a], avg(3), avg(0), avg(1), avg(2));
+        }
+        LOG_INFO(Render, "DIAG-SGT-074: by arm of the A/B:{}", arms);
+    }
+    {
+        std::string tails;
+        for (int a = 0; a < 2; ++a) {
+            const auto& t = g_arm_tail[a];
+            if (t[0] == 0) continue;
+            tails += fmt::format(" [{}{}: {} EOPs, recorder reached -> list submitted {:.2f} ms, "
+                                 "submitted -> signal {:.2f} ms]",
+                                 g_arm_split[0] && g_arm_split[1] ? "arm " : "",
+                                 g_arm_split[0] && g_arm_split[1] ? (a ? "B" : "A") : "all", t[0],
+                                 double(t[1]) / double(t[0]) / 1e6, double(t[2]) / double(t[0]) / 1e6);
+        }
+        if (!tails.empty()) LOG_INFO(Render, "DIAG-SGT-074: tail split:{}", tails);
+        if (const s64 sleeps = g_cp_idle_sleeps.exchange(0); sleeps != 0 && g_lat_eops != 0) {
+            const double per = 1e6 * double(g_lat_eops);
+            LOG_INFO(Render, "DIAG-SGT-080: command processor idle {:.2f} ms an EOP ({} sleeps), "
+                             "of it {:.2f} ms ({} sleeps) while a submission's EOP was not decoded",
+                     double(g_cp_idle_ns.exchange(0)) / per, sleeps,
+                     double(g_cp_idle_open_ns.exchange(0)) / per, g_cp_idle_open_sleeps.exchange(0));
+        }
+        if (const auto first = ::Vulkan::TakeFirstListStats(); first[0] != 0) {
+            LOG_INFO(Render, "DIAG-SGT-074: the frame's first list reached the queue {:.2f} ms "
+                             "(max {:.2f}) after the game's first submit ({} frames)",
+                     double(first[1]) / double(first[0]) / 1e6, double(first[2]) / 1e6, first[0]);
+        }
+        g_arm_tail = {};
+    }
+    g_arm_split = {};
+    for (auto& arm : g_arm_sum) arm = {};
+    g_lat_eops = g_lat_submits = g_lat_reactions = g_lat_split = 0;
+    g_part_sum = {};
+    g_part_max = {};
+    g_lat_sum = g_lat_max = g_react_sum = g_react_max = 0;
+    g_lat_since = now;
+}
+static void NoteSubmitForLatency(u64 submit) {
+    if (!EopLatencyDiag()) return;
+    const s64 now = NowNs();
+    g_submit_ns[submit % g_submit_ns.size()].store(now, std::memory_order_relaxed);
+    g_last_submit_ns.store(now, std::memory_order_relaxed); // DIAG-SGT-080
+    std::scoped_lock lk{g_lat_mutex};
+    ++g_lat_submits;
+    if (const s64 eop = g_lat_last_eop_ns.exchange(0); eop != 0) {
+        ::Vulkan::NoteFrameStart(now); // the frame's first submit
+        const s64 react = now - eop;
+        ++g_lat_reactions;
+        g_react_sum += react;
+        g_react_max = std::max(g_react_max, react);
+    }
+    ReportEopLatency(now);
+}
+static void NoteEopForLatency(u64 submit) {
+    if (!EopLatencyDiag() || submit == 0) return;
+    const s64 now = NowNs();
+    const s64 at = g_submit_ns[submit % g_submit_ns.size()].load(std::memory_order_relaxed);
+    g_lat_last_eop_ns.store(now);
+    std::scoped_lock lk{g_lat_mutex};
+    if (at != 0 && now > at) {
+        ++g_lat_eops;
+        g_lat_sum += now - at;
+        g_lat_max = std::max(g_lat_max, now - at);
+        const s64 decoded = g_eop_stage_ns[0][submit % 1024].load(std::memory_order_relaxed);
+        const s64 reached = g_eop_stage_ns[1][submit % 1024].load(std::memory_order_relaxed);
+        if (decoded >= at && reached >= decoded && now >= reached) {
+            const std::array<s64, 3> parts{decoded - at, reached - decoded, now - reached};
+            ++g_lat_split;
+            const int arm = ::Vulkan::SubmitAbArm().load(std::memory_order_relaxed);
+            const u64 tick = g_eop_tick[submit % 1024].load(std::memory_order_relaxed);
+            const s64 submitted = tick ? ::Vulkan::TickSubmittedNs(tick) : 0;
+            if (submitted >= reached && now >= submitted) {
+                ++g_arm_tail[arm][0];
+                g_arm_tail[arm][1] += submitted - reached;
+                g_arm_tail[arm][2] += now - submitted;
+            }
+            ++g_arm_split[arm];
+            g_arm_sum[arm][3] += now - at;
+            for (int i = 0; i < 3; ++i) g_arm_sum[arm][i] += parts[i];
+            for (int i = 0; i < 3; ++i) {
+                g_part_sum[i] += parts[i];
+                g_part_max[i] = std::max(g_part_max[i], parts[i]);
+            }
+        }
+    }
+    ReportEopLatency(now);
+}
 static void NoteEop(u64 submit = 0) {
+    NoteEopForLatency(submit); // DIAG-SGT-074
 #ifndef NDEBUG
     g_last_eop_ns.store(NowNs());
     g_eop_submit.store(submit);
@@ -184,6 +343,13 @@ static std::chrono::steady_clock::time_point FrontendWaitNow() noexcept {
     return {};
 #endif
 }
+// DIAG-SGT-080 (diagnostics builds, SHADGT_DIAG_READ_AHEAD_AB=1): no pipeline read-ahead (PERF-034)
+// in arm 1 of the 2 s A/B, for its cost to decode against what it saves the recorder.
+static bool ReadAheadSkipped() {
+    static const bool ab = Common::DiagEnv("SHADGT_DIAG_READ_AHEAD_AB") != nullptr;
+    return ab && ::Vulkan::SubmitAbArm().load(std::memory_order_relaxed) == 1;
+}
+
 static void RecordFrontendWait(FrontendWait kind, uintptr_t address,
                                std::chrono::steady_clock::time_point start) {
     // PERF-012: whoever the queue waited for may have written memory later draws read.
@@ -425,6 +591,20 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
 Liverpool::~Liverpool() {
     process_thread.request_stop();
     process_thread.join();
+    if (b_thread.joinable()) { // FEAT-SGT-079
+        b_thread.request_stop();
+        b_thread.join();
+    }
+    if (baton_thread.joinable()) { // FEAT-SGT-079 step 5
+        baton_quit.store(true, std::memory_order_release);
+        baton_seq.fetch_add(1, std::memory_order_acq_rel);
+        baton_seq.notify_one();
+        {
+            std::scoped_lock lk{overlap_mutex};
+        }
+        overlap_cv.notify_all(); // FEAT-SGT-079 step 19
+        baton_thread.join();
+    }
     draw_pipe.reset();
 }
 
@@ -449,6 +629,13 @@ void Liverpool::StartDrawPipe() {
     // Dispatches carry their queue's compute registers; there is no current queue here.
     recorder->cb_extent = last_cb_extent;
     recorder->db_extent = last_db_extent;
+    select_state = std::make_unique<RecorderState>(*recorder); // PERF-SGT-077
+    b_state = std::make_unique<RecorderState>(*recorder);      // FEAT-SGT-079
+    if (RecorderBMode() == 4) {
+        b_thread = std::jthread{[this](std::stop_token stop) { RecorderBThread(stop); }};
+    }
+    // PERF-SGT-077: compiles on the select thread hold the guest clocks, as on this one.
+    DrawPipe::select_init = [] { Common::GuestClock::MarkGpuCommandThread(); };
     regs_dirty = {};
     // PERF-034: the pipeline read-ahead goes on with the draw pipe; -DisablePerf 49 (or 19)
     // turns it off.
@@ -470,6 +657,7 @@ void Liverpool::StartDrawPipe() {
         recorder_tid = gettid();
 #endif
     }, DrawPipe::DefaultMaxPending, [this] {
+        RecorderBSync(); // FEAT-SGT-079 step 19: B's handed work, before the recorder sleeps
         // A held label may be the very thing the guest waits for before
         // publishing its next command buffer. Submit it before the recorder
         // sleeps instead of requiring another draw or EOP to trigger a flush.
@@ -481,6 +669,14 @@ void Liverpool::StartDrawPipe() {
         }
     });
     pipe_report_start = std::chrono::steady_clock::now();
+    if (RecorderBOverlap()) { // FEAT-SGT-079 step 19: sync B before a job outside its pass
+        draw_pipe->before_job = [this](u64 tag) {
+            if (overlap_outstanding && (tag == 0 || tag != overlap_pass_tag)) RecorderBSync();
+        };
+    }
+    if (RecorderBMode() >= 5) { // FEAT-SGT-079 step 5
+        baton_thread = std::thread{[this] { RecorderBBatonThread(); }};
+    }
     pipelined.store(true, std::memory_order_release);
     // PERF-063: SHADGT_EARLY_FENCES=1 signals graphics fences at decode when the work before
     // them reads guest memory only through a capture (=2: also right after fences that waited
@@ -893,6 +1089,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     // recorder checks the selection against the memory it sees before using it.
     Vulkan::Rasterizer::SelectedPipelinePtr selected; // PERF-GT7-125
     bool prepared_draw = false;
+    const void* prepared_hint = nullptr; // PERF-SGT-081
 #ifdef RYTY_GPU
     // OPT-012: a draw a game job thread prepared is selected there (the recorder installs
     // that selection).
@@ -900,12 +1097,34 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         regs.primitive_type != PrimitiveType::QuadList &&
         Vulkan::NativeRenderer::PreparedOn()) { // DIAG-GT7-003: off in A/B windows
         if (auto* native = rasterizer->Native()) {
-            prepared_draw = native->HasPrepared(decode_draw_packet);
+            // PERF-SGT-081: where it is, for the recorder to ask for it a job ahead (it may be
+            // freed or replaced by then: only prefetched, never read through this pointer).
+            prepared_hint = native->PreparedAddress(decode_draw_packet);
+            prepared_draw = prepared_hint != nullptr;
         }
     }
+#endif
+    const void* const job_packet = direct_draw && !compute ? decode_draw_packet : nullptr;
+#ifdef RYTY_GPU
     decode_draw_packet = nullptr;
 #endif
-    if (direct_draw && rasterizer->SelectsPipelinesAhead() && !prepared_draw) {
+    // PERF-SGT-077 (SHADGT_SELECT_STAGE): the selection below runs on the select stage, from its
+    // own copy of the registers, instead of here. Not with early fences (their capture of the
+    // draw's reads needs the selection now) or the buffer stage.
+    const bool defer_select = draw_pipe->HasSelectStage() && !early_fences_mode &&
+                              !draw_pipe->HasStage();
+    struct SelectSlot {
+        std::vector<u32> delta;
+        Vulkan::Rasterizer::SelectedPipelinePtr selected;
+        bool indirect_selected = false;
+        const void* hint = nullptr; ///< the selection, for the job's prefetch hint
+    };
+    std::shared_ptr<SelectSlot> slot;
+    if (defer_select) {
+        slot = std::make_shared<SelectSlot>();
+        slot->delta = delta;
+    }
+    if (!defer_select && direct_draw && rasterizer->SelectsPipelinesAhead() && !prepared_draw) {
         selected = compute ? rasterizer->SelectComputePipelineAhead()
                            : rasterizer->SelectPipelineAhead();
     }
@@ -919,7 +1138,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         return !(env && env[0] == '0');
     }();
     bool indirect_selected = false;
-    if (indirect && !compute && indirect_ahead && !selected &&
+    if (!defer_select && indirect && !compute && indirect_ahead && !selected &&
         rasterizer->SelectsPipelinesAhead()) {
         const Vulkan::DrawIndirectParams params{
             .vertex_sgpr_offset = indirect->vertex,
@@ -931,7 +1150,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         indirect_selected = selected != nullptr;
     }
 #ifdef RYTY_GPU
-    if (!compute && !indirect_selected && Native::ShadowComparing()) {
+    if (!defer_select && !compute && !indirect_selected && Native::ShadowComparing()) {
         // NAT-030: the pipeline the draw's job looked up on its thread, against this selection.
         Native::ShadowCheckPipeline(selected ? selected->pipeline : nullptr, selected != nullptr);
     }
@@ -941,6 +1160,58 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     const u32 decode_epoch = VideoCore::g_upload_epoch.load(std::memory_order_acquire);
     if (selected && !indirect_selected) {
         rasterizer->HashDrawPagesAhead(*selected, decode_epoch);
+    }
+    DrawPipe::Work select_work;
+    if (defer_select) {
+        // What the selection reads from this thread's state, taken now.
+        std::optional<IndirectSgprs> indirect_sgprs;
+        if (indirect) indirect_sgprs = *indirect;
+        select_work = [this, slot, compute, direct_draw, prepared_draw, cs, indirect_sgprs,
+                       cb_extent = last_cb_extent, db_extent = last_db_extent, decode_epoch] {
+            auto& state = *select_state;
+            RegsDelta<Regs::NumRegs>::Apply(slot->delta,
+                                            std::span<u32, Regs::NumRegs>{state.regs.reg_array});
+            if (cs) {
+                state.cs = *cs;
+            }
+            state.cb_extent = cb_extent;
+            state.db_extent = db_extent;
+            // DrawRegs() reads these while selecting; the command thread's own come back after
+            // (in the alternating mode this runs on the command thread).
+            RecorderState* const previous = std::exchange(recorder_state, &state);
+            SCOPE_EXIT {
+                recorder_state = previous;
+            };
+            Vulkan::Rasterizer::SelectedPipelinePtr chosen;
+            if (direct_draw && rasterizer->SelectsPipelinesAhead() && !prepared_draw) {
+                chosen = compute ? rasterizer->SelectComputePipelineAhead()
+                                 : rasterizer->SelectPipelineAhead();
+            }
+            bool chosen_indirect = false;
+            if (indirect_sgprs && !compute && indirect_ahead && !chosen &&
+                rasterizer->SelectsPipelinesAhead()) {
+                const Vulkan::DrawIndirectParams params{
+                    .vertex_sgpr_offset = indirect_sgprs->vertex,
+                    .instance_sgpr_offset = indirect_sgprs->instance,
+                    .tessellate_quads = true,
+                    .is_indirect = true,
+                };
+                chosen = rasterizer->SelectPipelineAhead(&params);
+                chosen_indirect = chosen != nullptr;
+            }
+#ifdef RYTY_GPU
+            if (!compute && !chosen_indirect && Native::ShadowComparing()) {
+                Native::ShadowCheckPipeline(chosen ? chosen->pipeline : nullptr, chosen != nullptr);
+            }
+#endif
+            if (chosen && !chosen_indirect) {
+                rasterizer->HashDrawPagesAhead(*chosen, decode_epoch);
+            }
+            slot->selected = std::move(chosen);
+            slot->indirect_selected = chosen_indirect;
+            slot->hint = slot->selected.get();
+            std::vector<u32>{}.swap(slot->delta);
+        };
     }
     // PERF-063: the pages the draw reads that the CPU can rewrite without a fault are copied
     // now; the recorder reads the copies.
@@ -1033,12 +1304,92 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     // one job ahead: the selection's stages and the register delta.
     const void* const selection_hint = staged ? static_cast<const void*>(staged->selected.get())
                                               : static_cast<const void*>(selected.get());
-    const void* const delta_hint = delta.data();
-    const size_t delta_hint_bytes = std::min<size_t>(delta.size() * sizeof(u32), 512);
+    // FEAT-SGT-079: what recorder B needs to work on this job ahead (B on only).
+    std::shared_ptr<QueuedDraw> queued_draw;
+    if (RecorderBOn()) {
+        queued_draw = std::make_shared<QueuedDraw>();
+        queued_draw->seq = ++queued_draw_seq;
+        if (b_thread.joinable()) {
+            queued_draw->delta = std::move(delta); // read by both recorders, owned by neither
+        } else {
+            queued_draw->delta = delta;
+        }
+        queued_draw->cs = cs;
+        queued_draw->cb_extent = last_cb_extent;
+        queued_draw->db_extent = last_db_extent;
+        queued_draw->packet = job_packet;
+        queued_draw->compute = compute;
+        queued_draw->direct = direct_draw;
+        // The deal: a pass starts where the targets differ from the draw before (a run of
+        // dispatches is one pass); runs of 4 passes go in turns to A and B.
+        u64 tag = 1;
+        if (!compute) {
+            tag = XXH3_64bits(&regs.color_buffers, sizeof(regs.color_buffers));
+            tag = XXH3_64bits_withSeed(&regs.depth_buffer, sizeof(regs.depth_buffer), tag) | 2;
+        }
+        const bool pass_start = tag != push_key;
+        if (pass_start) {
+            ++push_pass;
+            push_key = tag;
+        }
+        queued_draw->tag = tag;
+        // FEAT-SGT-079 step 12: dispatches stay with the recorder (39% of B's runs held one).
+        queued_draw->to_b = !compute && (push_pass / 4) % 2 == 1;
+#ifdef RYTY_GPU
+        // FEAT-SGT-079 step 17 (SHADGT_RECORDER_B_LEARNED=1; 2: in arm 1 of the 2 s A/B): B gets
+        // the passes whose output waited 0.5 ms+ in one of the last two frames, matched by key and
+        // occurrence (GT7's double-buffered targets alternate keys from frame to frame).
+        if (pass_start) {
+            push_draw_in_pass = 0;
+        }
+        if (const u32 chunk = RecorderBChunk(); chunk != 0) { // FEAT-SGT-079 step 18
+            // SHADGT_RECORDER_B_CHUNK_AB=1: B takes no chunk in arm 0 of the 2 s A/B.
+            static const bool chunk_ab = [] {
+                const char* env = std::getenv("SHADGT_RECORDER_B_CHUNK_AB");
+                return env && env[0] == '1';
+            }();
+            queued_draw->to_b = !compute && (push_draw_in_pass / chunk) % 2 == 1 &&
+                                !(chunk_ab &&
+                                  ::Vulkan::SubmitAbArm().load(std::memory_order_relaxed) == 0);
+        }
+        ++push_draw_in_pass;
+        if (pass_start) {
+            push_occurrence_hash =
+                Vulkan::NativeRenderer::PassOccurrenceHash(tag, push_occurrences[tag]++);
+        }
+        if (RecorderBLearned()) {
+            auto* native = rasterizer ? rasterizer->Native() : nullptr;
+            queued_draw->to_b = !compute && native && native->LearnedWantsB(push_occurrence_hash);
+        }
+#endif
+        // FEAT-SGT-079 step 13 (SHADGT_RECORDER_B_FIRST_A=1; 2: in arm 1 of the 2 s A/B): the
+        // first draw of each of B's passes is the recorder's. A pass brings the pictures it
+        // samples up to date at its first draw (rewrites, sources: 37% of B's passes, against
+        // 2% later in the pass), which is ordered work B cannot do ahead.
+        if (pass_start && queued_draw->to_b && RecorderBFirstToA()) {
+            queued_draw->to_b = false;
+        }
+        queued_draw->pushed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count();
+        if (b_thread.joinable()) {
+            bool was_empty;
+            {
+                std::scoped_lock lk{b_mutex};
+                was_empty = b_queue.empty();
+                b_queue.push_back(queued_draw);
+            }
+            if (was_empty) b_wake.notify_one();
+        }
+    }
+    const std::vector<u32>& job_delta = queued_draw && delta.empty() ? queued_draw->delta : delta;
+    const void* const delta_hint = job_delta.data();
+    const size_t delta_hint_bytes = std::min<size_t>(job_delta.size() * sizeof(u32), 512);
     DrawPipe::Work job{[this, delta = std::move(delta), cs, cb_extent = last_cb_extent,
                      db_extent = last_db_extent, expected = std::move(expected),
                      selected = std::move(selected), draw = std::move(draw),
-                     decode_epoch, capture = std::move(capture), staged, indirect_selected, ahead_sequence
+                     decode_epoch, capture = std::move(capture), staged, indirect_selected, ahead_sequence,
+                     slot, queued_draw
 #ifndef NDEBUG
                      , trace_id, pair_token
 #endif
@@ -1051,21 +1402,39 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         if (pair_token) ReadAheadPair::NoteRecorderStarted(pair_token);
         if (trace_id) GeometryTrace::Record("recorder_begin", trace_id);
 #endif
+        if (queued_draw && !b_thread.joinable()) { // FEAT-SGT-079: B's registers keep up
+            if (RecorderBOverlap() && !::Vulkan::OnRecorderBThread()) {
+                overlap_since_b.push_back(queued_draw); // step 19: B applies them before its job
+            } else {
+                RecorderBApply(*queued_draw);
+            }
+        }
+        running_queued_draw = queued_draw.get();
+        if (slot) { // PERF-SGT-077: what the select stage chose
+            selected = std::move(slot->selected);
+            indirect_selected = slot->indirect_selected;
+        }
         auto& sel = staged ? staged->selected : selected;
 #ifndef NDEBUG
         if (trace_id && sel) GeometryTrace::Record("selected", trace_id,
             reinterpret_cast<std::uintptr_t>(sel->pipeline),
             reinterpret_cast<std::uintptr_t>(sel->compute), indirect_selected, bool(staged));
 #endif
-        auto& state = *recorder;
-        RegsDelta<Regs::NumRegs>::Apply(delta, std::span<u32, Regs::NumRegs>{state.regs.reg_array});
+        // FEAT-SGT-079 step 15: on B's thread, B's registers only (the recorder applies the
+        // delta to its own when the job comes back to it).
+        auto& state = b_state && recorder_state == b_state.get() ? *b_state : *recorder;
+        RegsDelta<Regs::NumRegs>::Apply(queued_draw && delta.empty() ? queued_draw->delta : delta,
+                                        std::span<u32, Regs::NumRegs>{state.regs.reg_array});
         if (cs) {
             state.cs = *cs;
         }
         state.cb_extent = cb_extent;
         state.db_extent = db_extent;
-        if (expected) {
+        if (expected && &state == recorder.get()) { // not on B's thread (FEAT-SGT-079)
             VerifyRecorderRegs(*expected);
+        }
+        if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-085: the recorder ran a job of its own
+            if (!b_state || recorder_state != b_state.get()) b_overlap_a_ran = true;
         }
         rasterizer->SetSelectedPipeline(sel.get());
         rasterizer->SetDrawEpoch(sel && !indirect_selected ? decode_epoch : 0);
@@ -1079,6 +1448,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         rasterizer->SetReadCapture(nullptr);
         rasterizer->SetDrawEpoch(0);
         rasterizer->SetSelectedPipeline(nullptr);
+        running_queued_draw = nullptr;
         delta_recycler.Give(std::move(delta));
         if (sel) {
             rasterizer->RecycleSelectedPipeline(std::move(sel));
@@ -1086,8 +1456,165 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     }};
     job.SetPrefetchHint(0, selection_hint, selection_hint ? 960 : 0);
     job.SetPrefetchHint(1, delta_hint, delta_hint_bytes);
-    draw_pipe->Push(std::move(job), kind, std::move(prepare), std::move(order));
-    if (read_ahead_states && !compute) {
+#ifdef RYTY_GPU
+    if (prepared_hint && Vulkan::NativeRenderer::PreparedPrefetchOn()) { // PERF-SGT-081
+        job.SetPrefetchHint(2, prepared_hint, Vulkan::NativeRenderer::PreparedPrefetchBytes());
+    }
+#endif
+    job.SetInfo(queued_draw.get()); // FEAT-SGT-079
+    // FEAT-SGT-079: the job's pass, from the targets it draws into (a dispatch: 1), for a
+    // recorder looking ahead for where passes start.
+    if (compute) {
+        job.SetTag(1);
+    } else {
+        u64 pass_key = XXH3_64bits(&regs.color_buffers, sizeof(regs.color_buffers));
+        pass_key = XXH3_64bits_withSeed(&regs.depth_buffer, sizeof(regs.depth_buffer), pass_key);
+        job.SetTag(pass_key | 2);
+    }
+    if (queued_draw && queued_draw->to_b && baton_thread.joinable()) {
+        // FEAT-SGT-079 step 5: B's jobs run on recorder B's thread while the recorder waits.
+        const u64 tag = job.Tag();
+        const void* const info = job.Info();
+        job = DrawPipe::Work{[this, inner = std::move(job), qd = queued_draw]() mutable {
+            if (RecorderBMode() == 6 && ::Vulkan::SubmitAbArm().load(std::memory_order_relaxed) == 0) {
+                inner();
+                return;
+            }
+            if (RecorderBOverlap()) { // FEAT-SGT-079 step 19
+                const auto cost_now = [] {
+                    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+                };
+                s64 cost_from = 0;
+                if constexpr (Common::DiagnosticsBuilt) cost_from = cost_now();
+                // B's jobs back to back (nothing of the recorder's between them) just queue; else
+                // B's last list goes in first, then the recorder's own.
+                const bool chunk_start =
+                    !overlap_outstanding || !overlap_since_b.empty() || overlap_pass_tag != qd->tag;
+                if (chunk_start) {
+                    RecorderBSync();
+                }
+                s64 prepare_from = 0;
+                if constexpr (Common::DiagnosticsBuilt) prepare_from = cost_now();
+#ifdef RYTY_GPU
+                auto* native = rasterizer->Native();
+                if (native && chunk_start) {
+                    // Step 21: this draw and B's next ones of its chunk (queued behind it) are
+                    // readied under one lock; their hand-overs then just queue.
+                    static thread_local std::vector<std::pair<u64, const QueuedDraw*>> ahead;
+                    PeekQueuedDraws(ahead, 128);
+                    static thread_local std::vector<QueuedDraw*> chunk;
+                    static thread_local std::vector<const void*> packets;
+                    static thread_local std::vector<u8> results;
+                    chunk.assign(1, qd.get());
+                    for (const auto& [ahead_tag, draw] : ahead) {
+                        if (!draw || !draw->to_b || draw->tag != qd->tag || chunk.size() >= 64) break;
+                        chunk.push_back(const_cast<QueuedDraw*>(draw));
+                    }
+                    packets.clear();
+                    for (const auto* d : chunk) packets.push_back(d->packet);
+                    results.assign(chunk.size(), 0);
+                    native->RecorderBPrepareChunk(packets, results);
+                    for (size_t i = 0; i < chunk.size(); ++i) chunk[i]->overlap_ready = results[i];
+                }
+                // Step 20: the draw's pictures ready first, in the recorder's list (spliced now,
+                // ahead of B's); a draw that cannot be readied stays the recorder's, after B's.
+                const bool keep =
+                    native && (qd->overlap_ready == 2 ||
+                               (qd->overlap_ready == 0 && !native->RecorderBPrepareForB(qd->packet)));
+                if (keep) {
+                    RecorderBSync();
+                    if constexpr (Common::DiagnosticsBuilt) ++overlap_cost.kept;
+                    qd->to_b = false;
+                    inner();
+                    return;
+                }
+#endif
+                s64 handoff_from = 0;
+                if constexpr (Common::DiagnosticsBuilt) {
+                    handoff_from = cost_now();
+                    overlap_cost.prepare += handoff_from - prepare_from;
+                }
+                {
+                    std::scoped_lock lk{overlap_mutex};
+                    overlap_queue.push_back({std::move(inner), std::move(overlap_since_b), qd});
+                    ++overlap_pushed;
+                    if (RecorderBOverlap() == 1) overlap_go = overlap_pushed;
+                }
+                overlap_since_b.clear();
+                overlap_cv.notify_one();
+                overlap_outstanding = true;
+                overlap_pass_tag = qd->tag;
+#ifdef RYTY_GPU
+                if (auto* native = rasterizer->Native()) native->SetRecorderBOutstanding(true);
+#endif
+                RegsDelta<Regs::NumRegs>::Apply(
+                    qd->delta, std::span<u32, Regs::NumRegs>{recorder->regs.reg_array});
+                if (qd->cs) recorder->cs = *qd->cs;
+                recorder->cb_extent = qd->cb_extent;
+                recorder->db_extent = qd->db_extent;
+                if constexpr (Common::DiagnosticsBuilt) {
+                    overlap_cost.handoff += cost_now() - handoff_from;
+                    ++overlap_cost.jobs;
+                    ReportOverlapCost();
+                    static_cast<void>(cost_from);
+                }
+                return;
+            }
+            auto run = [&inner] { inner(); };
+#ifdef RYTY_GPU
+            if (auto* native = rasterizer->Native()) {
+                // FEAT-SGT-079 step 14: a draw that needs ordered work stays the recorder's.
+                const bool hoist = RecorderBHoist();
+                if ((hoist || RecorderBFirstToA()) && !native->RecorderBCanTake(qd->packet, hoist)) {
+                    qd->to_b = false;
+                    inner();
+                    return;
+                }
+                native->RecorderBEnter(); // FEAT-SGT-079
+            }
+#endif
+            s64 b_job_from = 0;
+            if constexpr (Common::DiagnosticsBuilt) b_job_from = OverlapNowNs(); // DIAG-SGT-085
+            RunOnRecorderB(run);
+            if constexpr (Common::DiagnosticsBuilt) NoteOverlap(b_job_from, OverlapNowNs());
+            // FEAT-SGT-079 step 15: the recorder's registers take the job's delta too, in order.
+            RegsDelta<Regs::NumRegs>::Apply(qd->delta,
+                                            std::span<u32, Regs::NumRegs>{recorder->regs.reg_array});
+            if (qd->cs) recorder->cs = *qd->cs;
+            recorder->cb_extent = qd->cb_extent;
+            recorder->db_extent = qd->db_extent;
+            if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-083: B's registers are A's
+                static u32 checked = 0;
+                if (b_state && (++checked & 255) == 0) {
+                    const auto& a_regs = recorder->regs.reg_array;
+                    const auto& b_regs = b_state->regs.reg_array;
+                    if (a_regs != b_regs) {
+                        static std::atomic<u32> logged{0};
+                        u32 first = 0;
+                        while (first < Regs::NumRegs && a_regs[first] == b_regs[first]) ++first;
+                        if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                            LOG_WARNING(Render, "DIAG-SGT-083: recorder B's registers differ "
+                                        "from the recorder's (first at {:#x}: {:#x} against {:#x})",
+                                        first, b_regs[first], a_regs[first]);
+                        }
+                    } else if (checked == 256 * 64) {
+                        LOG_INFO(Render, "DIAG-SGT-083: recorder B's registers match the "
+                                 "recorder's after B's jobs (64 checks)");
+                    }
+                }
+            }
+        }};
+        job.SetTag(tag);
+        job.SetInfo(info);
+    }
+    if (defer_select) {
+        draw_pipe->PushSelected(std::move(select_work), std::move(job), &slot->hint); // PERF-SGT-077
+    } else {
+        draw_pipe->Push(std::move(job), kind, std::move(prepare), std::move(order));
+    }
+    if (read_ahead_states && !compute && !ReadAheadSkipped()) {
         OfferDrawState(ahead_sequence
 #ifndef NDEBUG
             , ReadAheadPair::Metadata{pair_token, indirect != nullptr}
@@ -1169,6 +1696,25 @@ void Liverpool::PipeReadAhead() {
 // the recorder had finished all it was given, ~4 ms a frame on GT7's pre-race screens, and nothing
 // else decoded meanwhile. The queue now yields until the recorder has run dry, and only then asks
 // for it. SHADGT_NATIVE_WAIT_NO_DRAIN=0: the wait drains the recorder at once.
+// PERF-SGT-078 (SHADGT_WAIT_FIRST_DRAIN=0; =2 in turns every 2 s; 1 or unset: as before): a compute
+// queue's WAIT_REG_MEM that its label does not meet yet checks a queued label write and the pending
+// fences without draining the recorder first. GT7 race (Release, nsys): that first drain was 7.2% of
+// the command processor's time, which decodes nothing while it waits for the recorder to catch up,
+// and decoding is what limits GT7's frame with keep-written mirrors (PERF-GT7-193). The checks run
+// in the order a label write moves through: queued (pending_labels, which the recorder clears only
+// after it registered the fence), pending fence (removed only after its value is in memory), memory.
+// A check that misses one keeps waiting, the loop drains when a label is written over the wait.
+static bool WaitSkipsFirstDrain() {
+    static const int mode = [] {
+        const char* env = std::getenv("SHADGT_WAIT_FIRST_DRAIN");
+        return env && (env[0] == '0' || env[0] == '2') ? (env[0] == '0' ? 1 : 2) : 0;
+    }();
+    if (mode != 2) {
+        return mode == 1;
+    }
+    return ::Vulkan::SubmitAbArm().load(std::memory_order_relaxed) == 1;
+}
+
 bool Liverpool::WaitsYieldToRecorder() const {
     static const bool enabled = [] {
         const char* env = std::getenv("SHADGT_NATIVE_WAIT_NO_DRAIN");
@@ -1456,8 +2002,357 @@ bool Liverpool::WritesLiveCommands(VAddr address, u64 size) const {
     return false;
 }
 
+int Liverpool::RecorderBMode() {
+    static const int mode = [] {
+        const char* env = std::getenv("SHADGT_RECORDER_B");
+        return env && env[0] >= '1' && env[0] <= '8' ? env[0] - '0' : 0;
+    }();
+    return mode;
+}
+
+s64 Liverpool::OverlapNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// DIAG-SGT-085 (diagnostics builds, SHADGT_DIAG_EOP_LATENCY=1): under the baton, how much A and B
+// could overlap. A run of B's (its jobs between two jobs of the recorder's) could run beside the
+// recorder's work that follows it, up to the next run of B's: the smaller of the two is what
+// overlapping that pair would save at most. The recorder's segment is wall time (it includes the
+// recorder waiting for work), so the sum is an upper bound.
+void Liverpool::NoteOverlap(s64 from, s64 to) {
+    auto& o = b_overlap;
+    if (o.since == 0) o.since = from;
+    if (b_overlap_a_ran) { // a segment of the recorder's ended: the last run of B's pairs with it
+        b_overlap_a_ran = false;
+        if (o.last_end != 0) {
+            const s64 a_seg = from - o.last_end;
+            o.b += o.run;
+            o.a += a_seg;
+            o.save += std::min(o.run, a_seg);
+            ++o.pairs;
+#ifdef RYTY_GPU
+            if (auto* native = rasterizer->Native()) { // DIAG-SGT-086: up to A needing B's run
+                const s64 free = std::min(native->RecorderBTakeFreeNs(from), a_seg);
+                o.free += free;
+                o.save_free += std::min(o.run, free);
+            }
+#endif
+        }
+        o.run = 0;
+    }
+    o.run += to - from;
+    o.last_end = to;
+    if (to - o.since >= 5'000'000'000 && o.pairs != 0) {
+        const double secs = double(to - o.since) / 1e9;
+        LOG_INFO(Render, "DIAG-SGT-085: overlap bound in {:.1f} s: {} pairs; B runs {:.1f} ms/s, the "
+                 "recorder's segments after them {:.1f} ms/s, the smaller of each pair summed "
+                 "{:.1f} ms/s; DIAG-SGT-086: the segments up to needing B's run {:.1f} ms/s, the "
+                 "smaller summed {:.1f} ms/s",
+                 secs, o.pairs, double(o.b) / 1e6 / secs, double(o.a) / 1e6 / secs,
+                 double(o.save) / 1e6 / secs, double(o.free) / 1e6 / secs,
+                 double(o.save_free) / 1e6 / secs);
+        o.b = o.a = o.save = o.free = o.save_free = 0;
+        o.pairs = 0;
+        o.since = to;
+    }
+}
+
+// SHADGT_RECORDER_B_FIRST_A: 1 the first draw of each of B's passes is the recorder's (step 13);
+// 2 that in arm 1 of the 2 s A/B; 3 B keeps it and the recorder does its ordered work at the
+// hand-over (step 16, the hoist); 4 the hoist in arm 1 and step 13 in arm 0; 5 both (the first
+// draw is the recorder's: its targets' rewrites; the others' work is hoisted); 6 5 in arm 1 and
+// 1 in arm 0.
+static int RecorderBFirstMode() {
+    static const int mode = [] {
+        const char* env = std::getenv("SHADGT_RECORDER_B_FIRST_A");
+        return env && env[0] >= '1' && env[0] <= '6' ? env[0] - '0' : 0;
+    }();
+    return mode;
+}
+
+// DIAG-SGT-088: every 5 s, the overlap's costs on the recorder (ms a second) and B's wait for the
+// renderer's lock: what the lock's shrinking can win back (the waits) and what it cannot (the
+// readying, the hand-over, the splices).
+void Liverpool::ReportOverlapCost() {
+    auto& c = overlap_cost;
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    if (c.since == 0) c.since = now;
+    if (now - c.since < 5'000'000'000) return;
+    const double secs = double(now - c.since) / 1e9;
+    u64 b_wait = 0;
+    u64 a_wait = 0;                     // DIAG-SGT-089
+    std::array<std::array<u64, 2>, 2> locked{};
+    std::array<u64, 2> locked_draws{};
+#ifdef RYTY_GPU
+    if (auto* native = rasterizer ? rasterizer->Native() : nullptr) {
+        b_wait = native->b_mutex_wait_ns.exchange(0, std::memory_order_relaxed);
+        a_wait = native->a_mutex_wait_ns.exchange(0, std::memory_order_relaxed);
+        for (u32 t = 0; t < 2; ++t) {
+            locked_draws[t] = native->draw_locked_count[t].exchange(0, std::memory_order_relaxed);
+            for (u32 p = 0; p < 2; ++p) {
+                locked[t][p] = native->draw_locked_ns[t][p].exchange(0, std::memory_order_relaxed);
+            }
+        }
+    }
+#endif
+    LOG_INFO(Render, "DIAG-SGT-088: overlap in {:.1f} s: {} jobs to B, {} kept, {} syncs; the "
+             "recorder waiting for B {:.1f} ms/s, readying B's draws {:.1f} ms/s, handing over "
+             "{:.1f} ms/s, splicing B's lists {:.1f} ms/s; B waiting for the renderer's lock "
+             "{:.1f} ms/s",
+             secs, c.jobs, c.kept, c.syncs, c.sync_wait / 1e6 / secs, c.prepare / 1e6 / secs,
+             c.handoff / 1e6 / secs, c.commit / 1e6 / secs, b_wait / 1e6 / secs);
+    const auto per_draw = [&](u32 t, u32 p) {
+        return locked_draws[t] ? double(locked[t][p]) / 1e3 / double(locked_draws[t]) : 0.0;
+    };
+    LOG_INFO(Render, "DIAG-SGT-089: in Draw with the renderer's lock: the recorder {} draws, "
+             "{:.1f} ms/s before the encode side + {:.1f} ms/s in it ({:.2f} + {:.2f} us a draw), "
+             "waiting for the lock while B holds work {:.1f} ms/s; B {} draws, {:.1f} + {:.1f} "
+             "ms/s ({:.2f} + {:.2f} us a draw)",
+             locked_draws[0], locked[0][0] / 1e6 / secs, locked[0][1] / 1e6 / secs, per_draw(0, 0),
+             per_draw(0, 1), a_wait / 1e6 / secs, locked_draws[1], locked[1][0] / 1e6 / secs,
+             locked[1][1] / 1e6 / secs, per_draw(1, 0), per_draw(1, 1));
+    c = {};
+    c.since = now;
+}
+
+int Liverpool::RecorderBOverlap() {
+    static const int mode = [] {
+        const char* env = std::getenv("SHADGT_RECORDER_B_OVERLAP");
+        return env && (env[0] == '1' || env[0] == '2') ? env[0] - '0' : 0;
+    }();
+    return mode;
+}
+
+// FEAT-SGT-079 step 19: recorder B's thread with a queue. It brings its registers up to each job
+// (the recorder's draws since its last job, then the job's own), runs it, and counts it done. In
+// late B (2) it waits for the recorder's go, so it records only when the recorder syncs.
+void Liverpool::RecorderBOverlapLoop() {
+    while (true) {
+        OverlapJob job;
+        {
+            std::unique_lock lk{overlap_mutex};
+            overlap_cv.wait(lk, [this] {
+                return baton_quit.load(std::memory_order_acquire) ||
+                       (!overlap_queue.empty() &&
+                        overlap_go > overlap_done.load(std::memory_order_acquire));
+            });
+            if (baton_quit.load(std::memory_order_acquire) && overlap_queue.empty()) return;
+            job = std::move(overlap_queue.front());
+            overlap_queue.pop_front();
+        }
+        for (const auto& draw : job.catch_up) {
+            RecorderBApply(*draw);
+        }
+        try {
+            job.work();
+        } catch (...) {
+            std::scoped_lock lk{overlap_mutex};
+            baton_error = std::current_exception();
+        }
+        overlap_done.fetch_add(1, std::memory_order_acq_rel);
+        overlap_done.notify_all();
+    }
+}
+
+// The recorder: B records everything it was handed, then its list goes into the command order
+// (ahead of the recorder's open list, which is spliced later).
+void Liverpool::RecorderBSync() {
+    if (!overlap_outstanding) return;
+    s64 cost_from = 0;
+    if constexpr (Common::DiagnosticsBuilt) {
+        cost_from = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    }
+    u64 target;
+    {
+        std::scoped_lock lk{overlap_mutex};
+        overlap_go = overlap_pushed;
+        target = overlap_pushed;
+    }
+    overlap_cv.notify_one();
+    for (u64 done = overlap_done.load(std::memory_order_acquire); done < target;
+         done = overlap_done.load(std::memory_order_acquire)) {
+        overlap_done.wait(done, std::memory_order_acquire);
+    }
+    if (baton_error) std::rethrow_exception(std::exchange(baton_error, nullptr));
+    overlap_outstanding = false;
+    s64 commit_from = 0;
+    if constexpr (Common::DiagnosticsBuilt) {
+        commit_from = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+        overlap_cost.sync_wait += commit_from - cost_from;
+        ++overlap_cost.syncs;
+    }
+#ifdef RYTY_GPU
+    if (auto* native = rasterizer ? rasterizer->Native() : nullptr) {
+        native->SetRecorderBOutstanding(false);
+        native->RecorderBCommit();
+    }
+#endif
+    if constexpr (Common::DiagnosticsBuilt) {
+        overlap_cost.commit += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count() -
+                               commit_from;
+    }
+}
+
+u32 Liverpool::RecorderBChunk() {
+    static const u32 chunk = [] {
+        const char* env = std::getenv("SHADGT_RECORDER_B_CHUNK");
+        return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 0u;
+    }();
+    return chunk;
+}
+
+bool Liverpool::RecorderBLearned() {
+    static const int mode = [] {
+        const char* env = std::getenv("SHADGT_RECORDER_B_LEARNED");
+        return env && (env[0] == '1' || env[0] == '2') ? env[0] - '0' : 0;
+    }();
+    return mode == 1 || (mode == 2 && ::Vulkan::SubmitAbArm().load(std::memory_order_relaxed) == 1);
+}
+
+bool Liverpool::RecorderBFirstToA() {
+    const int mode = RecorderBFirstMode();
+    const int arm = ::Vulkan::SubmitAbArm().load(std::memory_order_relaxed);
+    return mode == 1 || (mode == 2 && arm == 1) || (mode == 4 && arm == 0) || mode == 5 ||
+           mode == 6;
+}
+
+bool Liverpool::RecorderBHoist() {
+    const int mode = RecorderBFirstMode();
+    const int arm = ::Vulkan::SubmitAbArm().load(std::memory_order_relaxed);
+    return mode == 3 || mode == 5 || ((mode == 4 || mode == 6) && arm == 1);
+}
+
+void Liverpool::RecorderBPause() {
+    _mm_pause();
+}
+
+// FEAT-SGT-079 step 5: recorder B's thread with the baton. It is set up as the recorder thread
+// is (its thread-locals: the recorder's register state, the buffer cache's and the guest clock's
+// marks) and counts as the recorder thread while it runs a job the recorder handed it.
+void Liverpool::RecorderBBatonThread() {
+    Common::SetCurrentThreadName("shadGT:GpuRecorderB");
+    VideoCore::BufferCache::MarkRecorderThread();
+    Common::GuestClock::MarkGpuCommandThread();
+    // FEAT-SGT-079 step 11: B's own registers, brought up to each job in push order (every
+    // job's delta is applied to them as it runs, RecorderBApply), not the recorder's.
+    recorder_state = b_state ? b_state.get() : recorder.get();
+    Common::PreferPerformanceCores(); // as the recorder (PERF-088)
+#ifdef RYTY_GPU
+    Common::NativeThreadPriority native_priority;
+#endif
+    draw_pipe->SetBatonThread(std::this_thread::get_id());
+    ::Vulkan::MarkRecorderBThread(); // FEAT-SGT-079
+    if (RecorderBOverlap()) {
+        RecorderBOverlapLoop();
+        return;
+    }
+    u64 seen = 0;
+    while (true) {
+#ifdef RYTY_GPU
+        native_priority.Update(Vulkan::NativeModeRequested() && Common::NativeCpuPriorityRequested());
+#endif
+        u64 seq = baton_seq.load(std::memory_order_acquire);
+        for (u32 spin = 0; seq == seen; ++spin) {
+            if (spin < 16384) {
+                RecorderBPause();
+            } else {
+                baton_seq.wait(seen, std::memory_order_acquire);
+            }
+            seq = baton_seq.load(std::memory_order_acquire);
+        }
+        seen = seq;
+        if (baton_quit.load(std::memory_order_acquire)) {
+            return;
+        }
+        try {
+            baton_call(baton_ctx);
+        } catch (...) {
+            baton_error = std::current_exception();
+        }
+        baton_done.store(seq, std::memory_order_release);
+        baton_done.notify_one();
+    }
+}
+
+bool Liverpool::RecorderBOn() {
+    return RecorderBMode() >= 3;
+}
+
+// FEAT-SGT-079 step 4 (SHADGT_RECORDER_B=4): recorder B's own thread. It takes every draw and
+// dispatch in push order (its registers are its own: each delta applied once, here), and for
+// the draws dealt to it does what B would do ahead of A: finds the draw's prepared draw and
+// checks it against B's registers and the change logs. A still records everything; at each of
+// B's draws it reads what B made of it, or that B had not got there yet.
+void Liverpool::RecorderBThread(std::stop_token stop) {
+    Common::SetCurrentThreadName("shadGT:GpuRecorderB");
+    while (!stop.stop_requested()) {
+        std::shared_ptr<QueuedDraw> draw;
+        {
+            std::unique_lock lk{b_mutex};
+            if (!b_wake.wait(lk, stop, [this] { return !b_queue.empty(); })) {
+                return;
+            }
+            draw = std::move(b_queue.front());
+            b_queue.pop_front();
+        }
+        RecorderBApply(*draw);
+        if (!draw->to_b || draw->compute) {
+            continue;
+        }
+#ifdef RYTY_GPU
+        if (auto* native = rasterizer->Native()) {
+            native->RecorderBPrepare(draw.get(), b_state->regs);
+        }
+#endif
+    }
+}
+
+void Liverpool::PeekQueuedDraws(std::vector<std::pair<u64, const QueuedDraw*>>& out, size_t max) {
+    out.clear();
+    if (!draw_pipe) return;
+    static thread_local std::vector<std::pair<u64, const void*>> jobs;
+    draw_pipe->PeekJobs(jobs, max);
+    for (const auto& [tag, info] : jobs) {
+        out.emplace_back(tag, static_cast<const QueuedDraw*>(info));
+    }
+}
+
+void Liverpool::RecorderBApply(const QueuedDraw& draw) {
+    if (!b_state || draw.seq <= b_applied_seq) return;
+    RegsDelta<Regs::NumRegs>::Apply(draw.delta,
+                                    std::span<u32, Regs::NumRegs>{b_state->regs.reg_array});
+    if (draw.cs) b_state->cs = *draw.cs;
+    b_state->cb_extent = draw.cb_extent;
+    b_state->db_extent = draw.db_extent;
+    b_applied_seq = draw.seq;
+}
+
+const Regs* Liverpool::RecorderBRegsAt(const QueuedDraw& draw) {
+    if (!b_state || draw.seq < b_applied_seq) return nullptr;
+    // Every draw before it must be applied first: the caller walks the queue in order.
+    if (draw.seq != b_applied_seq + 1 && draw.seq != b_applied_seq) return nullptr;
+    RecorderBApply(draw);
+    return &b_state->regs;
+}
+
+void Liverpool::PeekQueuedTags(std::vector<u64>& out, size_t max) {
+    out.clear();
+    if (draw_pipe) draw_pipe->PeekTags(out, max);
+}
+
 bool Liverpool::IsGpuThread(std::thread::id id) const {
-    return id == gpu_id || (Pipelined() && id == draw_pipe->RecorderThreadId());
+    return id == gpu_id || (Pipelined() && (id == draw_pipe->RecorderThreadId() ||
+                                            id == draw_pipe->BatonThreadId())); // FEAT-SGT-079
 }
 
 #ifdef __linux__
@@ -1598,7 +2493,20 @@ void Liverpool::Process(std::stop_token stoken) {
                     Libraries::SystemService::IsSplashVisible());
                 lk.lock();
             }
+            const bool idle_diag = EopLatencyDiag() && !has_work(); // DIAG-SGT-080
+            const s64 idle_from = idle_diag ? NowNs() : 0;
+            const bool idle_open = idle_diag && g_last_submit_ns.load(std::memory_order_relaxed) >
+                                                    g_last_decoded_ns.load(std::memory_order_relaxed);
             Common::CondvarWait(submit_cv, lk, stoken, has_work);
+            if (idle_diag) {
+                const s64 slept = NowNs() - idle_from;
+                g_cp_idle_ns.fetch_add(slept, std::memory_order_relaxed);
+                g_cp_idle_sleeps.fetch_add(1, std::memory_order_relaxed);
+                if (idle_open) {
+                    g_cp_idle_open_ns.fetch_add(slept, std::memory_order_relaxed);
+                    g_cp_idle_open_sleeps.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
         }
         if (stoken.stop_requested()) {
             break;
@@ -1985,7 +2893,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
     // PERF-034: with the draw pipe the command thread reads ahead itself, from each command
     // buffer's start while new pipelines keep appearing (PERF-020).
-    if (read_ahead_states && !dcb.empty() &&
+    if (read_ahead_states && !dcb.empty() && !ReadAheadSkipped() &&
         read_ahead_states->MissWithin(std::chrono::seconds{5}) &&
         !(Common::PerfFeatureEnabled(23) && scanned_packets.contains(dcb.data()))) {
         lookahead_dcb = dcb;
@@ -2728,6 +3636,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::EventWriteEop: {
                 const auto event = *reinterpret_cast<const PM4CmdEventWriteEop*>(header);
                 const u64 eop_submit = decoding_submit.load(std::memory_order_relaxed);
+                NoteEopStage(eop_submit, 0); // DIAG-SGT-074: decoded
+                const bool frame_eop = event.int_sel.Value() != InterruptSelect::None;
+                if (frame_eop) {
+                    push_occurrences.clear(); // FEAT-SGT-079 step 17: a frame ends
+                    push_key = 0;
+                }
                 // FIX-GTS-492: when this event raises the interrupt, the game takes back the
                 // command memory decoded so far (whole buffers, the rest of this one included):
                 // the prepared draws in it are dropped where the event is signaled, before its
@@ -2769,7 +3683,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 RecordLabelWrite(
                     reinterpret_cast<VAddr>(event.Address<u32>()),
                     FenceValueBytes(event.data_sel.Value(), event.DataDWord(), event.DataQWord()),
-                    [this, event, eop_submit, retire_prepared] {
+                    [this, event, eop_submit, retire_prepared, frame_eop] {
+                        NoteEopStage(eop_submit, 1); // DIAG-SGT-074: the recorder got here
+#ifdef RYTY_GPU
+                        if (frame_eop && rasterizer) { // FEAT-SGT-079 step 17
+                            if (auto* native = rasterizer->Native()) native->LearnedFrameEnd();
+                        }
+#endif
+                        if (EopLatencyDiag() && eop_submit && rasterizer) {
+                            g_eop_tick[eop_submit % 1024].store(
+                                rasterizer->GetScheduler().CurrentTick(), std::memory_order_relaxed);
+                        }
                         const auto* event_eop = &event;
                         const bool deferred =
                             rasterizer &&
@@ -3873,6 +4797,28 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     }
                     return true;
                 }
+                // PERF-SGT-078: the first check, and a turn after a label was written over the
+                // wait, without the drain; every 64th turn still drains (work that writes the
+                // label without a label write).
+                if (WaitSkipsFirstDrain() &&
+                    (first || label_writes_over_wait[slot] != label_writes_at_drain)) {
+                    label_writes_at_drain = label_writes_over_wait[slot];
+                    if (PendingLabelSatisfies(*wait_reg_mem)) {
+                        // As above: the recorder waits for it in order.
+                        ++waits_moved;
+                        RecordSafe([this, wait = *wait_reg_mem] { RecorderWaitRegMem(wait); });
+                        return false;
+                    }
+                    if (SatisfiedByPendingFence(rasterizer, wait_reg_mem) ||
+                        wait_reg_mem->Test(regs.reg_array)) {
+                        return false;
+                    }
+                    if constexpr (Common::DiagnosticsBuilt) {
+                        ::Vulkan::NoteSubmitSite(first ? "compute wait without drain"
+                                                       : "compute wait turn without drain", {}); // DIAG-SGT-076
+                    }
+                    return true;
+                }
 #ifndef NDEBUG
                 if (first) {
                     ++tally.packets;
@@ -3882,6 +4828,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 }
 #endif
                 label_writes_at_drain = label_writes_over_wait[slot];
+                if constexpr (Common::DiagnosticsBuilt) {
+                    ::Vulkan::NoteSubmitSite(first ? "compute wait first drain" : "compute wait loop drain", {});
+                }
                 SyncRecorder("wait reg mem");
                 const bool label = wait_reg_mem->Test(regs.reg_array);
                 const bool fence = !label && SatisfiedByPendingFence(rasterizer, wait_reg_mem);
@@ -4303,6 +5252,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     const auto original_dcb = dcb;
     if (!dcb.empty()) {
         const u64 submit = submitted_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        NoteSubmitForLatency(submit); // DIAG-SGT-074
         if (TessSubmitCheckEnabled()) {
             static std::array<u32, 16> hs{}; // only this thread submits graphics work
             const s64 now = NowNs();

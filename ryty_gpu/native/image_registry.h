@@ -318,6 +318,9 @@ public:
     /// OPT-010: whether no picture was made or dropped over any of the ranges since generation
     /// `since` (false when the log of changes no longer reaches back that far).
     bool Untouched(u64 since, std::span<const std::pair<VAddr, VAddr>> ranges);
+    /// DIAG-SGT-075 (diagnostics): whether a picture was made after `since` over one of the
+    /// ranges (`exact`: with exactly that range); true when the log no longer reaches back.
+    bool MadeOverSince(u64 since, std::span<const std::pair<VAddr, VAddr>> ranges, bool exact);
     /// PERF-GTS-404: as Untouched, for work that holds pictures by pointer: an eviction
     /// counts only when it took a picture whose own range (address and size) is one of
     /// `held`, the ranges of the pictures held. A picture made or reused over `ranges`

@@ -506,8 +506,29 @@ private:
     /// many draws go to A and B in turns (draws of one pass do not read each other's output; the
     /// lists keep their order at the splices). 0 or unset: off.
     static u32 RecorderBChunk();
+    /// FEAT-SGT-079 step 19 (SHADGT_RECORDER_B_OVERLAP: 2 late B, serial; 1 B runs at once): B's
+    /// jobs are queued to B's thread and the recorder goes on. Before a job outside B's pass, at
+    /// its next hand-over to B and when it runs dry, the recorder syncs: B records what it was
+    /// handed, and the recorder splices B's list ahead of its own.
+    static int RecorderBOverlap();
+    struct OverlapJob {
+        Common::UniqueFunction<void> work;
+        std::vector<std::shared_ptr<QueuedDraw>> catch_up; ///< the recorder's draws since B's last
+        std::shared_ptr<QueuedDraw> draw;
+    };
+    std::deque<OverlapJob> overlap_queue;
+    std::mutex overlap_mutex;
+    std::condition_variable overlap_cv;
+    u64 overlap_pushed = 0, overlap_go = 0; ///< recorder thread writes, under overlap_mutex
+    std::atomic<u64> overlap_done{0};
+    std::vector<std::shared_ptr<QueuedDraw>> overlap_since_b; ///< recorder thread
+    bool overlap_outstanding = false;                          ///< recorder thread
+    u64 overlap_pass_tag = 0;                                  ///< recorder thread
+    void RecorderBSync();
+    void RecorderBOverlapLoop();
     u32 push_draw_in_pass = 0;
-    const QueuedDraw* running_queued_draw = nullptr; ///< recorder thread
+    /// FEAT-SGT-079: the job each recorder thread runs (recorder B's too).
+    static inline thread_local const QueuedDraw* running_queued_draw = nullptr;
     // SHADGT_RECORDER_B=4: recorder B's thread and its queue (every draw and dispatch, in order).
     std::mutex b_mutex;
     std::condition_variable_any b_wake;

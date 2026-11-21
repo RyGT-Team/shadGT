@@ -218,6 +218,21 @@ public:
     /// its own context is the current one, it splices its open list and makes B's current, so
     /// that B's thread never splices (the command order is the recorder's).
     void RecorderBEnter();
+    /// FEAT-SGT-079 step 19 (late B / overlap): the recorder splices its own open list before
+    /// handing B a job (no context switch: B's thread records into B's context); RecorderBCommit
+    /// splices B's list once B has recorded what it was handed; while B holds handed work, the
+    /// recorder's size and feed splices wait.
+    void RecorderBOverlapEnter();
+    /// FEAT-SGT-079 step 20: the recorder, before it hands B a draw in late B / overlap: when the
+    /// draw's prepared draw holds and needs no ordered work, its pictures are made ready here
+    /// (pending inits, uploads), in the recorder's list, which is spliced at once (ahead of B's).
+    /// False: the recorder keeps the draw.
+    bool RecorderBPrepareForB(const void* packet);
+    void RecorderBCommit();
+    void SetRecorderBOutstanding(bool on) {
+        b_outstanding.store(on, std::memory_order_release);
+    }
+    std::atomic<bool> b_outstanding{false};
     /// DIAG-SGT-086: the recorder's time since B's last run before it first needed what that run
     /// drew (all of it when it never did), and the segment's counts noted; a new segment starts.
     s64 RecorderBTakeFreeNs(s64 now);

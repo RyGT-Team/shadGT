@@ -599,6 +599,10 @@ Liverpool::~Liverpool() {
         baton_quit.store(true, std::memory_order_release);
         baton_seq.fetch_add(1, std::memory_order_acq_rel);
         baton_seq.notify_one();
+        {
+            std::scoped_lock lk{overlap_mutex};
+        }
+        overlap_cv.notify_all(); // FEAT-SGT-079 step 19
         baton_thread.join();
     }
     draw_pipe.reset();
@@ -653,6 +657,7 @@ void Liverpool::StartDrawPipe() {
         recorder_tid = gettid();
 #endif
     }, DrawPipe::DefaultMaxPending, [this] {
+        RecorderBSync(); // FEAT-SGT-079 step 19: B's handed work, before the recorder sleeps
         // A held label may be the very thing the guest waits for before
         // publishing its next command buffer. Submit it before the recorder
         // sleeps instead of requiring another draw or EOP to trigger a flush.
@@ -664,6 +669,11 @@ void Liverpool::StartDrawPipe() {
         }
     });
     pipe_report_start = std::chrono::steady_clock::now();
+    if (RecorderBOverlap()) { // FEAT-SGT-079 step 19: sync B before a job outside its pass
+        draw_pipe->before_job = [this](u64 tag) {
+            if (overlap_outstanding && (tag == 0 || tag != overlap_pass_tag)) RecorderBSync();
+        };
+    }
     if (RecorderBMode() >= 5) { // FEAT-SGT-079 step 5
         baton_thread = std::thread{[this] { RecorderBBatonThread(); }};
     }
@@ -1386,7 +1396,11 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         if (trace_id) GeometryTrace::Record("recorder_begin", trace_id);
 #endif
         if (queued_draw && !b_thread.joinable()) { // FEAT-SGT-079: B's registers keep up
-            RecorderBApply(*queued_draw);
+            if (RecorderBOverlap() && !::Vulkan::OnRecorderBThread()) {
+                overlap_since_b.push_back(queued_draw); // step 19: B applies them before its job
+            } else {
+                RecorderBApply(*queued_draw);
+            }
         }
         running_queued_draw = queued_draw.get();
         if (slot) { // PERF-SGT-077: what the select stage chose
@@ -1457,6 +1471,42 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         job = DrawPipe::Work{[this, inner = std::move(job), qd = queued_draw]() mutable {
             if (RecorderBMode() == 6 && ::Vulkan::SubmitAbArm().load(std::memory_order_relaxed) == 0) {
                 inner();
+                return;
+            }
+            if (RecorderBOverlap()) { // FEAT-SGT-079 step 19
+                // B's jobs back to back (nothing of the recorder's between them) just queue; else
+                // B's last list goes in first, then the recorder's own.
+                if (!overlap_outstanding || !overlap_since_b.empty() || overlap_pass_tag != qd->tag) {
+                    RecorderBSync();
+                }
+#ifdef RYTY_GPU
+                // Step 20: the draw's pictures ready first, in the recorder's list (spliced now,
+                // ahead of B's); a draw that cannot be readied stays the recorder's, after B's.
+                if (auto* native = rasterizer->Native(); native && !native->RecorderBPrepareForB(qd->packet)) {
+                    RecorderBSync();
+                    qd->to_b = false;
+                    inner();
+                    return;
+                }
+#endif
+                {
+                    std::scoped_lock lk{overlap_mutex};
+                    overlap_queue.push_back({std::move(inner), std::move(overlap_since_b), qd});
+                    ++overlap_pushed;
+                    if (RecorderBOverlap() == 1) overlap_go = overlap_pushed;
+                }
+                overlap_since_b.clear();
+                overlap_cv.notify_one();
+                overlap_outstanding = true;
+                overlap_pass_tag = qd->tag;
+#ifdef RYTY_GPU
+                if (auto* native = rasterizer->Native()) native->SetRecorderBOutstanding(true);
+#endif
+                RegsDelta<Regs::NumRegs>::Apply(
+                    qd->delta, std::span<u32, Regs::NumRegs>{recorder->regs.reg_array});
+                if (qd->cs) recorder->cs = *qd->cs;
+                recorder->cb_extent = qd->cb_extent;
+                recorder->db_extent = qd->db_extent;
                 return;
             }
             auto run = [&inner] { inner(); };
@@ -1969,6 +2019,70 @@ static int RecorderBFirstMode() {
     return mode;
 }
 
+int Liverpool::RecorderBOverlap() {
+    static const int mode = [] {
+        const char* env = std::getenv("SHADGT_RECORDER_B_OVERLAP");
+        return env && (env[0] == '1' || env[0] == '2') ? env[0] - '0' : 0;
+    }();
+    return mode;
+}
+
+// FEAT-SGT-079 step 19: recorder B's thread with a queue. It brings its registers up to each job
+// (the recorder's draws since its last job, then the job's own), runs it, and counts it done. In
+// late B (2) it waits for the recorder's go, so it records only when the recorder syncs.
+void Liverpool::RecorderBOverlapLoop() {
+    while (true) {
+        OverlapJob job;
+        {
+            std::unique_lock lk{overlap_mutex};
+            overlap_cv.wait(lk, [this] {
+                return baton_quit.load(std::memory_order_acquire) ||
+                       (!overlap_queue.empty() &&
+                        overlap_go > overlap_done.load(std::memory_order_acquire));
+            });
+            if (baton_quit.load(std::memory_order_acquire) && overlap_queue.empty()) return;
+            job = std::move(overlap_queue.front());
+            overlap_queue.pop_front();
+        }
+        for (const auto& draw : job.catch_up) {
+            RecorderBApply(*draw);
+        }
+        try {
+            job.work();
+        } catch (...) {
+            std::scoped_lock lk{overlap_mutex};
+            baton_error = std::current_exception();
+        }
+        overlap_done.fetch_add(1, std::memory_order_acq_rel);
+        overlap_done.notify_all();
+    }
+}
+
+// The recorder: B records everything it was handed, then its list goes into the command order
+// (ahead of the recorder's open list, which is spliced later).
+void Liverpool::RecorderBSync() {
+    if (!overlap_outstanding) return;
+    u64 target;
+    {
+        std::scoped_lock lk{overlap_mutex};
+        overlap_go = overlap_pushed;
+        target = overlap_pushed;
+    }
+    overlap_cv.notify_one();
+    for (u64 done = overlap_done.load(std::memory_order_acquire); done < target;
+         done = overlap_done.load(std::memory_order_acquire)) {
+        overlap_done.wait(done, std::memory_order_acquire);
+    }
+    if (baton_error) std::rethrow_exception(std::exchange(baton_error, nullptr));
+    overlap_outstanding = false;
+#ifdef RYTY_GPU
+    if (auto* native = rasterizer ? rasterizer->Native() : nullptr) {
+        native->SetRecorderBOutstanding(false);
+        native->RecorderBCommit();
+    }
+#endif
+}
+
 u32 Liverpool::RecorderBChunk() {
     static const u32 chunk = [] {
         const char* env = std::getenv("SHADGT_RECORDER_B_CHUNK");
@@ -2018,6 +2132,10 @@ void Liverpool::RecorderBBatonThread() {
 #endif
     draw_pipe->SetBatonThread(std::this_thread::get_id());
     ::Vulkan::MarkRecorderBThread(); // FEAT-SGT-079
+    if (RecorderBOverlap()) {
+        RecorderBOverlapLoop();
+        return;
+    }
     u64 seen = 0;
     while (true) {
 #ifdef RYTY_GPU

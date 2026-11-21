@@ -5322,8 +5322,9 @@ void NativeRenderer::PrepareImages(const DrawBindings& b) {
 
 void NativeRenderer::ChunkFlushCheck() {
     // FEAT-SGT-079 step 10: recorder B's thread never splices or submits; its run is one list,
-    // spliced by the recorder at the run's end.
-    if (OnRecorderBThread()) return;
+    // spliced by the recorder at the run's end. Step 19: nor does the recorder while B holds
+    // handed work (B's list must go in first).
+    if (OnRecorderBThread() || b_outstanding.load(std::memory_order_acquire)) return;
     // Long lists are run and submitted as they grow, so the GPU starts on them (as the old
     // path's SubmitChunkIfNeeded does).
     if (Ctx().stream.commands >= SpliceAfter) {
@@ -22845,6 +22846,51 @@ bool NativeRenderer::RecorderBCanTake(const void* packet, bool hoist) {
     return true;
 }
 
+void NativeRenderer::RecorderBOverlapEnter() {
+    std::scoped_lock lock{mutex};
+    if (main_record_context.stream.list) Splice();
+}
+
+bool NativeRenderer::RecorderBPrepareForB(const void* packet) {
+    if (!RecorderBCanTake(packet, false)) return false; // holds, no ordered work (it locks)
+    std::scoped_lock lock{mutex};
+    PreparedDraw* p = nullptr;
+    {
+        PreparedShard& shard = ShardFor(packet);
+        std::scoped_lock shard_lock{shard.mutex};
+        if (const auto it = shard.draws.find(packet); it != shard.draws.end()) p = it->second;
+    }
+    if (!p) return false;
+    // Its pictures' uploads and every pending init, only when there are any (a list each time
+    // made a splice per draw).
+    const auto stale = [&](const Native::ImageEntry* e) {
+        return e && e->from_cpu && registry->UploadDue(*e);
+    };
+    const bool needed = device->PendingImageInit() || registry->HasPendingUploads() ||
+                        std::ranges::any_of(p->bindings.sampled, stale) ||
+                        std::ranges::any_of(p->bindings.stored, stale);
+    if (needed) {
+        Begin();
+        PrepareImages(p->bindings);
+    }
+    if (main_record_context.stream.list) { // the recorder's own work so far, ahead of B's
+        const bool was = b_outstanding.exchange(false, std::memory_order_acq_rel);
+        Splice();
+        b_outstanding.store(was, std::memory_order_release);
+    }
+    if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B draw prepared by A", {});
+    return true;
+}
+
+void NativeRenderer::RecorderBCommit() {
+    std::scoped_lock lock{mutex};
+    if (!b_record_context.stream.list) return;
+    RecordContext* const was = current_context;
+    current_context = &b_record_context; // this thread splices B's list (B is idle)
+    Splice();
+    current_context = was;
+}
+
 void NativeRenderer::RecorderBEnter() {
     std::scoped_lock lock{mutex};
     if (current_context != &main_record_context) {
@@ -23034,6 +23080,16 @@ void NativeRenderer::GraphDraw(bool dispatch, const AmdGpu::Regs& regs) {
 void NativeRenderer::RecorderBDeal(bool dispatch, const AmdGpu::Regs& regs) {
     if (PassGraphOn()) GraphDraw(dispatch, regs); // DIAG-SGT-087
     if (RecorderBMode() < 3) {
+        return;
+    }
+    static const bool overlap = [] { // FEAT-SGT-079 step 19: the contexts are the threads'
+        const char* env = std::getenv("SHADGT_RECORDER_B_OVERLAP");
+        return env && (env[0] == '1' || env[0] == '2');
+    }();
+    if (overlap) {
+        if constexpr (Common::DiagnosticsBuilt) {
+            if (OnRecorderBThread()) NoteSubmitSite("recorder B overlap draw", {});
+        }
         return;
     }
     u64 key = 1;
@@ -26337,6 +26393,17 @@ void NativeRenderer::Splice(std::source_location where) {
     if constexpr (Common::DiagnosticsBuilt) AuditCount(AuditSplice); // DIAG-SGT-075
     if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("splice", where); // DIAG-SGT-076
     if constexpr (Common::DiagnosticsBuilt) NoteRecorderBMain("B: splice", where); // DIAG-SGT-082
+    if constexpr (Common::DiagnosticsBuilt) { // FEAT-SGT-079 step 19: should not happen
+        if (!OnRecorderBThread() && &Ctx() == &main_record_context &&
+            b_outstanding.load(std::memory_order_acquire)) {
+            NoteSubmitSite("A splice while B holds work", where);
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_WARNING(Render_Vulkan, "FEAT-SGT-079: the recorder splices its list while recorder "
+                            "B holds handed work (line {})", where.line());
+            }
+        }
+    }
     DrainBinder(); // FEAT-SGT-022: its jobs use the list's pools and binds
     // DIAG-SGT-023: only a splice that ends a list drains (the submit callback after
     // ChunkFlushCheck's own splice finds none open).

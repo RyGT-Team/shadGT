@@ -329,6 +329,11 @@ private:
     const size_t max_pending;
     std::atomic<std::thread::id> recorder_id{};
     std::atomic<std::thread::id> baton_id{}; // FEAT-SGT-079
+public:
+    /// FEAT-SGT-079 step 19: called on the recorder thread before each job, with its tag (set
+    /// before the recorder starts; the late B mode syncs recorder B there).
+    std::function<void(u64)> before_job;
+private:
     std::function<void()> thread_init;
     const std::function<void()> idle_hook; // D5
     Stats stats{};

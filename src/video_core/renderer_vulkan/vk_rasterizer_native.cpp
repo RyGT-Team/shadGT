@@ -13079,21 +13079,11 @@ bool NativeRenderer::StoreLongSet(u64 hash, u64 check, vk::DescriptorSetLayout l
         return false;
     }
     long_sets.entries.Insert(hash, check, u64(VkDescriptorSetLayout(layout)), set);
-    // PERF-GTS-378: a list per handle. In a multimap every set's entry for a handle they all
-    // hold (the ahead upload arena, a sampler) was inserted after a walk over that handle's
-    // other entries: up to 1.8 us a draw once the constants all came from one buffer. The
-    // arena lives as long as the renderer and is left out.
-    const u64 arena_handle = u64(VkBuffer(ahead_arena.handle));
-    for (const u64 handle : handles) {
-        if (handle == 0 || handle == arena_handle) continue;
-        auto& list = long_sets.users[handle];
-        if (list.size() > 2 * long_sets.entries.Size() + 4096) {
-            std::erase_if(list, [&](const auto& key) {
-                return !long_sets.entries.Find(key.first, key.second);
-            });
-        }
-        list.emplace_back(hash, check);
-    }
+    // PERF-GTS-378: a list per handle (a multimap walked a handle they all hold at each insert).
+    // FIX-SGT-044: the set goes once into each distinct handle's list, and a list is thinned by
+    // ids and serials (Native::KeptSetUsers), so a pass always removes more than half of it.
+    // The ahead upload arena lives as long as the renderer and is left out.
+    long_sets.users.Add(hash, check, handles, u64(VkBuffer(ahead_arena.handle)));
     ++long_sets.made;
     return true;
 }
@@ -13115,15 +13105,13 @@ bool NativeRenderer::HoldsDroppedSampler(std::span<const u64> handles) {
 void NativeRenderer::DropLongSets(std::span<const u64> dead_handles) {
     for (const u64 handle : dead_handles) {
         long_sets.dead_ring[long_sets.dead_count++ % long_sets.dead_ring.size()] = handle; // PERF-GTS-398
-        const auto found = long_sets.users.find(handle);
-        if (found == long_sets.users.end()) continue;
         // The open list may have bound the set: it is written again only after the GPU ran it.
         const u64 tick = r.scheduler.CurrentTick() + 1;
-        for (const auto& key : found->second) {
+        const bool had_sets = long_sets.users.Drop(handle, [&](u64 hash, u64 check) {
             vk::DescriptorSet set{};
             u64 layout = 0;
-            if (!long_sets.entries.Erase(key.first, key.second, set, layout)) {
-                continue;
+            if (!long_sets.entries.Erase(hash, check, set, layout)) {
+                return;
             }
             ++long_sets.dropped;
             // DIAG-SGT-019: by what was destroyed (the sets are empty with the switch off)
@@ -13134,9 +13122,8 @@ void NativeRenderer::DropLongSets(std::span<const u64> dead_handles) {
             } else {
                 long_sets.retired.push_back({tick, layout, set});
             }
-        }
-        long_sets.users.erase(found);
-        long_sets.spare.erase(handle); // sets of a layout that goes
+        });
+        if (had_sets) long_sets.spare.erase(handle); // sets of a layout that goes
     }
 }
 
@@ -13151,7 +13138,7 @@ void NativeRenderer::FlushLongSets() {
     }
     long_sets.pools.clear();
     long_sets.entries.Clear();
-    long_sets.users.clear();
+    long_sets.users.Clear();
     long_sets.retired.clear();
     long_sets.spare.clear();
     long_sets.unused_sets = 0;
@@ -25748,6 +25735,21 @@ void NativeRenderer::Report() {
                      samplers.size(), retired_samplers.size(), SamplerLimit(), counts[0],
                      counts[1], counts[2], counts[3]);
             sampler_report = counts;
+        }
+    }
+    static std::chrono::steady_clock::time_point users_last{};
+    if (std::chrono::steady_clock::now() - users_last >= std::chrono::seconds{10}) {
+        // FIX-SGT-044: the kept sets' handle lists, when a list was thinned (every build). Not
+        // under sampler_mutex: StoreLongSet takes that one inside long_sets_mutex.
+        users_last = std::chrono::steady_clock::now();
+        std::scoped_lock long_lock{long_sets_mutex};
+        const auto thinned = long_sets.users.TakeStats();
+        if (thinned.passes != 0) {
+            LOG_INFO(Render_Vulkan,
+                     "FIX-SGT-044 (10 s): kept sets' handle lists thinned {} times, {} entries "
+                     "looked at, {} stale ones removed, longest list {}; {} sets kept",
+                     thinned.passes, thinned.scanned, thinned.removed, thinned.longest,
+                     long_sets.users.Kept());
         }
     }
 #if !defined(NDEBUG)

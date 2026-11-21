@@ -32,6 +32,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include "ryty_gpu/native/kept_set_table.h"
+#include "ryty_gpu/native/kept_set_users.h"
 #include "ryty_gpu/native/recorder_binder.h"
 #include "ryty_gpu/native/ordered_timing.h"
 #include <vector>
@@ -595,9 +596,8 @@ private:
             vk::DescriptorSet set;
         };
         Native::KeptSetTable<vk::DescriptorSet> entries;                ///< by 128-bit key hash
-        /// handle -> the key hashes of the sets that hold it (and of sets since dropped: a
-        /// list is thinned when it is much longer than the table)
-        std::unordered_map<u64, std::vector<std::pair<u64, u64>>> users;
+        /// FIX-SGT-044: handle -> the kept sets that hold it (DropLongSets).
+        Native::KeptSetUsers users;
         std::deque<Retired> retired;
         std::unordered_map<u64, std::vector<vk::DescriptorSet>> spare;  ///< by layout
         std::vector<vk::DescriptorPool> pools;

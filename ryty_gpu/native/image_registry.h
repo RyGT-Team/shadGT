@@ -192,6 +192,14 @@ public:
     /// wrote it (samples 0: the standard ones), which its layout changes must carry. Recorder
     /// thread only, set in draw order.
     mutable Vulkan::SampleLocations::Pattern written_locations{};
+#ifdef SHADGT_DIAGNOSTICS
+    /// DIAG-SGT-071 (diagnostics builds only): the last frame a draw or dispatch sampled it,
+    /// through the recorder's binds or a prepared draw's commit, whatever SHADGT_ONE_OFF_LEARN
+    /// says (sampled_frame misses prepared draws and follows that switch). Read by the race
+    /// report of skipped one-off pictures only. Recorder thread only; last, so the fields above
+    /// keep the offsets they have in Release.
+    mutable u64 race_read_frame = 0;
+#endif
 
     /// A view, made on first use.
     const Rhi::ImageView* View(Rhi::Device& device, const ImageViewKey& key);

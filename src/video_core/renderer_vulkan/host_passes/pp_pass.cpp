@@ -40,7 +40,7 @@ static_assert(offsetof(PostProcessingConstants, dlss_sharpening) == 56);
 static_assert(sizeof(PostProcessingConstants) == 72);
 } // namespace
 
-void PostProcessingPass::Create(vk::Device device, const vk::Format surface_format) {
+void PostProcessingPass::Create(vk::Device device, vk::PhysicalDevice physical_device) {
     boost::container::static_vector<vk::DescriptorSetLayoutBinding, 5> bindings{
         {
             .binding = 0,
@@ -120,14 +120,6 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
     pipeline_layout =
         Check<"create pp pipeline layout">(device.createPipelineLayoutUnique(layout_info));
 
-    const std::array pp_color_formats{
-        surface_format,
-    };
-    const vk::PipelineRenderingCreateInfo pipeline_rendering_ci{
-        .colorAttachmentCount = pp_color_formats.size(),
-        .pColorAttachmentFormats = pp_color_formats.data(),
-    };
-
     const vk::PipelineVertexInputStateCreateInfo vertex_input_info{
         .vertexBindingDescriptionCount = 0u,
         .vertexAttributeDescriptionCount = 0u,
@@ -198,8 +190,9 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
         .pDynamicStates = dynamic_states.data(),
     };
 
+    vk::PipelineRenderingCreateInfo rendering_info{.colorAttachmentCount = 1};
     const vk::GraphicsPipelineCreateInfo pipeline_info{
-        .pNext = &pipeline_rendering_ci,
+        .pNext = &rendering_info,
         .stageCount = shaders_ci.size(),
         .pStages = shaders_ci.data(),
         .pVertexInputState = &vertex_input_info,
@@ -212,21 +205,16 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
         .layout = *pipeline_layout,
     };
 
-    pipeline = Check<"create post process pipeline">(device.createGraphicsPipelineUnique(
-        /*pipeline_cache*/ {}, pipeline_info));
-
-    // FIX-GT7-145: the same pipeline for the frames of an HDR10 output.
-    const std::array hdr_color_formats{
-        HdrFrameFormat,
-    };
-    const vk::PipelineRenderingCreateInfo hdr_rendering_ci{
-        .colorAttachmentCount = hdr_color_formats.size(),
-        .pColorAttachmentFormats = hdr_color_formats.data(),
-    };
-    auto hdr_pipeline_info = pipeline_info;
-    hdr_pipeline_info.pNext = &hdr_rendering_ci;
-    hdr_pipeline = Check<"create HDR post process pipeline">(
-        device.createGraphicsPipelineUnique(/*pipeline_cache*/ {}, hdr_pipeline_info));
+    // A replacement surface can choose the other 8-bit format while older frames are in flight.
+    for (auto& output : output_pipelines) {
+        const auto features = physical_device.getFormatProperties(output.format).optimalTilingFeatures;
+        if (!(features & vk::FormatFeatureFlagBits::eColorAttachment)) {
+            continue;
+        }
+        rendering_info.pColorAttachmentFormats = &output.format;
+        output.pipeline = Check<"create post process pipeline">(
+            device.createGraphicsPipelineUnique(/*pipeline_cache*/ {}, pipeline_info));
+    }
 
     // Once pipeline is compiled, we don't need the shader module anymore
     device.destroyShaderModule(vs_module);
@@ -388,10 +376,13 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         },
     };
 
-    // FIX-GT7-145: by the frame's own format, not the pass's setting: the two change at
-    // different moments around an HDR switch.
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics,
-                        frame.is_hdr ? *hdr_pipeline : *pipeline);
+    const auto output = std::ranges::find(output_pipelines, frame.image_view_format,
+                                          &OutputPipeline::format);
+    if (output == output_pipelines.end() || !output->pipeline) [[unlikely]] {
+        UNREACHABLE_MSG("Unsupported post-processing attachment format: {}",
+                        vk::to_string(frame.image_view_format));
+    }
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *output->pipeline);
 
     // WIDE-009: a 16:9 picture (the boot screens, shown before the high-resolution UI takes
     // over) on a wide window goes between black bars instead of being stretched over it.

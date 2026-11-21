@@ -927,7 +927,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     fsr3_pass.Create(instance.GetInstance(), instance.GetPhysicalDevice(), device,
                      instance.GetAllocator(), num_images);
 #endif
-    pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
+    pp_pass.Create(device, instance.GetPhysicalDevice());
     pp_pass.CreateHudBuffer(instance.GetAllocator()); // GT7-UW
 
     ImGui::Layer::AddLayer(Common::Singleton<Core::Devtools::Layer>::Instance());
@@ -1035,6 +1035,7 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     };
     auto view = Check<"create frame image view">(device.createImageView(view_info));
     frame->image_view = view;
+    frame->image_view_format = view_info.format;
     frame->width = width;
     frame->height = height;
 
@@ -1394,6 +1395,7 @@ void Presenter::PrepareHudlessReference(Frame& frame, vk::CommandBuffer cmd, vk:
     Frame hudless;
     hudless.width = frame.width; hudless.height = frame.height;
     hudless.image = snapshot.hudless_output; hudless.image_view = *snapshot.hudless_output_view;
+    hudless.image_view_format = snapshot.hudless_output_format;
     hudless.is_hdr = frame.is_hdr;
     pp_pass.Render(cmd, *snapshot.hudless_scene_view, snapshot.hudless_scene_size,
                    hudless, pp_settings, {}, false);

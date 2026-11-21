@@ -1343,7 +1343,14 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
             push_draw_in_pass = 0;
         }
         if (const u32 chunk = RecorderBChunk(); chunk != 0) { // FEAT-SGT-079 step 18
-            queued_draw->to_b = !compute && (push_draw_in_pass / chunk) % 2 == 1;
+            // SHADGT_RECORDER_B_CHUNK_AB=1: B takes no chunk in arm 0 of the 2 s A/B.
+            static const bool chunk_ab = [] {
+                const char* env = std::getenv("SHADGT_RECORDER_B_CHUNK_AB");
+                return env && env[0] == '1';
+            }();
+            queued_draw->to_b = !compute && (push_draw_in_pass / chunk) % 2 == 1 &&
+                                !(chunk_ab &&
+                                  ::Vulkan::SubmitAbArm().load(std::memory_order_relaxed) == 0);
         }
         ++push_draw_in_pass;
         if (pass_start) {
@@ -1474,21 +1481,36 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
                 return;
             }
             if (RecorderBOverlap()) { // FEAT-SGT-079 step 19
+                const auto cost_now = [] {
+                    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+                };
+                s64 cost_from = 0;
+                if constexpr (Common::DiagnosticsBuilt) cost_from = cost_now();
                 // B's jobs back to back (nothing of the recorder's between them) just queue; else
                 // B's last list goes in first, then the recorder's own.
                 if (!overlap_outstanding || !overlap_since_b.empty() || overlap_pass_tag != qd->tag) {
                     RecorderBSync();
                 }
+                s64 prepare_from = 0;
+                if constexpr (Common::DiagnosticsBuilt) prepare_from = cost_now();
 #ifdef RYTY_GPU
                 // Step 20: the draw's pictures ready first, in the recorder's list (spliced now,
                 // ahead of B's); a draw that cannot be readied stays the recorder's, after B's.
                 if (auto* native = rasterizer->Native(); native && !native->RecorderBPrepareForB(qd->packet)) {
                     RecorderBSync();
+                    if constexpr (Common::DiagnosticsBuilt) ++overlap_cost.kept;
                     qd->to_b = false;
                     inner();
                     return;
                 }
 #endif
+                s64 handoff_from = 0;
+                if constexpr (Common::DiagnosticsBuilt) {
+                    handoff_from = cost_now();
+                    overlap_cost.prepare += handoff_from - prepare_from;
+                }
                 {
                     std::scoped_lock lk{overlap_mutex};
                     overlap_queue.push_back({std::move(inner), std::move(overlap_since_b), qd});
@@ -1507,6 +1529,12 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
                 if (qd->cs) recorder->cs = *qd->cs;
                 recorder->cb_extent = qd->cb_extent;
                 recorder->db_extent = qd->db_extent;
+                if constexpr (Common::DiagnosticsBuilt) {
+                    overlap_cost.handoff += cost_now() - handoff_from;
+                    ++overlap_cost.jobs;
+                    ReportOverlapCost();
+                    static_cast<void>(cost_from);
+                }
                 return;
             }
             auto run = [&inner] { inner(); };
@@ -2019,6 +2047,33 @@ static int RecorderBFirstMode() {
     return mode;
 }
 
+// DIAG-SGT-088: every 5 s, the overlap's costs on the recorder (ms a second) and B's wait for the
+// renderer's lock: what the lock's shrinking can win back (the waits) and what it cannot (the
+// readying, the hand-over, the splices).
+void Liverpool::ReportOverlapCost() {
+    auto& c = overlap_cost;
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    if (c.since == 0) c.since = now;
+    if (now - c.since < 5'000'000'000) return;
+    const double secs = double(now - c.since) / 1e9;
+    u64 b_wait = 0;
+#ifdef RYTY_GPU
+    if (auto* native = rasterizer ? rasterizer->Native() : nullptr) {
+        b_wait = native->b_mutex_wait_ns.exchange(0, std::memory_order_relaxed);
+    }
+#endif
+    LOG_INFO(Render, "DIAG-SGT-088: overlap in {:.1f} s: {} jobs to B, {} kept, {} syncs; the "
+             "recorder waiting for B {:.1f} ms/s, readying B's draws {:.1f} ms/s, handing over "
+             "{:.1f} ms/s, splicing B's lists {:.1f} ms/s; B waiting for the renderer's lock "
+             "{:.1f} ms/s",
+             secs, c.jobs, c.kept, c.syncs, c.sync_wait / 1e6 / secs, c.prepare / 1e6 / secs,
+             c.handoff / 1e6 / secs, c.commit / 1e6 / secs, b_wait / 1e6 / secs);
+    c = {};
+    c.since = now;
+}
+
 int Liverpool::RecorderBOverlap() {
     static const int mode = [] {
         const char* env = std::getenv("SHADGT_RECORDER_B_OVERLAP");
@@ -2062,6 +2117,12 @@ void Liverpool::RecorderBOverlapLoop() {
 // (ahead of the recorder's open list, which is spliced later).
 void Liverpool::RecorderBSync() {
     if (!overlap_outstanding) return;
+    s64 cost_from = 0;
+    if constexpr (Common::DiagnosticsBuilt) {
+        cost_from = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    }
     u64 target;
     {
         std::scoped_lock lk{overlap_mutex};
@@ -2075,12 +2136,26 @@ void Liverpool::RecorderBSync() {
     }
     if (baton_error) std::rethrow_exception(std::exchange(baton_error, nullptr));
     overlap_outstanding = false;
+    s64 commit_from = 0;
+    if constexpr (Common::DiagnosticsBuilt) {
+        commit_from = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+        overlap_cost.sync_wait += commit_from - cost_from;
+        ++overlap_cost.syncs;
+    }
 #ifdef RYTY_GPU
     if (auto* native = rasterizer ? rasterizer->Native() : nullptr) {
         native->SetRecorderBOutstanding(false);
         native->RecorderBCommit();
     }
 #endif
+    if constexpr (Common::DiagnosticsBuilt) {
+        overlap_cost.commit += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count() -
+                               commit_from;
+    }
 }
 
 u32 Liverpool::RecorderBChunk() {

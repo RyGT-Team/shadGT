@@ -525,6 +525,12 @@ private:
     bool overlap_outstanding = false;                          ///< recorder thread
     u64 overlap_pass_tag = 0;                                  ///< recorder thread
     void RecorderBSync();
+    /// DIAG-SGT-088 (diagnostics builds): what overlap costs, on the recorder.
+    struct {
+        s64 since = 0, sync_wait = 0, prepare = 0, handoff = 0, commit = 0;
+        u64 syncs = 0, jobs = 0, kept = 0;
+    } overlap_cost;
+    void ReportOverlapCost();
     void RecorderBOverlapLoop();
     u32 push_draw_in_pass = 0;
     /// FEAT-SGT-079: the job each recorder thread runs (recorder B's too).

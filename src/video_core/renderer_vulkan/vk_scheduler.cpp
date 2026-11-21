@@ -472,7 +472,7 @@ std::atomic<int>& SubmitAbArm() {
                (recorder_b && (recorder_b[0] == '2' || recorder_b[0] == '6' ||
                                recorder_b[0] == '8')) ||
                (prefetch && prefetch[0] == '2') || (b_ring && b_ring[0] == '2') ||
-               (b_first && (b_first[0] == '2' || b_first[0] == '4' || b_first[0] == '6')) || (b_learned && b_learned[0] == '2') ||
+               (b_first && (b_first[0] == '2' || b_first[0] == '4' || b_first[0] == '6')) || std::getenv("SHADGT_RECORDER_B_CHUNK_AB") != nullptr || (b_learned && b_learned[0] == '2') ||
                Common::DiagEnv("SHADGT_DIAG_FENCE_BATCH_AB") != nullptr ||
                Common::DiagEnv("SHADGT_DIAG_FEED_GPU_AB") != nullptr ||
                Common::DiagEnv("SHADGT_DIAG_PARALLEL_AB") != nullptr ||
@@ -564,6 +564,11 @@ static void NoteFlush(const std::source_location& loc) {
 #endif
 u64 Scheduler::Flush(SubmitInfo& info, std::source_location loc) {
     if constexpr (Common::DiagnosticsBuilt) NoteRecorderBMain("B: flush", loc); // DIAG-SGT-082
+    if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-088: a submit while B's list is pending
+        if (!t_on_recorder_b && g_b_outstanding.load(std::memory_order_relaxed)) {
+            NoteSubmitSite("A flush while B holds work", loc);
+        }
+    }
     if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("submit", loc); // DIAG-SGT-076
 #ifndef NDEBUG
     NoteFlush(loc);

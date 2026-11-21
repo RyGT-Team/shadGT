@@ -5291,6 +5291,9 @@ void NativeRenderer::PrepareImages(std::span<const Native::ImageEntry* const> bo
         return;
     }
     if constexpr (Common::DiagnosticsBuilt) NoteCommitUploads(uploads); // PERF-SGT-062
+    if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-088: B readies pictures itself
+        if (OnRecorderBThread()) NoteSubmitSite(init ? "B: pending inits" : "B: uploads", {});
+    }
     Stream& s = Ctx().stream;
     trace.Next(2);
     EndRendering();
@@ -10193,6 +10196,7 @@ bool NativeRenderer::QueueCommit(CommitKind kind, void* target, VAddr address, u
 void NativeRenderer::NoteCommitWork(CommitKind kind) {
     if constexpr (Common::DiagnosticsBuilt) {
         if (OnRecorderBThread()) { // DIAG-SGT-084
+            NoteSubmitSite("B: ordered work", {}); // DIAG-SGT-088
             b_run_flags |= 1;
             b_draw_kinds |= 1u << u32(kind);
         }
@@ -16536,7 +16540,22 @@ void NativeRenderer::PassAuditDraw(u64 ns) {
 void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::DrawTotal}; // DIAG-SGT-023
     YieldToMappingChanges(); // PERF-GTS-368
-    std::scoped_lock lock{mutex};
+    std::unique_lock<decltype(mutex)> lock{mutex, std::defer_lock};
+    if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-088: B's thread's wait for the lock
+        if (OnRecorderBThread()) {
+            const auto from = std::chrono::steady_clock::now();
+            lock.lock();
+            b_mutex_wait_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - from)
+                    .count(),
+                std::memory_order_relaxed);
+        } else {
+            lock.lock();
+        }
+    } else {
+        lock.lock();
+    }
     struct PassItemTimer { // DIAG-SGT-061, PERF-SGT-062 (diagnostics builds)
         NativeRenderer* self;
         std::chrono::steady_clock::time_point start;
@@ -16824,6 +16843,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         prepared = TakePrepared(Rasterizer::t_draw_packet);
         if (prepared && PreparedPrefetchOn()) PrefetchPreparedParts(*prepared); // PERF-SGT-081
         a_prepared_why = prepared ? nullptr : DiagText("A: none taken");
+        if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-088
+            if (!prepared && OnRecorderBThread()) NoteSubmitSite("B: draw without prepared", {});
+        }
         // FIX-GTS-492: a prepared draw kept under this packet's address but made for another
         // draw (other programs, or the same ones with other user data: its own frame's tables)
         // is never installed. A cold GT Sport race lost the GPU device on a tessellated pipeline
@@ -23220,6 +23242,9 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     }
     const auto reject = [&](u32 why) {
         NATIVE_DIAGNOSTIC(++stats.prepared_rejected[why]);
+        if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-088
+            if (OnRecorderBThread()) NoteSubmitSite("B: prepared rejected", {});
+        }
         Native::OrderedTiming::NotePrepared(Native::OrderedTiming::PreparedRejected + why);
         if constexpr (Common::DiagnosticsBuilt) { // FEAT-SGT-079: by arm (DIAG-SGT-076)
             static constexpr std::array<const char*, 5> names{

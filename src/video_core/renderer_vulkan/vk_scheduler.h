@@ -385,6 +385,8 @@ inline thread_local bool t_on_recorder_b = false; ///< FEAT-SGT-079: set by Mark
 inline bool OnRecorderBThread() {
     return t_on_recorder_b;
 }
+/// FEAT-SGT-079 step 19: recorder B holds handed work (set by the recorder).
+inline std::atomic<bool> g_b_outstanding{false};
 void NoteRecorderBMain(const char* what, const std::source_location& loc);
 /// DIAG-SGT-074: when the command thread submitted a tick to the queue (0: not known), for the
 /// split of the EOP tail into our submit and the GPU's run. Diagnostics builds only.

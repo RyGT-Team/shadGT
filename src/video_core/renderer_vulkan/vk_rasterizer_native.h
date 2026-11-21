@@ -231,7 +231,9 @@ public:
     void RecorderBCommit();
     void SetRecorderBOutstanding(bool on) {
         b_outstanding.store(on, std::memory_order_release);
+        g_b_outstanding.store(on, std::memory_order_release);
     }
+    std::atomic<u64> b_mutex_wait_ns{0}; ///< DIAG-SGT-088: B's thread waiting for `mutex` in Draw
     std::atomic<bool> b_outstanding{false};
     /// DIAG-SGT-086: the recorder's time since B's last run before it first needed what that run
     /// drew (all of it when it never did), and the segment's counts noted; a new segment starts.

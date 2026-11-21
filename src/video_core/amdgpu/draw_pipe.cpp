@@ -807,7 +807,7 @@ void DrawPipe::Run(std::stop_token stop) {
                 }
                 batch.front().PrefetchHints();
             }
-            if (before_job) before_job(work.Tag()); // FEAT-SGT-079 step 19
+            if (before_job) before_job(work.Tag(), work.Info()); // FEAT-SGT-079 step 19
             work();
             ++ran;
 #ifndef NDEBUG

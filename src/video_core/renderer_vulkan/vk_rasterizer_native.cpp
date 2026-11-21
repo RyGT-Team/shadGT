@@ -23033,6 +23033,44 @@ bool NativeRenderer::RecorderBPrepareForB(const void* packet, bool splice) {
     return true;
 }
 
+bool NativeRenderer::RecorderAOrderedFree(const void* packet) {
+    if (!packet) return false;
+    std::scoped_lock lock{mutex};
+    PreparedDraw* p = nullptr;
+    {
+        PreparedShard& shard = ShardFor(packet);
+        std::scoped_lock shard_lock{shard.mutex};
+        if (const auto it = shard.draws.find(packet); it != shard.draws.end()) p = it->second;
+    }
+    if (!p) return false;
+    if (p->unmap_gen != unmap_generation.load(std::memory_order_acquire) ||
+        p->sampler_drops != samplers_dropped.load(std::memory_order_acquire) ||
+        !registry->UntouchedHolding(p->image_generation, p->image_ranges, p->picture_ranges) ||
+        !PreparedBuffersUntouched(*p, p->buffer_seq)) {
+        return false;
+    }
+    if (!p->missing_pictures.empty() || !p->in_place.empty()) return false;
+    if (device->PendingImageInit() || registry->HasPendingUploads()) return false;
+    if (BWindowWritesPending(*p)) return false;
+    for (const auto& use : p->regions) {
+        if (!use.region || use.region->dirty_pages.empty()) continue;
+        const VAddr begin = Common::AlignDown(std::max(use.address, use.region->begin), 4096);
+        const VAddr end = std::min(use.region->end, use.address + use.size);
+        for (const VAddr page : use.region->dirty_pages) {
+            if (page >= begin && page < end) return false;
+        }
+    }
+    for (const Mirror* m : p->mirrors) {
+        if (m && !m->dirty_pages.empty()) return false;
+    }
+    for (const auto* list : {&p->bindings.stored, &p->bindings.sampled}) {
+        for (const auto* e : *list) {
+            if (e && !BWindowPictureClean(*e)) return false;
+        }
+    }
+    return true;
+}
+
 void NativeRenderer::RecorderBCommit() {
     std::scoped_lock lock{mutex};
     if (!b_record_context.stream.list) return;

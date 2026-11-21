@@ -232,6 +232,10 @@ public:
     /// (1 readied, 2 kept); the recorder's list is spliced once at the end.
     void RecorderBPrepareChunk(std::span<const void* const> packets, std::span<u8> results);
     void RecorderBCommit();
+    /// FEAT-SGT-079 step 23: the recorder's own draw (in B's pass, B holding work) needs no
+    /// ordered work: its prepared draw holds, nothing it reads is dirty or due an upload, and no
+    /// init or upload is pending. False: B's work goes in first.
+    bool RecorderAOrderedFree(const void* packet);
     void SetRecorderBOutstanding(bool on) {
         b_outstanding.store(on, std::memory_order_release);
         g_b_outstanding.store(on, std::memory_order_release);

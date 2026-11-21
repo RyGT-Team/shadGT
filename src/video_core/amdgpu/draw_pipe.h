@@ -332,7 +332,7 @@ private:
 public:
     /// FEAT-SGT-079 step 19: called on the recorder thread before each job, with its tag (set
     /// before the recorder starts; the late B mode syncs recorder B there).
-    std::function<void(u64)> before_job;
+    std::function<void(u64, const void*)> before_job; ///< (tag, info)
 private:
     std::function<void()> thread_init;
     const std::function<void()> idle_hook; // D5

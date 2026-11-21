@@ -670,8 +670,26 @@ void Liverpool::StartDrawPipe() {
     });
     pipe_report_start = std::chrono::steady_clock::now();
     if (RecorderBOverlap()) { // FEAT-SGT-079 step 19: sync B before a job outside its pass
-        draw_pipe->before_job = [this](u64 tag) {
-            if (overlap_outstanding && (tag == 0 || tag != overlap_pass_tag)) RecorderBSync();
+        draw_pipe->before_job = [this](u64 tag, const void* info) {
+            if (!overlap_outstanding) return;
+            if (tag == 0 || tag != overlap_pass_tag) {
+                RecorderBSync();
+                return;
+            }
+#ifdef RYTY_GPU
+            // FEAT-SGT-079 step 23: the recorder's own draw in B's pass does its ordered work
+            // (refreshes, uploads, inits) only once B's earlier work is in: B records later than
+            // its place in the lists, and must not take that work as done before it.
+            const auto* qd = static_cast<const QueuedDraw*>(info);
+            if (qd && qd->to_b) return; // B's (the hand-over checks it)
+            auto* native = rasterizer ? rasterizer->Native() : nullptr;
+            if (!native || !qd || qd->compute || !native->RecorderAOrderedFree(qd->packet)) {
+                if constexpr (Common::DiagnosticsBuilt) {
+                    ::Vulkan::NoteSubmitSite("A draw with ordered work: B synced", {});
+                }
+                RecorderBSync();
+            }
+#endif
         };
     }
     if (RecorderBMode() >= 5) { // FEAT-SGT-079 step 5

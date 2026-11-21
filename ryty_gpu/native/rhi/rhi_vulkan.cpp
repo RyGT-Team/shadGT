@@ -2683,7 +2683,11 @@ static std::unique_ptr<Device> CreateStandaloneVulkanDeviceImpl(std::string* err
     if (clip_enable) {
         enabled.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
     }
-    const auto features = physical.getFeatures();
+    // The tiling shaders use 16-bit values in their uniform buffer, as on the shared device.
+    vk::PhysicalDeviceVulkan11Features supported11{};
+    vk::PhysicalDeviceFeatures2 supported{.pNext = &supported11};
+    physical.getFeatures2(&supported);
+    const auto& features = supported.features;
     vk::PhysicalDeviceDepthClipEnableFeaturesEXT clip_features{.depthClipEnable = clip_enable};
     vk::PhysicalDeviceVulkan13Features vk13{
         .pNext = clip_enable ? &clip_features : nullptr,
@@ -2697,8 +2701,13 @@ static std::unique_ptr<Device> CreateStandaloneVulkanDeviceImpl(std::string* err
         .timelineSemaphore = true,
         .bufferDeviceAddress = true,
     };
-    const vk::PhysicalDeviceFeatures2 features2{
+    vk::PhysicalDeviceVulkan11Features vk11{
         .pNext = &vk12,
+        .storageBuffer16BitAccess = supported11.storageBuffer16BitAccess,
+        .uniformAndStorageBuffer16BitAccess = supported11.uniformAndStorageBuffer16BitAccess,
+    };
+    const vk::PhysicalDeviceFeatures2 features2{
+        .pNext = &vk11,
         .features{
             .independentBlend = features.independentBlend,
             .geometryShader = features.geometryShader,

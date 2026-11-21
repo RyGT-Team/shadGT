@@ -182,6 +182,11 @@ public:
     /// version once the rewrite is applied (later, at its next use), so targets drawn between
     /// the fill and that use still count as newer for the textures made of them.
     u64 rewrite_clock = 0;
+    /// FIX-SGT-072 (review): partial fills of this 3D picture that failed in a row for lack of
+    /// memory, and the frame of the last one (the next attempt waits for a later frame).
+    /// Recorder thread only.
+    u8 volume_fill_failures = 0;
+    u64 volume_fill_failed_frame = ~u64{0};
     // Protected by ImageRegistry::recent_fills_mutex, including CPU fault callbacks.
     bool remembered_fill_pending = false;
     bool remembered_fill_invalid = false;
@@ -370,6 +375,9 @@ public:
     void ExpireRecentFills(u64 frame);
     struct FillClaim { bool valid = true; std::shared_ptr<RememberedFillReceipt> receipt; };
     FillClaim ClaimRememberedFill(ImageEntry& entry);
+    /// FIX-SGT-072 (review): puts back a claim whose fill was not recorded and is tried again,
+    /// so its receipt stays live until an attempt records the fill or drops it.
+    void ReturnRememberedFill(ImageEntry& entry, FillClaim& claim);
     /// NAT-120: uploads the image from guest memory before its next use.
     // Admission happens on actual image use, not on each intermediate streaming write.
     // Duplicate requests are harmless: RecordUploads atomically consumes needs_upload.
@@ -460,6 +468,13 @@ public:
     /// guest memory the CPU reads after the GPU wrote it.
     bool RecordDownload(Rhi::CommandList& list, ImageEntry& entry, const Rhi::Buffer& out,
                         u64 out_offset = 0, DownloadBatch* batch = nullptr);
+    // FIX-SGT-072 (review): what RecordPartialVolumeFill needs, checked and made before anything
+    // is recorded. Ineligible does not change for the image; OutOfMemory may pass later.
+    enum class PartialFill : u8 { Ready, Ineligible, OutOfMemory };
+    PartialFill PreparePartialVolumeFill(ImageEntry& entry, u64 written);
+    // FIX-SGT-072: preserve the live GPU suffix when a guest prefix cannot be copied as texels.
+    bool RecordPartialVolumeFill(Rhi::CommandList& list, ImageEntry& entry,
+                                 const Rhi::Buffer& pattern, u64 written);
     /// PERF-GT7-045: scratch memory for downloads of up to `bytes` recorded into `batch`.
     bool BeginDownloads(DownloadBatch& batch, u64 bytes, u64 alignment);
     /// PERF-GT7-045: tiles the downloads recorded into `batch` and copies them to their buffers.
@@ -507,6 +522,7 @@ private:
                     const std::function<void(ImageEntry&)>& on_evict);
     void UnindexEntry(ImageEntry& entry);
     std::unique_ptr<Rhi::Buffer> TilingParamsBuffer(const VideoCore::ImageInfo& info);
+    bool PrepareTilingScratch(ImageEntry& entry, bool convert);
 
     Rhi::Device& device;
     ImageFactory image_factory;

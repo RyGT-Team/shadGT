@@ -12548,7 +12548,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                 const char* env = Common::DiagEnv("SHADGT_FRAME_DUMP_ALL_TEXTURES");
                 return env && env[0] == '1';
             }();
-            if (dump_all || !entry->from_cpu || SceneTrace::Id()) {
+            if (VideoCore::FullFrameDump() || dump_all || !entry->from_cpu || SceneTrace::Id()) {
                 auto key = Rasterizer::FrameDumpTextureKey(desc.info); // NAT-123
                 if (std::ranges::find(dump_textures, key, &decltype(dump_textures)::value_type::first) ==
                     dump_textures.end()) {
@@ -24060,6 +24060,7 @@ void NativeRenderer::EvictImages() {
         pending_linear_downloads.erase(&entry);
         std::erase(frame_writebacks, &entry);
         std::erase(dump_entries, &entry);
+        std::erase_if(dump_textures, [&](const auto& sampled) { return sampled.second == &entry; });
         for (auto it = stencil_owners.begin(); it != stencil_owners.end();) {
             auto& owners = it->second;
             owners.erase(std::remove(owners.begin(), owners.end(), &entry), owners.end());
@@ -25421,7 +25422,7 @@ void NativeRenderer::SnapProgramMips(std::span<const Shader::Info* const> stages
 }
 
 void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
-#if !defined(NDEBUG)
+#if !defined(NDEBUG) || defined(SHADGT_DIAGNOSTICS)
     std::scoped_lock lock{mutex};
     struct Readback {
         const Native::ImageEntry* entry;
@@ -25607,6 +25608,35 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
         std::fwrite(region_manifest.data(), 1, region_manifest.size(), file);
         std::fclose(file);
     }
+    const bool full_capture = VideoCore::FullFrameDump();
+    u32 written_images = 0;
+    const auto flush_readbacks = [&] {
+        const vk::MemoryBarrier2 to_host{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+            .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+        };
+        s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount=1, .pMemoryBarriers=&to_host});
+        Splice();
+        r.scheduler.Finish();
+        for (const auto& readback : readbacks) {
+            const auto& name = jobs[readback.index].second;
+            const auto path = dir / (readback.mip == 0 ? name :
+                std::filesystem::path(name).stem().string() + fmt::format("_mip{}.bin", readback.mip));
+            readback.buffer->Invalidate();
+            if (std::FILE* out = std::fopen(path.string().c_str(), "wb")) {
+                const auto bytes = std::fwrite(readback.buffer->Mapped(), 1, readback.size, out);
+                const int closed = std::fclose(out);
+                if (bytes == readback.size && closed == 0) {
+                    ++written_images;
+                    continue;
+                }
+            }
+            LOG_ERROR(Render_Vulkan, "Frame capture: could not write {}", path.string());
+        }
+        readbacks.clear();
+    };
     std::string mip_manifest="file,address,mip,width,height,depth,layers,unit_bytes,compressed,bytes,status,version,format,depth_aspect\n";
     u32 index=0;
     for(const auto& [entry,name]:jobs){
@@ -25623,10 +25653,19 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
             if(desc.samples!=1)status="skipped_msaa";
             else if(!(desc.usage & Native::Rhi::ImageUsageTransferSrc))status="skipped_no_transfer_src";
             else if(!l.bytes)status="skipped_layout";
-            else if(mip>0 && l.bytes>(64ull<<20)-extra_bytes)status="skipped_extra_mip_budget";
-            else if(l.bytes>TraceReadbackBudget-total_readback_bytes)status="skipped_total_readback_budget";
+            else if(!full_capture && mip>0 && l.bytes>(64ull<<20)-extra_bytes)status="skipped_extra_mip_budget";
+            else if(!full_capture && l.bytes>TraceReadbackBudget-total_readback_bytes)status="skipped_total_readback_budget";
             if(std::string_view(status)!="queued"){
                 mip_manifest+=fmt::format("{},{:#x},{},{},{},{},{},{},{},{},{},{},{},{}\n",file,entry->info.guest_address,mip,l.width,l.height,l.depth,l.layers,unit,block,l.bytes,status,entry->write_version.load(),u32(desc.format),bool(entry->info.props.is_depth));continue;
+            }
+            // Full captures keep all readable mips. Drain a batch before allocating the next
+            // readback; a single subresource larger than the batch is drained on its own.
+            if (full_capture && !readbacks.empty() &&
+                l.bytes > TraceReadbackBudget - std::min(total_readback_bytes, TraceReadbackBudget)) {
+                flush_readbacks();
+                Begin();
+                GlobalBarrier();
+                total_readback_bytes = 0;
             }
             auto buffer=device->CreateBuffer({.size=l.bytes,.usage=Native::Rhi::BufferUsageTransferDst,.memory=Native::Rhi::MemoryKind::Readback,.name="scene trace mip"});
             if(!buffer || !buffer->Mapped())status="allocation_failed";
@@ -25643,10 +25682,7 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
         }
     }
     if(auto* f=std::fopen((dir/"mip-manifest.csv").string().c_str(),"w")){std::fwrite(mip_manifest.data(),1,mip_manifest.size(),f);std::fclose(f);}
-    const vk::MemoryBarrier2 trace_to_host{.srcStageMask=vk::PipelineStageFlagBits2::eAllTransfer,.srcAccessMask=vk::AccessFlagBits2::eTransferWrite,.dstStageMask=vk::PipelineStageFlagBits2::eHost,.dstAccessMask=vk::AccessFlagBits2::eHostRead};
-    s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount=1,.pMemoryBarriers=&trace_to_host});
-    Splice();
-    r.scheduler.Finish();
+    flush_readbacks();
     for (const auto& readback : region_readbacks) {
         readback.buffer->Invalidate();
         if (auto* file = std::fopen((dir / (readback.stem + "-gpu.bin")).string().c_str(), "wb")) {
@@ -25660,6 +25696,7 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
             }
         }
     }
+#ifndef NDEBUG
     g_pixel_trace.armed = false; // the next dump reads pixel-trace.txt again
     if (g_pixel_trace.rect && !g_pixel_trace.hashes.empty()) {
         // DIAG-GTS-429: draw i's rectangle is bytes [i*w*h*4, (i+1)*w*h*4) of pixel-trace.bin.
@@ -25692,17 +25729,7 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
         }
         g_pixel_trace.hashes.clear();
     }
-    for (const auto& readback : readbacks) {
-        const auto& info = readback.entry->info;
-        const auto& desc = readback.entry->image->Desc();
-        const auto& name=jobs[readback.index].second;
-        const auto path=dir/(readback.mip==0?name:std::filesystem::path(name).stem().string()+fmt::format("_mip{}.bin",readback.mip));
-        readback.buffer->Invalidate();
-        if (std::FILE* file = std::fopen(path.string().c_str(), "wb")) {
-            std::fwrite(readback.buffer->Mapped(), 1, readback.size, file);
-            std::fclose(file);
-        }
-    }
+#endif
     for (const auto& snap : pass_snaps) { // DIAG-226
         if (std::FILE* file = std::fopen((dir / snap.name).string().c_str(), "wb")) {
             std::fwrite(snap.buffer->Mapped(), 1, snap.buffer->Size(), file);
@@ -25716,7 +25743,7 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
     last_snap_key = {};
     pass_snap_index = 0;
     LOG_WARNING(Render_Vulkan, "NAT-116: {} render targets and textures of the frame dumped to {}",
-                readbacks.size(), dir.string());
+                written_images, dir.string());
     if(scene_indirect_buffer){
         scene_indirect_buffer->Invalidate();
         if(auto* f=std::fopen((dir/"indirect-arguments.csv").string().c_str(),"w")){

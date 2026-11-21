@@ -379,7 +379,11 @@ public:
     bool FrameDumpActive() const noexcept {
         return frame_dump_collecting || TraceRange().first != TraceRange().second;
     }
+#elif defined(SHADGT_DIAGNOSTICS)
+    // F1/F8 captures in an optimized diagnostics build: only the dump, no trace range.
+    bool FrameDumpActive() const noexcept { return frame_dump_collecting; }
 #else
+    // Release (PERF-SGT-025): no capture, so the per-draw checks are dropped at compile time.
     constexpr bool FrameDumpActive() const noexcept { return false; }
 #endif
     /// NAT-130: whether [address, address + size) meets the traced range.
@@ -715,7 +719,7 @@ private:
     bool frame_dump_collecting{};
     bool frame_dump_done{};
     bool frame_dump_write_old{}; // written at the next draw (not at the flip)
-#ifndef NDEBUG
+#if !defined(NDEBUG) || defined(SHADGT_DIAGNOSTICS)
     bool debug_frame_dump_active{};
     bool debug_frame_dump_previous_done{};
     std::filesystem::path debug_frame_dump_dir;

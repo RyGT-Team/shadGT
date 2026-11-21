@@ -22643,11 +22643,11 @@ static int RecorderBUnlocked() {
 }
 
 // Step 22b (diagnosis): which of the window's skips run (SHADGT_RECORDER_B_UNLOCKED_SKIP, a mask:
-// 1 CPU writes sorted, 2 regions, 4 pictures, 8 mirrors and in-place ranges; all by default).
+// 1 CPU writes sorted, 2 regions, 4 pictures, 8 mirrors, 16 in-place ranges; all by default).
 static u32 BWindowSkips() {
     static const u32 mask = [] {
         const char* env = std::getenv("SHADGT_RECORDER_B_UNLOCKED_SKIP");
-        return env && *env ? u32(std::strtoul(env, nullptr, 0)) : 15u;
+        return env && *env ? u32(std::strtoul(env, nullptr, 0)) : 15u; // 16 drew glitches
     }();
     return mask;
 }
@@ -23334,15 +23334,28 @@ bool NativeRenderer::CommitPreparedVertices(PreparedDraw& p, const GraphicsPipel
     // (noted as mirror candidates).
     if (t_b_window && RecorderBUnlocked() != 0 && BindCommitMode() == 0 &&
         (BWindowSkips() & 8)) { // step 22b: read only
-        for (const Mirror* mirror : p.mirrors) {
+        for (Mirror* mirror : p.mirrors) {
             if (mirror && !mirror->dirty_pages.empty()) {
                 if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B window: mirror", {});
                 return reject();
             }
+            if (!mirror) continue;
+            // RefreshMirror's first check: a mirror over a CPU thread's stack is never bound.
+            Native::CpuStackRegistry::Lease lease{Native::CpuStacks()};
+            if (!lease.Allowed(mirror->begin, mirror->end)) {
+                if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B window: stack", {});
+                return reject();
+            }
+        }
+        for (Mirror* mirror : p.mirrors) {
+            if (mirror) mirror->used_frame = frame; // kept, as RefreshMirror's callers do
         }
         if (!p.in_place.empty()) {
-            if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B window: in place", {});
-            return reject();
+            if (BWindowSkips() & 16) {
+                if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B window: in place", {});
+                return reject();
+            }
+            for (const auto& [address, size] : p.in_place) MirrorBuffer(address, size); // as before
         }
         NATIVE_DIAGNOSTIC(++stats.prepared_vertices);
         return true;
@@ -23367,6 +23380,18 @@ bool NativeRenderer::BWindowWritesPending(const PreparedDraw& p) {
         }
         for (const Mirror* m : p.mirrors) {
             if (m && m->begin < end && m->end > begin) return true;
+        }
+        // Everything else it reads: its buffers, the mirrors they are bound through, its pictures.
+        for (const auto* list : {&p.buffer_ranges}) {
+            for (const auto& [b, e] : *list) {
+                if (b < end && e > begin) return true;
+            }
+        }
+        for (const auto& [b, e] : p.mirror_ranges) {
+            if (b < end && e > begin) return true;
+        }
+        for (const auto& [b, e] : p.image_ranges) {
+            if (b < end && e > begin) return true;
         }
         return false;
     };

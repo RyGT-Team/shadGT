@@ -3390,7 +3390,15 @@ vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& original,
     const u64 extra = (is_depth ? 1u : 0u) | (custom ? u64(border.Address()) << 1 : 0) |
                       (explicit_lod ? u64{1} << 63 : 0);
     const u64 recycle_epoch = sampler_epoch.load(std::memory_order_acquire);
-    if (NextMemoEnabled()) {
+    // PERF-SGT-047 (SHADGT_SAMPLER_CACHE=0: only with SHADGT_NATIVE_NEXT=1, as before): on by
+    // itself. Without it every sampler took MakeSampler's hash, memo and lock: SamplerFor was
+    // 2.3% of GT7's recorder (Pro mode, Tokyo, nsys, 20-11), 0.6% with this cache. The rest of
+    // SHADGT_NATIVE_NEXT stays off: its memo-slot hash cost more than XXH3 there (1.9% vs 0.9%).
+    static const bool cache_on = [] {
+        const char* env = std::getenv("SHADGT_SAMPLER_CACHE");
+        return env && env[0] == '0' ? NextMemoEnabled() : true;
+    }();
+    if (cache_on) {
         cache = &cached[MemoHash(raw.data(), raw.size(), extra) & (cached.size() - 1)];
         if (cache->sampler && cache->owner == this &&
             cache->epoch == sampler_cache_epoch.load(std::memory_order_acquire) &&

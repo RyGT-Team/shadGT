@@ -436,6 +436,9 @@ public:
         const char* b_why = nullptr; ///< written by B before its b_result store (release)
         s64 b_done_ns = 0;          ///< when B was done with it (steady clock)
         s64 pushed_ns = 0;          ///< when it was pushed
+        /// FEAT-SGT-079 step 21 (recorder thread): readied for B with its chunk (1), to be
+        /// kept by the recorder (2), or not looked at yet (0).
+        u8 overlap_ready = 0;
     };
     /// FEAT-SGT-079: the queued draw of the job the recorder runs (null: none or B off).
     const QueuedDraw* RunningQueuedDraw() const {

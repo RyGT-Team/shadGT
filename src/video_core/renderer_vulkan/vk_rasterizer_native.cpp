@@ -22873,7 +22873,20 @@ void NativeRenderer::RecorderBOverlapEnter() {
     if (main_record_context.stream.list) Splice();
 }
 
-bool NativeRenderer::RecorderBPrepareForB(const void* packet) {
+void NativeRenderer::RecorderBPrepareChunk(std::span<const void* const> packets,
+                                           std::span<u8> results) {
+    std::scoped_lock lock{mutex};
+    for (size_t i = 0; i < packets.size() && i < results.size(); ++i) {
+        results[i] = RecorderBPrepareForB(packets[i], false) ? 1 : 2;
+    }
+    if (main_record_context.stream.list) { // the recorder's own work so far, ahead of B's
+        const bool was = b_outstanding.exchange(false, std::memory_order_acq_rel);
+        Splice();
+        b_outstanding.store(was, std::memory_order_release);
+    }
+}
+
+bool NativeRenderer::RecorderBPrepareForB(const void* packet, bool splice) {
     if (!RecorderBCanTake(packet, false)) return false; // holds, no ordered work (it locks)
     std::scoped_lock lock{mutex};
     PreparedDraw* p = nullptr;
@@ -22895,7 +22908,7 @@ bool NativeRenderer::RecorderBPrepareForB(const void* packet) {
         Begin();
         PrepareImages(p->bindings);
     }
-    if (main_record_context.stream.list) { // the recorder's own work so far, ahead of B's
+    if (splice && main_record_context.stream.list) { // the recorder's own work, ahead of B's
         const bool was = b_outstanding.exchange(false, std::memory_order_acq_rel);
         Splice();
         b_outstanding.store(was, std::memory_order_release);

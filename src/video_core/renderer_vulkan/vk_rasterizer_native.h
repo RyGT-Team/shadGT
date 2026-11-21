@@ -227,7 +227,10 @@ public:
     /// draw's prepared draw holds and needs no ordered work, its pictures are made ready here
     /// (pending inits, uploads), in the recorder's list, which is spliced at once (ahead of B's).
     /// False: the recorder keeps the draw.
-    bool RecorderBPrepareForB(const void* packet);
+    bool RecorderBPrepareForB(const void* packet, bool splice = true);
+    /// FEAT-SGT-079 step 21: the same for the draws of a chunk B is about to get, under one lock
+    /// (1 readied, 2 kept); the recorder's list is spliced once at the end.
+    void RecorderBPrepareChunk(std::span<const void* const> packets, std::span<u8> results);
     void RecorderBCommit();
     void SetRecorderBOutstanding(bool on) {
         b_outstanding.store(on, std::memory_order_release);

@@ -1490,15 +1490,40 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
                 if constexpr (Common::DiagnosticsBuilt) cost_from = cost_now();
                 // B's jobs back to back (nothing of the recorder's between them) just queue; else
                 // B's last list goes in first, then the recorder's own.
-                if (!overlap_outstanding || !overlap_since_b.empty() || overlap_pass_tag != qd->tag) {
+                const bool chunk_start =
+                    !overlap_outstanding || !overlap_since_b.empty() || overlap_pass_tag != qd->tag;
+                if (chunk_start) {
                     RecorderBSync();
                 }
                 s64 prepare_from = 0;
                 if constexpr (Common::DiagnosticsBuilt) prepare_from = cost_now();
 #ifdef RYTY_GPU
+                auto* native = rasterizer->Native();
+                if (native && chunk_start) {
+                    // Step 21: this draw and B's next ones of its chunk (queued behind it) are
+                    // readied under one lock; their hand-overs then just queue.
+                    static thread_local std::vector<std::pair<u64, const QueuedDraw*>> ahead;
+                    PeekQueuedDraws(ahead, 128);
+                    static thread_local std::vector<QueuedDraw*> chunk;
+                    static thread_local std::vector<const void*> packets;
+                    static thread_local std::vector<u8> results;
+                    chunk.assign(1, qd.get());
+                    for (const auto& [ahead_tag, draw] : ahead) {
+                        if (!draw || !draw->to_b || draw->tag != qd->tag || chunk.size() >= 64) break;
+                        chunk.push_back(const_cast<QueuedDraw*>(draw));
+                    }
+                    packets.clear();
+                    for (const auto* d : chunk) packets.push_back(d->packet);
+                    results.assign(chunk.size(), 0);
+                    native->RecorderBPrepareChunk(packets, results);
+                    for (size_t i = 0; i < chunk.size(); ++i) chunk[i]->overlap_ready = results[i];
+                }
                 // Step 20: the draw's pictures ready first, in the recorder's list (spliced now,
                 // ahead of B's); a draw that cannot be readied stays the recorder's, after B's.
-                if (auto* native = rasterizer->Native(); native && !native->RecorderBPrepareForB(qd->packet)) {
+                const bool keep =
+                    native && (qd->overlap_ready == 2 ||
+                               (qd->overlap_ready == 0 && !native->RecorderBPrepareForB(qd->packet)));
+                if (keep) {
                     RecorderBSync();
                     if constexpr (Common::DiagnosticsBuilt) ++overlap_cost.kept;
                     qd->to_b = false;

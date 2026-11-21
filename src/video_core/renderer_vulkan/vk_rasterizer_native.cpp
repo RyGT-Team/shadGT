@@ -2989,12 +2989,12 @@ static bool CubeCompatible(const Instance& instance, u32 width, u32 height, u32 
 
 static bool ListedInPlace(VAddr address, u64 size);
 
-bool NativeRenderer::WantedPicturesOn() { // PERF-SGT-093
-    static const bool on = [] {
+bool NativeRenderer::WantedPicturesOn() { // PERF-SGT-093 (2: in arm 1 of the 2 s A/B)
+    static const int mode = [] {
         const char* env = std::getenv("SHADGT_PREPARE_WANTED_PICTURES");
-        return env && env[0] == '1';
+        return env && (env[0] == '1' || env[0] == '2') ? env[0] - '0' : 0;
     }();
-    return on;
+    return mode == 1 || (mode == 2 && SubmitAbArm().load(std::memory_order_relaxed) == 1);
 }
 
 // PERF-SGT-021 (SHADGT_RECYCLE_FRAME_TEXTURES=0: as before): GT7 writes a few small lookup

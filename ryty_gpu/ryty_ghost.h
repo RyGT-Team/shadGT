@@ -2,6 +2,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cstdlib>
 #include <string_view>
@@ -12,8 +13,7 @@
 namespace Vulkan::RytyGhost {
 
 inline bool IsGhostCoverageDraw(const AmdGpu::Regs& regs) {
-    const u32 first = regs.reg_array[0xa30e];
-    const u32 second = regs.reg_array[0xa30f];
+    const auto [first, second] = regs.AaSampleMask();
     const bool ghost_mask = (first == 0xcccc9999u && second == 0x33336666u) ||
                             (first == 0x33336666u && second == 0xcccc9999u);
     if (!ghost_mask) {
@@ -45,13 +45,17 @@ inline bool Enabled() {
         if (const auto value = Common::RytyGameConfigValue("smooth_ghost")) {
             return value->starts_with("true") || value->starts_with("1");
         }
-        return true;
+        return false; // FIX-SGT-069: both games supply their own coverage by default.
     }();
     return enabled;
 }
 
 inline bool ShouldSmooth(const AmdGpu::Regs& regs) {
     return IsGhostCoverageDraw(regs) && Enabled();
+}
+
+inline std::array<u32, 2> DrawSampleMask(const AmdGpu::Regs& regs) {
+    return ShouldSmooth(regs) ? std::array{~0u, ~0u} : regs.AaSampleMask();
 }
 
 inline AmdGpu::BlendControl SmoothBlendControl() {

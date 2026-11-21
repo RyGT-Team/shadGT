@@ -86,6 +86,7 @@ target_sources(tiling_specialization_test PRIVATE "${SHADGT_ROOT}/src/video_core
 target_compile_definitions(tiling_specialization_test PRIVATE FMT_HEADER_ONLY)
 
 add_test(NAME ghost_smoothing_disabled COMMAND ghost_smoothing_test disabled)
+add_test(NAME ghost_original_default COMMAND ghost_smoothing_test default)
 add_executable(parallel_vertex_direct_hint_test parallel_vertex_direct_hint_test.cpp)
 target_compile_features(parallel_vertex_direct_hint_test PRIVATE cxx_std_23)
 target_include_directories(parallel_vertex_direct_hint_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")

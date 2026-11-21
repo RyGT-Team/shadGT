@@ -409,8 +409,6 @@ public:
     static u64 PromoteHash() {
         return t_promote_hash;
     }
-    /// PERF-GTS-494: the play state comes from the race's own state (GAME-006), in a race.
-    static bool RaceSignalPlay();
     /// FEAT-GTS-471: a stored pipeline key file and its shaders' names (program, record SPIR-V hash).
     struct PipelineRecipe {
         std::array<std::pair<u64, u64>, MaxShaderStages> names{};

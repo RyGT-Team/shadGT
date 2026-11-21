@@ -343,8 +343,14 @@ std::array<u8, 48_KB> Liverpool::ConstantEngine::constants_heap;
 bool Liverpool::DirectNestedResume() {
     static const bool on = [] {
         const char* env = std::getenv("SHADGT_DIRECT_NESTED_RESUME");
-        // PERF-GTS-407: on in native mode unless set to something else.
-        return env && *env ? env[0] == '1' : Vulkan::NativeModeRequested();
+        if (env && *env) {
+            return env[0] == '1';
+        }
+#ifdef RYTY_GPU
+        return Vulkan::NativeModeRequested(); // PERF-GTS-407: on by default in native mode.
+#else
+        return false; // FIX-SGT-070: the standalone target has no native renderer.
+#endif
     }();
     return on;
 }

@@ -3615,12 +3615,17 @@ void PipelineCache::BuildOnScreen() {
 // race's state applies in a race session only (RytyGtsInRace: its loading and pre-race screen stay
 // out of play, as PERF-GTS-494 wants); elsewhere the frame-time measure. SHADGT_MENU_PLAY_MEASURE=0:
 // the race's state everywhere, as before.
-static bool RaceStatePlay(bool race_signal) {
+static std::optional<bool> RacePlayState() {
+#ifdef RYTY_GPU
     static const bool menu_measure = [] {
         const char* env = std::getenv("SHADGT_MENU_PLAY_MEASURE");
         return !(env && env[0] == '0');
     }();
-    return race_signal && (!menu_measure || RytyGtsInRace());
+    if (RytyRaceStartSignal() && (!menu_measure || RytyGtsInRace())) {
+        return RytyRaceRunning();
+    }
+#endif
+    return std::nullopt; // FIX-SGT-070: No applicable game signal: use the measured frame time.
 }
 
 void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
@@ -3635,6 +3640,7 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
     // heavy scene keeps it so at any speed (SHADGT_PLAY_HOLD_DRAWS=<draws a frame>, 1000; 0: frame
     // time only). Measured whatever SHADGT_COMPILE_CATCH_UP says.
     {
+        const auto race_play = RacePlayState();
         const auto totals = Common::GetGameFrameTotals();
         const u64 draws = Common::GetWorkCounters().draws.load(std::memory_order_relaxed);
         if (state.play_window == std::chrono::steady_clock::time_point{}) {
@@ -3664,7 +3670,7 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
             // (menus, Scapes, without the hook or with SHADGT_RACE_START_SIGNAL=0): the
             // frame-time measure above.
             // FIX-GTS-516: the race's state only in a race session; out of one (menus, GT7's
-            // dealership, Scapes) the frame-time measure, as shadgt7 always did, see RaceStatePlay.
+            // dealership, Scapes) the frame-time measure, as shadgt7 always did.
             bool measured = fps >= 5.0 && (slow || held);
             // FIX-GTS-519: a stall (under 5 frames a second) while in play keeps play for
             // SHADGT_PLAY_STALL_HOLD_MS (3000; 0: as before); only a longer one counts as a load.
@@ -3683,7 +3689,7 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
             } else {
                 state.stall_since = {};
             }
-            const bool play = RaceStatePlay(RaceSignalPlay()) ? RytyRaceRunning() : measured;
+            const bool play = race_play.value_or(measured);
             g_game_in_play.store(play, std::memory_order_relaxed);
             if (play != state.in_play) {
                 state.in_play = play;
@@ -3697,8 +3703,8 @@ void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
         // loading and the pre-race screen are not play (the compiles are not held back there,
         // every core once many draws wait, FIX-GT7-106); from the countdown, two builds at once
         // below normal priority, the frame rate first.
-        if (RaceStatePlay(RaceSignalPlay())) {
-            const bool play = RytyRaceRunning();
+        if (race_play.has_value()) {
+            const bool play = *race_play;
             g_game_in_play.store(play, std::memory_order_relaxed);
             if (play != state.in_play) {
                 state.in_play = play;
@@ -4682,15 +4688,6 @@ bool PipelineCache::RaceNeverWaits() {
     const bool started =
         running || (!waits_after_finish && session_started.load(std::memory_order_relaxed));
     return enabled && AsyncPipelines() && (started || !RytyRaceStartSignal());
-#else
-    return false;
-#endif
-}
-
-bool PipelineCache::RaceSignalPlay() {
-#ifdef RYTY_GPU
-    // PERF-GTS-494: GAME-006's hook reads the race's state, and a race session is on.
-    return RytyRaceStartSignal() && RytyGtsInRace();
 #else
     return false;
 #endif

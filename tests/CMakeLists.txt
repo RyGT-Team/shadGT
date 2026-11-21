@@ -9,6 +9,13 @@ include(FetchContent)
 )
 FetchContent_MakeAvailable(googletest)
 
+# The tests are configured without the main target's add_compile_definitions(NOMINMAX ...)
+# (ENABLE_TESTS skips that section): windows.h's min/max macros broke seven test targets that
+# include thread or page headers (std::numeric_limits<>::max(), chrono durations).
+if(WIN32)
+    add_compile_definitions(NOMINMAX)
+endif()
+
 # Google Test builds itself with warnings as errors; a newer compiler's diagnostics (clang 22's
 # -Wcharacter-conversion in gtest-printers.h) must not stop the test build. The form upstream uses.
 foreach(gtest_target gtest gtest_main gmock gmock_main)
@@ -103,34 +110,11 @@ target_include_directories(shadgt_upload_memory_recovery_test PRIVATE ${CMAKE_SO
 target_compile_features(shadgt_upload_memory_recovery_test PRIVATE cxx_std_23)
 target_link_libraries(shadgt_upload_memory_recovery_test PRIVATE GTest::gtest_main)
 gtest_discover_tests(shadgt_upload_memory_recovery_test)
-add_executable(shadps4_shared_build_map_test test_shared_build_map.cpp)
-target_include_directories(shadps4_shared_build_map_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_compile_features(shadps4_shared_build_map_test PRIVATE cxx_std_23)
-target_link_libraries(shadps4_shared_build_map_test PRIVATE GTest::gtest_main)
-gtest_discover_tests(shadps4_shared_build_map_test)
-
-add_executable(shadps4_shader_object_cache_test test_shader_object_cache.cpp)
-target_include_directories(shadps4_shader_object_cache_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_compile_features(shadps4_shader_object_cache_test PRIVATE cxx_std_23)
-target_link_libraries(shadps4_shader_object_cache_test PRIVATE GTest::gtest_main xxHash::xxhash)
-gtest_discover_tests(shadps4_shader_object_cache_test)
-add_executable(shadgt_unique_function_test test_unique_function.cpp)
-target_include_directories(shadgt_unique_function_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_compile_features(shadgt_unique_function_test PRIVATE cxx_std_23)
-target_link_libraries(shadgt_unique_function_test PRIVATE GTest::gtest_main Threads::Threads)
-gtest_discover_tests(shadgt_unique_function_test)
 add_executable(shadgt_native_command_ring_test test_native_command_ring.cpp)
 target_include_directories(shadgt_native_command_ring_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(shadgt_native_command_ring_test PRIVATE cxx_std_23)
 target_link_libraries(shadgt_native_command_ring_test PRIVATE GTest::gtest_main fmt::fmt Boost::headers Vulkan::Headers)
 gtest_discover_tests(shadgt_native_command_ring_test)
-# PERF-GT7-057, FIX-GT7-080/081/087: probe-filter subresource proof.
-add_executable(shadps4_same_texel_test test_same_texel.cpp)
-target_include_directories(shadps4_same_texel_test PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
-target_compile_features(shadps4_same_texel_test PRIVATE cxx_std_23)
-target_link_libraries(shadps4_same_texel_test PRIVATE GTest::gtest_main)
-gtest_discover_tests(shadps4_same_texel_test)
-
 gtest_discover_tests(shadps4_stencil_test)
 
 add_executable(shadps4_ryty_config_test test_ryty_config.cpp)

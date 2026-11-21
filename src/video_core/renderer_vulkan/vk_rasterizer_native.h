@@ -31,6 +31,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include "ryty_gpu/native/image_registry.h"
 #include "ryty_gpu/native/kept_set_table.h"
 #include "ryty_gpu/native/kept_set_users.h"
 #include "ryty_gpu/native/recorder_binder.h"
@@ -150,6 +151,11 @@ public:
     /// DIAG-SGT-023: `where` names the most frequent callers.
     void Splice(std::source_location where = std::source_location::current());
 
+    // FIX-SGT-063: owned scratch images can outlive the slot that was resized.
+    struct TemporalScratchImage : Native::ImageEntry {
+        u64 presenter_tick{};
+    };
+
     /// The picture at a display buffer, for the presenter (none when nothing drew there).
     struct Display {
         vk::Image image;
@@ -174,7 +180,10 @@ public:
         /// DLSS-GT7-001: the frame's depth, motion vectors and jitter, when the game's temporal
         /// anti-aliasing pass was seen in it (RYGT_DLSS_TEMPORAL=1).
         std::optional<RytyUpscale::TemporalInputs> temporal;
+        // Keep the views alive between FindDisplay and submission of the presenter's reads.
+        std::array<std::shared_ptr<TemporalScratchImage>, 4> temporal_images{};
     };
+    void NoteTemporalRead(const Display& display, u64 tick);
     std::optional<Display> FindDisplay(const VideoCore::ImageInfo& info, vk::Format view_format,
                                        vk::Extent2D output_size);
 
@@ -431,8 +440,8 @@ private:
     /// to two pictures of the display's layout instead, one cleared black and one white, so the
     /// presenter can stretch the scene over the window and lay the HUD over it at 16:9.
     struct HudLayer {
-        Native::ImageEntry* black = nullptr; ///< made once, kept for the run
-        Native::ImageEntry* white = nullptr;
+        std::shared_ptr<TemporalScratchImage> black;
+        std::shared_ptr<TemporalScratchImage> white;
         u64 composite_frame = ~u64{0}; ///< the frame the scene was drawn in
         u64 hud_frame = ~u64{0};       ///< the frame HUD draws went to the layer in
         bool clear_pending = false;    ///< the next HUD draw clears both pictures first
@@ -447,6 +456,10 @@ private:
 
     /// DLSS-GT7-001 (temporal DLSS): what GT7's temporal anti-aliasing pass
     /// read in the frame being drawn, for the presenter's DLSS pass (ryty_upscale.h).
+    struct RetiredTemporalPicture {
+        std::shared_ptr<TemporalScratchImage> picture;
+        u64 native_tick{}; ///< assigned after the native and HUD lists have been spliced
+    };
     struct TemporalCapture {
         const Native::ImageEntry* depth = nullptr;
         const Native::ImageEntry* motion = nullptr;
@@ -482,7 +495,7 @@ private:
         u32 through_changes = 0;      ///< logged
         /// The display as it was before its interface, in such frames (two, by frame parity:
         /// the presenter may still read the last one while the next frame draws).
-        std::array<Native::ImageEntry*, 2> ui_scene{};
+        std::array<std::shared_ptr<TemporalScratchImage>, 2> ui_scene{};
         u64 ui_scene_frame = ~u64{0}; ///< the frame the last one was taken in
         u32 ui_scene_slot = 0;        ///< which
         VAddr ui_scene_address = 0;   ///< the display buffer it was taken from
@@ -491,11 +504,11 @@ private:
         u64 batches = 0;              ///< batches closed
         u64 batched_draws = 0;        ///< HUD draws recorded so
         u64 mirror_frame = ~u64{0}; ///< the last such frame
-        Native::ImageEntry* kept = nullptr;        ///< the pass's own result, while swapped
-        Native::ImageEntry* raw_display = nullptr; ///< the display as DLSS is to see it
+        std::shared_ptr<TemporalScratchImage> kept;        ///< the pass's own result, while swapped
+        std::shared_ptr<TemporalScratchImage> raw_display; ///< the display as DLSS is to see it
         /// DLSS-GT7-003: the un-resolved colour with the game's draws into the result since the
         /// pass (motion blur, glows), while the result itself stays resolved for the game.
-        Native::ImageEntry* raw_result = nullptr;
+        std::shared_ptr<TemporalScratchImage> raw_result;
         u64 raw_result_frame = ~u64{0}; ///< the frame it was last started in
         u32 beside_logged = 0;          ///< logged
         /// The result picture, while it holds the un-resolved colour.
@@ -503,7 +516,7 @@ private:
         u64 raw_frame = ~u64{0}; ///< the frame raw_display was last drawn in
         VAddr raw_address = 0;   ///< the display buffer it stands for
         u64 mirrored = 0;        ///< frames drawn so
-        std::vector<Native::ImageEntry*> retired; ///< pictures of another size, kept alive
+        std::vector<RetiredTemporalPicture> retired;
         bool race = false;    ///< as of the last pass seen
         u32 race_changes = 0; ///< logged
         /// The pass's result was replaced but its size is not the display's (a picture cropped
@@ -513,6 +526,7 @@ private:
         u32 size_mismatches = 0; ///< frames in a row so, before it is refused
     };
     TemporalCapture temporal;
+    std::mutex temporal_read_mutex; ///< orders release of a Display pin after publishing its tick
     /// Called at the end of a draw: notes the pass's inputs and replaces its result.
     void NoteTemporalDraw(const GraphicsPipeline& pipeline, const Targets& targets,
                           const DrawBindings& b);
@@ -527,15 +541,18 @@ private:
     void CopyPicture(const Native::ImageEntry& from, const Native::ImageEntry& to);
     /// A picture of the prototype's own like another, made again when the size changes.
     /// size: the picture's size, when not like's.
-    Native::ImageEntry* TemporalPicture(Native::ImageEntry*& slot, const Native::ImageEntry& like,
-                                        vk::Extent2D size = {});
+    Native::ImageEntry* TemporalPicture(std::shared_ptr<TemporalScratchImage>& slot,
+                                        const Native::ImageEntry& like, vk::Extent2D size = {});
+    void RetireTemporalPicture(std::shared_ptr<TemporalScratchImage>& slot);
+    void SealTemporalPictures(u64 tick);
+    void CollectTemporalPictures(u64 completed);
+    void ReleaseTemporalPicture(std::shared_ptr<TemporalScratchImage>& picture);
+    void ClearTemporalPictures();
     /// DLSS-GT7-001: the HUD split for this frame: a wide screen's, or a frame with the pass.
     bool HudSplitNow() const;
     /// DLSS-GT7-001: how many times the display's size the prototype's HUD pictures are.
     u32 HudScale() const;
-    /// size: the picture's size before scale, when not like's.
-    Native::ImageEntry* MakeHudPicture(const Native::ImageEntry& like, u32 scale = 1,
-                                       vk::Extent2D size = {});
+    std::shared_ptr<TemporalScratchImage> MakeHudPicture(const Native::ImageEntry& like, vk::Extent2D size);
     vk::ImageView View(const Native::ImageEntry& entry, const VideoCore::ImageViewInfo& info,
                        ViewUse use);
     /// explicit_lod (FIX-GT7-182): the shader reads this S# at a level it chose, which must not

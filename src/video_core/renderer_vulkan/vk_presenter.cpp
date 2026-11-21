@@ -1710,10 +1710,10 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
             });
     }
     frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
-    frame->ready_tick = draw_scheduler.CurrentTick();
     frame->ready_scheduler = &draw_scheduler;
     SubmitInfo info{};
-    draw_scheduler.Flush(info);
+    frame->ready_tick = draw_scheduler.Flush(info);
+    native.NoteTemporalRead(*display, frame->ready_tick);
     return frame;
 }
 #endif

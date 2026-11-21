@@ -1978,7 +1978,7 @@ void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Ta
         if (i.size.width != size.width || i.size.height != size.height || i.num_samples != 1 ||
             i.resources.layers != 1 || i.resources.levels != 1) { NATIVE_DIAGNOSTIC(static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 3, fs {:#x}", fs ? fs->pgm_hash : 0);); return; }
         // The sampled R32 descriptor may alias the real depth/stencil attachment.
-        // TemporalImage preserves its actual aspects; Capture extracts D32 through
+        // TemporalScratchImage preserves its actual aspects; Capture extracts D32 through
         // a buffer into FSR's separate R32 image instead of making a D32-only view.
         if (i.pixel_format == vk::Format::eR32Sfloat ||
             i.pixel_format == vk::Format::eD32Sfloat ||
@@ -2648,6 +2648,7 @@ NativeRenderer::~NativeRenderer() {
         ApplyRingPriority(false);
         r.scheduler.SyncCommandThread();
     }
+    ClearTemporalPictures();
     retired_pipeline_owners.ClearAfterGpuIdle();
     Ctx().stream.writeback_plan_leases.clear();
     retired_writeback_plans.ClearAfterGpuIdle();
@@ -2835,7 +2836,9 @@ void NativeRenderer::CloseHudBatch() {
         return;
     }
     r.scheduler.EndRendering();
-    SpliceHudStream(r.scheduler.CurrentTick());
+    const u64 tick = r.scheduler.CurrentTick();
+    SpliceHudStream(tick);
+    SealTemporalPictures(std::max(tick, ActiveSubmitSignal()));
 }
 
 void NativeRenderer::SpliceStream(Stream& s, u64 tick) {
@@ -2903,20 +2906,15 @@ u32 NativeRenderer::HudScale() const {
                : 1;
 }
 
-Native::ImageEntry* NativeRenderer::MakeHudPicture(const Native::ImageEntry& like, u32 scale,
-                                                   vk::Extent2D size) {
-    auto* entry = new Native::ImageEntry{};
+std::shared_ptr<NativeRenderer::TemporalScratchImage> NativeRenderer::MakeHudPicture(
+    const Native::ImageEntry& like, vk::Extent2D size) {
+    auto entry = std::make_shared<TemporalScratchImage>();
     entry->info = like.info;
-    if (size.width != 0 && size.height != 0) {
-        entry->info.size.width = size.width;
-        entry->info.size.height = size.height;
-    }
-    entry->info.size.width *= scale;
-    entry->info.size.height *= scale;
+    entry->info.size.width = size.width;
+    entry->info.size.height = size.height;
     Native::MadeImage made = MakeImage(entry->info, true);
     if (!made.image) {
-        delete entry;
-        return nullptr;
+        return {};
     }
     entry->image = std::move(made.image);
     entry->backend_usage = made.usage;
@@ -16398,22 +16396,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             layer.clear_pending = true;
             // DLSS-GT7-001: the shown part of the display (ShownPart), times the HUD's scale.
             const vk::Extent2D shown = ShownPart(*targets.colors[0]);
-            const u32 scale = HudScale();
-            if (!layer.black || layer.scale != scale ||
-                layer.black->info.size.width != shown.width * scale ||
-                layer.black->info.size.height != shown.height * scale) {
-                // DLSS-GT7-001: made again when End changes their size (the old ones are kept:
-                // recorded commands may still name them).
-                if (layer.black) {
-                    temporal.retired.push_back(layer.black);
-                }
-                if (layer.white) {
-                    temporal.retired.push_back(layer.white);
-                }
-                layer.scale = scale;
-                layer.black = MakeHudPicture(*targets.colors[0], layer.scale, shown);
-                layer.white = MakeHudPicture(*targets.colors[0], layer.scale, shown);
-            }
+            layer.scale = HudScale();
+            const vk::Extent2D size{shown.width * layer.scale, shown.height * layer.scale};
+            TemporalPicture(layer.black, *targets.colors[0], size);
+            TemporalPicture(layer.white, *targets.colors[0], size);
         } else if (layer.black && layer.white) {
             const VideoCore::TextureCache::ImageDesc desc{regs.color_buffers[0],
                                                           r.liverpool->DrawCbExtent(0)};
@@ -19559,7 +19545,78 @@ void NativeRenderer::CopyPicture(const Native::ImageEntry& from, const Native::I
     ++s.commands;
 }
 
-Native::ImageEntry* NativeRenderer::TemporalPicture(Native::ImageEntry*& slot,
+// FIX-SGT-063: neither a CPU recording scope nor an unsubmitted list has a completed GPU tick.
+void NativeRenderer::NoteTemporalRead(const Display& display, u64 tick) {
+    if (std::ranges::none_of(display.temporal_images, [](const auto& image) { return bool(image); })) {
+        return;
+    }
+    std::scoped_lock lock{temporal_read_mutex};
+    for (const auto& image : display.temporal_images) {
+        if (image) image->presenter_tick = std::max(image->presenter_tick, tick);
+    }
+}
+
+void NativeRenderer::RetireTemporalPicture(std::shared_ptr<TemporalScratchImage>& slot) {
+    auto& retired = temporal.retired.emplace_back();
+    retired.picture = std::move(slot);
+}
+
+void NativeRenderer::SealTemporalPictures(u64 tick) {
+    // Unsealed images form a suffix. A later splice must never extend a sealed lifetime.
+    for (auto it = temporal.retired.rbegin(); it != temporal.retired.rend() && !it->native_tick; ++it) {
+        it->native_tick = tick;
+    }
+}
+
+void NativeRenderer::ReleaseTemporalPicture(std::shared_ptr<TemporalScratchImage>& picture) {
+    if (!picture) return;
+    {
+        std::scoped_lock lock{views_mutex};
+        const auto found = views.find(picture.get());
+        if (found != views.end()) {
+            for (const auto& record : found->second) {
+                Native::DeadHandles::Note(static_cast<VkImageView>(*record.view));
+            }
+            views.erase(found);
+        }
+    }
+    picture.reset();
+}
+
+void NativeRenderer::CollectTemporalPictures(u64 completed) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_DLSS_TEMPORAL_RETIRE");
+        return !(env && env[0] == '0');
+    }();
+    if (!enabled || temporal.retired.empty()) return;
+    // While an unpublished Display exists it owns a reference. After its last reference drops
+    // this lock makes its submitted tick visible without relying on use_count for ordering.
+    std::scoped_lock read_lock{temporal_read_mutex};
+    std::erase_if(temporal.retired, [&](RetiredTemporalPicture& item) {
+        if (!item.native_tick || item.native_tick > completed || item.picture.use_count() != 1 ||
+            item.picture->presenter_tick > completed) {
+            return false;
+        }
+        ReleaseTemporalPicture(item.picture);
+        return true;
+    });
+}
+
+void NativeRenderer::ClearTemporalPictures() {
+    // The scheduler has finished and the presenter no longer records commands.
+    for (auto& [address, layer] : hud_layers) {
+        ReleaseTemporalPicture(layer.black);
+        ReleaseTemporalPicture(layer.white);
+    }
+    for (auto& slot : temporal.ui_scene) ReleaseTemporalPicture(slot);
+    ReleaseTemporalPicture(temporal.kept);
+    ReleaseTemporalPicture(temporal.raw_display);
+    ReleaseTemporalPicture(temporal.raw_result);
+    for (auto& item : temporal.retired) ReleaseTemporalPicture(item.picture);
+    temporal.retired.clear();
+}
+
+Native::ImageEntry* NativeRenderer::TemporalPicture(std::shared_ptr<TemporalScratchImage>& slot,
                                                     const Native::ImageEntry& like,
                                                     vk::Extent2D size) {
     if (size.width == 0 || size.height == 0) {
@@ -19567,13 +19624,12 @@ Native::ImageEntry* NativeRenderer::TemporalPicture(Native::ImageEntry*& slot,
     }
     if (slot && (slot->info.size.width != size.width || slot->info.size.height != size.height ||
                  slot->image->Desc().format != like.image->Desc().format)) {
-        temporal.retired.push_back(slot); // commands recorded may still name it
-        slot = nullptr;
+        RetireTemporalPicture(slot);
     }
     if (!slot) {
-        slot = MakeHudPicture(like, 1, size);
+        slot = MakeHudPicture(like, size);
     }
-    return slot;
+    return slot.get();
 }
 
 bool NativeRenderer::TemporalSwapIn() {
@@ -24442,6 +24498,10 @@ void NativeRenderer::Splice(std::source_location where) {
     AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Splices};
     Stream& s = Ctx().stream;
     if (!s.list) {
+        if (!temporal.retired.empty() && !Ctx().hud_stream.list && !Ctx().hud_black_stream.list) {
+            SealTemporalPictures(std::max(r.scheduler.CurrentTick(), ActiveSubmitSignal()));
+            CollectTemporalPictures(r.scheduler.GetWorkSemaphore()->KnownGpuTick());
+        }
         return;
     }
     DrainBinder(); // FEAT-SGT-022: its jobs use the list's pools and binds
@@ -24510,6 +24570,8 @@ void NativeRenderer::Splice(std::source_location where) {
         device->MarkExecuted(s.list, {timeline.get(), tick});
     }
     const u64 retire_tick = std::max(tick, boundary_signal);
+    SealTemporalPictures(retire_tick);
+    CollectTemporalPictures(r.scheduler.GetWorkSemaphore()->KnownGpuTick());
     retired_pipeline_owners.Retire(retire_tick);
     retired_pipeline_owners.Collect(r.scheduler.GetWorkSemaphore()->KnownGpuTick(),
         [&](auto owners) { r.pipeline_cache.ReleaseCompletedPipelineOwners(std::move(owners)); });
@@ -24701,6 +24763,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
                                                                    vk::Extent2D output_size) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::FindDisplay}; // DIAG-SGT-023
     std::scoped_lock lock{mutex};
+    CollectTemporalPictures(r.scheduler.GetWorkSemaphore()->KnownGpuTick());
     (void)A82CaptureAfterRace(); // Observe race even when target shader does not run.
     if (InPlaceSampled()) {
         for (u32 i = 0; i < in_place.pages.size(); ++i) {
@@ -24935,6 +24998,8 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
             hud_view.format = view_format;
             display.hud_black = View(*it->second.black, hud_view, ViewUse::Sampled);
             display.hud_white = View(*it->second.white, hud_view, ViewUse::Sampled);
+            display.temporal_images[0] = it->second.black;
+            display.temporal_images[1] = it->second.white;
             display.hud_race = it->second.race_frame + 1 == frame;
         }
     }
@@ -24957,6 +25022,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         if (const vk::ImageView raw = View(*temporal.raw_display, view_info, ViewUse::Sampled)) {
             display.image =
                 vk::Image{Handle<VkImage_T>(temporal.raw_display->image->NativeHandle())};
+            display.temporal_images[2] = temporal.raw_display;
             display.view = raw;
             raw_shown = true;
         }
@@ -25010,13 +25076,14 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         inputs.reset = temporal.reset;
         // A menu frame whose interface went through DLSS: the display before its interface,
         // seen through the display's own view (same channel order as what DLSS gets).
-        const Native::ImageEntry* ui_scene = temporal.ui_scene[temporal.ui_scene_slot];
+        const auto& ui_scene = temporal.ui_scene[temporal.ui_scene_slot];
         if (ui_scene && temporal.ui_scene_frame + 1 == frame &&
             temporal.ui_scene_address == entry->info.guest_address &&
             ui_scene->info.size.width == entry->info.size.width &&
             ui_scene->info.size.height == entry->info.size.height &&
             RytyUpscale::TemporalUiMask().load(std::memory_order_relaxed)) {
             inputs.ui_scene_view = View(*ui_scene, view_info, ViewUse::Sampled);
+            display.temporal_images[3] = ui_scene;
         }
         if (inputs.depth_view && inputs.motion_view) {
             display.temporal = inputs;

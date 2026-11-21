@@ -431,12 +431,12 @@ static void NoteFlush(const std::source_location& loc) {
 }
 
 #endif
-void Scheduler::Flush(SubmitInfo& info, std::source_location loc) {
+u64 Scheduler::Flush(SubmitInfo& info, std::source_location loc) {
 #ifndef NDEBUG
     NoteFlush(loc);
 #endif
     // When flushing, we only send data to the driver; no waiting is necessary.
-    SubmitExecution(info);
+    return SubmitExecution(info);
 }
 
 void Scheduler::Flush(std::source_location loc) {
@@ -558,7 +558,7 @@ void Scheduler::CloseSession() {
     Check(session.primary.end());
 }
 
-void Scheduler::SubmitExecution(SubmitInfo& info) {
+u64 Scheduler::SubmitExecution(SubmitInfo& info) {
     Common::PhaseTimer submit_timer{Common::Phase::Submit};
     RYDIAG_SCOPE(Submit);
     AmdGpu::RecorderParts::Scope part{AmdGpu::RecorderParts::Part::Submits}; // DIAG-GT7-005
@@ -627,7 +627,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
                     ms(queue_end, session_end), ms(begin_end, queue_end), ms(finish, begin_end));
     }
 #endif
-
+    return signal_value;
 }
 
 void Scheduler::SubmitSessions(SubmitInfo& info, u64 signal_value) {

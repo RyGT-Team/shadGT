@@ -378,8 +378,8 @@ public:
     ~Scheduler();
 
     /// Sends the current execution context to the GPU
-    /// and increments the scheduler timeline semaphore.
-    void Flush(SubmitInfo& info, std::source_location loc = std::source_location::current());
+    /// and returns the timeline value signalled by this submission.
+    u64 Flush(SubmitInfo& info, std::source_location loc = std::source_location::current());
 
     /// Sends the current execution context to the GPU
     /// and increments the scheduler timeline semaphore.
@@ -536,7 +536,7 @@ private:
 
     void EndSession();
 
-    void SubmitExecution(SubmitInfo& info);
+    u64 SubmitExecution(SubmitInfo& info);
 
     /// The parts that touch command buffers and the queue (the command thread, if any).
     void OpenSession();

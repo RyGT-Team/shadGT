@@ -783,9 +783,12 @@ private:
     /// were all skipped (their skipped draws' pipelines are built first from then on).
     void NoteSkippedReads(const DrawBindings& b, const Shader::Info* reader);
     void CheckOneOffs();     ///< each frame
-    /// PERF-GTS-493: one-off pictures skipped in a race and not drawn since (end-of-race report).
+#ifdef SHADGT_DIAGNOSTICS
+    /// PERF-GTS-493: one-off pictures skipped in a race and not drawn since (end-of-race report;
+    /// DIAG-SGT-071: diagnostics builds only, its writers with it).
     void NoteRaceMissing(const AmdGpu::Regs& regs);
     void CheckRaceMissing(); ///< each frame
+#endif
     std::string OneOffText(); ///< the window's counts, then cleared
     /// What the draw that first waited for a picture says of it: is it a colour target (and
     /// which) or the depth buffer, its pitch, height, slices, samples, format and tiling.
@@ -832,11 +835,16 @@ private:
     u64 one_off_budget_frame = ~u64{0};
     u64 one_off_wait_ns_frame = 0;
     std::unordered_map<VAddr, OneOffWatch> one_off_watch;
+#ifdef SHADGT_DIAGNOSTICS
     struct RaceMissing {
         OneOffHit hit{};
         u64 frame = 0;
         u64 ps_hash = 0;
         u64 skips = 0;
+        u64 last_skip = 0;  ///< DIAG-SGT-071: the frame of its last skip
+        u64 first_read = 0; ///< DIAG-SGT-071: first frame seen reading it, from the last skip's on
+        u64 last_read = 0;  ///< and the last one
+        u64 read_frames = 0; ///< frames seen reading it (each report pass counts a change once)
     };
     std::unordered_map<VAddr, RaceMissing> race_missing; ///< PERF-GTS-493
     struct {
@@ -844,6 +852,7 @@ private:
         bool running = false;
         std::chrono::steady_clock::time_point last{};
     } race_missing_state; ///< PERF-GTS-493
+#endif
     struct {
         /// [never drawn, not lately][redrawn after 1, 2-4, 5-16, 17-64, 65-300 frames; sampled
         /// in a later frame first; neither in 300 frames]: pictures, and the draws that waited.

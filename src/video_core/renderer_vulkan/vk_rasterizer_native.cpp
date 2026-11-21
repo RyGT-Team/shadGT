@@ -7695,6 +7695,9 @@ static void NoteCheckerboardRead(VAddr address, u64 program, bool storage) {
                 program, address, storage ? " as storage" : "");
 }
 
+#ifdef SHADGT_DIAGNOSTICS
+// PERF-GTS-493, DIAG-SGT-071: the race report is diagnostic only (its one reader is the log
+// line), so it is built, writers and reader together, in diagnostics builds only.
 void NativeRenderer::NoteRaceMissing(const AmdGpu::Regs& regs) {
     u64 ps_hash = 0;
     if (regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Fragment))) {
@@ -7714,14 +7717,41 @@ void NativeRenderer::NoteRaceMissing(const AmdGpu::Regs& regs) {
             it->second.ps_hash = ps_hash;
         }
         ++it->second.skips;
+        // DIAG-SGT-071: a read is counted from the last skip on (what it reads is that stale).
+        it->second.last_skip = frame;
+        it->second.first_read = 0;
+        it->second.last_read = 0;
+        it->second.read_frames = 0;
     }
 }
 
 void NativeRenderer::CheckRaceMissing() {
-    std::erase_if(race_missing, [&](const auto& item) {
+    std::erase_if(race_missing, [&](auto& item) {
         const Native::ImageEntry* entry = registry->FindExisting(
             item.first, [](const Native::ImageEntry& e) { return !e.from_cpu && e.image != nullptr; });
-        return entry && entry->written_frame.load(std::memory_order_relaxed) > item.second.frame;
+        if (!entry) {
+            return false;
+        }
+        if (entry->written_frame.load(std::memory_order_relaxed) > item.second.frame) {
+            return true;
+        }
+        // DIAG-SGT-071: whether the game reads the picture it could not draw (then a stale or
+        // empty picture is on screen) or never does (the skip cost nothing), and when. Reads
+        // and skips are known by frame, so a read in the frame of the last skip counts: one-off
+        // pictures are usually drawn and then sampled in the same frame, the very case to see.
+        // A read earlier in that frame, before the skip, counts too; it is rare, and that read
+        // also saw a picture the frame did not draw. A draw count per skip and per read would
+        // tell the two apart, at the cost of one more counter on every draw.
+        auto& missing = item.second;
+        const u64 read = entry->race_read_frame;
+        if (read >= missing.last_skip && read != missing.last_read) {
+            if (missing.first_read == 0) {
+                missing.first_read = read;
+            }
+            missing.last_read = read;
+            ++missing.read_frames;
+        }
+        return false;
     });
     const bool in_race = RytyGtsInRace();
     const bool running = RytyRaceRunning();
@@ -7744,11 +7774,17 @@ void NativeRenderer::CheckRaceMissing() {
             break;
         }
         const auto& h = missing.hit;
-        list += fmt::format(" {:#x} {} {}x{} format {}/{} ps {:#x}, skipped {} times since frame "
-                            "{};",
+        // DIAG-SGT-071: and whether it was read from the frame of its last skip on.
+        const std::string read =
+            missing.first_read == 0
+                ? std::string{"not read since"}
+                : fmt::format("read since (frames {} to {}, {} seen)", missing.first_read,
+                              missing.last_read, missing.read_frames);
+        list += fmt::format(" {:#x} {} {}x{} format {}/{} ps {:#x}, skipped {} times from frame "
+                            "{} to {}, {};",
                             address, h.depth ? std::string{"depth"} : fmt::format("color{}", h.cb), h.pitch,
                             h.height, h.format, h.number_format, missing.ps_hash, missing.skips,
-                            missing.frame);
+                            missing.frame, missing.last_skip, read);
     }
     LOG_WARNING(Render_Vulkan,
                 "PERF-GTS-493 {}: {} one-off pictures skipped in the race and not drawn since{}{}",
@@ -7761,6 +7797,7 @@ void NativeRenderer::CheckRaceMissing() {
         race_missing.clear(); // a new session's pictures are its own
     }
 }
+#endif // SHADGT_DIAGNOSTICS
 
 void NativeRenderer::CheckOneOffs() {
     if (!OneOffTrackOn() || one_off_watch.empty()) {
@@ -15977,7 +16014,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         } else {
             ++stats.one_off_race_skips;
             stats.kept_shadow_skips += one_off_kept_shadow ? 1 : 0;
-            NoteRaceMissing(regs); // for the end-of-race report
+#ifdef SHADGT_DIAGNOSTICS
+            NoteRaceMissing(regs); // for the end-of-race report (diagnostics builds only)
+#endif
             WatchOneOffs(regs, true);
         }
     } else if (!pipeline && !one_off_hits.empty()) {
@@ -21622,6 +21661,12 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         auto& entry = *const_cast<Native::ImageEntry*>(sampled);
         checks.Next(1);
         entry.last_use.store(frame, std::memory_order_relaxed);
+#ifdef SHADGT_DIAGNOSTICS
+        // DIAG-SGT-071 (diagnostics builds only): a prepared draw's read, in GPU order. The job
+        // thread's lookups are not reads: a draw it prepared may be turned down here, and the
+        // recorder then binds it again (SeqBind).
+        entry.race_read_frame = frame;
+#endif
         checks.Next(2);
         if (entry.from_cpu) registry->LayersRewritten(entry, frame);
         checks.Next(3);
@@ -23412,6 +23457,11 @@ void NativeRenderer::SeqBind(const Native::ImageEntry& entry, const AmdGpu::Imag
         const_cast<Native::ImageEntry&>(entry).sampled_frame.store(frame,
                                                                    std::memory_order_relaxed);
     }
+#ifdef SHADGT_DIAGNOSTICS
+    if (!storage) {
+        entry.race_read_frame = frame; // DIAG-SGT-071 (diagnostics builds only): a recorded read
+    }
+#endif
     if (!SeqTraced(&entry)) {
         return;
     }
@@ -24798,7 +24848,9 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         RyDiag::SetProfileTag(drawn > 3300 ? 2 : 0);
     }
     CheckOneOffs(); // DIAG-GT7-008
-    CheckRaceMissing(); // PERF-GTS-493
+#ifdef SHADGT_DIAGNOSTICS
+    CheckRaceMissing(); // PERF-GTS-493 (diagnostics builds only)
+#endif
     // The game's render target there (its layout from the CB registers may differ in details
     // from the video out description), else an image of the display layout.
     // Merge (shadGT): GT7 looks its display up by its exact size, and shows the corner of a larger

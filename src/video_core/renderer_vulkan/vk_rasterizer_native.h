@@ -1073,8 +1073,21 @@ private:
         }
     };
     static_assert(sizeof(BufferMemo) == 64);
-    u64 buffer_generation = 0;
-    u64 buffer_hard_generation = 0; ///< PERF-GT7-047: what the change log doesn't tell
+    /// PERF-SGT-062: a counter only the recorder writes (under `mutex`) that other threads may
+    /// read: a relaxed atomic, bumped by a load and a store (no locked add on the hot path), read
+    /// as a plain u64.
+    struct RecorderCounter {
+        std::atomic<u64> value{0};
+        operator u64() const {
+            return value.load(std::memory_order_relaxed);
+        }
+        RecorderCounter& operator++() {
+            value.store(value.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+            return *this;
+        }
+    };
+    RecorderCounter buffer_generation;
+    RecorderCounter buffer_hard_generation; ///< PERF-GT7-047: what the change log doesn't tell
     /// OPT-003: what the last lookup can be remembered as (set by GuestBufferLookup).
     enum class MemoKind : u8 { None, Region, Mirror, InPlace };
     /// OPT-004: the mirror the last GuestBuffer bound from (none when it bound anything else).
@@ -1213,6 +1226,31 @@ private:
     u64 ReuseGeneration() const;
     void BindStages(std::span<const Shader::Info* const> stages, const AmdGpu::Regs& regs,
                     bool compute, DrawBindings& b);
+    /// PERF-SGT-062: BindStages as it always was: every state change done where binding asks.
+    void BindStagesNow(std::span<const Shader::Info* const> stages, const AmdGpu::Regs& regs,
+                       bool compute, DrawBindings& b);
+    /// PERF-SGT-062 (SHADGT_BIND_COMMIT): bind with the content-only work queued, then commit it
+    /// in order; on a failed check the queue is dropped and the work binds again at once.
+    void BindStagesCommitted(std::span<const Shader::Info* const> stages, const AmdGpu::Regs& regs,
+                             bool compute, DrawBindings& b);
+    /// PERF-SGT-062: whether bind-then-commit runs for the next work (the switch, or its arm in
+    /// the alternating mode).
+    bool BindCommitOn();
+    /// PERF-SGT-062: while binding queues, puts the op in the commit list (true: queued, the
+    /// caller does nothing now).
+    enum class CommitKind : u8 { RefreshRegion, RefreshMirror, ApplyRewrite, SyncDepthTwin,
+                                 RefreshSources, Count };
+    bool QueueCommit(CommitKind kind, void* target, VAddr address = 0, u64 size = 0);
+    /// PERF-SGT-062 (diagnostics builds): counts an op that does work, queued or not.
+    void NoteCommitWork(CommitKind kind);
+    /// PERF-SGT-062: a pass starts (render scope or dispatch run): the generations binding sees.
+    void BindCommitPassBegin(bool render);
+    u64 PassDiagMutations() const;     ///< DIAG-SGT-061 (diagnostics builds)
+    void PassDiagBegin(bool render);   ///< DIAG-SGT-061: a render scope or a dispatch run starts
+    void PassDiagItem(u64 ns);         ///< DIAG-SGT-061: a draw or dispatch's recorder time
+    void PassDiagSampled(const DrawBindings& b); ///< DIAG-SGT-061: sampled pictures of a draw
+    void PassDiagWritten(const void* entry);     ///< DIAG-SGT-061: a picture written by this pass
+    bool PassDiagOn() const;           ///< DIAG-SGT-061
     /// FIX-GT7-090: BindStages again when a region made while binding took in one an earlier
     /// binding of the same draw or dispatch was given (its writes would go to the old buffer).
     void BindStagesStable(std::span<const Shader::Info* const> stages, const AmdGpu::Regs& regs,
@@ -1940,6 +1978,29 @@ private:
         Region* memo_region = nullptr;
         Mirror* memo_mirror = nullptr;
         Mirror* last_mirror = nullptr;
+        /// PERF-SGT-062 (SHADGT_BIND_COMMIT): the commit list of the work being bound. Binding
+        /// queues the work that changes only contents (region and mirror page copies, picture
+        /// rewrites, depth-twin and source copies: the handles bound stay the same) and the
+        /// commit does it in the order it was asked for, before the work's commands. Work that
+        /// makes or drops something (regions, mirrors, pictures) is still done where binding asks;
+        /// a change of the generations below after the first queued op fails the commit check.
+        struct CommitOp {
+            CommitKind kind;
+            void* target;
+            VAddr address;
+            u64 size;
+        };
+        struct BindCommit {
+            bool queueing = false;
+            bool armed = false; ///< generations taken at the first queued op
+            bool dispatch_run = false; ///< the current pass is a run of dispatches
+            u64 buffer_generation = 0, hard_generation = 0, registry_generation = 0,
+                unmap_generation = 0;
+            std::vector<CommitOp> ops;
+            /// The generations when the current pass started (what a recorder binding the pass
+            /// ahead would bind under), and when the pass before it started.
+            std::array<u64, 3> pass_generations{}, previous_pass_generations{};
+        } commit;
     };
     /// A plain member, not behind a pointer: Ctx() then compiles to what the members did (a
     /// unique_ptr adds a load on every access and keeps the members out of registers).

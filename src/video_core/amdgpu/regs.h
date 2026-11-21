@@ -165,6 +165,12 @@ union Regs {
     };
     std::array<u32, NumRegs> reg_array;
 
+    // FIX-SGT-069: both games write PA_SC_AA_MASK_X0Y0_X1Y0 and X0Y1_X1Y1.
+    // Each word contains the two 16-bit pixel masks of one quad row.
+    std::array<u32, 2> AaSampleMask() const {
+        return {reg_array[0xa30e], reg_array[0xa30f]};
+    }
+
     const ShaderProgram* ProgramForStage(u32 index) const {
         switch (index) {
         case 0:

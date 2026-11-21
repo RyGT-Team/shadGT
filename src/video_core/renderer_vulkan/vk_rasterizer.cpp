@@ -79,17 +79,10 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     push_data.xscale = regs.viewport_control.xscale_enable ? regs.viewports[0].xscale : 1.f;
     push_data.yoffset = regs.viewport_control.yoffset_enable ? regs.viewports[0].yoffset : 0.f;
     push_data.yscale = regs.viewport_control.yscale_enable ? regs.viewports[0].yscale : 1.f;
-    push_data.quad_sample_mask = {regs.reg_array[0xa30e], regs.reg_array[0xa30f]};
 #ifdef RYTY_GPU
-    if (RytyGhost::ShouldSmooth(regs)) {
-        push_data.quad_sample_mask = {~0u, ~0u};
-        static std::once_flag logged;
-        std::call_once(logged, [] {
-            LOG_WARNING(Render_Vulkan,
-                        "ryGT ghost: smooth 50% color blend for ghost coverage draws; "
-                        "depth/stencil state and velocity output retained");
-        });
-    }
+    push_data.quad_sample_mask = RytyGhost::DrawSampleMask(regs);
+#else
+    push_data.quad_sample_mask = regs.AaSampleMask();
 #endif
     return push_data;
 }
@@ -3865,6 +3858,7 @@ void Rasterizer::FrameDumpPass(const AmdGpu::Regs& regs, const RenderState& stat
                                            : std::string{},
                             db.stencil_clear ? " SCLEAR" : "");
     }
+    const auto extent_at = text.size();
     text += fmt::format(" | {}x{}", state.width, state.height);
     std::scoped_lock lock{frame_dump_mutex};
     if (TraceRange().first != TraceRange().second && text != trace_last_pass) {
@@ -3887,6 +3881,27 @@ void Rasterizer::FrameDumpPass(const AmdGpu::Regs& regs, const RenderState& stat
     }
     if (!frame_dump_collecting && !traced_draw) {
         return;
+    }
+    // FIX-SGT-069: keep masked draws distinguishable in a capture even when they share
+    // the opaque car's targets. Record the guest's sample-0 XY byte for each quad pixel.
+    const auto [mask0, mask1] = regs.AaSampleMask();
+    if (frame_dump_collecting && (mask0 != ~0u || mask1 != ~0u)) {
+        std::string coverage = fmt::format(
+            " aa_mask {:#010x} {:#010x} sample0_xy {:02x}/{:02x}/{:02x}/{:02x}",
+            mask0, mask1, regs.reg_array[0xa2fe] & 0xff, regs.reg_array[0xa302] & 0xff,
+            regs.reg_array[0xa306] & 0xff, regs.reg_array[0xa30a] & 0xff);
+        if (pipeline) {
+            const auto& stages = pipeline->GetStages();
+            const auto* hull = stages[u32(Shader::SwStage::TessellationControl)];
+            const auto* fragment = stages[u32(Shader::SwStage::Fragment)];
+            coverage += fmt::format(" hs {:#x} fs {:#x} lds_mode {} raster_samples {}",
+                                    hull ? hull->pgm_hash : 0, fragment ? fragment->pgm_hash : 0,
+                                    pipeline->LdsEmulation(), pipeline->RasterSamples());
+        }
+#ifdef RYTY_GPU
+        coverage += fmt::format(" smooth_ghost {}", RytyGhost::ShouldSmooth(regs));
+#endif
+        text.insert(extent_at, coverage);
     }
     // DIAG-203 (SHADGT_FRAME_DUMP_DRAWS=1): every draw gets its own line, not only a pass's first.
     static const bool every_draw = [] {

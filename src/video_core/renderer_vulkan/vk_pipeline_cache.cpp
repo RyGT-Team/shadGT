@@ -299,7 +299,8 @@ u32 TessLdsEmulation(const AmdGpu::Regs& regs) {
     }();
     if (mode == 0 || !regs.stage_enable.hs_en || regs.ls_hs_config.hs_input_control_points == 0 ||
         regs.ls_hs_config.num_patches <= 1) return 0;
-    return TessLdsModeForMask(mode, regs.reg_array[0xa30e], regs.reg_array[0xa30f]);
+    const auto [top, bottom] = regs.AaSampleMask();
+    return TessLdsModeForMask(mode, top, bottom);
 }
 namespace {
 ExitSaveRegistry<PipelineCache>& ExitCacheRegistry() {
@@ -1587,8 +1588,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
             ReadsVertexValues(regs.ps_program); // DIAG-222 (port): counted on any GPU
         }
         info.hw.fs.front_face_all_bits = regs.barycentric_control.front_face_all_bits;
-        info.hw.fs.quad_sample_mask =
-            regs.reg_array[0xa30e] != ~0u || regs.reg_array[0xa30f] != ~0u;
+        info.hw.fs.quad_sample_mask = regs.AaSampleMask() != std::array{~0u, ~0u};
         info.hw.fs.num_samples =
             regs.ps_input_addr.sample_coverage_ena && regs.ps_input_ena.sample_coverage_ena
                 ? regs.aa_config.NumSamples()

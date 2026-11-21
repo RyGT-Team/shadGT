@@ -10,17 +10,34 @@
 
 using namespace Vulkan::RytyGhost;
 inline constexpr Appearance DefaultAppearance{};
+bool test_default{};
+
+#ifdef _WIN32
+// FIX-SGT-069: this fixture supplies the smoothing switch and appearance explicitly.
+// Reading a player's configuration would make the result depend on the installation.
+std::string_view Common::GameSettingsSerial() {
+    if (test_default) {
+        return "GHOST-TEST-EMPTY-PROFILE";
+    }
+    throw std::logic_error("ghost test unexpectedly requested the player's configuration");
+}
+#endif
 
 void Check(bool condition, const char* message) {
     if (!condition)
         throw std::runtime_error(message);
 }
 
-int main(int argc, char**) {
+int main(int argc, char** argv) {
+    test_default = argc > 1 && std::string_view{argv[1]} == "default";
 #ifdef _WIN32
-    _putenv_s("SHADGT_SMOOTH_GHOST", argc > 1 ? "0" : "1");
+    _putenv_s("SHADGT_SMOOTH_GHOST", test_default ? "" : argc > 1 ? "0" : "1");
 #else
-    setenv("SHADGT_SMOOTH_GHOST", argc > 1 ? "0" : "1", 1);
+    if (test_default) {
+        unsetenv("SHADGT_SMOOTH_GHOST");
+    } else {
+        setenv("SHADGT_SMOOTH_GHOST", argc > 1 ? "0" : "1", 1);
+    }
 #endif
     auto regs = std::make_unique<AmdGpu::Regs>();
     std::memset(regs.get(), 0, sizeof(*regs));
@@ -38,6 +55,24 @@ int main(int argc, char**) {
     regs->color_target_mask.raw = 0xff;
     regs->blend_constants = {0.1f, 0.2f, 0.3f, 0.4f};
     Check(IsGhostCoverageDraw(*regs), "captured ghost state must match");
+    // FIX-SGT-069: register words observed in GT7 and GT Sport. Also exercise an arbitrary
+    // mask so the renderer cannot pass this check by substituting a table for the game.
+    auto pro = std::make_unique<AmdGpu::Regs>(*regs);
+    for (const auto words : {std::array{0u, 0u}, std::array{0x44448888u, 0x11112222u},
+                             std::array{0xcccc9999u, 0x33336666u}, std::array{0x33336666u, 0xcccc9999u},
+                             std::array{0xddddbbbbu, 0x7777eeeeu}, std::array{~0u, ~0u},
+                             std::array{0x8421abcdu, 0x12345a5au}}) {
+        pro->reg_array[0xa30e] = words[0];
+        pro->reg_array[0xa30f] = words[1];
+        pro->depth_buffer.z_info.num_samples = 1; // two depth samples in the Pro pass
+        Check(DrawSampleMask(*pro) == words, "Pro must preserve both guest quad rows");
+        pro->depth_buffer.z_info.num_samples = 0;
+        if (argc > 1 || !IsGhostCoverageDraw(*pro)) {
+            Check(DrawSampleMask(*pro) == words, "standard path must preserve guest coverage");
+        } else {
+            Check(DrawSampleMask(*pro) == std::array{~0u, ~0u}, "requested single-sample smoothing");
+        }
+    }
     if (argc > 1) {
         regs->primitive_type = AmdGpu::PrimitiveType::PatchPrimitive;
         for (const u64 hash : {TireShaderHash, RimShaderHash, RimDetailShaderHash}) {

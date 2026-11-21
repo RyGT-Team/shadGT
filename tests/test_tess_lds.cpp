@@ -74,6 +74,10 @@ TEST(TessLdsScratch, RawMaskSelectsUnmodifiedShader) {
     EXPECT_EQ(TessLdsModeForMask(2, 0xffff0000u, ~0u), 0u);
     EXPECT_EQ(TessLdsModeForMask(2, 0xffff0000u, 0xffff0000u), 0u);
     EXPECT_EQ(TessLdsModeForMask(0, ~0u, ~0u), 0u);
-    // A ghost override only changes pushed words; raw registers still select mode zero.
-    EXPECT_EQ(TessLdsModeForMask(2, ~0u, 0xffff0000u), 0u);
+    // FIX-SGT-069: the two ghost phases still select the native hull shader if the
+    // recorder later replaces the pushed mask for smooth ghost blending.
+    for (const auto mode : {1u, 2u}) {
+        EXPECT_EQ(TessLdsModeForMask(mode, 0xcccc9999u, 0x33336666u), 0u);
+        EXPECT_EQ(TessLdsModeForMask(mode, 0x33336666u, 0xcccc9999u), 0u);
+    }
 }

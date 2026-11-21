@@ -109,6 +109,32 @@
 #include "ryty_gpu/ryty_diag.h"
 
 namespace {
+// FIX-SGT-094: SHADGT_SRT_FULL_MEMO=0 translates a shader whose walker the SRT walker storage
+// refused again at each of its draws, as before (each try a front end on the command thread, the
+// draw skipped all the same).
+bool WalkerMemoEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_SRT_FULL_MEMO");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+#ifdef SHADGT_DIAGNOSTICS
+// FIX-SGT-094 (diagnostics builds): the draws whose pipeline lookup found no key, and the time
+// those lookups took on their thread, given in the walker storage's 5 s summary. Lookups hold the
+// lookup lock (PERF-047), one at a time.
+struct NullDraws {
+    u64 count{};
+    std::chrono::steady_clock::duration time{};
+    std::chrono::steady_clock::time_point since{std::chrono::steady_clock::now()};
+};
+NullDraws g_null_draws;
+void NoteNullDraw(std::chrono::steady_clock::time_point lookup_start) {
+    ++g_null_draws.count;
+    g_null_draws.time += std::chrono::steady_clock::now() - lookup_start;
+}
+#endif
+
 // DIAG-SGT-024 (diagnostics builds): how program searches are decided, by stage group (pixel,
 // other graphics, compute), logged every 5 s: the memo's replays, the last match's packed and
 // full checks, the loop over permutations and the specializations it builds.
@@ -5342,6 +5368,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     // FIX-078: missing translations of this draw's stages are queued together first; then the
     // draws after it are read and their shaders queued too, and the key is made again, waiting
     // for the workers' results (the slowest one, not their sum).
+#ifdef SHADGT_DIAGNOSTICS
+    const auto lookup_start = std::chrono::steady_clock::now(); // FIX-SGT-094 (NoteNullDraw)
+#endif
     defer_misses = AsyncTranslation();
     deferred_miss = false;
     fallback_miss = false;
@@ -5402,6 +5431,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         ++async_stats.skipped_translating;
 #endif
         NoteSkippedDraw();
+#ifdef SHADGT_DIAGNOSTICS
+        NoteNullDraw(lookup_start);
+#endif
         return nullptr;
     }
     if (!key_valid && deferred_miss) {
@@ -5409,6 +5441,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         key_valid = RefreshGraphicsKey();
     }
     if (!key_valid) {
+#ifdef SHADGT_DIAGNOSTICS
+        NoteNullDraw(lookup_start);
+#endif
         return nullptr;
     }
     {
@@ -6636,6 +6671,14 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
         Common::RecoverableScope recoverable;
         const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
         spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
+    } catch (const Shader::SrtStorageFull& full) {
+        // FIX-SGT-094: GetProgramImpl translates it again only once its walker could fit.
+        LOG_ERROR(Render_Vulkan,
+                  "SHADER-FAIL: {} shader {:#x} (permutation {}, {} dwords) could not be "
+                  "translated: {}; draws that use it are skipped",
+                  info.hw_stage, info.pgm_hash, perm_idx, code.size(), full.what());
+        NoteWalkerRefused(info.pgm_hash, info.hw_stage, full.bytes);
+        return {};
     } catch (const Common::RecoverableFailure& e) {
         LOG_ERROR(Render_Vulkan,
                   "SHADER-FAIL: {} shader {:#x} (permutation {}, {} dwords) could not be "
@@ -6803,6 +6846,12 @@ void PipelineCache::ApplyStoredListing(StoredListing&& listing, Program& program
         try {
             Common::RecoverableScope recoverable;
             valid = ar.SizeBytes() >= 24 && LoadShaderMeta(ar, *info, spec, stored_idx);
+        } catch (const Shader::SrtStorageFull&) {
+            // FIX-SGT-094: not of another version: the walker storage was full. Counted apart;
+            // the permutation is lost for the session, and translated again (through the memo)
+            // if its draws come and the storage has room.
+            ++walker_refused_entries;
+            continue;
         } catch (const Common::RecoverableFailure&) {
             valid = false;
         }
@@ -6838,8 +6887,9 @@ void PipelineCache::ApplyStoredListing(StoredListing&& listing, Program& program
     if (++programs % 500 == 0) {
         LOG_WARNING(Render_Vulkan,
                     "PERF-032: shader store: {} programs looked up, {} stored permutations "
-                    "listed, {} entries of another version skipped",
-                    programs, listed, stale);
+                    "listed, {} entries of another version skipped, {} refused by the walker "
+                    "storage (FIX-SGT-094)",
+                    programs, listed, stale, walker_refused_entries);
     }
 }
 
@@ -8807,6 +8857,61 @@ void PipelineCache::RecordStoredUse(HwStage hw_stage, SwStage sw_stage,
     }
 }
 
+bool PipelineCache::WalkerTranslationAllowed(u64 pgm_hash, HwStage hw_stage) {
+    if (!WalkerMemoEnabled()) return true;
+    const auto refused = walker_refused.find(HashCombine(pgm_hash, u64(hw_stage)));
+    const bool refused_before = refused != walker_refused.end();
+    const bool may_fit = refused_before && Shader::SrtWalkerMayFit(refused->second);
+    const auto now = std::chrono::steady_clock::now();
+    const auto gate = DecideWalkerGate(refused_before, may_fit, Shader::SrtWalkerStorageAtWall(),
+                                       walker_wall, now);
+    if (gate == WalkerGate::Translate) {
+        walker_attempt = now;
+        return true;
+    }
+    ++(gate == WalkerGate::SkipRefused ? walker_skips : walker_wall_skips);
+    if (now - walker_report >= std::chrono::seconds{5}) {
+        std::string null_draws;
+#ifdef SHADGT_DIAGNOSTICS
+        auto& n = g_null_draws;
+        null_draws = fmt::format(
+            "; {} draws found no pipeline in {:.1f} s, their lookups {:.1f} ms in all ({:.1f} us each)",
+            n.count, std::chrono::duration<double>(now - n.since).count(),
+            std::chrono::duration<double, std::milli>(n.time).count(),
+            n.count ? std::chrono::duration<double, std::micro>(n.time).count() / double(n.count) : 0.0);
+        n = {};
+#endif
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-SGT-094: translations skipped for the SRT walker storage in {:.1f} s: {} "
+                    "of refused shaders, {} for the wall's budget ({} shaders wait for room, {} "
+                    "stored permutations refused so far); their draws are skipped{}",
+                    std::chrono::duration<double>(now - walker_report).count(),
+                    std::exchange(walker_skips, 0), std::exchange(walker_wall_skips, 0),
+                    walker_refused.size(), walker_refused_entries, null_draws);
+        walker_report = now;
+    }
+    return false;
+}
+
+void PipelineCache::NoteWalkerRefused(u64 pgm_hash, HwStage hw_stage, size_t bytes) {
+    const auto now = std::chrono::steady_clock::now();
+    ChargeWalkerWall(walker_wall, walker_attempt, now);
+    if (!WalkerMemoEnabled()) return;
+    walker_refused[HashCombine(pgm_hash, u64(hw_stage))] = bytes;
+    static u64 refusals = 0;
+    if (++refusals <= 20 || std::has_single_bit(refusals)) {
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-SGT-094: {} shader {:#x}: its walker ({} bytes) does not fit in the SRT "
+                    "walker storage; translated again once it could ({} refusals, {} shaders "
+                    "waiting)",
+                    hw_stage, pgm_hash, bytes, refusals, walker_refused.size());
+    }
+}
+
+void PipelineCache::NoteWalkerTranslated(u64 pgm_hash, HwStage hw_stage) {
+    if (!walker_refused.empty()) walker_refused.erase(HashCombine(pgm_hash, u64(hw_stage)));
+}
+
 bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
                                      const Shader::ShaderParams& params,
                                      const Shader::RuntimeInfo& runtime_info,
@@ -8816,6 +8921,9 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
 #endif
     static const bool reported=[] { LOG_INFO(Render_Vulkan, "CPU/compiler diagnostic batch mask {} (1 priority, 2 retry, 4 library futures, 8 descriptor hash)", CompileCpuBatchMask()); return true; }();
     (void)reported;
+    // FIX-SGT-094: first, before translate_jobs gets an entry for this program (the queue cap
+    // below walks the whole map).
+    if (!WalkerTranslationAllowed(params.hash, hw_stage)) return false;
     auto& jobs = translate_jobs[params.hash];
     const auto now = std::chrono::steady_clock::now();
     std::erase_if(jobs, [&](const auto& job) {
@@ -8967,6 +9075,12 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
             std::chrono::steady_clock::now() - preparation_start).count();
 #endif
         job->prepared_translation = std::move(prepared);
+        NoteWalkerTranslated(params.hash, hw_stage); // FIX-SGT-094
+    } catch (const Shader::SrtStorageFull& full) {
+        // FIX-SGT-094: the walker is made here (front end); it was swallowed below, untold, and
+        // the next draw made the whole front end again.
+        NoteWalkerRefused(params.hash, hw_stage, full.bytes);
+        return false;
     } catch (const Common::RecoverableFailure&) {
         return false;
     } catch (const std::bad_alloc&) {
@@ -10038,6 +10152,12 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
             fallback_miss = true;
             return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
         }
+        // FIX-SGT-094: a translation the walker storage refuses now is a plain miss. Nothing is
+        // queued for it, so it sets no deferred_miss: with one, the key builder looked each such
+        // draw up again up to 8 times, with a read-ahead (094b's race at the wall: 13.5 fps).
+        if (!WalkerTranslationAllowed(params.hash, hw_stage)) {
+            return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
+        }
         const bool unlocked = t_required_lookup_lock && UnlockedShadersEnabled() && !read_ahead &&
                               !force_legacy && !fallback_nested && PreservesDepthOutput();
         if (read_ahead || defer_misses || skip_wait || unlocked) {
@@ -10085,6 +10205,9 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
     // cache then got a different specialization, overwriting the stored shader and leaving
     // every pipeline that used it unloadable ("stale"; about 1,085 per GT Sport run, compiled
     // again in every race). Start after the stored indices instead.
+    if (!WalkerTranslationAllowed(params.hash, hw_stage)) { // FIX-SGT-094, before the slot's probes
+        return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
+    }
     size_t perm_idx = program->modules.size();
     if (const auto it = stored_perm_end.find(params.hash); it != stored_perm_end.end()) {
         perm_idx = std::max(perm_idx, it->second);
@@ -10110,6 +10233,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         binding = start;
         return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
     }
+    NoteWalkerTranslated(params.hash, hw_stage); // FIX-SGT-094
     auto spec = Shader::StageSpecialization(*info, runtime_info, profile, start);
     KeepCompiledTessellationLayout(spec, compile_runtime_info);
     RegisterShaderMeta(*info, spec.fetch_shader_data, spec, perm_hash, perm_idx);

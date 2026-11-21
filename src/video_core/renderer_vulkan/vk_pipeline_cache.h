@@ -19,6 +19,7 @@
 #include <deque>
 #include "video_core/renderer_vulkan/guarded_shader_snapshot.h"
 #include "video_core/renderer_vulkan/read_ahead_retry_queue.h"
+#include "video_core/renderer_vulkan/translation_retry.h"
 #include <filesystem>
 #include <functional>
 #include <future>
@@ -876,6 +877,18 @@ private:
                           const Shader::Backend::Bindings& start, bool speculative = false);
     tsl::robin_map<u64, std::vector<std::shared_ptr<TranslateJob>>> translate_jobs;
     tsl::robin_map<u64, std::vector<std::shared_ptr<TranslateJob>>> ready_translations;
+    /// FIX-SGT-094 (lookup lock held): whether a translation of this shader may start now, given
+    /// the SRT walker storage (translation_retry.h); NoteWalkerRefused keeps a refused walker's
+    /// size, NoteWalkerTranslated forgets it.
+    bool WalkerTranslationAllowed(u64 pgm_hash, Shader::HwStage hw_stage);
+    void NoteWalkerRefused(u64 pgm_hash, Shader::HwStage hw_stage, size_t bytes);
+    void NoteWalkerTranslated(u64 pgm_hash, Shader::HwStage hw_stage);
+    tsl::robin_map<u64, size_t> walker_refused; ///< by HashCombine(program, stage): bytes
+    WalkerWallBudget walker_wall{};
+    std::chrono::steady_clock::time_point walker_attempt{};
+    u64 walker_skips{}, walker_wall_skips{};
+    u64 walker_refused_entries{}; ///< refused stored permutations (listings)
+    std::chrono::steady_clock::time_point walker_report{std::chrono::steady_clock::now()};
     /// FIX-078: while set, a draw's own missing translations are queued (all its stages at
     /// once) instead of made here one by one; `deferred_miss` tells that one was.
     bool defer_misses{};

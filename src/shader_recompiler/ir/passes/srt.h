@@ -7,6 +7,7 @@
 #include <boost/container/set.hpp>
 #include <boost/container/small_vector.hpp>
 #include "common/types.h"
+#include "shader_recompiler/ir/passes/srt_storage_full.h"
 
 namespace Serialization {
 struct Archive;
@@ -24,6 +25,11 @@ struct WalkerCode {
 };
 /// Publishes complete walker code at a stable address owned by the returned lease.
 WalkerCode RegisterWalkerCode(const u8* ptr, size_t size, u64 key = 0);
+/// FIX-SGT-094: false when no free run of the walker storage can take a walker of `bytes`,
+/// decided without a scan of its slots. True can still fail (a bound the next failure tightens).
+bool SrtWalkerMayFit(size_t bytes);
+/// FIX-SGT-094: true from a walker the storage refused until its next release.
+bool SrtWalkerStorageAtWall();
 
 struct PersistentSrtInfo {
     // Special case when fetch shader uses step rates.

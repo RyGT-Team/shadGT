@@ -236,6 +236,9 @@ public:
     /// ordered work: its prepared draw holds, nothing it reads is dirty or due an upload, and no
     /// init or upload is pending. False: B's work goes in first.
     bool RecorderAOrderedFree(const void* packet);
+    /// FEAT-SGT-079 step 26 (with `mutex`): the ranges of the pictures B's handed draws had not
+    /// found when they were prepared (B looks them up at its commit); cleared when B's work is in.
+    std::vector<std::pair<VAddr, VAddr>> b_missing_ranges;
     void SetRecorderBOutstanding(bool on) {
         b_outstanding.store(on, std::memory_order_release);
         g_b_outstanding.store(on, std::memory_order_release);

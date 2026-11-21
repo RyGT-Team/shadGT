@@ -1530,6 +1530,10 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
                 inner();
                 return;
             }
+            if (RecorderBOverlap() && !qd->to_b) { // FEAT-SGT-079 step 26: its chunk went to A
+                inner();
+                return;
+            }
             if (RecorderBOverlap()) { // FEAT-SGT-079 step 19
                 const auto cost_now = [] {
                     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1562,11 +1566,45 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
                         if (!draw || !draw->to_b || draw->tag != qd->tag || chunk.size() >= 64) break;
                         chunk.push_back(const_cast<QueuedDraw*>(draw));
                     }
+                    // Step 26: a chunk the pass ends right after (fewer than 8 of the recorder's draws
+                    // behind it) is the recorder's: the pass end would wait for B at once.
+                    {
+                        size_t follow = 0;
+                        bool end_seen = false;
+                        for (size_t k = chunk.size() - 1; k < ahead.size(); ++k) {
+                            const auto* d = ahead[k].second;
+                            if (!d || d->tag != qd->tag) {
+                                end_seen = true;
+                                break;
+                            }
+                            ++follow;
+                        }
+                        if (end_seen && follow < 8) {
+                            for (auto* d : chunk) d->to_b = false;
+                            if constexpr (Common::DiagnosticsBuilt) {
+                                ::Vulkan::NoteSubmitSite("B chunk given to the recorder: pass ends", {});
+                            }
+                            RecorderBSync(1);
+                            inner();
+                            return;
+                        }
+                    }
                     packets.clear();
                     for (const auto* d : chunk) packets.push_back(d->packet);
                     results.assign(chunk.size(), 0);
                     native->RecorderBPrepareChunk(packets, results);
                     for (size_t i = 0; i < chunk.size(); ++i) chunk[i]->overlap_ready = results[i];
+                    // Step 26: a chunk with a draw the recorder keeps is the recorder's whole (a
+                    // kept draw amid B's would make the recorder wait for B's draws before it).
+                    if (std::ranges::any_of(results, [](u8 r) { return r == 2; })) {
+                        for (auto* d : chunk) d->to_b = false;
+                        if constexpr (Common::DiagnosticsBuilt) {
+                            ::Vulkan::NoteSubmitSite("B chunk given to the recorder: a draw kept", {});
+                            overlap_cost.kept += chunk.size();
+                        }
+                        inner();
+                        return;
+                    }
                 }
                 // Step 20: the draw's pictures ready first, in the recorder's list (spliced now,
                 // ahead of B's); a draw that cannot be readied stays the recorder's, after B's.

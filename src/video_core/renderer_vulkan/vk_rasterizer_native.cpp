@@ -23059,6 +23059,11 @@ bool NativeRenderer::RecorderBPrepareForB(const void* packet, bool splice) {
         Begin();
         PrepareImages(p->bindings);
     }
+    for (const auto& missing : p->missing_pictures) { // step 26
+        b_missing_ranges.emplace_back(missing.info.guest_address,
+                                      missing.info.guest_address +
+                                          std::max<u64>(missing.info.guest_size, 1));
+    }
     if (splice && main_record_context.stream.list) { // the recorder's own work, ahead of B's
         const bool was = b_outstanding.exchange(false, std::memory_order_acq_rel);
         Splice();
@@ -23069,7 +23074,11 @@ bool NativeRenderer::RecorderBPrepareForB(const void* packet, bool splice) {
 }
 
 bool NativeRenderer::RecorderAOrderedFree(const void* packet) {
-    if (!packet) return false;
+    const auto no = [](const char* why) { // DIAG-SGT-091: why the recorder's draw syncs B
+        if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite(why, {});
+        return false;
+    };
+    if (!packet) return no("A ordered: no packet");
     std::scoped_lock lock{mutex};
     PreparedDraw* p = nullptr;
     {
@@ -23077,30 +23086,55 @@ bool NativeRenderer::RecorderAOrderedFree(const void* packet) {
         std::scoped_lock shard_lock{shard.mutex};
         if (const auto it = shard.draws.find(packet); it != shard.draws.end()) p = it->second;
     }
-    if (!p) return false;
+    if (!p) return no("A ordered: no prepared draw");
     if (p->unmap_gen != unmap_generation.load(std::memory_order_acquire) ||
         p->sampler_drops != samplers_dropped.load(std::memory_order_acquire) ||
         !registry->UntouchedHolding(p->image_generation, p->image_ranges, p->picture_ranges) ||
         !PreparedBuffersUntouched(*p, p->buffer_seq)) {
-        return false;
+        return no("A ordered: prepared draw no longer holds");
     }
-    if (!p->missing_pictures.empty() || !p->in_place.empty()) return false;
-    if (device->PendingImageInit() || registry->HasPendingUploads()) return false;
-    if (BWindowWritesPending(*p)) return false;
+    // Step 26: a picture the recorder's draw makes now matters only if one of B's handed draws
+    // also looks it up at its commit (it would find it made, with its first contents in the
+    // recorder's list, after B's).
+    for (const auto& missing : p->missing_pictures) {
+        const auto& mi = missing.info;
+        const VAddr begin = mi.guest_address;
+        const VAddr end = begin + std::max<u64>(mi.guest_size, 1);
+        bool shared = false;
+        for (const auto& [b_begin, b_end] : b_missing_ranges) {
+            shared = shared || (begin < b_end && b_begin < end);
+        }
+        if (!shared) continue;
+        // Made already (the job thread's lookup just did not find it): the commit's lookup
+        // finds it and makes nothing.
+        const bool exists = registry->FindExisting(begin, [&](const Native::ImageEntry& e) {
+                                const auto& o = e.info;
+                                return o.guest_address == begin && o.guest_size == mi.guest_size &&
+                                       o.pixel_format == mi.pixel_format && o.type == mi.type &&
+                                       o.size.width == mi.size.width &&
+                                       o.size.height == mi.size.height;
+                            }) != nullptr;
+        if (!exists) return no("A ordered: a picture B also looks up");
+        if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("A ordered: shared lookup, made already", {});
+    }
+    if (!p->in_place.empty()) return no("A ordered: in place");
+    if (device->PendingImageInit()) return no("A ordered: pending init (any)");
+    if (registry->HasPendingUploads()) return no("A ordered: pending upload (any)");
+    if (BWindowWritesPending(*p)) return no("A ordered: CPU writes pending");
     for (const auto& use : p->regions) {
         if (!use.region || use.region->dirty_pages.empty()) continue;
         const VAddr begin = Common::AlignDown(std::max(use.address, use.region->begin), 4096);
         const VAddr end = std::min(use.region->end, use.address + use.size);
         for (const VAddr page : use.region->dirty_pages) {
-            if (page >= begin && page < end) return false;
+            if (page >= begin && page < end) return no("A ordered: region dirty");
         }
     }
     for (const Mirror* m : p->mirrors) {
-        if (m && !m->dirty_pages.empty()) return false;
+        if (m && !m->dirty_pages.empty()) return no("A ordered: mirror dirty");
     }
     for (const auto* list : {&p->bindings.stored, &p->bindings.sampled}) {
         for (const auto* e : *list) {
-            if (e && !BWindowPictureClean(*e)) return false;
+            if (e && !BWindowPictureClean(*e)) return no("A ordered: picture");
         }
     }
     return true;
@@ -23108,6 +23142,7 @@ bool NativeRenderer::RecorderAOrderedFree(const void* packet) {
 
 void NativeRenderer::RecorderBCommit() {
     std::scoped_lock lock{mutex};
+    b_missing_ranges.clear(); // step 26: B's handed draws are all recorded
     if (!b_record_context.stream.list) return;
     RecordContext* const was = current_context;
     current_context = &b_record_context; // this thread splices B's list (B is idle)

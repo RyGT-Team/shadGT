@@ -101,4 +101,71 @@ int main() {
     CHECK(!large.Contains(large_lease->Code() + 4097)); // allocated slot padding
     CHECK(!large.Contains(large_lease->Code() + 64 * 65));
     CHECK(reinterpret_cast<Fn>(const_cast<std::uint8_t*>(large_lease->Code()))() == 81);
+
+    // FIX-SGT-094: a limit below the compiled segment count is kept, in whole segments.
+    using Limited = Shader::SrtWalkerStorage<4096, 4>;
+    CHECK(Limited{1}.Limit() == 4096);
+    CHECK(Limited{3 * 4096 + 100}.Limit() == 3 * 4096);
+    CHECK(Limited{std::size_t{1} << 30}.Limit() == 4 * 4096);
+    Limited limited{4096};
+    CHECK(limited.MayFit(64) && limited.MayFit(4096) && !limited.MayFit(4097) && !limited.AtWall());
+    const auto refusal = [](auto& storage, const std::vector<std::uint8_t>& code) -> std::size_t {
+        try { storage.Publish(code.data(), code.size()); }
+        catch (const Shader::SrtStorageFull& full) { return full.bytes; }
+        return 0;
+    };
+    std::vector<std::shared_ptr<Limited::WalkerLease>> slots;
+    auto slot_code = Emit(5, 64);
+    for (int i = 0; i < 64; ++i) slots.push_back(limited.Publish(slot_code.data(), slot_code.size()));
+    const auto* limited_base = slots[0]->Code();
+    for (int i = 0; i < 64; ++i) CHECK(slots[i]->Code() == limited_base + i * 64);
+    CHECK(limited.Reserved() == 4096 && !limited.MayFit(64));
+    // The one segment the limit allows is full: refused, with the walker's size.
+    CHECK(refusal(limited, slot_code) == 64);
+    CHECK(limited.AtWall() && !limited.MayFit(64) && limited.Stats().failures == 1);
+    CHECK(limited.Stats().reserved == 4096 && limited.Stats().limit == 4096);
+    // A second refusal looks at the segments only, not at their slots.
+    const auto scanned = limited.Stats().scanned;
+    CHECK(refusal(limited, slot_code) == 64 && limited.Stats().scanned == scanned);
+    // Every other slot released: 32 free, none side by side. A two-slot walker is refused unscanned.
+    for (int i = 0; i < 64; i += 2) slots[i].reset();
+    CHECK(!limited.AtWall() && limited.MayFit(64) && !limited.MayFit(65) && !limited.MayFit(128));
+    auto two_slot_code = Emit(6, 128);
+    CHECK(refusal(limited, two_slot_code) == 128 && limited.Stats().scanned == scanned);
+    CHECK(limited.AtWall());
+    // Slot 1 released between free slots 0 and 2: a run of three.
+    slots[1].reset();
+    CHECK(!limited.AtWall() && limited.MayFit(3 * 64) && !limited.MayFit(3 * 64 + 1));
+    auto three_slot_code = Emit(7, 3 * 64);
+    auto three = limited.Publish(three_slot_code.data(), three_slot_code.size());
+    CHECK(three->Code() == limited_base && limited.Available(three->Code()) == 3 * 64);
+    CHECK(reinterpret_cast<Fn>(const_cast<std::uint8_t*>(three->Code()))() == 7);
+    slots.clear();
+    three.reset();
+    CHECK(limited.MayFit(4096) && !limited.MayFit(4097));
+    CHECK(limited.Publish(slot_code.data(), slot_code.size()) != nullptr);
+
+    // Released slots join their free neighbours across a bitmap word (slots 63 and 64).
+    using Wide = Shader::SrtWalkerStorage<8192, 1>;
+    Wide wide;
+    std::vector<std::shared_ptr<Wide::WalkerLease>> row;
+    for (int i = 0; i < 128; ++i) row.push_back(wide.Publish(slot_code.data(), slot_code.size()));
+    for (int i = 0; i < 128; ++i) CHECK(row[i]->Code() == row[0]->Code() + i * 64);
+    CHECK(refusal(wide, slot_code) == 64 && !wide.MayFit(64));
+    row[62].reset();
+    row[63].reset();
+    row[65].reset();
+    CHECK(wide.MayFit(2 * 64) && !wide.MayFit(3 * 64));
+    row[64].reset();
+    CHECK(wide.MayFit(4 * 64) && !wide.MayFit(5 * 64));
+    auto four_slot_code = Emit(8, 4 * 64);
+    auto four = wide.Publish(four_slot_code.data(), four_slot_code.size());
+    CHECK(four->Code() == row[0]->Code() + 62 * 64 && wide.Available(four->Code()) == 4 * 64);
+    CHECK(wide.Contains(four->Code() + 4 * 64 - 1) && wide.Contains(row[66]->Code()));
+    CHECK(reinterpret_cast<Fn>(const_cast<std::uint8_t*>(four->Code()))() == 8);
+    // The last free slot taken, the next one is refused without a scan.
+    CHECK(refusal(wide, slot_code) == 64);
+    const auto wide_scanned = wide.Stats().scanned;
+    CHECK(refusal(wide, slot_code) == 64 && wide.Stats().scanned == wide_scanned);
+    std::printf("srt_walker_storage: PASS\n");
 }

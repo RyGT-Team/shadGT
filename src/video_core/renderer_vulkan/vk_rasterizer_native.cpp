@@ -107,6 +107,7 @@
 #include <string_view>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <fmt/ranges.h>
 #include <magic_enum/magic_enum.hpp>
@@ -133,6 +134,7 @@
 #include "core/libraries/kernel/process.h"
 #include "core/debug_state.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/skipped_picture_read.h"
 #include "core/guest_hash.h"
 #include "core/memory.h"
 #include "ryty_gpu/native/committed_pages.h"
@@ -7344,6 +7346,34 @@ void NativeRenderer::SaveOneOffKinds(bool wait) {
         write();
     } else {
         std::thread(std::move(write)).detach(); // a cold file open costs the recorder ~5 ms
+    }
+}
+
+void NativeRenderer::NoteSkippedReads(const DrawBindings& b, const Shader::Info* reader) {
+    // FIX-SGT-048 (skipped_picture_read.h): a picture this draw or dispatch samples, whose draws
+    // in this frame were all skipped for want of their pipeline, holds an older frame whole. From
+    // then on a skipped draw into it moves its pipeline's build to the front of the queue (Draw).
+    if (!PipelineCache::SkippedReadFirst()) {
+        return;
+    }
+    for (const auto* sampled : b.sampled) {
+        if (!sampled || !SkippedPictureRead::ReadsOnlySkipped(
+                            sampled->skipped_frame.load(std::memory_order_relaxed),
+                            sampled->written_frame.load(std::memory_order_relaxed), frame)) {
+            continue;
+        }
+        auto* entry = const_cast<Native::ImageEntry*>(sampled);
+        if (entry->read_after_skip.exchange(true, std::memory_order_relaxed)) {
+            continue;
+        }
+        static std::atomic<u32> logged{};
+        if (const u32 n = logged++; n < 64 || n % 500 == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-SGT-048: shader {:#x} reads {:#x} {}x{}, whose draws were all skipped "
+                        "in this frame (frame {}): their pipelines go first from now on ({} so far)",
+                        reader ? reader->pgm_hash : 0, entry->info.guest_address,
+                        entry->info.size.width, entry->info.size.height, frame, n + 1);
+        }
     }
 }
 
@@ -15966,7 +15996,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             const char* env = std::getenv("SHADGT_NATIVE_ONE_OFF_LAYOUT");
             return !(env && env[0] == '0');
         }();
-        if (empty_target && regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Disable) {
+        // FIX-SGT-048: each existing picture the draw writes notes the skip; if one was read in a
+        // frame whose draws into it were all skipped, the pipeline is looked up again below.
+        const bool skipped_read_first = PipelineCache::SkippedReadFirst();
+        bool promote = false;
+        if ((empty_target || skipped_read_first) &&
+            regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Disable) {
             for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
                 const auto& col_buf = regs.color_buffers[cb];
                 if (!col_buf || regs.color_target_mask.GetMask(cb) == 0) {
@@ -15975,13 +16010,21 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 const VideoCore::TextureCache::ImageDesc desc{col_buf,
                                                               r.liverpool->DrawCbExtent(cb)};
                 const auto& info = desc.info;
-                if (info.num_samples != 1 ||
-                    registry->FindExisting(col_buf.Address(), [&](const Native::ImageEntry& e) {
-                        return !e.from_cpu && e.image != nullptr && e.info.pitch == info.pitch &&
-                               e.info.num_bits == info.num_bits &&
-                               e.info.tile_mode == info.tile_mode &&
-                               e.info.num_samples == info.num_samples;
-                    })) {
+                Native::ImageEntry* const existing =
+                    info.num_samples != 1
+                        ? nullptr
+                        : registry->FindExisting(col_buf.Address(), [&](const Native::ImageEntry& e) {
+                              return !e.from_cpu && e.image != nullptr &&
+                                     e.info.pitch == info.pitch &&
+                                     e.info.num_bits == info.num_bits &&
+                                     e.info.tile_mode == info.tile_mode &&
+                                     e.info.num_samples == info.num_samples;
+                          });
+                if (existing && skipped_read_first) {
+                    existing->skipped_frame.store(frame, std::memory_order_relaxed);
+                    promote |= existing->read_after_skip.load(std::memory_order_relaxed);
+                }
+                if (!empty_target || info.num_samples != 1 || existing) {
                     continue;
                 }
                 Native::ImageEntry* const made = registry->Find(info, true, frame);
@@ -15999,6 +16042,49 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                                 "FIX-GT7-131: a draw into {:#x} {}x{} skipped without its pipeline: "
                                 "its target starts empty (frame {}, {} so far)",
                                 col_buf.Address(), info.size.width, info.size.height, frame, n + 1);
+                }
+            }
+        }
+        if (promote) {
+            // FIX-SGT-048: the lookup moves what the draw waits for to the front of its queue
+            // (the listing of its stored shaders, their translation, or its pipeline build) and
+            // waits for nothing; the draw stays skipped this frame and draws at a later one.
+            const char* stop = nullptr;
+            u64 stop_hash = 0;
+            bool found = false;
+            {
+                PipelineCache::PromoteSkippedScope promote_scope;
+                std::unique_lock lock{r.pipeline_cache.LookupMutex()};
+                found = r.pipeline_cache.GetGraphicsPipelineUnlocked(params, lock) != nullptr;
+                stop = PipelineCache::PromoteStop();
+                stop_hash = PipelineCache::PromoteHash();
+            }
+            if constexpr (Common::DiagnosticsBuilt) {
+                // Where the lookup stopped, once per program and step (diagnostics builds only).
+                u64 ps_hash = 0;
+                if (regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Fragment))) {
+                    if (const auto* pgm = regs.ProgramForStage(u32(Shader::HwStage::Fragment));
+                        pgm && pgm->Address<u32*>()) {
+                        ps_hash = AmdGpu::GetParams(*pgm).hash;
+                    }
+                }
+                static std::mutex promoted_mutex;
+                static std::unordered_set<u64> promoted_seen;
+                const char* const what = found ? "found built" : stop ? stop : "another step";
+                bool first = false;
+                {
+                    std::scoped_lock seen_lock{promoted_mutex};
+                    first = promoted_seen.size() < 512 &&
+                            promoted_seen
+                                .insert(ps_hash ^ (std::hash<std::string_view>{}(what) << 1))
+                                .second;
+                }
+                if (first) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-SGT-048: a skipped draw of ps {:#x} into a picture read "
+                                "stale: its lookup stopped at {} ({:#x}), moved to the front "
+                                "(frame {})",
+                                ps_hash, what, stop_hash, frame);
                 }
             }
         }
@@ -16496,6 +16582,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
+    NoteSkippedReads(b, pipeline->GetStages()[u32(Shader::SwStage::Fragment)]); // FIX-SGT-048
     static thread_local VertexIndexState vertex_index;
     const VertexIndexState* vi = &vertex_index;
     {
@@ -22017,6 +22104,7 @@ void NativeRenderer::DispatchDirect() {
         NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
+    NoteSkippedReads(b, &pipeline->GetStage(Shader::SwStage::Compute)); // FIX-SGT-048
     ReadFillShader(pipeline->GetStage(Shader::SwStage::Compute), b); // NAT-120
     const bool image_work = device->PendingImageInit() || registry->HasPendingUploads();
 #if !defined(NDEBUG)
@@ -22433,6 +22521,7 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
+    NoteSkippedReads(b, &pipeline->GetStage(Shader::SwStage::Compute)); // FIX-SGT-048
     if (regions_taken_in != indirect_region_before) {
         args = GuestBuffer(address + offset, std::max<u32>(size, 12), false);
         if (!args) {

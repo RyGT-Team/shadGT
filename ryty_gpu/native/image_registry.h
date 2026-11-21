@@ -156,6 +156,11 @@ public:
     /// before that one it was written in (0: none).
     std::atomic<u64> written_frame{0};
     std::atomic<u64> written_frame_before{0};
+    /// FIX-SGT-048: the frame a draw into it was last skipped for want of its pipeline, and
+    /// whether a shader has read it in a frame whose draws into it were all skipped (from then
+    /// on, the pipelines of skipped draws into it are built first).
+    std::atomic<u64> skipped_frame{0};
+    std::atomic<bool> read_after_skip{false};
     /// DIAG-GT7-008 (diagnosis): the last frame a shader sampled it (kept with SHARED_DIAG=1).
     std::atomic<u64> sampled_frame{0};
     std::atomic<bool> kept{false};

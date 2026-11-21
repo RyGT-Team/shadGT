@@ -337,6 +337,10 @@ private:
     /// Builds the pipeline unless a worker already started; returns when it is built.
     void FinishBuild(PipelineBuild& build);
     void NoteAsyncSkip(const std::shared_ptr<PipelineBuild>& build, bool again);
+    void PromoteSkippedBuild(const std::shared_ptr<PipelineBuild>& build); // FIX-SGT-048
+    void PromoteTranslations(u64 hash, Shader::HwStage hw_stage, Shader::SwStage sw_stage,
+                             const Shader::RuntimeInfo& runtime_info,
+                             const Shader::Backend::Bindings& binding); // FIX-SGT-048
     void BuildOnScreen();
     void UpdateCatchUp(std::chrono::steady_clock::time_point now);
     /// PERF-019: starts builds for the new pipelines of the draws after the current one.
@@ -383,6 +387,28 @@ public:
     /// its build is done (draws that write memory, and some translations, still wait: see the .cpp).
     /// Waits come back during an offline pause, after the finish and in GT Sport's replays.
     static bool RaceNeverWaits();
+    /// FIX-SGT-048: pipelines of skipped draws into a picture then read are built first.
+    static bool SkippedReadFirst();
+    /// FIX-SGT-048: while one lives on a thread, the pipeline lookups there that skip a draw move
+    /// its build to the front of the queue (PromoteSkippedBuild).
+    struct PromoteSkippedScope {
+        PromoteSkippedScope() {
+            t_promote_skipped = true;
+            t_promote_stop = nullptr;
+            t_promote_hash = 0;
+        }
+        ~PromoteSkippedScope() { t_promote_skipped = false; }
+        PromoteSkippedScope(const PromoteSkippedScope&) = delete;
+        PromoteSkippedScope& operator=(const PromoteSkippedScope&) = delete;
+    };
+    /// FIX-SGT-048: where this thread's last promoted lookup stopped (nullptr: it found its
+    /// pipeline, or stopped elsewhere), and the program it stopped at.
+    static const char* PromoteStop() {
+        return t_promote_stop;
+    }
+    static u64 PromoteHash() {
+        return t_promote_hash;
+    }
     /// PERF-GTS-494: the play state comes from the race's own state (GAME-006), in a race.
     static bool RaceSignalPlay();
     /// FEAT-GTS-471: a stored pipeline key file and its shaders' names (program, record SPIR-V hash).
@@ -551,6 +577,9 @@ private:
     static inline thread_local KeyScratch* t_scratch = nullptr;
     /// NAT-030: this thread is a game job thread looking a pipeline up (LookupBuiltPipeline).
     static inline thread_local bool t_lookup_only = false;
+    static inline thread_local bool t_promote_skipped = false; ///< FIX-SGT-048
+    static inline thread_local const char* t_promote_stop = nullptr; ///< FIX-SGT-048
+    static inline thread_local u64 t_promote_hash = 0;               ///< FIX-SGT-048
     static inline thread_local const char* t_last_miss = nullptr; ///< of this thread's last lookup
     static inline thread_local const std::array<const Shader::Info*, MaxShaderStages>* t_job_infos =
         nullptr;

@@ -764,6 +764,9 @@ private:
     static bool OneOffDiagAll(); ///< SHADGT_DIAG_ONE_OFF_REDRAW=1: draws with their pipeline too
     /// After a FIX-198 wait (or a draw PERF-GT7-023 skipped instead): from one_off_hits.
     void WatchOneOffs(const AmdGpu::Regs& regs, bool skipped);
+    /// FIX-SGT-048: notes the pictures a draw or dispatch reads in a frame whose draws into them
+    /// were all skipped (their skipped draws' pipelines are built first from then on).
+    void NoteSkippedReads(const DrawBindings& b, const Shader::Info* reader);
     void CheckOneOffs();     ///< each frame
     /// PERF-GTS-493: one-off pictures skipped in a race and not drawn since (end-of-race report).
     void NoteRaceMissing(const AmdGpu::Regs& regs);

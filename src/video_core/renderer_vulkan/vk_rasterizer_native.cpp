@@ -196,6 +196,12 @@ bool RaceCarStopped();  // the car stands still (WIDE-005)
 
 namespace Vulkan {
 
+namespace {
+// PERF-SGT-062 (diagnostics builds): a region (0) or mirror (1) made, a mirror dropped (2).
+void NoteCommitMade(int what);
+void NoteCommitUploads(bool uploads); // PERF-SGT-062: work that recorded picture uploads
+} // namespace
+
 struct NativeRenderer::PendingLinearDownload {
     std::vector<VideoCore::DirectMemory::LeasedPart> imports;
     std::vector<Native::LinearDownloadCopy> copies;
@@ -4388,6 +4394,8 @@ void NativeRenderer::BeginRendering(const RenderState& state) {
     if (s.rendering && s.render == state) {
         return;
     }
+    if constexpr (Common::DiagnosticsBuilt) PassDiagBegin(true); // DIAG-SGT-061
+    BindCommitPassBegin(true); // PERF-SGT-062
     EndRendering();
     // As Scheduler::BeginRendering.
     std::array<vk::RenderingAttachmentInfo, 8> colors;
@@ -5215,6 +5223,7 @@ void NativeRenderer::PrepareImages(std::span<const Native::ImageEntry* const> bo
     if (!init && !uploads) {
         return;
     }
+    if constexpr (Common::DiagnosticsBuilt) NoteCommitUploads(uploads); // PERF-SGT-062
     Stream& s = Ctx().stream;
     trace.Next(2);
     EndRendering();
@@ -5720,6 +5729,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
     WatchPages(begin, end - begin);
     DropMirrors(begin, end - begin); // NAT-150: reads there use the region from now on
     NATIVE_DIAGNOSTIC(++stats.regions_made);
+    if constexpr (Common::DiagnosticsBuilt) NoteCommitMade(0); // PERF-SGT-062
 #if !defined(NDEBUG)
     if (end-begin >= 4_MB && !merged.empty()) {
         LOG_INFO(Render_Vulkan,
@@ -5838,6 +5848,7 @@ void NativeRenderer::SortRegionWrites() {
                 if(mirror_diag)NoteMirrorDiagnostic(MirrorCpuDrop,begin,end,mirror.begin,mirror.end,unmap_generation.load(),blocked_granule,blocked_age);
                 mirror_bytes -= mirror.end - mirror.begin;
                 NATIVE_DIAGNOSTIC(++stats.mirrors_dropped);
+                if constexpr (Common::DiagnosticsBuilt) NoteCommitMade(2); // PERF-SGT-062
                 ++buffer_generation; // OPT-003
                 buffer_log.Note(mirror.begin, mirror.end, true); // OPT-010
                 retired_watch_ranges.emplace_back(mirror.begin, mirror.end);
@@ -6041,6 +6052,12 @@ bool NativeRenderer::RefreshMirror(Mirror& mirror) {
     if (mirror.dirty_pages.empty()) {
         return true;
     }
+    // PERF-SGT-062: with a list open (no Begin() that could make or drop mirrors), the pages are
+    // copied at the commit; a failure there binds the work again at once.
+    if (Ctx().stream.list && QueueCommit(CommitKind::RefreshMirror, &mirror)) {
+        return true;
+    }
+    if constexpr (Common::DiagnosticsBuilt) NoteCommitWork(CommitKind::RefreshMirror); // PERF-SGT-062
     const VAddr mirror_begin = mirror.begin, mirror_end = mirror.end;
     Mirror* const original = &mirror;
     auto* direct = r.buffer_cache.GetDirectMemory();
@@ -6281,6 +6298,7 @@ void NativeRenderer::MakePendingMirrors() {
                     !(it->second.begin < end && it->second.end > begin)) {
                     mirror_bytes -= it->second.end - it->second.begin;
                     NATIVE_DIAGNOSTIC(++stats.mirrors_evicted);
+                    if constexpr (Common::DiagnosticsBuilt) NoteCommitMade(2); // PERF-SGT-062
                     ++buffer_generation;
                     buffer_log.Note(it->second.begin, it->second.end, true);
                     retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
@@ -6373,6 +6391,7 @@ void NativeRenderer::MakePendingMirrors() {
         NoteHistory(begin, end - begin, 12, 0); // DIAG-187 (diagnosis)
         mirror_bytes += end - begin;
         NATIVE_DIAGNOSTIC(++stats.mirrors_made);
+        if constexpr (Common::DiagnosticsBuilt) NoteCommitMade(1); // PERF-SGT-062
         NATIVE_DIAGNOSTIC(stats.mirror_made_bytes += end - begin);
         // DIAG-GTS-387: how much of what is copied was in a mirror already.
         NATIVE_DIAGNOSTIC(stats.mirrors_regrown += taken != 0);
@@ -6400,6 +6419,7 @@ void NativeRenderer::DropMirrors(VAddr address, u64 size, u32 diagnostic_reason)
             NoteMirrorDiagnostic(diagnostic_reason,address,address+size,it->second.begin,it->second.end,unmap_generation.load());
         mirror_bytes -= it->second.end - it->second.begin;
         ++buffer_generation; // OPT-003
+        if constexpr (Common::DiagnosticsBuilt) NoteCommitMade(2); // PERF-SGT-062
         buffer_log.Note(it->second.begin, it->second.end, true); // OPT-010
         retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
         std::unique_lock map_lock{buffer_map_mutex};
@@ -6709,6 +6729,9 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
     if (dirty.empty() || size == 0) {
         return;
     }
+    if (QueueCommit(CommitKind::RefreshRegion, &region, address, size)) {
+        return; // PERF-SGT-062: copied at the commit (the pages stay dirty until then)
+    }
     if (!region.dirty_sorted) {
         std::ranges::sort(dirty);
         dirty.erase(std::unique(dirty.begin(), dirty.end()), dirty.end());
@@ -6724,6 +6747,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
     if (first == last) {
         return;
     }
+    if constexpr (Common::DiagnosticsBuilt) NoteCommitWork(CommitKind::RefreshRegion); // PERF-SGT-062
     std::vector<VAddr> pages(first, last);
 #if !defined(NDEBUG)
     const auto refresh_start = std::chrono::steady_clock::now();
@@ -9862,8 +9886,283 @@ void NativeRenderer::BindStagesStable(std::span<const Shader::Info* const> stage
     LOG_WARNING(Render_Vulkan, "FIX-GT7-090: region bindings did not stabilize");
 }
 
+// PERF-SGT-062 (SHADGT_BIND_COMMIT, phase 1 of plan-multi-recorder.md): binding, then a commit
+// of what binding asked to change, on the one recorder thread. Binding queues the work that only
+// changes contents (a region's or mirror's dirty pages copied in, a picture's pending rewrite, a
+// depth twin's or a texture's sources copied in) instead of doing it: the handles and views bound
+// do not depend on it, and the flags that ask for it (dirty pages, `rewrite`, `sources_dirty`) stay
+// set until the commit does it. The commit runs right after binding, before anything records the
+// work's commands, in the order binding asked, so the GPU sees what it sees today. Work that makes
+// or drops something (regions, mirrors, pictures, snapshots) is still done where binding asks:
+// it gives the handles binding returns. If any of it happened after the first queued op (a
+// generation moved), the queue is dropped and the work binds again with everything done at once.
+// This is what a second recorder needs: binding that only reads, a commit list in GPU order, and
+// a check of the generations it was bound under.
+namespace {
+struct BindCommitDiag { // PERF-SGT-062 (diagnostics builds): per arm, 0 off and 1 on
+    static constexpr size_t Kinds = 5;
+    std::array<std::array<u64, Kinds>, 2> work{};   // ops that did work (queued or not)
+    std::array<u64, Kinds> queued{}, committed{};
+    u64 commits = 0, rejected = 0, failed = 0, rebinds = 0, binds = 0;
+    std::array<u64, 4> reject_why{}; // buffer, hard, registry, unmap generation
+    std::array<u64, 2> frames{}, frame_ns{}, structural{}, uploads{};
+    std::array<std::array<u64, 4>, 2> made{}; // regions made, mirrors made, mirrors dropped, pictures
+    // Passes: would a recorder that bound the pass ahead (from the generations at the start of
+    // the pass before, or of the run of 4 before) be rejected at its commit?
+    u64 passes = 0, passes_changed = 0, stale_1 = 0, stale_4 = 0;
+    u64 pass_ns = 0, ns_changed = 0, ns_stale_1 = 0, ns_stale_4 = 0;
+    std::array<u64, 3> run4_generations{}, run4_previous{};
+    u64 pass_index = 0, pass_frame = ~u64{0};
+    bool pass_open = false;
+    std::array<u64, 3> pass_start{};
+    u64 pass_item_ns = 0;
+    bool pass_stale_1 = false, pass_stale_4 = false;
+    u64 last_registry = 0, bind_frame = ~u64{0};
+    int arm = 0;
+    std::chrono::steady_clock::time_point frame_at{}, since = std::chrono::steady_clock::now();
+};
+BindCommitDiag& CommitDiag() {
+    static BindCommitDiag d;
+    return d;
+}
+void NoteCommitMade(int what) {
+    auto& d = CommitDiag();
+    ++d.made[d.arm][what];
+}
+void NoteCommitUploads(bool uploads) {
+    auto& d = CommitDiag();
+    d.uploads[d.arm] += uploads ? 1 : 0;
+}
+constexpr std::array<const char*, 5> CommitKindNames{"region refreshes", "mirror refreshes",
+                                                     "rewrites", "depth-twin copies",
+                                                     "source copies"};
+// Every 5 s: per arm the frame time and the work binding asked for a frame; for the on arm what
+// was queued and committed, the checks that failed, and the passes a recorder binding ahead would
+// have had rejected.
+void ReportBindCommit(BindCommitDiag& d) {
+    std::string arms;
+    for (int a = 0; a < 2; ++a) {
+        if (d.frames[a] == 0) continue;
+        const double f = double(d.frames[a]);
+        std::string work;
+        for (size_t k = 0; k < BindCommitDiag::Kinds; ++k) {
+            work += fmt::format(" {} {:.1f},", CommitKindNames[k], d.work[a][k] / f);
+        }
+        arms += fmt::format(" [{}: {} frames, {:.2f} ms a frame; a frame:{} regions made {:.1f}, "
+                            "mirrors made {:.2f}, mirrors dropped {:.2f}, pictures made or "
+                            "dropped {:.1f}, uploads {:.1f}]",
+                            a ? "on" : "off", d.frames[a], d.frame_ns[a] / f / 1e6, work,
+                            d.made[a][0] / f, d.made[a][1] / f, d.made[a][2] / f, d.made[a][3] / f,
+                            d.uploads[a] / f);
+    }
+    std::string queued;
+    for (size_t k = 0; k < BindCommitDiag::Kinds; ++k) {
+        queued += fmt::format(" {} {}/{},", CommitKindNames[k], d.queued[k], d.committed[k]);
+    }
+    const auto pct = [](u64 a, u64 b) { return b ? 100.0 * double(a) / double(b) : 0.0; };
+    LOG_INFO(Render_Vulkan,
+             "PERF-SGT-062: in 5 s:{}; on: {} binds, {} with a commit list; queued/committed:{} "
+             "check failed {} times (buffer {}, hard {}, registry {}, unmap generation {}), "
+             "mirror copy failed {}, bound again {}; passes {} ({:.2f} ms each): something made or "
+             "dropped while bound {:.1f}% of pass time ({:.1f}% of passes), bound under the pass "
+             "before's generations would fail {:.1f}% ({:.1f}%), under the run of 4 before's "
+             "{:.1f}% ({:.1f}%)",
+             arms, d.binds, d.commits, queued, d.rejected, d.reject_why[0], d.reject_why[1],
+             d.reject_why[2], d.reject_why[3], d.failed, d.rebinds, d.passes,
+             d.passes ? d.pass_ns / 1e6 / double(d.passes) : 0.0, pct(d.ns_changed, d.pass_ns),
+             pct(d.passes_changed, d.passes), pct(d.ns_stale_1, d.pass_ns), pct(d.stale_1, d.passes),
+             pct(d.ns_stale_4, d.pass_ns), pct(d.stale_4, d.passes));
+    for (auto& w : d.work) w = {};
+    d.queued = d.committed = {};
+    d.commits = d.rejected = d.failed = d.rebinds = d.binds = 0;
+    d.reject_why = {};
+    d.frames = d.frame_ns = d.structural = d.uploads = {};
+    for (auto& m : d.made) m = {};
+    d.passes = d.passes_changed = d.stale_1 = d.stale_4 = 0;
+    d.pass_ns = d.ns_changed = d.ns_stale_1 = d.ns_stale_4 = 0;
+}
+} // namespace
+
+// 1 = on; 2 = on and off in turns every 2 s at a frame boundary (an A/B within one drive).
+static int BindCommitMode() {
+    static const int mode = [] {
+        const char* env = std::getenv("SHADGT_BIND_COMMIT");
+        return env && (env[0] == '1' || env[0] == '2') ? env[0] - '0' : 0;
+    }();
+    return mode;
+}
+
+bool NativeRenderer::BindCommitOn() {
+    const int mode = BindCommitMode();
+    if (mode != 2) {
+        return mode == 1;
+    }
+    static u64 seen_frame = ~u64{0};
+    static bool on = false;
+    static auto since = std::chrono::steady_clock::now();
+    if (seen_frame != frame) {
+        seen_frame = frame;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - since >= std::chrono::seconds{2}) {
+            on = !on;
+            since = now;
+        }
+    }
+    return on;
+}
+
+bool NativeRenderer::QueueCommit(CommitKind kind, void* target, VAddr address, u64 size) {
+    auto& c = Ctx().commit;
+    if (!c.queueing) {
+        return false;
+    }
+    if (!c.armed) {
+        c.armed = true;
+        c.buffer_generation = buffer_generation;
+        c.hard_generation = buffer_hard_generation;
+        c.registry_generation = registry->Generation();
+        c.unmap_generation = unmap_generation.load(std::memory_order_relaxed);
+    }
+    c.ops.push_back({kind, target, address, size});
+    if constexpr (Common::DiagnosticsBuilt) ++CommitDiag().queued[size_t(kind)];
+    return true;
+}
+
+void NativeRenderer::NoteCommitWork(CommitKind kind) {
+    if constexpr (Common::DiagnosticsBuilt) {
+        auto& d = CommitDiag();
+        ++d.work[d.arm][size_t(kind)];
+    }
+}
+
 void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
                                 const AmdGpu::Regs& regs, bool compute, DrawBindings& b) {
+    const bool on = BindCommitOn();
+    if (Common::DiagnosticsBuilt && BindCommitMode() != 0) {
+        auto& d = CommitDiag();
+        // Frame times and per-frame counts by arm: a frame counts for the arm in force when its
+        // first work bound (the alternating mode turns only at frame boundaries).
+        if (d.bind_frame != frame) {
+            d.bind_frame = frame;
+            const auto now = std::chrono::steady_clock::now();
+            if (d.frame_at.time_since_epoch().count() != 0) {
+                ++d.frames[d.arm];
+                d.frame_ns[d.arm] += u64(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(now - d.frame_at).count());
+            }
+            d.frame_at = now;
+            const u64 reg = registry->Generation();
+            if (d.last_registry != 0) d.made[d.arm][3] += reg - d.last_registry;
+            d.last_registry = reg;
+            if (now - d.since >= std::chrono::seconds{5}) {
+                ReportBindCommit(d);
+                d.since = now;
+            }
+            d.arm = on ? 1 : 0;
+        }
+    }
+    if (on) {
+        BindStagesCommitted(stages, regs, compute, b);
+    } else {
+        BindStagesNow(stages, regs, compute, b);
+    }
+}
+
+void NativeRenderer::BindStagesCommitted(std::span<const Shader::Info* const> stages,
+                                         const AmdGpu::Regs& regs, bool compute,
+                                         DrawBindings& b) {
+    auto& c = Ctx().commit;
+    // An earlier bind left by an exception queued nothing it consumed: its flags are still set.
+    c.ops.clear();
+    c.armed = false;
+    c.queueing = true;
+    struct Stop {
+        RecordContext::BindCommit& c;
+        ~Stop() {
+            c.queueing = false;
+        }
+    } stop{c};
+    BindStagesNow(stages, regs, compute, b);
+    c.queueing = false;
+    if constexpr (Common::DiagnosticsBuilt) ++CommitDiag().binds;
+    if (c.ops.empty()) {
+        return;
+    }
+    // The check: nothing was made or dropped since the first queued op (the pointers queued are
+    // live and the work's order against what was made is today's).
+    const auto changed = [&]() -> int {
+        if (c.buffer_generation != buffer_generation) return 0;
+        if (c.hard_generation != buffer_hard_generation) return 1;
+        if (c.registry_generation != registry->Generation()) return 2;
+        if (c.unmap_generation != unmap_generation.load(std::memory_order_relaxed)) return 3;
+        return -1;
+    };
+    int why = changed();
+    bool ok = why < 0;
+    size_t done = 0;
+    if (ok) {
+        for (const auto& op : c.ops) {
+            // A copy may start a list (Begin makes the pending mirrors): check again before each.
+            if ((why = changed()) >= 0) {
+                ok = false;
+                break;
+            }
+            switch (op.kind) {
+            case CommitKind::RefreshRegion:
+                RefreshRegion(*static_cast<Region*>(op.target), op.address, op.size);
+                break;
+            case CommitKind::RefreshMirror:
+                if (!RefreshMirror(*static_cast<Mirror*>(op.target))) {
+                    ok = false;
+                }
+                break;
+            case CommitKind::ApplyRewrite:
+                ApplyRewrite(*static_cast<Native::ImageEntry*>(op.target));
+                break;
+            case CommitKind::SyncDepthTwin:
+                SyncDepthTwin(*static_cast<Native::ImageEntry*>(op.target));
+                break;
+            case CommitKind::RefreshSources:
+                RefreshSources(*static_cast<Native::ImageEntry*>(op.target));
+                break;
+            default:
+                break;
+            }
+            ++done;
+            if (!ok) {
+                break;
+            }
+        }
+    }
+    if constexpr (Common::DiagnosticsBuilt) {
+        auto& d = CommitDiag();
+        ++d.commits;
+        for (size_t i = 0; i < done; ++i) {
+            ++d.committed[size_t(c.ops[i].kind)];
+        }
+        if (!ok) {
+            if (why >= 0) {
+                ++d.rejected;
+                ++d.reject_why[why];
+            } else {
+                ++d.failed;
+            }
+        }
+    }
+    c.ops.clear();
+    c.armed = false;
+    if (!ok) {
+        // What was not committed is still flagged: binding again does it at once, in today's
+        // order.
+        if constexpr (Common::DiagnosticsBuilt) ++CommitDiag().rebinds;
+        b.Clear();
+        b.push = UserData(regs);
+        BindStagesNow(stages, regs, compute, b);
+    }
+}
+
+void NativeRenderer::BindStagesNow(std::span<const Shader::Info* const> stages,
+                                   const AmdGpu::Regs& regs, bool compute, DrawBindings& b) {
     const u64 nulls_before = stats.null_images; // DIAG-170
     const auto reasons_before = stats.null_reasons;
     size_t total = 0;
@@ -14557,6 +14856,7 @@ void NativeRenderer::WrittenSubresources(const Native::ImageEntry* entry, u64 at
     if (!entry) {
         return;
     }
+    if constexpr (Common::DiagnosticsBuilt) PassDiagWritten(entry); // DIAG-SGT-061
     auto* written = const_cast<Native::ImageEntry*>(entry);
 #if !defined(NDEBUG)
     const bool watched = Native::WatchedTexture(entry->info.guest_address,
@@ -14675,6 +14975,11 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::RefreshSources}; // DIAG-SGT-023
     // NAT-111: only when one of its targets was drawn since the last time.
     const bool traced = Rasterizer::Traced(texture.info.guest_address, texture.info.guest_size);
+    // PERF-SGT-062: queued whether or not the flag is set now: a copy queued before it (a rewrite
+    // or a depth twin of one of its sources) may set it. The commit checks and clears it in order.
+    if (QueueCommit(CommitKind::RefreshSources, &texture)) {
+        return;
+    }
     if (!texture.sources_dirty.exchange(false, std::memory_order_relaxed)) {
         if (traced) {
             LOG_WARNING(Render_Vulkan, "DIAG-165: texture {:#x} {}x{} not dirty (frame {})",
@@ -14981,6 +15286,7 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
         ProbeRefresh(texture, what); // DIAG-179 (diagnosis)
     }
     NATIVE_DIAGNOSTIC(stats.source_copies += picks.size());
+    if constexpr (Common::DiagnosticsBuilt) NoteCommitWork(CommitKind::RefreshSources); // PERF-SGT-062
     ++s.commands;
 }
 
@@ -15004,6 +15310,11 @@ void NativeRenderer::SyncDepthTwin(Native::ImageEntry& entry) {
         (!info.props.is_depth && !LiverpoolToVK::IsFormatDepthCompatible(info.pixel_format))) {
         return;
     }
+    // PERF-SGT-062: queued before the version check: a rewrite queued before it may change
+    // either picture's version. The commit runs the whole check in order.
+    if (QueueCommit(CommitKind::SyncDepthTwin, &entry)) {
+        return;
+    }
     Native::ImageEntry* twin =
         registry->FindExisting(info.guest_address, [&](const Native::ImageEntry& other) {
             const auto& o = other.info;
@@ -15022,6 +15333,7 @@ void NativeRenderer::SyncDepthTwin(Native::ImageEntry& entry) {
     if (version == 0 || version <= entry.write_version.load(std::memory_order_relaxed)) {
         return;
     }
+    if constexpr (Common::DiagnosticsBuilt) NoteCommitWork(CommitKind::SyncDepthTwin); // PERF-SGT-062
     const u32 texel = std::max<u32>(info.num_bits / 8, 1);
     const u32 mips = std::max<u32>(info.resources.levels, 1);
     const u32 layers = std::max<u32>(info.resources.layers, 1);
@@ -15532,10 +15844,234 @@ void NativeRenderer::YieldToMappingChanges() {
     }
 }
 
+// DIAG-SGT-061 (SHADGT_DIAG_PASS_SPLIT=1, diagnostics builds): phase 0 of plan-multi-recorder.md. How
+// much of the recorder's frame lies in passes a second recorder could record? A pass is a render
+// scope (BeginRendering) or a run of dispatches between them. Per pass: draws and dispatches,
+// recorder time, state changes made while it was recorded (PERF-SGT-062: a buffer, hard or picture
+// generation moved: regions, mirrors or pictures made or dropped, memory unmapped; and small
+// rewrites), texture work done at bind time (PERF-SGT-062's counted rewrites, depth-twin and source
+// copies), and sampled pictures another recorder's earlier pass wrote this frame, for passes dealt in
+// runs of N = 1, 4, 8 and 16 (recorder (pass / N) % 2). Every 5 s, shares of the recorder time a
+// frame.
+namespace {
+constexpr std::array<u64, 4> PassRun{1, 4, 8, 16};
+struct PassSplitDiag {
+    bool on = false;
+    u64 frame = ~u64{0};
+    u64 pass = 0;           // pass index in the frame
+    bool pass_is_render = false;
+    bool pass_open = false;
+    u64 pass_ns = 0, pass_items = 0, pass_state_start = 0, pass_tex_start = 0;
+    std::array<u64, 4> pass_cross{};
+    std::unordered_map<const void*, u64> written; // entry -> pass index that wrote it this frame
+    // totals since the last report
+    u64 frames = 0, passes = 0, items = 0, ns = 0, max_pass_ns = 0;
+    u64 ns_state = 0, ns_tex = 0, ns_neither_change = 0;
+    std::array<u64, 4> ns_cross{}, ns_clean{}, ns_b{}, ns_b_clean{};
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+};
+PassSplitDiag& PassDiag() {
+    static PassSplitDiag d = [] {
+        PassSplitDiag x;
+        x.on = Common::DiagEnv("SHADGT_DIAG_PASS_SPLIT") != nullptr;
+        return x;
+    }();
+    return d;
+}
+void PassDiagClose(PassSplitDiag& d, u64 state_now, u64 tex_now) {
+    if (!d.pass_open) return;
+    const bool state = state_now != d.pass_state_start, tex = tex_now != d.pass_tex_start;
+    ++d.passes;
+    d.items += d.pass_items;
+    d.ns += d.pass_ns;
+    d.max_pass_ns = std::max(d.max_pass_ns, d.pass_ns);
+    if (state) d.ns_state += d.pass_ns;
+    if (tex) d.ns_tex += d.pass_ns;
+    if (!state && !tex) d.ns_neither_change += d.pass_ns;
+    for (size_t i = 0; i < PassRun.size(); ++i) {
+        const bool cross = d.pass_cross[i] != 0;
+        const bool clean = !state && !tex && !cross;
+        if (cross) d.ns_cross[i] += d.pass_ns;
+        if (clean) d.ns_clean[i] += d.pass_ns;
+        if ((d.pass / PassRun[i]) % 2 == 1) {
+            d.ns_b[i] += d.pass_ns;
+            if (clean) d.ns_b_clean[i] += d.pass_ns;
+        }
+    }
+    d.pass_open = false;
+}
+void PassDiagStart(PassSplitDiag& d, u64 frame, bool render, u64 state_now, u64 tex_now) {
+    PassDiagClose(d, state_now, tex_now);
+    if (d.frame != frame) {
+        if (d.frame != ~u64{0}) ++d.frames;
+        d.frame = frame;
+        d.pass = 0;
+        d.written.clear();
+    } else {
+        ++d.pass;
+    }
+    d.pass_open = true;
+    d.pass_is_render = render;
+    d.pass_ns = d.pass_items = 0;
+    d.pass_cross = {};
+    d.pass_state_start = state_now;
+    d.pass_tex_start = tex_now;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - d.since < std::chrono::seconds{5} || d.frames == 0 || d.ns == 0) return;
+    const double f = double(d.frames), t = double(d.ns);
+    const auto pct = [&](u64 v) { return 100.0 * double(v) / t; };
+    std::string runs;
+    for (size_t i = 0; i < PassRun.size(); ++i) {
+        runs += fmt::format(" N={}: cross {:.0f}%, clean {:.0f}%, B {:.0f}% (clean {:.0f}%), "
+                            "hand-offs {:.0f};",
+                            PassRun[i], pct(d.ns_cross[i]), pct(d.ns_clean[i]), pct(d.ns_b[i]),
+                            d.ns_b[i] ? 100.0 * d.ns_b_clean[i] / d.ns_b[i] : 0.0,
+                            d.passes / f / PassRun[i]);
+    }
+    LOG_INFO(Render_Vulkan,
+             "DIAG-SGT-061: {:.0f} frames; per frame {:.1f} passes, {:.0f} draws+dispatches, {:.2f} ms "
+             "in passes (largest {:.2f} ms); time in passes with state changes {:.0f}%, with bind-time "
+             "texture work {:.0f}%, with neither {:.0f}%; dealt in runs of N passes:{}",
+             f, d.passes / f, d.items / f, t / f / 1e6, d.max_pass_ns / 1e6, pct(d.ns_state),
+             pct(d.ns_tex), pct(d.ns_neither_change), runs);
+    d.frames = d.passes = d.items = d.ns = d.max_pass_ns = 0;
+    d.ns_state = d.ns_tex = d.ns_neither_change = 0;
+    d.ns_cross = d.ns_clean = d.ns_b = d.ns_b_clean = {};
+    d.since = now;
+}
+u64 PassDiagTextureWork() {
+    u64 sum = 0;
+    for (const auto& arm : CommitDiag().work) {
+        for (size_t k = 2; k < arm.size(); ++k) { // rewrites, depth-twin and source copies
+            sum += arm[k];
+        }
+    }
+    return sum;
+}
+} // namespace
+
+u64 NativeRenderer::PassDiagMutations() const {
+    return u64(buffer_generation) + u64(buffer_hard_generation) + registry->Generation() +
+           stats.small_rewrites;
+}
+
+bool NativeRenderer::PassDiagOn() const {
+    if constexpr (!Common::DiagnosticsBuilt) {
+        return false;
+    } else {
+        return PassDiag().on;
+    }
+}
+void NativeRenderer::PassDiagBegin(bool render) {
+    if (!PassDiagOn()) return;
+    auto& d = PassDiag();
+    // A dispatch run continues while dispatches follow each other outside rendering.
+    if (!render && d.pass_open && !d.pass_is_render && d.frame == frame) return;
+    PassDiagStart(d, frame, render, PassDiagMutations(), PassDiagTextureWork());
+}
+void NativeRenderer::PassDiagItem(u64 ns) {
+    if constexpr (Common::DiagnosticsBuilt) CommitDiag().pass_item_ns += ns; // PERF-SGT-062
+    if (!PassDiagOn()) return;
+    auto& d = PassDiag();
+    if (!d.pass_open) return;
+    d.pass_ns += ns;
+    ++d.pass_items;
+}
+void NativeRenderer::PassDiagSampled(const DrawBindings& b) {
+    if (!PassDiagOn()) return;
+    auto& d = PassDiag();
+    if (!d.pass_open) return;
+    for (const auto* entry : b.sampled) {
+        const auto it = d.written.find(entry);
+        if (it == d.written.end() || it->second == d.pass) continue;
+        for (size_t i = 0; i < PassRun.size(); ++i) {
+            const u64 n = PassRun[i];
+            if (it->second / n != d.pass / n && (it->second / n) % 2 != (d.pass / n) % 2) {
+                ++d.pass_cross[i];
+            }
+        }
+    }
+}
+void NativeRenderer::PassDiagWritten(const void* entry) {
+    if (!PassDiagOn()) return;
+    auto& d = PassDiag();
+    if (d.pass_open) d.written[entry] = d.pass;
+}
+
+// PERF-SGT-062: a pass starts. The generations binding sees from here on are recorded for the pass
+// (a second recorder binding it ahead would commit it only while they hold). Diagnostics builds
+// also close the pass before: whether something was made or dropped while it was bound, and
+// whether it would have failed that check had it been bound one pass, or one run of 4, ahead.
+void NativeRenderer::BindCommitPassBegin(bool render) {
+    // The pass check reads only generations: in the alternating mode it runs in both arms, so a
+    // pass never spans an arm turn.
+    if (BindCommitMode() == 0 || (!Common::DiagnosticsBuilt && !BindCommitOn())) {
+        return;
+    }
+    auto& c = Ctx().commit;
+    // A dispatch run continues while dispatches follow each other outside rendering.
+    if (!render && c.dispatch_run) {
+        return;
+    }
+    c.dispatch_run = !render;
+    const std::array<u64, 3> now{u64(buffer_generation), u64(buffer_hard_generation),
+                                 registry->Generation()};
+    c.previous_pass_generations = c.pass_generations;
+    c.pass_generations = now;
+    if constexpr (Common::DiagnosticsBuilt) {
+        auto& d = CommitDiag();
+        if (d.pass_open) {
+            const u64 ns = d.pass_item_ns;
+            ++d.passes;
+            d.pass_ns += ns;
+            if (now != d.pass_start) {
+                ++d.passes_changed;
+                d.ns_changed += ns;
+            }
+            if (d.pass_stale_1) {
+                ++d.stale_1;
+                d.ns_stale_1 += ns;
+            }
+            if (d.pass_stale_4) {
+                ++d.stale_4;
+                d.ns_stale_4 += ns;
+            }
+        }
+        if (d.pass_frame != frame) {
+            d.pass_frame = frame;
+            d.pass_index = 0;
+        } else {
+            ++d.pass_index;
+        }
+        if (d.pass_index % 4 == 0) {
+            d.run4_previous = d.run4_generations;
+            d.run4_generations = now;
+        }
+        d.pass_stale_1 = d.pass_open && now != c.previous_pass_generations;
+        d.pass_stale_4 = d.pass_index >= 4 && now != d.run4_previous;
+        d.pass_open = true;
+        d.pass_start = now;
+        d.pass_item_ns = 0;
+    }
+    (void)render;
+}
+
 void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::DrawTotal}; // DIAG-SGT-023
     YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
+    struct PassItemTimer { // DIAG-SGT-061, PERF-SGT-062 (diagnostics builds)
+        NativeRenderer* self;
+        std::chrono::steady_clock::time_point start;
+        ~PassItemTimer() {
+            if (self) self->PassDiagItem(u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - start).count()));
+        }
+    };
+    NativeRenderer* const timed_pass =
+        Common::DiagnosticsBuilt && (PassDiagOn() || BindCommitMode() != 0) ? this : nullptr;
+    const PassItemTimer pass_timer{timed_pass, timed_pass ? std::chrono::steady_clock::now()
+                                                          : std::chrono::steady_clock::time_point{}};
     EnsureAheadArena(); // PERF-GTS-377
     struct StreamUnwindGuard {
         NativeRenderer& renderer;
@@ -16504,6 +17040,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         b.push = UserData(regs);
         BindStagesStable(pipeline->GetStages(), regs, false, b);
     }
+    if constexpr (Common::DiagnosticsBuilt) PassDiagSampled(b); // DIAG-SGT-061
     WritebacksBefore(b); // includes worker-prepared bindings
     if (b.failed) {
         NATIVE_DIAGNOSTIC(++stats.skipped);
@@ -21753,6 +22290,10 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
     if (entry.rewrite == Rewrite::None && !entry.stencil_clear_pending) {
         return;
     }
+    if (QueueCommit(CommitKind::ApplyRewrite, &entry)) {
+        return; // PERF-SGT-062: the rewrite stays pending until the commit
+    }
+    if constexpr (Common::DiagnosticsBuilt) NoteCommitWork(CommitKind::ApplyRewrite); // PERF-SGT-062
     auto claim = registry->ClaimRememberedFill(entry);
     const auto retire_claim = [&] {
         // Attach after recording: PatternBuffer/GlobalBarrier can splice while
@@ -21975,6 +22516,20 @@ void NativeRenderer::DispatchDirect() {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::DispatchTotal}; // DIAG-SGT-023
     YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
+    if constexpr (Common::DiagnosticsBuilt) PassDiagBegin(false); // DIAG-SGT-061
+    BindCommitPassBegin(false); // PERF-SGT-062
+    struct PassItemTimer { // DIAG-SGT-061, PERF-SGT-062 (diagnostics builds)
+        NativeRenderer* self;
+        std::chrono::steady_clock::time_point start;
+        ~PassItemTimer() {
+            if (self) self->PassDiagItem(u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - start).count()));
+        }
+    };
+    NativeRenderer* const timed_pass =
+        Common::DiagnosticsBuilt && (PassDiagOn() || BindCommitMode() != 0) ? this : nullptr;
+    const PassItemTimer pass_timer{timed_pass, timed_pass ? std::chrono::steady_clock::now()
+                                                          : std::chrono::steady_clock::time_point{}};
     AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Dispatches};
 #if !defined(NDEBUG)
     const auto start = std::chrono::steady_clock::now();

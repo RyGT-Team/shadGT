@@ -5821,6 +5821,19 @@ void NativeRenderer::SortRegionWrites() {
                 dynamic = false;
             }
 #endif
+            // PERF-SGT-055 (SHADGT_NATIVE_MIRROR_KEEP_WRITTEN=1, off by default): as FIX-184's
+            // diagnosis switch, in every build. A dropped mirror's range is read in place over PCIe
+            // for up to five minutes (PERF-GTS-386); keeping it and copying the pages the CPU wrote
+            // (about 1.3 MB a frame at Tokyo) cut GT7's GPU time in the rain pack from about 24 to
+            // 19.5 ms a frame and PCIe reads by 10-20%, for about 1.2 ms more CPU time a frame
+            // (more write faults) (Release, 2026-11-20).
+            static const bool keep_written = [] {
+                const char* env = std::getenv("SHADGT_NATIVE_MIRROR_KEEP_WRITTEN");
+                return env && env[0] == '1';
+            }();
+            if (dynamic && keep_written) {
+                dynamic = false;
+            }
             if (dynamic) {
                 if(mirror_diag)NoteMirrorDiagnostic(MirrorCpuDrop,begin,end,mirror.begin,mirror.end,unmap_generation.load(),blocked_granule,blocked_age);
                 mirror_bytes -= mirror.end - mirror.begin;
@@ -6042,17 +6055,27 @@ bool NativeRenderer::RefreshMirror(Mirror& mirror) {
     const vk::Buffer dst{Handle<VkBuffer_T>(mirror.buffer->NativeHandle())};
     std::ranges::sort(pages);
     pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
-    for (const VAddr page : pages) {
-        if (page < mirror.begin || page >= mirror.end) {
+    // PERF-SGT-055: consecutive pages are copied and watched again as one run (one ForEachPart and
+    // one WatchPages each), not page by page: with CPU-written mirrors kept, about 330 pages a frame
+    // came through here and WatchPages' protection changes were 2% of GT7's recorder.
+    for (size_t i = 0; i < pages.size();) {
+        const VAddr run_begin = pages[i];
+        if (run_begin < mirror.begin || run_begin >= mirror.end) {
+            ++i;
             continue;
         }
-        direct->ForEachPart(page, std::min<u64>(4096, mirror.end - page),
+        size_t j = i + 1;
+        while (j < pages.size() && pages[j] == pages[j - 1] + 4096 && pages[j] < mirror.end) {
+            ++j;
+        }
+        const VAddr run_end = std::min<VAddr>(pages[j - 1] + 4096, mirror.end);
+        direct->ForEachPart(run_begin, run_end - run_begin,
                             [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset,
                                 u64 bytes) {
                                 s.cmd.copyBuffer(view.Handle(), dst,
                                                  vk::BufferCopy{.srcOffset = view_offset,
-                                                                .dstOffset = page - mirror.begin +
-                                                                             offset,
+                                                                .dstOffset = run_begin -
+                                                                             mirror.begin + offset,
                                                                 .size = bytes});
                             });
         {
@@ -6062,12 +6085,14 @@ bool NativeRenderer::RefreshMirror(Mirror& mirror) {
                 s.buffers_written = true;
                 return false;
             }
-            WatchPages(page, std::min<u64>(4096, mirror.end - page));
+            WatchPages(run_begin, run_end - run_begin);
         }
-        const u64 g = (page - mirror.begin) / MirrorGranule; // FIX-176
-        if (g < mirror.hashes.size()) {
-            mirror.hashes[g] = 0;
+        for (u64 g = (run_begin - mirror.begin) / MirrorGranule;
+             g <= (run_end - 1 - mirror.begin) / MirrorGranule && g < mirror.hashes.size();
+             ++g) {
+            mirror.hashes[g] = 0; // FIX-176
         }
+        i = j;
     }
     s.buffers_written = true;
     NATIVE_DIAGNOSTIC(stats.mirror_refresh_pages += pages.size());

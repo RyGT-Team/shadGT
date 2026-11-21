@@ -287,6 +287,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_NATIVE_INPLACE_RANGES|string|Memory & VRAM|unset (none; GT7's launcher sets it)|'<hex addr>+<hex size>,...'|Guest ranges (GT7 per-frame memory) whose GPU writes stay in guest memory. Normally set by the launcher.",
     "RYGTSW1|SHADGT_NATIVE_KEEP_TEXTURES_MB|int|Memory & VRAM|GT Sport: 1/8 of VRAM budget; GT7: half the video memory setting; max 2048|MB|Video memory (MB) kept for idle game textures so they need no re-upload. Lower it if VRAM runs out.",
     "RYGTSW1|SHADGT_NATIVE_MIRRORS|choice|Memory & VRAM|on|0 = off; v = vertex ranges only; i = index ranges only|Device-local mirrors of vertex/index data. 0 turns them off; v or i mirrors only one kind (diagnosis).",
+    "RYGTSW1|SHADGT_NATIVE_MIRROR_KEEP_WRITTEN|flag|Memory & VRAM|off|1 = on|Keeps video-memory mirrors the CPU writes into and copies the written pages instead of reading the range over PCIe (PERF-SGT-055). Test: more CPU write faults.",
     "RYGTSW1|SHADGT_NATIVE_MIRROR_MB|int|Memory & VRAM|1024|MB|Budget in MB for vertex/index buffer mirrors in video memory.",
     "RYGTSW1|SHADGT_NATIVE_MIRROR_STORAGE|int|Memory & VRAM|64|MB, 0-4096|Read-only storage buffers up to this size (MB) are kept in reusable video-memory mirrors.",
     "RYGTSW1|SHADGT_NATIVE_READABLE_CUT|flag|Memory & VRAM|on|0 = off|Cuts buffer bindings down to their readable part of guest memory. 0 binds the full size.",

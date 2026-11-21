@@ -975,3 +975,9 @@ foreach(kind memo_filter translation_priority translation_retry library_future)
     target_link_libraries(native_${kind}_test PRIVATE Threads::Threads)
     add_test(NAME native_${kind} COMMAND native_${kind}_test)
 endforeach()
+
+# FIX-GT7-175 (PRT-TROPHY port): /app0 folder stack for sce_sys files.
+add_executable(shadps4_ryty_app0_test test_ryty_app0.cpp ${CMAKE_SOURCE_DIR}/ryty_gpu/ryty_app0.cpp)
+target_include_directories(shadps4_ryty_app0_test PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(shadps4_ryty_app0_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_ryty_app0_test)

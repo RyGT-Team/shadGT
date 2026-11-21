@@ -377,11 +377,12 @@ void Scheduler::EndRendering() {
     CommandBuffer().endRendering();
 }
 
-CmdBuf Scheduler::UploadCommandBuffer() {
+CmdBuf Scheduler::UploadCommandBuffer(std::source_location loc) {
     if (ring) {
         if (CommandRing* worker = ThreadRing()) {
             return CmdBuf{worker, CmdTarget::Upload}; // MT-002
         }
+        if constexpr (Common::DiagnosticsBuilt) NoteRecorderBMain("B: main ring, upload", loc);
         return CmdBuf{ring.get(), CmdTarget::Upload};
     }
     return CmdBuf{OpenUploadCommandBuffer()};
@@ -446,6 +447,21 @@ s64 TickSubmittedNs(u64 tick) {
     return g_tick_submit_ns[tick % g_tick_submit_ns.size()].load(std::memory_order_relaxed);
 }
 
+namespace {
+thread_local bool t_recorder_b = false; // FEAT-SGT-079
+}
+void MarkRecorderBThread() {
+    t_recorder_b = true;
+}
+bool OnRecorderBThread() {
+    return t_recorder_b;
+}
+void NoteRecorderBMain(const char* what, const std::source_location& loc) {
+    if constexpr (Common::DiagnosticsBuilt) {
+        if (t_recorder_b) NoteSubmitSite(what, loc);
+    }
+}
+
 std::atomic<int>& SubmitAbArm() {
     static std::atomic<int> arm{0};
     // The A/B switches turn every 2 s: SHADGT_SELECT_STAGE=2 (PERF-SGT-077, any build) and the
@@ -455,9 +471,11 @@ std::atomic<int>& SubmitAbArm() {
         const char* wait = std::getenv("SHADGT_WAIT_FIRST_DRAIN"); // PERF-SGT-078
         const char* recorder_b = std::getenv("SHADGT_RECORDER_B"); // FEAT-SGT-079
         const char* prefetch = std::getenv("SHADGT_PREPARED_PREFETCH"); // PERF-SGT-081
+        const char* b_ring = std::getenv("SHADGT_RECORDER_B_RING");      // FEAT-SGT-079
         return (select && select[0] == '2') || (wait && wait[0] == '2') ||
-               (recorder_b && (recorder_b[0] == '2' || recorder_b[0] == '6')) ||
-               (prefetch && prefetch[0] == '2') ||
+               (recorder_b && (recorder_b[0] == '2' || recorder_b[0] == '6' ||
+                               recorder_b[0] == '8')) ||
+               (prefetch && prefetch[0] == '2') || (b_ring && b_ring[0] == '2') ||
                Common::DiagEnv("SHADGT_DIAG_FENCE_BATCH_AB") != nullptr ||
                Common::DiagEnv("SHADGT_DIAG_FEED_GPU_AB") != nullptr ||
                Common::DiagEnv("SHADGT_DIAG_PARALLEL_AB") != nullptr ||
@@ -548,6 +566,7 @@ static void NoteFlush(const std::source_location& loc) {
 
 #endif
 u64 Scheduler::Flush(SubmitInfo& info, std::source_location loc) {
+    if constexpr (Common::DiagnosticsBuilt) NoteRecorderBMain("B: flush", loc); // DIAG-SGT-082
     if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("submit", loc); // DIAG-SGT-076
 #ifndef NDEBUG
     NoteFlush(loc);

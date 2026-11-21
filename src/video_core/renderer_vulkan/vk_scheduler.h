@@ -377,6 +377,12 @@ using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
 void NoteSubmitSite(const char* what, const std::source_location& loc);
 /// DIAG-SGT-076: the arm of an A/B that alternates every 2 s (0 or 1; 0 when none runs).
 std::atomic<int>& SubmitAbArm();
+/// FEAT-SGT-079: recorder B's thread marks itself (any build); DIAG-SGT-082 (diagnostics builds,
+/// SHADGT_DIAG_SUBMITS=1) counts, by caller, what it does on the main command ring or to the
+/// command order (splices, flushes), which it must stop doing before it records beside A.
+void MarkRecorderBThread();
+bool OnRecorderBThread();
+void NoteRecorderBMain(const char* what, const std::source_location& loc);
 /// DIAG-SGT-074: when the command thread submitted a tick to the queue (0: not known), for the
 /// split of the EOP tail into our submit and the GPU's run. Diagnostics builds only.
 void NoteTickSubmitted(u64 tick);
@@ -421,7 +427,7 @@ public:
     /// Returns the current command buffer used for uploads. PERF-066: it runs before the
     /// session's primary command buffer, after everything submitted before it (barriers at its
     /// start and end).
-    CmdBuf UploadCommandBuffer();
+    CmdBuf UploadCommandBuffer(std::source_location loc = std::source_location::current());
 
     /// PERF-084: from now on, Vulkan commands are recorded into a ring and replayed by a
     /// command thread, which also submits. Call once, from the thread that records.
@@ -434,7 +440,11 @@ public:
 
     /// PERF-GT7-018: the command thread's ring (nullptr without one), for lists the command
     /// thread makes and records; recorded into from the thread that records, like CommandBuffer.
-    CommandRing* CommandThreadRing() const noexcept {
+    CommandRing* CommandThreadRing(
+        std::source_location loc = std::source_location::current()) const noexcept {
+#ifdef SHADGT_DIAGNOSTICS
+        if (ring) NoteRecorderBMain("B: main ring, CommandThreadRing", loc); // DIAG-SGT-082
+#endif
         return ring.get();
     }
 
@@ -475,10 +485,13 @@ public:
     }
 
     /// Returns the current command buffer.
-    CmdBuf CommandBuffer() const {
+    CmdBuf CommandBuffer(std::source_location loc = std::source_location::current()) const {
         if (CommandRing* worker = ThreadRing()) {
             return CmdBuf{worker, CmdTarget::Primary}; // MT-002
         }
+#ifdef SHADGT_DIAGNOSTICS
+        if (ring) NoteRecorderBMain("B: main ring, CommandBuffer", loc); // DIAG-SGT-082
+#endif
         if (ring) {
             return CmdBuf{ring.get(), CmdTarget::Primary};
         }

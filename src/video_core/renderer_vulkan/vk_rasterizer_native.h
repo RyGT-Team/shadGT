@@ -214,6 +214,10 @@ public:
     /// Liverpool::QueuedDraw): the checks of its prepared draw on B's registers. Sets its
     /// b_result unless A got there first.
     void RecorderBPrepare(void* queued_draw, const AmdGpu::Regs& regs);
+    /// FEAT-SGT-079 step 10: the recorder, before it hands one of B's jobs to B's thread: when
+    /// its own context is the current one, it splices its open list and makes B's current, so
+    /// that B's thread never splices (the command order is the recorder's).
+    void RecorderBEnter();
     /// FIX-GTS-492: whether a prepared draw ends with the command memory it was made from
     /// (SHADGT_PREPARED_LIFETIME=0: it stays until a draw takes it, as before).
     static bool PreparedLifetimeOn();
@@ -1660,6 +1664,7 @@ private:
         /// FEAT-SGT-022: the last binder job binding from this draw's bindings (0: none); the
         /// draw is given back only once that job has run.
         u64 binder_job = 0;
+        u8 binder_index = 0; ///< FEAT-SGT-079: which context's binder took that job
         const GraphicsPipeline* pipeline = nullptr;
         std::shared_ptr<const void> pipeline_keepalive;
         std::atomic<std::shared_ptr<void>> ahead_descriptor_lease;
@@ -2025,6 +2030,10 @@ private:
     /// and its list is spliced in order at each hand-over.
     RecordContext b_record_context;
     RecordContext* current_context = &main_record_context;
+    /// FEAT-SGT-079 (SHADGT_RECORDER_B_RING): recorder B's own command ring for its context's
+    /// lists, and how far of it has been put into the command order (at B's splices).
+    std::unique_ptr<CommandRing> b_ring;
+    u64 b_ring_handed = 0;
     struct RecorderBDealState {
         u64 frame = ~u64{0};
         u64 pass = 0;
@@ -2053,15 +2062,29 @@ private:
         BindInputs inputs{};
     };
     static void RunBindJob(void* owner, BindJob& job, CommandRing& ring);
-    /// FEAT-SGT-022 (SHADGT_RECORDER_BINDER=1): the binder thread; null when off.
-    std::unique_ptr<Native::RecorderBinder<BindJob>> binder;
+    /// FEAT-SGT-022 (SHADGT_RECORDER_BINDER=1): the binder threads; null when off.
+    /// FEAT-SGT-079: one per record context (0: the main one, 1: recorder B's). A binder has one
+    /// producer, and its placeholders replay in its jobs' order from its context's lists.
+    std::array<std::unique_ptr<Native::RecorderBinder<BindJob>>, 2> binders;
+    u8 ContextIndex() const {
+        return current_context == &b_record_context ? 1 : 0;
+    }
+    Native::RecorderBinder<BindJob>* CtxBinder() const {
+        return binders[ContextIndex()].get();
+    }
+    bool AnyBinder() const {
+        return binders[0] || binders[1];
+    }
     /// FEAT-SGT-022: waits until the binder made every bind handed to it (before the recorder
     /// changes what its jobs read: splices, stream swaps, evictions, dropped samplers).
+    /// FEAT-SGT-079: every context's binder.
     void DrainBinder() const {
-        if (!binder) return;
+        if (!AnyBinder()) return;
         namespace OT = Native::OrderedTiming;
         const std::uint64_t from = OT::Enabled() ? OT::Ticks() : 0;
-        binder->Drain();
+        for (const auto& binder : binders) {
+            if (binder) binder->Drain();
+        }
         if (OT::Enabled()) {
             OT::NoteBinder(OT::BinderDrains);
             OT::NoteBinder(OT::BinderWaitTicks, OT::Ticks() - from);

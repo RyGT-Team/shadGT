@@ -1426,6 +1426,9 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
                 return;
             }
             auto run = [&inner] { inner(); };
+#ifdef RYTY_GPU
+            if (auto* native = rasterizer->Native()) native->RecorderBEnter(); // FEAT-SGT-079
+#endif
             RunOnRecorderB(run);
         }};
         job.SetTag(tag);
@@ -1827,7 +1830,7 @@ bool Liverpool::WritesLiveCommands(VAddr address, u64 size) const {
 int Liverpool::RecorderBMode() {
     static const int mode = [] {
         const char* env = std::getenv("SHADGT_RECORDER_B");
-        return env && env[0] >= '1' && env[0] <= '6' ? env[0] - '0' : 0;
+        return env && env[0] >= '1' && env[0] <= '8' ? env[0] - '0' : 0;
     }();
     return mode;
 }
@@ -1849,6 +1852,7 @@ void Liverpool::RecorderBBatonThread() {
     Common::NativeThreadPriority native_priority;
 #endif
     draw_pipe->SetBatonThread(std::this_thread::get_id());
+    ::Vulkan::MarkRecorderBThread(); // FEAT-SGT-079
     u64 seen = 0;
     while (true) {
 #ifdef RYTY_GPU

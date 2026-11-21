@@ -2623,8 +2623,8 @@ static std::atomic<u64> g_lds_owned_epoch{1};
 static void NoteOwnedMapChange() { g_lds_owned_epoch.fetch_add(1, std::memory_order_acq_rel); }
 
 NativeRenderer::~NativeRenderer() {
-    if (binder) { // FEAT-SGT-022: every job made before anything its jobs use goes
-        binder->Drain();
+    for (auto& binder : binders) { // FEAT-SGT-022: every job made before anything its jobs use goes
+        if (binder) binder->Drain();
     }
     g_lds_owned_epoch.fetch_add(1, std::memory_order_acq_rel); // PERF-GT7-133
     auto expected_observer = one_off_observer;
@@ -2639,7 +2639,8 @@ NativeRenderer::~NativeRenderer() {
         r.scheduler.Finish();
         r.scheduler.SyncCommandThread();
     }
-    if (binder) { // FEAT-SGT-022: its placeholders replayed, nothing points at it any more
+    for (auto& binder : binders) { // FEAT-SGT-022: its placeholders replayed, nothing points at it any more
+        if (!binder) continue;
         binder->WaitReplayed();
         binder.reset();
     }
@@ -3840,7 +3841,43 @@ CmdBuf NativeRenderer::StreamCmdOf(Native::Rhi::CommandList& list) const {
     return CmdBuf{vk::CommandBuffer{Handle<VkCommandBuffer_T>(list.NativeHandle())}};
 }
 
+static bool RecorderBRawLists(); // FEAT-SGT-079 step 7
+
+// FEAT-SGT-079 step 9 (SHADGT_RECORDER_B_RING=1; 2: in arm 1 of the 2 s A/B): recorder B's
+// context records its lists through a command ring of its own (and their deferred-list pool is
+// that ring's). At each of its splices the main ring replays B's ring up to there in place
+// (Scheduler::RecordChunk, on the command thread), then runs the list. B's lists keep the
+// command thread and the binder, unlike step 7's raw lists.
+static bool RecorderBOwnRing() {
+    static const int mode = [] {
+        const char* env = std::getenv("SHADGT_RECORDER_B_RING");
+        return env && (env[0] == '1' || env[0] == '2') ? env[0] - '0' : 0;
+    }();
+    return mode == 1 || (mode == 2 && SubmitAbArm().load(std::memory_order_relaxed) == 1);
+}
+
 void NativeRenderer::AcquireList(Stream& s) {
+    if (&s == &b_record_context.stream && RecorderBRawLists()) { // FEAT-SGT-079 step 7
+        // Not ApplyRingPriority: the command thread's priority follows A's lists.
+        s.list = device->AcquireCommandList(Native::Rhi::CommandListLevel::Secondary);
+        s.list->Begin();
+        s.cmd = CmdBuf{vk::CommandBuffer{Handle<VkCommandBuffer_T>(s.list->NativeHandle())}};
+        if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("recorder B raw list", {});
+        return;
+    }
+    if (&s == &b_record_context.stream && RecorderBOwnRing() && RingEnabled() &&
+        r.scheduler.CommandThreadRing() && !Native::GpuCheckpoints::Requested() &&
+        !Scheduler::ThreadRing()) { // FEAT-SGT-079 step 9
+        if (!b_ring) b_ring = r.scheduler.NewWorkerRing();
+        if (auto* list = device->AcquireDeferredCommandList(b_ring.get())) {
+            s.list = list;
+            list->Begin();
+            s.cmd = CmdBuf{b_ring.get(),
+                           reinterpret_cast<const vk::CommandBuffer*>(list->NativeHandleSlot())};
+            if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("recorder B own-ring list", {});
+            return;
+        }
+    }
     const bool enabled = RingEnabled();
     static const bool logged = [enabled] {
         if (enabled && ParallelRecordingRequested())
@@ -4196,7 +4233,7 @@ void NativeRenderer::BindGraphics(Stream& s, const GraphicsPipeline& pipeline,
             return value == "keep" ? 0 : value == "change" ? 1 : 2;
         }();
         if (so_bindings == 2 || (so_bindings == 1 && !(known && shaders == pipeline.ShaderObjects()))) {
-            if (binder) {
+            if (AnyBinder()) {
                 s.binding_commands_stale = true; // FEAT-SGT-022: the binder may be using them
             } else {
                 s.binding_commands.Invalidate();
@@ -5284,6 +5321,9 @@ void NativeRenderer::PrepareImages(const DrawBindings& b) {
 }
 
 void NativeRenderer::ChunkFlushCheck() {
+    // FEAT-SGT-079 step 10: recorder B's thread never splices or submits; its run is one list,
+    // spliced by the recorder at the run's end.
+    if (OnRecorderBThread()) return;
     // Long lists are run and submitted as they grow, so the GPU starts on them (as the old
     // path's SubmitChunkIfNeeded does).
     if (Ctx().stream.commands >= SpliceAfter) {
@@ -13306,7 +13346,7 @@ void NativeRenderer::LongSetsUpkeep() {
     const bool some = Native::DeadHandles::Take(dead);
     if (some) g_buffer_size_epoch.fetch_add(1, std::memory_order_release); // PERF-SGT-020
     std::unique_lock<std::mutex> lock{long_sets_mutex, std::defer_lock};
-    if (ParallelRecordingRequested() || binder) lock.lock(); // FEAT-SGT-022: the binder's too
+    if (ParallelRecordingRequested() || AnyBinder()) lock.lock(); // FEAT-SGT-022: the binder's too
     if (some) DropLongSets(dead);
     if (long_sets.entries.Size() > 200000 || long_sets.unused_sets > 20000) FlushLongSets();
 }
@@ -13607,6 +13647,7 @@ static int RecorderBinderWanted() {
 
 NativeRenderer::DrawBindings& NativeRenderer::NextBindings() {
     RecordContext& c = Ctx();
+    auto* const binder = CtxBinder(); // FEAT-SGT-079: this context's
     if (!binder) {
         return c.binding_slots[0];
     }
@@ -13640,6 +13681,8 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     LongSetsUpkeep();
     Stream& s = Ctx().stream;
     RecordContext& c = Ctx();
+    const u8 binder_index = ContextIndex();
+    auto& binder = binders[binder_index]; // FEAT-SGT-079: this context's
     if (!binder && RecorderBinderWanted() != 0 && s.cmd.Ring()) {
         binder = std::make_unique<Native::RecorderBinder<BindJob>>(this, &RunBindJob);
         binder_mode = RecorderBinderWanted();
@@ -13670,6 +13713,7 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             c.binding_jobs[&b - c.binding_slots.data()] = seq;
         } else {
             binding_prepared->binder_job = seq;
+            binding_prepared->binder_index = binder_index;
         }
         auto* const owner = binder.get();
         s.cmd.Control([owner, seq](Scheduler& scheduler) {
@@ -13698,7 +13742,7 @@ void NativeRenderer::PushBindingsWith(const Pipeline& pipeline, vk::PipelineBind
     // PERF-GTS-398: with parallel recording the table is the pass workers' too.
     static const bool long_sets_shared = ParallelRecordingRequested();
     // FEAT-SGT-022: and the binder's (locked as it is shared, without changing what is kept).
-    const bool long_sets_locked = long_sets_shared || binder != nullptr;
+    const bool long_sets_locked = long_sets_shared || AnyBinder();
     auto* pending_owner = inputs.on_binder ? nullptr : FindParallelRuntime(this);
     if(!parallel_binding_capture && pending_owner)
         pending_owner->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::Serial);
@@ -20908,20 +20952,22 @@ NativeRenderer::PreparedDraw* NativeRenderer::NewPrepared() {
 void NativeRenderer::ReleaseBinderHeld() {
     // FEAT-SGT-022: prepared draws whose binder jobs have run go back now (in order: jobs run
     // in order, so the first one still running stops the walk).
-    size_t released = 0;
-    while (released < binder_held.size() && binder &&
-           binder->Done(binder_held[released]->binder_job)) {
-        binder_held[released]->binder_job = 0;
-        FreePrepared(binder_held[released]);
-        ++released;
-    }
-    binder_held.erase(binder_held.begin(), binder_held.begin() + released);
+    // FEAT-SGT-079: with a binder per context, jobs run in order per binder only: every held
+    // draw is looked at.
+    std::erase_if(binder_held, [this](PreparedDraw* draw) {
+        const auto& binder = binders[draw->binder_index];
+        if (binder && !binder->Done(draw->binder_job)) return false;
+        draw->binder_job = 0;
+        FreePrepared(draw);
+        return true;
+    });
 }
 
 void NativeRenderer::FreePrepared(PreparedDraw* draw) {
     // FEAT-SGT-022: a draw whose binds the binder still makes keeps its bindings until then
     // (only the recorder gives back drawn prepared draws; others never had a job).
-    if (draw->binder_job != 0 && binder && !binder->Done(draw->binder_job)) {
+    if (draw->binder_job != 0 && binders[draw->binder_index] &&
+        !binders[draw->binder_index]->Done(draw->binder_job)) {
         binder_held.push_back(draw);
         return;
     }
@@ -22379,9 +22425,18 @@ bool NativeRenderer::PrepareVertices(PreparedDraw& p, const AmdGpu::Regs& regs,
 static int RecorderBMode() {
     static const int mode = [] {
         const char* env = std::getenv("SHADGT_RECORDER_B");
-        return env && env[0] >= '1' && env[0] <= '6' ? env[0] - '0' : 0;
+        return env && env[0] >= '1' && env[0] <= '8' ? env[0] - '0' : 0;
     }();
     return mode;
+}
+// FEAT-SGT-079 step 7 (SHADGT_RECORDER_B=7; 8: in arm 1 of the 2 s A/B, the baton in both):
+// recorder B's context records raw secondaries, as parallel recording's pass workers do: from
+// its thread's own list pool, with the driver called on its thread and its bindings made inline
+// (the binder only takes lists on the ring). B then needs neither the command ring, the shared
+// deferred-list pool nor the binder; the recorder still runs its lists in order at the splice.
+static bool RecorderBRawLists() {
+    const int mode = RecorderBMode();
+    return mode == 7 || (mode == 8 && SubmitAbArm().load(std::memory_order_relaxed) == 1);
 }
 static bool RecorderBSplit() {
     const int mode = RecorderBMode();
@@ -22550,6 +22605,22 @@ void NativeRenderer::RecorderBDryRun(u64 key) {
 // list, so lists run in recording order and at most one is open (the submit callback's splice
 // then takes it). This checks that B's context records draws as the main one does: its own
 // streams, pipelines and dynamic state, bindings scratch and memos.
+void NativeRenderer::RecorderBEnter() {
+    std::scoped_lock lock{mutex};
+    if (current_context != &main_record_context) {
+        return;
+    }
+    if (Ctx().stream.list) {
+        Splice();
+    }
+    current_context = &b_record_context;
+    if constexpr (Common::DiagnosticsBuilt) {
+        ++b_deal.switches;
+        NoteSubmitSite("recorder B hand-over", {}); // DIAG-SGT-076
+        NoteSubmitSite("recorder B run", {});
+    }
+}
+
 void NativeRenderer::RecorderBDeal(bool dispatch, const AmdGpu::Regs& regs) {
     if (RecorderBMode() < 3) {
         return;
@@ -25837,6 +25908,7 @@ void NativeRenderer::Splice(std::source_location where) {
     }
     if constexpr (Common::DiagnosticsBuilt) AuditCount(AuditSplice); // DIAG-SGT-075
     if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("splice", where); // DIAG-SGT-076
+    if constexpr (Common::DiagnosticsBuilt) NoteRecorderBMain("B: splice", where); // DIAG-SGT-082
     DrainBinder(); // FEAT-SGT-022: its jobs use the list's pools and binds
     // DIAG-SGT-023: only a splice that ends a list drains (the submit callback after
     // ChunkFlushCheck's own splice finds none open).
@@ -25879,7 +25951,17 @@ void NativeRenderer::Splice(std::source_location where) {
         }
     }
     if (!wrapped) {
-        r.scheduler.CommandBuffer().executeCommands(s.cmd);
+        if (CommandRing* own = s.cmd.Ring(); own && own != r.scheduler.CommandThreadRing()) {
+            // FEAT-SGT-079 step 9: B's ring up to here (the list's commands and its binds' and
+            // ends') goes into the command order first.
+            ASSERT_MSG(own == b_ring.get(), "FEAT-SGT-079: a list from an unknown ring");
+            const u64 end = own->Recorded();
+            r.scheduler.RecordChunk(own, b_ring_handed, end);
+            b_ring_handed = end;
+            r.scheduler.CommandBuffer().executeCommandsAfterChunk(s.cmd);
+        } else {
+            r.scheduler.CommandBuffer().executeCommands(s.cmd);
+        }
     }
     // PERF-GTS-398: every pass of the list has been recorded: its packets' prepared draws go
     // (at the next draw: a draw that is being recorded may have asked for this splice).

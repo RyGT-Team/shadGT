@@ -2404,6 +2404,18 @@ void Liverpool::RecorderBBatonThread() {
 #endif
     draw_pipe->SetBatonThread(std::this_thread::get_id());
     ::Vulkan::MarkRecorderBThread(); // FEAT-SGT-079
+    // FEAT-SGT-079 step 27 (SHADGT_RECORDER_B_PRIORITY): 1, B at high priority as the recorder
+    // when boosted; 2, also on the logical processors of SHADGT_RECORDER_B_CPUS (a hex mask).
+    if (const char* env = std::getenv("SHADGT_RECORDER_B_PRIORITY"); env && (env[0] == '1' || env[0] == '2')) {
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+        if (env[0] == '2') {
+            if (const char* cpus = std::getenv("SHADGT_RECORDER_B_CPUS"); cpus && *cpus) {
+                Common::SetCurrentThreadProcessors(std::strtoull(cpus, nullptr, 16));
+            }
+        }
+        LOG_INFO(Render, "FEAT-SGT-079 step 27: recorder B at high priority{}",
+                 env[0] == '2' ? " on SHADGT_RECORDER_B_CPUS" : "");
+    }
     if (RecorderBOverlap()) {
         RecorderBOverlapLoop();
         return;

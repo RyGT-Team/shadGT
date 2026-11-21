@@ -18172,10 +18172,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     // the lock again for what the draw wrote (NoteWrites on).
     struct BUnlocked {
         NativeRenderer* self = nullptr;
-        ~BUnlocked() {
-            if (self) self->b_pin.unlock_shared();
+        std::unique_lock<decltype(NativeRenderer::mutex)>* lock = nullptr;
+        ~BUnlocked() { // an early return: the lock again before GiveBack's FreePrepared runs
+            if (!self) return;
+            self->b_pin.unlock_shared();
+            if (lock && !lock->owns_lock()) lock->lock();
         }
     } b_unlocked;
+    b_unlocked.lock = &lock;
     if (OnRecorderBThread() && t_b_window && RecorderBUnlocked() == 2 && from_prepared &&
         prepared_vertices_valid && !parallel && !indirect && !hud_black_state &&
         !hud_white_state && !Gt7TemporalRequested() && !pipeline->LdsEmulation() &&
@@ -23096,6 +23100,13 @@ bool NativeRenderer::RecorderAOrderedFree(const void* packet) {
     // Step 26: a picture the recorder's draw makes now matters only if one of B's handed draws
     // also looks it up at its commit (it would find it made, with its first contents in the
     // recorder's list, after B's).
+    // FEAT-SGT-079 step 27: strict by default (any missing picture syncs B). The narrowed test
+    // below (SHADGT_RECORDER_B_STEP23_STRICT=0) drew glitches once B ran at high priority.
+    static const bool strict = [] {
+        const char* env = std::getenv("SHADGT_RECORDER_B_STEP23_STRICT");
+        return !(env && env[0] == '0');
+    }();
+    if (strict && !p->missing_pictures.empty()) return no("A ordered: missing pictures (strict)");
     for (const auto& missing : p->missing_pictures) {
         const auto& mi = missing.info;
         const VAddr begin = mi.guest_address;

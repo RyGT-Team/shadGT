@@ -13,6 +13,18 @@
 // (PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0..X1Y1), given to Vulkan with VK_EXT_sample_locations.
 namespace Vulkan::SampleLocations {
 
+// FIX-SGT-066: custom positions require a graphics pipeline that uses them and a
+// recorder that preserves the last written pattern on depth layout transitions.
+constexpr const char* BackendDisableReason(bool native_renderer, bool shader_objects) {
+    if (!native_renderer) {
+        return "non-native renderer uses standard depth sample locations";
+    }
+    if (shader_objects) {
+        return "shader objects are on";
+    }
+    return nullptr;
+}
+
 /// The positions of one draw. samples 0: the pipeline has no sample-locations state.
 /// A position is one byte: x in the low nibble, y in the high nibble, in 1/16 pixel from the
 /// pixel's top-left corner (Vulkan's 0..0.9375). grid 1: one pattern for every pixel; grid 2:

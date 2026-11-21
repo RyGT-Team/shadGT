@@ -2,8 +2,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <gtest/gtest.h>
+#include "video_core/renderer_vulkan/sample_locations.h"
 #include "video_core/amdgpu/regs_depth.h"
 #include "video_core/renderer_vulkan/depth_attachment.h"
+
+TEST(DepthAttachment, CustomSampleLocationsRequireNativePipelineDepthTracking) {
+    using Vulkan::SampleLocations::BackendDisableReason;
+    EXPECT_NE(BackendDisableReason(false, false), nullptr);
+    EXPECT_NE(BackendDisableReason(false, true), nullptr);
+    EXPECT_NE(BackendDisableReason(true, true), nullptr);
+    EXPECT_EQ(BackendDisableReason(true, false), nullptr);
+}
 
 TEST(DepthAttachment, NarrowReadOnlyFarRangeDoesNotRoundSkyToClearDepth) {
     AmdGpu::DepthControl control{};

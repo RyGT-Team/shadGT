@@ -1354,6 +1354,9 @@ struct PipelineCache::PipelineBuild {
     bool preloading{};
     // FEAT-GTS-470: a precompile build of only the stage libraries (PrecompileLibrariesOnly).
     bool libraries_only{};
+    // FIX-SGT-086: built for a draw of the game (on demand or read ahead from the command stream,
+    // not a legacy key): its key is stored once it is built, whether or not a draw installs it.
+    bool remember{};
     // PERF-076: a new pipeline its draws skip until a worker has built it.
     bool async{};
     u32 required_waiters{}; // lookup mutex only; never touched by compiler workers
@@ -3488,7 +3491,24 @@ std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::MakePipelineBuild()
     build->modules = S().modules;
     build->done = build->promise.get_future().share();
     build->queued = std::chrono::steady_clock::now();
+    build->remember = !S().key_uses_legacy; // FIX-SGT-086 (the precompile's builds are left out)
     return build;
+}
+
+// FIX-SGT-086 (SHADGT_KEYS_AT_BUILD_END, on unless 0): a pipeline's key was stored only when a draw
+// installed it. A draw skipped while its pipeline was building (PERF-076) that never came back
+// (a one-off picture, a loading screen, the first frames of a race) left a built pipeline and no
+// key: on 11-21, a cold GT7 session built 1,135 pipelines in game and kept 395 keys, and a
+// session started from its store with every stored pipeline built at the splash still built 718
+// pipelines of known shaders in game. Now a pipeline built for a draw is stored once built; the
+// read-ahead builds only real draws ahead in the command stream, so they are kept too. Compute
+// pipelines still keep their key only when a dispatch installs them.
+static bool KeysAtBuildEnd() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_KEYS_AT_BUILD_END");
+        return !(env && env[0] == '0');
+    }();
+    return on;
 }
 
 // FEAT-GTS-470 (SHADGT_DIAG_PRECOMPILE=1): the splash precompile's throughput, logged every
@@ -3550,6 +3570,16 @@ void PipelineCache::FinishBuild(PipelineBuild& build) {
         build.pipeline->SetStageInfos(build.canonical);
         build.info_copies = {};
         build.user_data = {};
+        // FIX-SGT-086: stored before the build is published, while only this thread uses it
+        // (the store's writes go through its own locked queue). A failed write never fails
+        // the build.
+        if (build.remember && !build.preloading && !build.libraries_only && KeysAtBuildEnd()) {
+            try {
+                RegisterPipelineData(build.key, std::hash<GraphicsPipelineKey>{}(build.key),
+                                     build.sdata);
+            } catch (...) {
+            }
+        }
         build.promise.set_value();
       } catch (...) {
         // Publish failures as well as success: no stranded waiter or exception escaping a

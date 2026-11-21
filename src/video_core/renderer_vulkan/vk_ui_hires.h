@@ -173,8 +173,12 @@ constexpr std::array<HudPiece, 6> HudPieces{{
 
 /// WIDE-001: wide output with the game's 16:9 picture in the middle.
 inline bool Wide() {
+#ifdef RYTY_GPU
     static const bool wide = Enabled() && RytyWideScene();
     return wide;
+#else
+    return false; // FIX-SGT-070: wide-scene hooks belong to the Ryty backend.
+#endif
 }
 
 
@@ -500,8 +504,12 @@ inline void Upscale(const Instance& instance, Scheduler& scheduler, Runtime& run
                     Proxy& proxy) {
     scheduler.EndRendering();
     proxy.full = false;
+#ifdef RYTY_GPU
     const bool dlss =
         !Wide() && !proxy.dlss_failed && RytyDlss::CanScale(proxy.native, proxy.size);
+#else
+    constexpr bool dlss = false; // Use the regular blit in the standalone renderer.
+#endif
     if (dlss) {
         runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
                         vk::PipelineStageFlagBits2::eComputeShader,
@@ -514,6 +522,7 @@ inline void Upscale(const Instance& instance, Scheduler& scheduler, Runtime& run
     runtime.FlushBarriers();
     const vk::CommandBuffer cmdbuf = scheduler.DirectCommandBuffer();
     bool scaled = false;
+#ifdef RYTY_GPU
     if (dlss) {
         VideoCore::ImageViewInfo info{};
         info.format = target_view.format;
@@ -524,6 +533,7 @@ inline void Upscale(const Instance& instance, Scheduler& scheduler, Runtime& run
             proxy.dlss_failed = true;
         }
     }
+#endif
     proxy.dlss_used = scaled;
     if (Wide()) {
         ClearProxyForBlit(cmdbuf, proxy); // WIDE-001: black beside the 16:9 picture

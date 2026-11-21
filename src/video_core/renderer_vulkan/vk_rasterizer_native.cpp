@@ -23766,6 +23766,31 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
             if (!entry) {
                 return reject(3); // the recorder's own lookups bind what there is
             }
+            if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-092: why the job thread missed it
+                NoteSubmitSite(entry->made_frame == frame ? "missing at prepare: made this frame"
+                               : entry->made_frame + 1 == frame ? "missing at prepare: made last frame"
+                                                                : "missing at prepare: made earlier",
+                               {});
+                if (entry->made_frame == frame) { // what came before it at that address
+                    const auto& mi = missing.info;
+                    const Native::ImageEntry* older = registry->FindExisting(
+                        mi.guest_address, [&](const Native::ImageEntry& e) {
+                            return &e != entry && e.made_frame < frame &&
+                                   e.info.size.width == mi.size.width &&
+                                   e.info.size.height == mi.size.height &&
+                                   e.info.num_bits == mi.num_bits;
+                        });
+                    NoteSubmitSite(!older ? "missing made this frame: no older picture there"
+                                   : older->reused.load(std::memory_order_relaxed)
+                                       ? "missing made this frame: older one reused (FIX-157)"
+                                   : older->from_cpu != entry->from_cpu
+                                       ? "missing made this frame: older one, other kind"
+                                       : "missing made this frame: older one, not matched",
+                                   {});
+                    NoteSubmitSite(entry->from_cpu ? "missing made this frame: a texture"
+                                                   : "missing made this frame: a target", {});
+                }
+            }
             if (trap) {
                 const bool made =
                     registry->GetStats().created_textures.load(std::memory_order_relaxed) != made_before;

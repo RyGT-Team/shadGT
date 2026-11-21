@@ -332,6 +332,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_TESS_LDS_EMULATION|int|Tessellation|2|0 = off; first digit is the mode passed on|Mode of hull-shader LDS emulation for tessellated draws with several patches; 0 turns it off. Mode meanings not documented here.",
     "RYGTSW1|SHADGT_TESS_LDS_SPREAD|flag|Tessellation|on|0 = off (uses a separate shader store)|Hull shaders' LDS writer pass shares its stores across the patch's invocations as vec4 stores (PERF-GTS-458).",
     // Frame pacing & present
+    "RYGTSW1|SHADGT_SWAPCHAIN_TIMEOUT_RECOVERY|flag|Frame pacing & present|on|0 = off|Recreates the presentation swapchain if acquiring or presenting an image times out.",
     "RYGTSW1|SHADGT_FAST_FLIPS|flag|Frame pacing & present|launcher's fast_flips option, else on in native mode without frame generation|1 = on, any other non-empty value = off|Frames flip as soon as they are ready between vblanks instead of on the vblank. Overrides the launcher option.",
     "RYGTSW1|SHADGT_FEED_GPU|flag|Frame pacing & present|on|0 = off|Submits the command list early when the GPU is idle so it is never starved. 0 turns it off.",
     "RYGTSW1|SHADGT_FEED_GPU_MIN|int|Frame pacing & present|32|commands, >= 1|Minimum commands in a list before SHADGT_FEED_GPU submits it early to an idle GPU.",

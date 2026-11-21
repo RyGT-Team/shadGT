@@ -502,6 +502,11 @@ private:
     std::unordered_map<u64, u32> push_occurrences;
     u64 push_occurrence_hash = 0;
     static bool RecorderBLearned();
+    /// FEAT-SGT-079 step 18 (SHADGT_RECORDER_B_CHUNK=<draws>): within each pass, chunks of that
+    /// many draws go to A and B in turns (draws of one pass do not read each other's output; the
+    /// lists keep their order at the splices). 0 or unset: off.
+    static u32 RecorderBChunk();
+    u32 push_draw_in_pass = 0;
     const QueuedDraw* running_queued_draw = nullptr; ///< recorder thread
     // SHADGT_RECORDER_B=4: recorder B's thread and its queue (every draw and dispatch, in order).
     std::mutex b_mutex;

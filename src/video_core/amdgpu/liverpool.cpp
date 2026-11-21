@@ -1330,6 +1330,13 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         // the passes whose output waited 0.5 ms+ in one of the last two frames, matched by key and
         // occurrence (GT7's double-buffered targets alternate keys from frame to frame).
         if (pass_start) {
+            push_draw_in_pass = 0;
+        }
+        if (const u32 chunk = RecorderBChunk(); chunk != 0) { // FEAT-SGT-079 step 18
+            queued_draw->to_b = !compute && (push_draw_in_pass / chunk) % 2 == 1;
+        }
+        ++push_draw_in_pass;
+        if (pass_start) {
             push_occurrence_hash =
                 Vulkan::NativeRenderer::PassOccurrenceHash(tag, push_occurrences[tag]++);
         }
@@ -1960,6 +1967,14 @@ static int RecorderBFirstMode() {
         return env && env[0] >= '1' && env[0] <= '6' ? env[0] - '0' : 0;
     }();
     return mode;
+}
+
+u32 Liverpool::RecorderBChunk() {
+    static const u32 chunk = [] {
+        const char* env = std::getenv("SHADGT_RECORDER_B_CHUNK");
+        return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 0u;
+    }();
+    return chunk;
 }
 
 bool Liverpool::RecorderBLearned() {

@@ -15873,7 +15873,11 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
             bool dep = false;
             for (const auto* e : b.sampled) dep = dep || b_prev_written.contains(e);
             for (const auto* e : b.stored) dep = dep || b_prev_written.contains(e);
-            if (targets) {
+            static const bool chunked = [] {
+                const char* env = std::getenv("SHADGT_RECORDER_B_CHUNK");
+                return env && *env && env[0] != '0';
+            }();
+            if (targets && !chunked) {
                 for (const auto* e : targets->colors) dep = dep || (e && b_prev_written.contains(e));
                 dep = dep || (targets->depth && b_prev_written.contains(targets->depth));
             }

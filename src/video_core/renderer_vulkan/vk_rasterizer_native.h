@@ -12,6 +12,7 @@
 // NAT-100: native mode (SHADGT_NATIVE=1, ryGT builds); see vk_rasterizer_native.cpp.
 
 #pragma once
+#include "video_core/renderer_vulkan/native_mode.h"
 #include "video_core/renderer_vulkan/pipeline_owner.h"
 #include "common/fast_hash.h"
 #include <tsl/robin_map.h>
@@ -103,9 +104,6 @@ class Rasterizer;
 struct GtsSceneImage;
 class GraphicsPipeline;
 class ComputePipeline;
-
-/// NAT-100: whether native mode was asked for (SHADGT_NATIVE=1).
-bool NativeModeRequested();
 
 class NativeRenderer {
 public:

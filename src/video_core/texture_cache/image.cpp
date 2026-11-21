@@ -509,6 +509,8 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     }
 
     image_uid = global_image_uid.Next();
+    // FIX-SGT-066: this cache uses standard depth sample locations. Only the native
+    // recorder tracks the last written pattern for images created with the compatibility flag.
     vk::ImageCreateFlags flags{vk::ImageCreateFlagBits::eMutableFormat |
                                vk::ImageCreateFlagBits::eExtendedUsage};
     if (info.props.is_volume) {
@@ -573,11 +575,6 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
 
     constexpr auto tiling = vk::ImageTiling::eOptimal;
     const auto supported_format = instance.GetSupportedFormat(info.pixel_format, format_features);
-    if (info.props.is_depth) {
-        // NEO-GTS-508: depth attachments of pipelines with the game's sample positions.
-        flags |= instance.SampleLocationsDepthFlag(supported_format, ConvertImageType(info.type),
-                                                   usage_flags, flags);
-    }
     const vk::PhysicalDeviceImageFormatInfo2 format_info{
         .format = supported_format,
         .type = ConvertImageType(info.type),

@@ -376,8 +376,8 @@ public:
         return truncate_combinations;
     }
 
-    /// NEO-GTS-508: VK_EXT_sample_locations is on: multi-sample pipelines take the game's sample
-    /// positions (PS4 Pro mode, SHADGT_SAMPLE_LOCATIONS not 0, the device able to).
+    /// NEO-GTS-508: native PS4 Pro draws can use the game's sample positions on this device
+    /// when SHADGT_SAMPLE_LOCATIONS is enabled.
     bool IsSampleLocationsOn() const {
         return sample_locations;
     }

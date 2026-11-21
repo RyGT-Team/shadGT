@@ -21,6 +21,8 @@
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/native_mode.h"
+#include "video_core/renderer_vulkan/sample_locations.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/image_allocation.h"
@@ -750,8 +752,9 @@ bool Instance::CreateDevice() {
             off = "not the PS4 Pro mode";
         } else if (const char* env = std::getenv("SHADGT_SAMPLE_LOCATIONS"); env && env[0] == '0') {
             off = "SHADGT_SAMPLE_LOCATIONS=0";
-        } else if (shader_object) {
-            off = "shader objects are on";
+        } else if (const char* reason = SampleLocations::BackendDisableReason(NativeModeRequested(),
+                                                                              shader_object)) {
+            off = reason;
         } else if (std::ranges::none_of(available_extensions, [](const auto& name) {
                        return name == VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME;
                    })) {

@@ -2337,6 +2337,12 @@ private:
         u64 features = 0;
     };
     std::mutex recycle_mutex; ///< taken after views_mutex when both are held
+    /// PERF-SGT-093 (SHADGT_PREPARE_WANTED_PICTURES=1): per-frame textures the job threads did not
+    /// find, by address; the recorder makes them at its next draw, in GPU order.
+    std::mutex wanted_mutex;
+    std::unordered_map<VAddr, VideoCore::ImageInfo> wanted_pictures;
+    std::atomic<bool> has_wanted_pictures{false};
+    static bool WantedPicturesOn();
     std::unordered_map<u64, u64> recycle_keys; ///< image handle -> shape key
     /// shape key -> its free images, oldest first: taken in the order they came back, so the
     /// images of a shape go round in a fixed order (and those of several shapes in step).

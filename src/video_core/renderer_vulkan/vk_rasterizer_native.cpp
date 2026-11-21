@@ -2989,6 +2989,14 @@ static bool CubeCompatible(const Instance& instance, u32 width, u32 height, u32 
 
 static bool ListedInPlace(VAddr address, u64 size);
 
+bool NativeRenderer::WantedPicturesOn() { // PERF-SGT-093
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_PREPARE_WANTED_PICTURES");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
 // PERF-SGT-021 (SHADGT_RECYCLE_FRAME_TEXTURES=0: as before): GT7 writes a few small lookup
 // textures (30x17x16 and 4x4x48 R32G32Uint, a 512x256 R32Sfloat with mips) at a new address
 // of its per-frame memory in most frames. Each got a new image and view, so every draw that
@@ -16664,6 +16672,22 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
     } stream_unwind_guard{*this};
     RecorderBDeal(false, r.liverpool->DrawRegs()); // FEAT-SGT-079
+    // PERF-SGT-093: the per-frame textures the job threads missed are made now, by the recorder,
+    // in GPU order (before the draws that sample them; the job threads find them from here on).
+    if (has_wanted_pictures.load(std::memory_order_acquire) && !OnRecorderBThread()) {
+        std::unordered_map<VAddr, VideoCore::ImageInfo> wanted;
+        {
+            std::scoped_lock wanted_lock{wanted_mutex};
+            wanted.swap(wanted_pictures);
+            has_wanted_pictures.store(false, std::memory_order_release);
+        }
+        for (const auto& [address, info] : wanted) {
+            const Native::ImageEntry* made = registry->Find(info, false, frame);
+            if constexpr (Common::DiagnosticsBuilt) {
+                NoteSubmitSite(made ? "wanted picture made by the recorder" : "wanted picture not made", {});
+            }
+        }
+    }
     if (ParallelRecordingRequested() && !parallel_sidecar_init_failed.load(std::memory_order_relaxed) && RytyGtsInRace() && !r.instance.IsIntel() && !FindParallelRuntime(this)) {
         try {
             auto sidecar=std::make_unique<ParallelRuntime>();
@@ -22340,6 +22364,20 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
             continue;
         }
         Native::ImageEntry* entry = registry->Find(desc.info, storage, now_frame, false);
+        // PERF-SGT-093 (SHADGT_PREPARE_WANTED_PICTURES=1): GT7 writes a few small lookup textures
+        // (the light grid) at a new address of its per-frame memory in most frames; the job threads
+        // prepare ahead of the frame's first commit of one, so nearly every draw missed it and the
+        // recorder looked it up again at commit (about 49k a second at Tokyo, DIAG-SGT-092). Such a
+        // texture is asked for here; the recorder makes it at its next draw, in GPU order.
+        if (!entry && !storage && WantedPicturesOn() && desc.info.guest_size != 0 &&
+            desc.info.guest_size <= 1_MB && !desc.info.props.is_depth &&
+            ListedInPlace(desc.info.guest_address, desc.info.guest_size)) {
+            std::scoped_lock wanted_lock{wanted_mutex};
+            if (wanted_pictures.size() < 256) {
+                wanted_pictures.try_emplace(desc.info.guest_address, desc.info);
+                has_wanted_pictures.store(true, std::memory_order_release);
+            }
+        }
         if (!storage && (!entry || entry->needs_upload.load(std::memory_order_relaxed))) {
             warm_upload(desc.info.guest_address, desc.info.guest_size);
         }

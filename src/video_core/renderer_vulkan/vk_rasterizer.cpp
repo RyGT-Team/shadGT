@@ -3569,7 +3569,10 @@ void Rasterizer::StartFrameDumpNow() {
 }
 
 void Rasterizer::FrameDumpFlip() {
-#ifndef NDEBUG
+#if !defined(NDEBUG) || defined(SHADGT_DIAGNOSTICS)
+#ifdef NDEBUG
+    if (!debug_frame_dump_active && !VideoCore::DebugFrameDumpRequested()) return;
+#endif
     // FIX-158 (diagnosis, SHADGT_PEEK=<hex address>[,...], SHADGT_PEEK_AT=<seconds>): the first
     // eight floats guest memory holds at each address, at 240 flips from that time on (what the
     // CPU reads back of GPU results, per frame).
@@ -3737,7 +3740,7 @@ void Rasterizer::FrameDumpFlip() {
             LOG_ERROR(Render_Vulkan, "F8 capture: at least 2 GiB of free disk space is required");
         } else {
             for (unsigned suffix = 0; suffix < 1000; ++suffix) {
-                debug_frame_dump_dir = parent / fmt::format("dump-f8-{}-{}", stamp, suffix);
+                debug_frame_dump_dir = parent / fmt::format("dump-{}-{}-{}", VideoCore::FullFrameDump() ? "f1" : "f8", stamp, suffix);
                 if ((created = std::filesystem::create_directory(debug_frame_dump_dir, ec))) {
                     break;
                 }
@@ -3757,6 +3760,10 @@ void Rasterizer::FrameDumpFlip() {
             debug_frame_dump_previous_done = frame_dump_done;
             frame_dump_done = false;
             VideoCore::RequestScreenshotToPath(debug_frame_dump_dir / "screenshot.png");
+            if (VideoCore::FullFrameDump()) {
+                VideoCore::RequestScreenshotToPath(debug_frame_dump_dir / "visible.png",
+                                                   VideoCore::ScreenshotRequest::WithOverlays);
+            }
             LOG_WARNING(Render_Vulkan, "F8 capture: {} (screenshot at next present)",
                         debug_frame_dump_dir.string());
         }
@@ -5953,7 +5960,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 return env && env[0] == '1';
             }();
             if (frame_dump_collecting && !is_storage &&
-                (dump_all || True(image.flags & VideoCore::ImageFlagBits::GpuModified))) {
+                (VideoCore::FullFrameDump() || dump_all || True(image.flags & VideoCore::ImageFlagBits::GpuModified))) {
                 auto key = FrameDumpTextureKey(desc.info); // NAT-123
                 if (std::ranges::find(frame_dump_textures, key,
                                       [](const auto& t) { return std::get<0>(t); }) ==

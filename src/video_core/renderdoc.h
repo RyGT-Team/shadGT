@@ -10,13 +10,22 @@
 
 namespace VideoCore {
 
-#ifndef NDEBUG
+#if !defined(NDEBUG) || defined(SHADGT_DIAGNOSTICS)
 /// One debug frame dump may be pending or in progress at a time. FEAT-SGT-002: `frames` consecutive
-/// frames are collected (F8: 1; Shift+F8's burst: as many as its screenshots).
-bool RequestDebugFrameDump(u32 frames = 1);
+/// frames are collected (F8: 1; Shift+F8's burst: as many as its screenshots). `full` (F1) keeps
+/// every texture and mip and adds the presented picture. Debug and diagnostics builds only
+/// (PERF-SGT-025); in Release, FullFrameDump() is constexpr false.
+bool RequestDebugFrameDump(u32 frames = 1, bool full = false);
+bool DebugFrameDumpRequested();
+bool FullFrameDump();
 u32 DebugFrameDumpFrames();
 bool BeginDebugFrameDump();
 void FinishDebugFrameDump();
+#else
+inline constexpr bool FullFrameDump() { return false; }
+#endif
+
+#ifndef NDEBUG
 
 /// Loads renderdoc dynamic library module.
 void LoadRenderDoc();
@@ -60,10 +69,11 @@ struct ScreenshotRequests {
 void RequestScreenshot(ScreenshotRequest request);
 
 /// Queues a "game only" screenshot written to the given path (used by IPC SCREENSHOT).
-void RequestScreenshotToPath(const std::filesystem::path& path);
+void RequestScreenshotToPath(const std::filesystem::path& path,
+                             ScreenshotRequest kind = ScreenshotRequest::GameOnly);
 
 /// Takes up to max_count paths queued by RequestScreenshotToPath, oldest first.
-std::vector<std::filesystem::path> TakeRequestedScreenshotPaths(u32 max_count);
+std::vector<std::filesystem::path> TakeRequestedScreenshotPaths(u32 max_count, ScreenshotRequest kind);
 
 /// Atomically consumes and returns pending "game only" screenshot request counter.
 u32 ConsumeGameOnlyScreenshotRequests();

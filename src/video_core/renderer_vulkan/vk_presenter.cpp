@@ -433,8 +433,9 @@ static std::vector<std::filesystem::path> BuildScreenshotPaths(const ScreenshotK
     }
 
     // Paths requested over IPC come first; the rest get generated names.
-    if (kind == ScreenshotKind::GameOnly) {
-        paths = VideoCore::TakeRequestedScreenshotPaths(count);
+    {
+        paths = VideoCore::TakeRequestedScreenshotPaths(count, kind == ScreenshotKind::GameOnly
+            ? VideoCore::ScreenshotRequest::GameOnly : VideoCore::ScreenshotRequest::WithOverlays);
         for (const auto& path : paths) {
             std::error_code ec{};
             std::filesystem::create_directories(path.parent_path(), ec);
@@ -998,7 +999,7 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
     const u64 guestFrame = g_prepared_frames.fetch_add(1, std::memory_order_relaxed);
-#ifndef NDEBUG
+#if !defined(NDEBUG) || defined(SHADGT_DIAGNOSTICS)
     rasterizer->FrameDumpFlip(); // NAT-116
 #endif
 #ifdef RYTY_GPU

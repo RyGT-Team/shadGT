@@ -28,18 +28,33 @@ enum class CaptureState {
     InProgress,
 };
 static CaptureState capture_state{CaptureState::Idle};
-enum class DebugFrameDumpState { Idle, Pending, Active };
+#endif
+
+#if !defined(NDEBUG) || defined(SHADGT_DIAGNOSTICS)
+enum class DebugFrameDumpState { Idle, Preparing, Pending, Active };
 static std::atomic<DebugFrameDumpState> debug_frame_dump{DebugFrameDumpState::Idle};
 
 static std::atomic<u32> debug_frame_dump_frames{1}; // FEAT-SGT-002
 
-bool RequestDebugFrameDump(u32 frames) {
+static std::atomic<bool> full_frame_dump{};
+
+bool RequestDebugFrameDump(u32 frames, bool full) {
     auto expected = DebugFrameDumpState::Idle;
-    if (!debug_frame_dump.compare_exchange_strong(expected, DebugFrameDumpState::Pending)) {
+    if (!debug_frame_dump.compare_exchange_strong(expected, DebugFrameDumpState::Preparing)) {
         return false;
     }
     debug_frame_dump_frames.store(std::max<u32>(frames, 1), std::memory_order_release);
+    full_frame_dump.store(full, std::memory_order_relaxed);
+    debug_frame_dump.store(DebugFrameDumpState::Pending, std::memory_order_release);
     return true;
+}
+
+bool DebugFrameDumpRequested() {
+    return debug_frame_dump.load(std::memory_order_acquire) == DebugFrameDumpState::Pending;
+}
+
+bool FullFrameDump() {
+    return full_frame_dump.load(std::memory_order_relaxed);
 }
 
 u32 DebugFrameDumpFrames() {
@@ -52,13 +67,14 @@ bool BeginDebugFrameDump() {
 }
 
 void FinishDebugFrameDump() {
+    full_frame_dump.store(false, std::memory_order_relaxed);
     debug_frame_dump.store(DebugFrameDumpState::Idle);
 }
 #endif
 static std::atomic<u32> screenshot_game_only_count{0};
 static std::atomic<u32> screenshot_with_overlays_count{0};
 static std::mutex requested_screenshot_paths_mutex;
-static std::vector<std::filesystem::path> requested_screenshot_paths;
+static std::vector<std::filesystem::path> requested_game_paths, requested_overlay_paths;
 
 #ifndef NDEBUG
 RENDERDOC_API_1_6_0* rdoc_api{};
@@ -190,16 +206,18 @@ void RequestScreenshot(const ScreenshotRequest request) {
     }
 }
 
-void RequestScreenshotToPath(const std::filesystem::path& path) {
+void RequestScreenshotToPath(const std::filesystem::path& path, ScreenshotRequest kind) {
     {
         std::scoped_lock lock{requested_screenshot_paths_mutex};
-        requested_screenshot_paths.push_back(path);
+        auto& paths = kind == ScreenshotRequest::WithOverlays ? requested_overlay_paths : requested_game_paths;
+        paths.push_back(path);
     }
-    RequestScreenshot(ScreenshotRequest::GameOnly);
+    RequestScreenshot(kind);
 }
 
-std::vector<std::filesystem::path> TakeRequestedScreenshotPaths(const u32 max_count) {
+std::vector<std::filesystem::path> TakeRequestedScreenshotPaths(const u32 max_count, ScreenshotRequest kind) {
     std::scoped_lock lock{requested_screenshot_paths_mutex};
+    auto& requested_screenshot_paths = kind == ScreenshotRequest::WithOverlays ? requested_overlay_paths : requested_game_paths;
     const auto count = std::min<size_t>(max_count, requested_screenshot_paths.size());
     std::vector<std::filesystem::path> paths(requested_screenshot_paths.begin(),
                                              requested_screenshot_paths.begin() + count);

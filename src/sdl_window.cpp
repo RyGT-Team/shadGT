@@ -258,12 +258,17 @@ void WindowSDL::WaitEvent() {
         }
         return;
     }
-#ifndef NDEBUG
+    // Plain F8 (frame dump) and F1 (full capture with the presented HUD): Debug and diagnostics
+    // builds only (PERF-SGT-025). Release leaves both keys to the game's input bindings.
+#if !defined(NDEBUG) || defined(SHADGT_DIAGNOSTICS)
+    const bool full_dump = event.key.scancode == SDL_SCANCODE_F1;
     if ((event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
-        event.key.scancode == SDL_SCANCODE_F8 && SDL_GetKeyboardFocus() == window) {
+        (full_dump || event.key.scancode == SDL_SCANCODE_F8) &&
+        !(event.key.mod & (SDL_KMOD_CTRL | SDL_KMOD_SHIFT | SDL_KMOD_ALT | SDL_KMOD_GUI)) &&
+        SDL_GetKeyboardFocus() == window) {
         if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
-            VideoCore::RequestDebugFrameDump()) {
-            LOG_INFO(Frontend, "F8 capture queued");
+            VideoCore::RequestDebugFrameDump(1, full_dump)) {
+            LOG_INFO(Frontend, "{} capture queued", full_dump ? "F1" : "F8");
 #ifdef _WIN32
             // Match the capture helper's acknowledgement on this window-event thread.
             Beep(1100, 60);

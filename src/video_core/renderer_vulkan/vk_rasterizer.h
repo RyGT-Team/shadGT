@@ -674,7 +674,23 @@ private:
     void prepareNativeHud(RenderState& state);
 #endif
     bool TemporalOwnsDisplay();
-    DrawContext* ctx = &main_ctx;
+    /// FEAT-SGT-079 step 25: recorder B's draw context; `ctx` is the calling thread's.
+    DrawContext b_ctx;
+    struct CtxSelect {
+        Rasterizer* r;
+        DrawContext* get() const {
+            return ::Vulkan::OnRecorderBThread() ? &r->b_ctx : &r->main_ctx;
+        }
+        DrawContext* operator->() const {
+            return get();
+        }
+        DrawContext& operator*() const {
+            return *get();
+        }
+        operator DrawContext*() const {
+            return get();
+        }
+    } ctx{this};
     /// DIAG-041: buffers and images of the current draw that were bound empty.
     /// DIAG-044: records the current draw or dispatch in the dependency history.
     void RecordDiagHistory(const Pipeline* pipeline, bool compute, u32 count);

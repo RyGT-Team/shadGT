@@ -2681,7 +2681,7 @@ NativeRenderer::~NativeRenderer() {
         r.scheduler.SyncCommandThread();
     }
     ClearTemporalPictures();
-    retired_pipeline_owners.ClearAfterGpuIdle();
+    { std::scoped_lock owners_lock{retired_owners_mutex}; retired_pipeline_owners.ClearAfterGpuIdle(); }
     Ctx().stream.writeback_plan_leases.clear();
     retired_writeback_plans.ClearAfterGpuIdle();
     if (auto* direct = r.buffer_cache.GetDirectMemory()) {
@@ -16577,6 +16577,8 @@ void NativeRenderer::PassAuditDraw(u64 ns) {
     d.ns += ns;
 }
 
+static int RecorderBUnlocked(); // FEAT-SGT-079 step 22
+
 void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::DrawTotal}; // DIAG-SGT-023
     YieldToMappingChanges(); // PERF-GTS-368
@@ -18165,6 +18167,24 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         }
     }
     auto* parallel=FindParallelRuntime(this);
+    // FEAT-SGT-079 step 25 (SHADGT_RECORDER_B_UNLOCKED=2): recorder B encodes a clean window
+    // draw without the renderer's lock, holding b_pin (what the draw points at stays), and takes
+    // the lock again for what the draw wrote (NoteWrites on).
+    struct BUnlocked {
+        NativeRenderer* self = nullptr;
+        ~BUnlocked() {
+            if (self) self->b_pin.unlock_shared();
+        }
+    } b_unlocked;
+    if (OnRecorderBThread() && t_b_window && RecorderBUnlocked() == 2 && from_prepared &&
+        prepared_vertices_valid && !parallel && !indirect && !hud_black_state &&
+        !hud_white_state && !Gt7TemporalRequested() && !pipeline->LdsEmulation() &&
+        s.lds_readers.empty() && !r.FrameDumpCollecting() && lock.owns_lock()) {
+        b_pin.lock_shared(); // at once: whoever takes it exclusively holds `mutex` first
+        b_unlocked.self = this;
+        lock.unlock();
+        if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B encode unlocked", {});
+    }
     const auto partition_mode=parallel && parallel->applied_mode.Enabled()?1u:0u;
     RecordPartitionEndGuard end_partition_guard{parallel?&parallel->record_partition[partition_mode][4]:nullptr};
     RecordPartitionClock admission_partition{parallel?&parallel->record_partition[partition_mode][0]:nullptr};
@@ -19560,7 +19580,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     }
     const u32 index_count = vi->index_count;
     const CmdBuf cmdbuf{s.cmd};
-    SHADGT_B_TOUCH("retired_pipeline_owners"); retired_pipeline_owners.Hold(pipeline_owner); drawn_pipelines.try_emplace(pipeline, frame); // step 24
+    SHADGT_B_TOUCH("retired_pipeline_owners"); { std::scoped_lock owners_lock{retired_owners_mutex}; retired_pipeline_owners.Hold(pipeline_owner); } if (!OnRecorderBThread()) drawn_pipelines.try_emplace(pipeline, frame); // steps 24, 25
     {
         PhaseClock part{stats.record_ns[4]};
         if (!parallel_draw) BindGraphics(s, *pipeline, pipeline_owner);
@@ -19749,7 +19769,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         // WIDE-008/031/060: the draw is split from its preparation, so the 32:9 paths can
         // issue it with their own viewports and scissors (several times for a split HUD element).
         const auto prepare_draw = [&] {
-        SHADGT_B_TOUCH("retired_pipeline_owners"); retired_pipeline_owners.Hold(pipeline_owner);
+        SHADGT_B_TOUCH("retired_pipeline_owners"); { std::scoped_lock owners_lock{retired_owners_mutex}; retired_pipeline_owners.Hold(pipeline_owner); }
         if (depth_snapshot) {
             // Preparation may splice after the copy. Retain the image again in
             // the actual draw stream immediately before recording its read.
@@ -20222,7 +20242,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         SceneTrace::GpuEnd(s.cmd);
         }
     }
-    SHADGT_B_TOUCH("retired_pipeline_owners"); retired_pipeline_owners.Hold(pipeline_owner);
+    if (b_unlocked.self) { // step 25: the lock again (b_pin first: never wait for `mutex` holding it)
+        b_pin.unlock_shared();
+        b_unlocked.self = nullptr;
+        lock.lock();
+    }
+    SHADGT_B_TOUCH("retired_pipeline_owners"); { std::scoped_lock owners_lock{retired_owners_mutex}; retired_pipeline_owners.Hold(pipeline_owner); }
     {
         PhaseClock part{stats.record_ns[7]};
         NoteWrites(&targets, b);
@@ -23399,7 +23424,7 @@ bool NativeRenderer::CommitPreparedVertices(PreparedDraw& p, const GraphicsPipel
             if (mirror) mirror->used_frame = frame; // kept, as RefreshMirror's callers do
         }
         if (!p.in_place.empty()) {
-            if (BWindowSkips() & 16) {
+            if ((BWindowSkips() & 16) || RecorderBUnlocked() == 2) { // mode 2: never MirrorBuffer
                 if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B window: in place", {});
                 return reject();
             }
@@ -23663,7 +23688,14 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         // (the regions below are used through pointers).
         trace.Next(5);
         upload_all();
-        SortRegionWrites();
+        if (window && (BWindowSkips() & 1)) { // step 22b: read only in B's window
+            if (BWindowWritesPending(p)) {
+                if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B window: CPU writes", {});
+                return reject(4);
+            }
+        } else {
+            SortRegionWrites();
+        }
         if (!PreparedBuffersUntouched(p, recheck_from)) return reject(4);
     }
     // PERF-GTS-403: the pictures the job thread did not find are looked up again and made
@@ -26841,9 +26873,11 @@ void NativeRenderer::Splice(std::source_location where) {
     const u64 retire_tick = std::max(tick, boundary_signal);
     SealTemporalPictures(retire_tick);
     CollectTemporalPictures(r.scheduler.GetWorkSemaphore()->KnownGpuTick());
+    std::unique_lock owners_lock{retired_owners_mutex}; // FEAT-SGT-079 step 25
     retired_pipeline_owners.Retire(retire_tick);
     retired_pipeline_owners.Collect(r.scheduler.GetWorkSemaphore()->KnownGpuTick(),
         [&](auto owners) { r.pipeline_cache.ReleaseCompletedPipelineOwners(std::move(owners)); });
+    owners_lock.unlock();
     retired_writeback_plans.Retire(s.writeback_plan_leases, retire_tick);
     retired_writeback_plans.Collect(r.scheduler.GetWorkSemaphore()->KnownGpuTick());
     if (auto* direct = r.buffer_cache.GetDirectMemory()) {

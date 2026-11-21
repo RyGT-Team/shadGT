@@ -1237,8 +1237,9 @@ private:
     /// WIDE-005: this draw is race HUD drawn in pieces; the 16:9 HUD rectangle in the proxy.
     bool hud_spread = false;
     bool menu_ui = false; // WIDE-019 (diagnosis): a menu UI draw, outside races
-    bool widen_flat = false; // WIDE-030: a menu 3D draw, its flattened cameras widened
-    bool widen_3d = false; // WIDE-031: a menu 3D draw, drawn into a narrowed viewport
+    // FEAT-SGT-079 step 25: per recorder thread.
+    static inline thread_local bool widen_flat = false; // WIDE-030: a menu 3D draw, its flattened cameras widened
+    static inline thread_local bool widen_3d = false; // WIDE-031: a menu 3D draw, drawn into a narrowed viewport
     vk::Rect2D hud_rect{};
     vk::Image hud_image{};      // WIDE-022: the proxy a menu draw goes into (null: the UI layer)
     vk::Extent2D hud_size{};
@@ -1935,8 +1936,8 @@ private:
     std::vector<PreparedDraw*> late_bound_done; ///< recorded: given back at the next draw
     /// FEAT-SGT-022 (recorder): prepared draws whose binds the binder still makes, and the
     /// prepared draw the current draw binds from.
-    std::vector<PreparedDraw*> binder_held;
-    PreparedDraw* binding_prepared = nullptr;
+    static inline thread_local std::vector<PreparedDraw*> binder_held; // FEAT-SGT-079 step 25: per thread
+    static inline thread_local PreparedDraw* binding_prepared = nullptr;
     void ReleaseBinderHeld();
     /// FIX-GTS-393: the recorder, for parallel recording: whether `info` (buffer info
     /// `info_index` of the prepared draw) binds bytes of the arena that hold until the GPU ran
@@ -2172,7 +2173,7 @@ private:
     /// FEAT-SGT-079 step 3 (diagnostics): recorder B's dry run of its next run, from the queue.
     void RecorderBDryRun(u64 key);
     std::unordered_set<const void*> b_accepted; ///< packets B's dry run took (diagnostics)
-    const char* a_prepared_why = nullptr; ///< FEAT-SGT-079 (diagnostics): why A's draw went without
+    static inline thread_local const char* a_prepared_why = nullptr; ///< FEAT-SGT-079 (diagnostics): why A's draw went without
     /// FEAT-SGT-079: the prepared draw for a packet, left where it is (null: none).
     const PreparedDraw* PeekPrepared(const void* packet);
     /// FEAT-SGT-022: the bindings scratch for the next draw or dispatch (a slot no binder job
@@ -2270,6 +2271,7 @@ private:
     Native::RetiredSnapshotPool<Native::Rhi::Buffer> snapshot_pool;
     Native::RetiredWritebackPlans retired_writeback_plans;
     PipelineOwnerRetirement retired_pipeline_owners;
+    std::mutex retired_owners_mutex; ///< FEAT-SGT-079 step 25: B holds owners without `mutex`
     std::deque<Chunk> retiring_chunks;
     std::vector<vk::DescriptorPool> free_pools;
     std::deque<std::pair<u64, vk::DescriptorPool>> retiring_pools;

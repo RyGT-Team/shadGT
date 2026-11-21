@@ -16,6 +16,7 @@
 
 #include "video_core/buffer_cache/direct_memory.h"
 #include "video_core/cache_storage.h"
+#include "video_core/shader_store_file.h"
 #include "video_core/shader_store_policy.h"
 #include "video_core/deferred_task_queue.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -33,6 +34,8 @@
 namespace {
 
 Storage::DeferredTaskQueue<std::packaged_task<void()>> requests;
+std::atomic_bool directory_writes_paused{};
+bool reported_blob_error{}; // Only the I/O worker uses this after Open.
 
 mz_zip_archive zip_ar{};
 bool ar_is_read_only{true};
@@ -133,6 +136,9 @@ void DataBase::Open() {
         }
     }
     if (!archived) {
+        const char* writes = std::getenv("SHADGT_SHADER_STORE_WRITES");
+        directory_writes_paused = writes && std::string_view{writes} == "0";
+        reported_blob_error = false;
         cache_path = GetUserPath(PathType::CacheDir) / game_info.GameSerial();
         // D2: direct-memory shaders differ from the stored ones, which load unchecked.
         if (VideoCore::DirectMemory::Enabled()) {
@@ -261,6 +267,9 @@ void DataBase::Close() {
 
 template <typename T>
 bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector<T>&& v, bool archived) {
+    if (!archived && directory_writes_paused.load(std::memory_order_relaxed)) {
+        return false;
+    }
     {
         auto request = std::packaged_task<void()>{[type, path=std::move(path_), data=std::move(v), archived]() mutable {
             path.replace_extension(GetBlobFileExtension(type));
@@ -271,10 +280,22 @@ bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector
                                            data.size() * sizeof(T), MZ_BEST_COMPRESSION)) {
                     LOG_ERROR(Render, "Failed to add {} to the archive", path.string().c_str());
                 }
-            } else {
-                using namespace Common::FS;
-                const auto file = IOFile{path, FileAccessMode::Create};
-                file.Write(data);
+            } else if (!directory_writes_paused.load(std::memory_order_relaxed)) {
+                const auto error = PublishShaderBlob(path, [&](std::FILE* file) {
+                    return data.empty() ||
+                           std::fwrite(data.data(), sizeof(T), data.size(), file) == data.size();
+                });
+                if (error == std::errc::no_space_on_device) {
+                    directory_writes_paused = true;
+                    LOG_WARNING(Render, "Shader cache write failed for {} ({}); pausing cache "
+                                        "writes for this session. Rendering and cache reads continue.",
+                                path.string(), error.message());
+                } else if (error && !reported_blob_error) {
+                    // A reader or antivirus can briefly lock a single destination on Windows.
+                    reported_blob_error = true;
+                    LOG_WARNING(Render, "Skipping shader cache entry {} ({}); other entries will "
+                                        "still be written.", path.string(), error.message());
+                }
             }
         }};
         requests.Push(std::move(request));

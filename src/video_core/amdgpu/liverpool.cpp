@@ -1325,6 +1325,19 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         queued_draw->tag = tag;
         // FEAT-SGT-079 step 12: dispatches stay with the recorder (39% of B's runs held one).
         queued_draw->to_b = !compute && (push_pass / 4) % 2 == 1;
+#ifdef RYTY_GPU
+        // FEAT-SGT-079 step 17 (SHADGT_RECORDER_B_LEARNED=1; 2: in arm 1 of the 2 s A/B): B gets
+        // the passes whose output waited 0.5 ms+ in one of the last two frames, matched by key and
+        // occurrence (GT7's double-buffered targets alternate keys from frame to frame).
+        if (pass_start) {
+            push_occurrence_hash =
+                Vulkan::NativeRenderer::PassOccurrenceHash(tag, push_occurrences[tag]++);
+        }
+        if (RecorderBLearned()) {
+            auto* native = rasterizer ? rasterizer->Native() : nullptr;
+            queued_draw->to_b = !compute && native && native->LearnedWantsB(push_occurrence_hash);
+        }
+#endif
         // FEAT-SGT-079 step 13 (SHADGT_RECORDER_B_FIRST_A=1; 2: in arm 1 of the 2 s A/B): the
         // first draw of each of B's passes is the recorder's. A pass brings the pictures it
         // samples up to date at its first draw (rewrites, sources: 37% of B's passes, against
@@ -1909,6 +1922,13 @@ void Liverpool::NoteOverlap(s64 from, s64 to) {
             o.a += a_seg;
             o.save += std::min(o.run, a_seg);
             ++o.pairs;
+#ifdef RYTY_GPU
+            if (auto* native = rasterizer->Native()) { // DIAG-SGT-086: up to A needing B's run
+                const s64 free = std::min(native->RecorderBTakeFreeNs(from), a_seg);
+                o.free += free;
+                o.save_free += std::min(o.run, free);
+            }
+#endif
         }
         o.run = 0;
     }
@@ -1918,10 +1938,12 @@ void Liverpool::NoteOverlap(s64 from, s64 to) {
         const double secs = double(to - o.since) / 1e9;
         LOG_INFO(Render, "DIAG-SGT-085: overlap bound in {:.1f} s: {} pairs; B runs {:.1f} ms/s, the "
                  "recorder's segments after them {:.1f} ms/s, the smaller of each pair summed "
-                 "{:.1f} ms/s",
+                 "{:.1f} ms/s; DIAG-SGT-086: the segments up to needing B's run {:.1f} ms/s, the "
+                 "smaller summed {:.1f} ms/s",
                  secs, o.pairs, double(o.b) / 1e6 / secs, double(o.a) / 1e6 / secs,
-                 double(o.save) / 1e6 / secs);
-        o.b = o.a = o.save = 0;
+                 double(o.save) / 1e6 / secs, double(o.free) / 1e6 / secs,
+                 double(o.save_free) / 1e6 / secs);
+        o.b = o.a = o.save = o.free = o.save_free = 0;
         o.pairs = 0;
         o.since = to;
     }
@@ -1938,6 +1960,14 @@ static int RecorderBFirstMode() {
         return env && env[0] >= '1' && env[0] <= '6' ? env[0] - '0' : 0;
     }();
     return mode;
+}
+
+bool Liverpool::RecorderBLearned() {
+    static const int mode = [] {
+        const char* env = std::getenv("SHADGT_RECORDER_B_LEARNED");
+        return env && (env[0] == '1' || env[0] == '2') ? env[0] - '0' : 0;
+    }();
+    return mode == 1 || (mode == 2 && ::Vulkan::SubmitAbArm().load(std::memory_order_relaxed) == 1);
 }
 
 bool Liverpool::RecorderBFirstToA() {
@@ -3354,6 +3384,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto event = *reinterpret_cast<const PM4CmdEventWriteEop*>(header);
                 const u64 eop_submit = decoding_submit.load(std::memory_order_relaxed);
                 NoteEopStage(eop_submit, 0); // DIAG-SGT-074: decoded
+                const bool frame_eop = event.int_sel.Value() != InterruptSelect::None;
+                if (frame_eop) {
+                    push_occurrences.clear(); // FEAT-SGT-079 step 17: a frame ends
+                    push_key = 0;
+                }
                 // FIX-GTS-492: when this event raises the interrupt, the game takes back the
                 // command memory decoded so far (whole buffers, the rest of this one included):
                 // the prepared draws in it are dropped where the event is signaled, before its
@@ -3395,8 +3430,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 RecordLabelWrite(
                     reinterpret_cast<VAddr>(event.Address<u32>()),
                     FenceValueBytes(event.data_sel.Value(), event.DataDWord(), event.DataQWord()),
-                    [this, event, eop_submit, retire_prepared] {
+                    [this, event, eop_submit, retire_prepared, frame_eop] {
                         NoteEopStage(eop_submit, 1); // DIAG-SGT-074: the recorder got here
+#ifdef RYTY_GPU
+                        if (frame_eop && rasterizer) { // FEAT-SGT-079 step 17
+                            if (auto* native = rasterizer->Native()) native->LearnedFrameEnd();
+                        }
+#endif
                         if (EopLatencyDiag() && eop_submit && rasterizer) {
                             g_eop_tick[eop_submit % 1024].store(
                                 rasterizer->GetScheduler().CurrentTick(), std::memory_order_relaxed);

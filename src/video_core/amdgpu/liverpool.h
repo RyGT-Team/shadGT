@@ -481,7 +481,7 @@ private:
     void NoteOverlap(s64 from, s64 to); ///< DIAG-SGT-085
     bool b_overlap_a_ran = false;
     struct {
-        s64 since = 0, last_end = 0, run = 0, b = 0, a = 0, save = 0;
+        s64 since = 0, last_end = 0, run = 0, b = 0, a = 0, save = 0, free = 0, save_free = 0;
         u64 pairs = 0;
     } b_overlap;
     void RecorderBApply(const QueuedDraw& draw);
@@ -497,6 +497,11 @@ private:
     u64 b_applied_seq = 0;                  ///< the last draw whose delta B's registers hold
     u64 queued_draw_seq = 0;                ///< command thread
     u64 push_pass = 0, push_key = 0;        ///< command thread: the deal at push
+    /// FEAT-SGT-079 step 17: the learned deal's count of each key's passes since the frame's
+    /// EOP (command thread), and the open pass's key-and-occurrence hash.
+    std::unordered_map<u64, u32> push_occurrences;
+    u64 push_occurrence_hash = 0;
+    static bool RecorderBLearned();
     const QueuedDraw* running_queued_draw = nullptr; ///< recorder thread
     // SHADGT_RECORDER_B=4: recorder B's thread and its queue (every draw and dispatch, in order).
     std::mutex b_mutex;

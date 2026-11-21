@@ -15828,8 +15828,66 @@ void NativeRenderer::DiagWrites(const Targets* targets, const DrawBindings& b) {
     }
 }
 
+static bool PassGraphOn(); // DIAG-SGT-087, below
+
 void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::NoteWrites}; // DIAG-SGT-023
+    if (PassGraphOn() && !graph.passes.empty()) { // DIAG-SGT-087: reads, then writes
+        const u32 cur = u32(graph.passes.size() - 1);
+        const auto read = [&](const void* e) {
+            if (!e) return;
+            const auto it = graph.last_writer.find(e);
+            if (it == graph.last_writer.end() || it->second == cur) return;
+            auto& w = graph.passes[it->second];
+            if (w.consumer < 0) {
+                w.consumer = s32(cur);
+                w.consumer_start = graph.passes[cur].start;
+            }
+        };
+        for (const auto* e : b.sampled) read(e);
+        for (const auto* e : b.stored) read(e);
+        if (targets) {
+            for (const auto* e : targets->colors) read(e);
+            read(targets->depth);
+            for (const auto* e : targets->colors) {
+                if (e) graph.last_writer[e] = cur;
+            }
+            if (targets->depth) graph.last_writer[targets->depth] = cur;
+        }
+        for (const auto* e : b.stored) {
+            if (e) graph.last_writer[e] = cur;
+        }
+    }
+    if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-086
+        if (OnRecorderBThread()) {
+            if (targets) {
+                for (const auto* color : targets->colors) {
+                    if (color) b_run_written.insert(color);
+                }
+                if (targets->depth) b_run_written.insert(targets->depth);
+            }
+            for (const auto* stored : b.stored) {
+                if (stored) b_run_written.insert(stored);
+            }
+        } else if (!b_prev_written.empty() && a_seg_dep < 0) {
+            bool dep = false;
+            for (const auto* e : b.sampled) dep = dep || b_prev_written.contains(e);
+            for (const auto* e : b.stored) dep = dep || b_prev_written.contains(e);
+            if (targets) {
+                for (const auto* e : targets->colors) dep = dep || (e && b_prev_written.contains(e));
+                dep = dep || (targets->depth && b_prev_written.contains(targets->depth));
+            }
+            if (dep) {
+                a_seg_dep = s32(a_seg_draws);
+                a_seg_dep_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count() -
+                               a_seg_from;
+            } else {
+                ++a_seg_draws;
+            }
+        }
+    }
     DiagWrites(targets, b);               // DIAG-178 (diagnosis)
     NoteProgramTextureWrites(targets, b); // DIAG-185 (diagnosis)
     if (WriteHistoryOn()) {
@@ -22654,8 +22712,35 @@ void NativeRenderer::NoteBPassEnd() {
     }
 }
 
+s64 NativeRenderer::RecorderBTakeFreeNs(s64 now) {
+    if constexpr (Common::DiagnosticsBuilt) {
+        std::scoped_lock lock{mutex};
+        const s64 free = a_seg_from == 0 ? 0 : a_seg_dep_ns >= 0 ? a_seg_dep_ns : now - a_seg_from;
+        if (a_seg_from != 0 && !b_prev_written.empty()) {
+            const s32 f = a_seg_dep;
+            NoteSubmitSite(f < 0 ? "A after B: never needs B's run" : f == 0 ? "A after B: needs it at once"
+                           : f < 4 ? "A after B: needs it after 1-3 draws"
+                           : f < 16 ? "A after B: needs it after 4-15 draws"
+                                    : "A after B: needs it after 16+ draws", {});
+        }
+        a_seg_from = 0;
+        return free;
+    }
+    return 0;
+}
+
 void NativeRenderer::NoteBRunEnd() {
     if constexpr (Common::DiagnosticsBuilt) {
+        if (b_run_open) { // DIAG-SGT-086: the run's written pictures; the recorder's segment starts
+            b_prev_written.swap(b_run_written);
+            b_run_written.clear();
+            a_seg_from = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+            a_seg_dep_ns = -1;
+            a_seg_draws = 0;
+            a_seg_dep = -1;
+        }
         NoteBPassEnd();
         b_pass_key = 0;
         if (!b_run_open) return;
@@ -22778,7 +22863,172 @@ void NativeRenderer::RecorderBEnter() {
     }
 }
 
+static bool PassGraphOn() { // DIAG-SGT-087
+    if constexpr (!Common::DiagnosticsBuilt) {
+        return false;
+    } else {
+        static const bool on = Common::DiagEnv("SHADGT_DIAG_PASS_GRAPH") != nullptr;
+        return on;
+    }
+}
+
+void NativeRenderer::GraphFrameEnd(s64 now) {
+    if constexpr (Common::DiagnosticsBuilt) {
+        auto& g = graph;
+        if (!g.passes.empty()) {
+            ++g.frames;
+            g.passes_total += g.passes.size();
+            std::vector<std::pair<u64, bool>> cur(g.passes.size());
+            std::unordered_map<u64, bool> occ_now;
+            std::unordered_map<u64, u32> seen;
+            for (u32 i = 0; i < g.passes.size(); ++i) {
+                const auto& p = g.passes[i];
+                const s64 busy = std::max<s64>(p.end - p.start, 0);
+                const s64 slack = std::max<s64>(
+                    (p.consumer < 0 ? now : p.consumer_start) - p.end, 0);
+                cur[i] = {p.key, slack >= 500'000};
+                { // the nth pass with this key, in either of the last two frames
+                    const u64 occ = PassOccurrenceHash(p.key, seen[p.key]++);
+                    occ_now[occ] = slack >= 500'000;
+                    const bool* was = nullptr;
+                    for (const auto& m : g.by_occurrence) {
+                        if (const auto it = m.find(occ); it != m.end()) {
+                            was = &it->second;
+                            break;
+                        }
+                    }
+                    if (was) {
+                        ++g.occ_matched;
+                        if (*was) {
+                            ++g.occ_predicted;
+                            g.occ_predicted_busy_ms += busy / 1e6;
+                            if (slack >= 500'000) {
+                                ++g.occ_hit;
+                                g.occ_hit_busy_ms += busy / 1e6;
+                            }
+                        }
+                    }
+                }
+                if (i < g.last.size()) { // the last frame's pass at this place predicts this one
+                    ++g.compared;
+                    if (g.last[i].first == p.key) {
+                        ++g.same_key;
+                        if (g.last[i].second) {
+                            ++g.predicted;
+                            g.predicted_busy_ms += busy / 1e6;
+                            if (slack >= 500'000) {
+                                ++g.predicted_hit;
+                                g.predicted_hit_busy_ms += busy / 1e6;
+                            }
+                        }
+                    }
+                }
+                g.busy_ms += busy / 1e6;
+                g.overlap_ms += std::min(busy, slack) / 1e6;
+                if (slack >= 1'000'000) {
+                    g.slack1_ms += slack / 1e6;
+                    g.slack1_busy_ms += busy / 1e6;
+                }
+                const s32 gap = p.consumer < 0 ? -1 : p.consumer - s32(i);
+                ++g.consumer_gap[gap < 0 ? 4 : gap <= 1 ? 0 : gap <= 4 ? 1 : gap <= 16 ? 2 : 3];
+            }
+            g.last.swap(cur);
+            g.by_occurrence[1] = std::move(g.by_occurrence[0]);
+            g.by_occurrence[0] = std::move(occ_now);
+            // FEAT-SGT-079 step 17: what the next frame deals to B.
+            auto learned = std::make_shared<std::unordered_set<u64>>();
+            for (const auto& m : g.by_occurrence) {
+                for (const auto& [occ, slack] : m) {
+                    if (slack) learned->insert(occ);
+                }
+            }
+            learned_b.store(std::move(learned), std::memory_order_release);
+        }
+        g.passes.clear();
+        g.last_writer.clear();
+        g.key = 0;
+        if (g.since == 0) g.since = now;
+        if (now - g.since >= 5'000'000'000 && g.frames != 0) {
+            const double f = double(g.frames);
+            LOG_INFO(Render_Vulkan, "DIAG-SGT-087: pass graph, {} frames: {:.1f} passes a frame, "
+                     "recording {:.2f} ms a frame; the sum of min(pass, its output's slack) "
+                     "{:.2f} ms a frame; passes with 1 ms+ slack: {:.2f} ms of recording a frame. "
+                     "First reader of a pass's output: the next pass {}, 2-4 later {}, 5-16 "
+                     "later {}, 17+ later {}, none in the frame {}",
+                     g.frames, g.passes_total / f, g.busy_ms / f, g.overlap_ms / f,
+                     g.slack1_busy_ms / f, g.consumer_gap[0], g.consumer_gap[1],
+                     g.consumer_gap[2], g.consumer_gap[3], g.consumer_gap[4]);
+            LOG_INFO(Render_Vulkan, "DIAG-SGT-087: frame to frame: {:.1f}% of passes have the last "
+                     "frame's key at their place; of those the last frame had at 0.5 ms+ slack, "
+                     "{:.1f}% have it again ({:.2f} of {:.2f} ms of recording a frame)",
+                     g.compared ? 100.0 * g.same_key / g.compared : 0.0,
+                     g.predicted ? 100.0 * g.predicted_hit / g.predicted : 0.0,
+                     g.predicted_hit_busy_ms / f, g.predicted_busy_ms / f);
+            LOG_INFO(Render_Vulkan, "DIAG-SGT-087: by key and occurrence in the last two frames: "
+                     "{:.1f}% of passes matched; of those with 0.5 ms+ slack before, {:.1f}% have it "
+                     "again ({:.2f} of {:.2f} ms of recording a frame)",
+                     g.passes_total ? 100.0 * g.occ_matched / g.passes_total : 0.0,
+                     g.occ_predicted ? 100.0 * g.occ_hit / g.occ_predicted : 0.0,
+                     g.occ_hit_busy_ms / f, g.occ_predicted_busy_ms / f);
+            g.occ_matched = g.occ_predicted = g.occ_hit = 0;
+            g.occ_predicted_busy_ms = g.occ_hit_busy_ms = 0;
+            g.same_key = g.compared = g.predicted = g.predicted_hit = 0;
+            g.predicted_busy_ms = g.predicted_hit_busy_ms = 0;
+            g.frames = g.passes_total = 0;
+            g.busy_ms = g.overlap_ms = g.slack1_ms = g.slack1_busy_ms = 0;
+            g.consumer_gap = {};
+            g.since = now;
+        }
+    }
+}
+
+u64 NativeRenderer::PassOccurrenceHash(u64 key, u32 occurrence) {
+    return XXH3_64bits_withSeed(&key, sizeof(key), occurrence);
+}
+
+void NativeRenderer::LearnedFrameEnd() {
+    if constexpr (Common::DiagnosticsBuilt) {
+        if (!PassGraphOn()) return;
+        std::scoped_lock lock{mutex};
+        graph_eop_frames = true;
+        GraphFrameEnd(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count());
+    }
+}
+
+bool NativeRenderer::LearnedWantsB(u64 occurrence_hash) const {
+    const auto set = learned_b.load(std::memory_order_acquire);
+    return set && set->contains(occurrence_hash);
+}
+
+void NativeRenderer::GraphDraw(bool dispatch, const AmdGpu::Regs& regs) {
+    if constexpr (Common::DiagnosticsBuilt) {
+        auto& g = graph;
+        const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        if (!graph_eop_frames && g.frame != frame) {
+            GraphFrameEnd(now);
+            g.frame = frame;
+        }
+        u64 key = 1;
+        if (!dispatch) {
+            key = XXH3_64bits(&regs.color_buffers, sizeof(regs.color_buffers));
+            key = XXH3_64bits_withSeed(&regs.depth_buffer, sizeof(regs.depth_buffer), key) | 2;
+        }
+        if (g.passes.empty() || key != g.key) {
+            if (!g.passes.empty()) g.passes.back().end = now;
+            g.passes.push_back({.key = key, .start = now, .end = now});
+            g.key = key;
+        }
+        g.passes.back().end = now;
+        ++g.passes.back().draws;
+    }
+}
+
 void NativeRenderer::RecorderBDeal(bool dispatch, const AmdGpu::Regs& regs) {
+    if (PassGraphOn()) GraphDraw(dispatch, regs); // DIAG-SGT-087
     if (RecorderBMode() < 3) {
         return;
     }

@@ -218,6 +218,14 @@ public:
     /// its own context is the current one, it splices its open list and makes B's current, so
     /// that B's thread never splices (the command order is the recorder's).
     void RecorderBEnter();
+    /// DIAG-SGT-086: the recorder's time since B's last run before it first needed what that run
+    /// drew (all of it when it never did), and the segment's counts noted; a new segment starts.
+    s64 RecorderBTakeFreeNs(s64 now);
+    /// FEAT-SGT-079 step 17: the recorder reached the frame's EOP (the learned deal's frames).
+    void LearnedFrameEnd();
+    /// FEAT-SGT-079 step 17: whether the pass with this key-and-occurrence hash goes to B.
+    bool LearnedWantsB(u64 occurrence_hash) const;
+    static u64 PassOccurrenceHash(u64 key, u32 occurrence);
     /// FEAT-SGT-079 step 14: the recorder, before it hands one of B's draws to B's thread: whether
     /// B can record it without ordered work (its prepared draw's regions and mirrors hold no CPU
     /// writes, its pictures no pending rewrite, stencil clear or dirty sources). Else the
@@ -2057,6 +2065,50 @@ private:
     bool b_draw_open = false;
     u32 b_pass_draw = 0;
     s32 b_pass_first_dirty = -1;
+    /// DIAG-SGT-086 (diagnostics builds): the pictures B's open run draws into or stores to, the
+    /// last finished run's, and the recorder's work after it up to its first draw or dispatch
+    /// that samples or draws into one of them (the time it could run ahead of B).
+    std::unordered_set<const void*> b_run_written, b_prev_written;
+    s64 a_seg_from = 0, a_seg_dep_ns = -1;
+    u32 a_seg_draws = 0;
+    s32 a_seg_dep = -1;
+    /// DIAG-SGT-087 (diagnostics builds, SHADGT_DIAG_PASS_GRAPH=1): the frame's passes (a pass
+    /// starts where the targets differ from the draw before; a run of dispatches is one), the
+    /// pictures each writes, and the first later pass reading or writing them: how long each
+    /// pass's output waits before it is needed (its slack), so how much of the frame a second
+    /// recorder could take without the first waiting on it.
+    struct GraphPass {
+        u64 key = 0;
+        s64 start = 0, end = 0;
+        u32 draws = 0;
+        s32 consumer = -1;
+        s64 consumer_start = 0;
+    };
+    struct {
+        u64 frame = ~u64{0};
+        u64 key = 0;
+        std::vector<GraphPass> passes;
+        std::unordered_map<const void*, u32> last_writer;
+        s64 since = 0;
+        u64 frames = 0, passes_total = 0;
+        double busy_ms = 0, overlap_ms = 0, slack1_ms = 0, slack1_busy_ms = 0;
+        std::array<u64, 5> consumer_gap{}; ///< next pass, 2-4, 5-16, 17+, never
+        /// The last frame's passes (key, slack >= 0.5 ms) and how well they predict this one's.
+        std::vector<std::pair<u64, bool>> last;
+        /// (key, its occurrence in the frame) -> slack >= 0.5 ms, for the last two frames.
+        std::array<std::unordered_map<u64, bool>, 2> by_occurrence;
+        u64 occ_matched = 0, occ_predicted = 0, occ_hit = 0;
+        double occ_predicted_busy_ms = 0, occ_hit_busy_ms = 0;
+        u64 same_key = 0, compared = 0, predicted = 0, predicted_hit = 0;
+        double predicted_busy_ms = 0, predicted_hit_busy_ms = 0;
+    } graph;
+    void GraphDraw(bool dispatch, const AmdGpu::Regs& regs);
+    /// FEAT-SGT-079 step 17 (the learned deal, with SHADGT_DIAG_PASS_GRAPH): the passes, by key
+    /// and occurrence, whose output waited 0.5 ms+ in either of the last two frames (frames end
+    /// at the recorder's EOP), for the command thread's deal.
+    std::atomic<std::shared_ptr<const std::unordered_set<u64>>> learned_b;
+    bool graph_eop_frames = false;
+    void GraphFrameEnd(s64 now);
     u64 b_pass_key = 0;
     void NoteBDrawEnd();
     void NoteBPassEnd();

@@ -467,11 +467,12 @@ std::atomic<int>& SubmitAbArm() {
         const char* prefetch = std::getenv("SHADGT_PREPARED_PREFETCH"); // PERF-SGT-081
         const char* b_ring = std::getenv("SHADGT_RECORDER_B_RING");      // FEAT-SGT-079
         const char* b_first = std::getenv("SHADGT_RECORDER_B_FIRST_A");  // FEAT-SGT-079
+        const char* b_learned = std::getenv("SHADGT_RECORDER_B_LEARNED"); // FEAT-SGT-079
         return (select && select[0] == '2') || (wait && wait[0] == '2') ||
                (recorder_b && (recorder_b[0] == '2' || recorder_b[0] == '6' ||
                                recorder_b[0] == '8')) ||
                (prefetch && prefetch[0] == '2') || (b_ring && b_ring[0] == '2') ||
-               (b_first && (b_first[0] == '2' || b_first[0] == '4' || b_first[0] == '6')) ||
+               (b_first && (b_first[0] == '2' || b_first[0] == '4' || b_first[0] == '6')) || (b_learned && b_learned[0] == '2') ||
                Common::DiagEnv("SHADGT_DIAG_FENCE_BATCH_AB") != nullptr ||
                Common::DiagEnv("SHADGT_DIAG_FEED_GPU_AB") != nullptr ||
                Common::DiagEnv("SHADGT_DIAG_PARALLEL_AB") != nullptr ||

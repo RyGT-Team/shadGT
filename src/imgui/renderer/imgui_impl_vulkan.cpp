@@ -10,7 +10,6 @@
 #include <imgui.h>
 
 #include "imgui_impl_vulkan.h"
-#include "common/game_title.h"
 #include "video_core/host_shaders/imgui_hdr_frag.h"
 
 #ifndef IM_MAX
@@ -995,7 +994,6 @@ static void CreatePipeline(vk::Device device, const vk::AllocationCallbacks* all
         },
         {
             .stage = vk::ShaderStageFlagBits::eFragment,
-            // FIX-GT7-142 for GT7; for GT Sport hdr_white_nits is 0 and the sRGB shader stays.
             .module = bd->hdr_output && bd->hdr_white_nits > 0.0f ? bd->shader_module_frag_hdr
                                                                    : bd->shader_module_frag,
             .pName = "main",
@@ -1331,9 +1329,8 @@ void OnSurfaceFormatChange(vk::Format surface_format, bool hdr) {
         const float value = std::strtof(text, nullptr);
         return value >= 0.0f && value <= 10000.0f ? value : 203.0f;
     }();
-    // GT Sport keeps its overlay as it was (the user prefers the splash screen so): 0 leaves the
-    // sRGB shader in place.
-    bd->hdr_white_nits = Common::IsGt7() ? white_nits : 0.0f;
+    // FIX-SGT-059: the output transfer function determines how to draw sRGB overlays.
+    bd->hdr_white_nits = white_nits;
     if (pl_format != surface_format || bd->hdr_output != hdr) {
         bd->hdr_output = hdr;
         pl_format = surface_format;

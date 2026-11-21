@@ -16557,6 +16557,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     struct DepthSnapshot {
         std::unique_ptr<Native::Rhi::Image> image;
         std::vector<vk::UniqueImageView> views;
+        // FIX-SGT-060: kept descriptor sets (PERF-GTS-375) written with these views must go
+        // before the views do: the next snapshot's view gets the same handle value, finds the
+        // kept set, and samples this destroyed image (AMD, 2026-11-20: a GPU page fault).
+        ~DepthSnapshot() {
+            for (const auto& view : views) Native::DeadHandles::Note(static_cast<VkImageView>(*view));
+        }
     };
     std::shared_ptr<DepthSnapshot> depth_snapshot;
     std::vector<std::pair<vk::ImageView, vk::ImageView>> snapshot_views;

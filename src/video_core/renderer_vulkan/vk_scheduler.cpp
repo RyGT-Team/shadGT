@@ -3,7 +3,12 @@
 
 #include <chrono>
 #include <functional>
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <map>
+#include <tuple>
+#include <vector>
 #include <string>
 #include <immintrin.h>
 #include <boost/container/small_vector.hpp>
@@ -406,6 +411,117 @@ vk::CommandBuffer Scheduler::OpenUploadCommandBuffer() {
     return upload_cmdbuf;
 }
 
+// DIAG-SGT-076 (SHADGT_DIAG_SUBMITS=1, diagnostics builds): where the scheduler's submits and
+// the native renderer's splices come from, every 5 s, by caller (file:line). A splice ends a
+// native list (DIAG-SGT-075 found a list start or splice in 30-50% of GT7's pass time).
+namespace {
+std::array<std::atomic<s64>, 1024> g_tick_submit_ns{}; // DIAG-SGT-074, by tick
+std::atomic<s64> g_frame_start_ns{0};                 // DIAG-SGT-074: waiting for its first list
+std::mutex g_first_list_mutex;
+std::array<s64, 3> g_first_list{};
+}
+void NoteFrameStart(s64 ns) {
+    g_frame_start_ns.store(ns, std::memory_order_relaxed);
+}
+std::array<s64, 3> TakeFirstListStats() {
+    std::scoped_lock lk{g_first_list_mutex};
+    return std::exchange(g_first_list, {});
+}
+void NoteTickSubmitted(u64 tick) {
+    if constexpr (Common::DiagnosticsBuilt) {
+        const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        g_tick_submit_ns[tick % g_tick_submit_ns.size()].store(now, std::memory_order_relaxed);
+        if (const s64 start = g_frame_start_ns.exchange(0, std::memory_order_relaxed);
+            start != 0 && now > start) {
+            std::scoped_lock lk{g_first_list_mutex};
+            ++g_first_list[0];
+            g_first_list[1] += now - start;
+            g_first_list[2] = std::max(g_first_list[2], now - start);
+        }
+    }
+}
+s64 TickSubmittedNs(u64 tick) {
+    return g_tick_submit_ns[tick % g_tick_submit_ns.size()].load(std::memory_order_relaxed);
+}
+
+std::atomic<int>& SubmitAbArm() {
+    static std::atomic<int> arm{0};
+    // The A/B switches turn every 2 s: SHADGT_SELECT_STAGE=2 (PERF-SGT-077, any build) and the
+    // diagnostics builds' SHADGT_DIAG_FENCE_BATCH_AB and SHADGT_DIAG_FEED_GPU_AB.
+    static const bool ab = [] {
+        const char* select = std::getenv("SHADGT_SELECT_STAGE");
+        const char* wait = std::getenv("SHADGT_WAIT_FIRST_DRAIN"); // PERF-SGT-078
+        const char* recorder_b = std::getenv("SHADGT_RECORDER_B"); // FEAT-SGT-079
+        const char* prefetch = std::getenv("SHADGT_PREPARED_PREFETCH"); // PERF-SGT-081
+        return (select && select[0] == '2') || (wait && wait[0] == '2') ||
+               (recorder_b && (recorder_b[0] == '2' || recorder_b[0] == '6')) ||
+               (prefetch && prefetch[0] == '2') ||
+               Common::DiagEnv("SHADGT_DIAG_FENCE_BATCH_AB") != nullptr ||
+               Common::DiagEnv("SHADGT_DIAG_FEED_GPU_AB") != nullptr ||
+               Common::DiagEnv("SHADGT_DIAG_PARALLEL_AB") != nullptr ||
+               Common::DiagEnv("SHADGT_DIAG_PREPARE_WORKERS_AB") != nullptr ||
+               Common::DiagEnv("SHADGT_DIAG_FLIP_BUFFER_AB") != nullptr ||
+               Common::DiagEnv("SHADGT_DIAG_READ_AHEAD_AB") != nullptr;
+    }();
+    {
+        if (ab) {
+            static std::atomic<s64> since{0};
+            const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            s64 from = since.load(std::memory_order_relaxed);
+            if ((from == 0 || now - from >= 2'000'000'000) &&
+                since.compare_exchange_strong(from, now) && from != 0) {
+                arm.store(1 - arm.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            }
+        }
+    }
+    return arm;
+}
+
+void NoteSubmitSite(const char* what, const std::source_location& loc) {
+    if constexpr (Common::DiagnosticsBuilt) {
+        static const bool on = Common::DiagEnv("SHADGT_DIAG_SUBMITS") != nullptr;
+        if (!on) return;
+        static std::mutex mutex;
+        static std::map<std::tuple<std::string_view, std::string_view, u32, int>, u64> sites;
+        static auto since = std::chrono::steady_clock::now();
+        static auto last = since;
+        static std::array<double, 2> arm_s{}; // seconds spent in each arm of an A/B
+        std::string_view file = loc.file_name();
+        if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+            file.remove_prefix(slash + 1);
+        }
+        const int arm = SubmitAbArm().load(std::memory_order_relaxed);
+        std::scoped_lock lk{mutex};
+        ++sites[{what, file, loc.line(), arm}];
+        const auto now = std::chrono::steady_clock::now();
+        arm_s[arm] += std::chrono::duration<double>(now - last).count();
+        last = now;
+        if (now - since < std::chrono::seconds{5}) return;
+        std::vector<std::pair<u64, std::string>> list;
+        for (const auto& [site, count] : sites) {
+            // A/B: per second of its arm, so the arms compare (arm 1 marked "B").
+            const double s = arm_s[std::get<3>(site)];
+            list.emplace_back(count, fmt::format("{} {}:{}{} {:.1f}/s", std::get<0>(site),
+                                                 std::get<1>(site), std::get<2>(site),
+                                                 std::get<3>(site) ? " B" : "",
+                                                 s > 0 ? count / s : 0.0));
+        }
+        std::ranges::sort(list, std::greater{});
+        std::string text;
+        for (const auto& [count, site] : list) {
+            text += fmt::format(" {}={},", site, count);
+        }
+        LOG_INFO(Render_Vulkan, "DIAG-SGT-076: in 5 s ({:.1f} s A, {:.1f} s B) by caller:{}",
+                 arm_s[0], arm_s[1], text);
+        arm_s = {};
+        sites.clear();
+        since = now;
+    }
+}
+
 #ifndef NDEBUG
 // DIAG-118: where submits come from, every 2 s.
 static void NoteFlush(const std::source_location& loc) {
@@ -432,6 +548,7 @@ static void NoteFlush(const std::source_location& loc) {
 
 #endif
 u64 Scheduler::Flush(SubmitInfo& info, std::source_location loc) {
+    if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("submit", loc); // DIAG-SGT-076
 #ifndef NDEBUG
     NoteFlush(loc);
 #endif
@@ -447,6 +564,7 @@ void Scheduler::Flush(std::source_location loc) {
 void Scheduler::Finish(std::source_location loc) {
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
+    if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("finish", loc); // DIAG-SGT-076
     SubmitInfo info{};
     SubmitExecution(info);
     Wait(presubmit_tick, loc);
@@ -673,6 +791,7 @@ void Scheduler::SubmitSessions(SubmitInfo& info, u64 signal_value) {
         }
         ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
     }
+    NoteTickSubmitted(signal_value); // DIAG-SGT-074
 
     work_semaphore.Refresh();
     if (ring) {

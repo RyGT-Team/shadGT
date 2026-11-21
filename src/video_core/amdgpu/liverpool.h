@@ -409,6 +409,91 @@ private:
     // in submission order, with the registers brought up to date from regs_dirty.
     static inline thread_local RecorderState* recorder_state = nullptr;
     std::unique_ptr<RecorderState> recorder;
+    /// PERF-SGT-077: the select stage's registers, brought up to date from the same deltas as
+    /// the recorder's, one stage earlier.
+    std::unique_ptr<RecorderState> select_state;
+
+public:
+    /// FEAT-SGT-079: recorder thread: the pass tags of the queued jobs after the running one.
+    void PeekQueuedTags(std::vector<u64>& out, size_t max);
+    /// FEAT-SGT-079 (SHADGT_RECORDER_B=3): what recorder B needs of a queued draw or dispatch to
+    /// work on it ahead: its register delta, compute registers and extents, its packet.
+    struct QueuedDraw {
+        u64 seq = 0;
+        std::vector<u32> delta;
+        std::optional<ComputeProgram> cs;
+        std::array<CbDbExtent, NUM_COLOR_BUFFERS> cb_extent{};
+        CbDbExtent db_extent{};
+        const void* packet = nullptr; ///< OPT-012: the draw packet (prepared draws' key)
+        bool compute = false;
+        bool direct = false;
+        u64 tag = 0;          ///< its pass (the job's tag)
+        bool to_b = false;    ///< dealt to recorder B at push (runs of 4 passes in turns)
+        /// SHADGT_RECORDER_B=4: what recorder B's thread made of it, and whether A got there
+        /// first. B sets it from Pending once; A exchanges it for AReached.
+        enum : u8 { Pending, Ready, Refused, NoPrepared, AReached };
+        std::atomic<u8> b_result{Pending};
+        const char* b_why = nullptr; ///< written by B before its b_result store (release)
+        s64 b_done_ns = 0;          ///< when B was done with it (steady clock)
+        s64 pushed_ns = 0;          ///< when it was pushed
+    };
+    /// FEAT-SGT-079: the queued draw of the job the recorder runs (null: none or B off).
+    const QueuedDraw* RunningQueuedDraw() const {
+        return running_queued_draw;
+    }
+    static int RecorderBMode();
+    /// Recorder thread: the queued jobs after the running one, with their QueuedDraw (or null).
+    void PeekQueuedDraws(std::vector<std::pair<u64, const QueuedDraw*>>& out, size_t max);
+    /// Recorder thread: recorder B's registers brought up to `draw` (each delta applied once,
+    /// in order; a draw run before B looked at it is applied when it runs). Null when B is off
+    /// or `draw` is behind what B has applied.
+    const Regs* RecorderBRegsAt(const QueuedDraw& draw);
+    static bool RecorderBOn();
+
+    /// FEAT-SGT-079 step 5 (SHADGT_RECORDER_B=5; 6: in arm 1 of the 2 s A/B only): the
+    /// recorder runs `f` on recorder B's thread and waits for it (the baton). Only one of the
+    /// two runs at a time; B's thread counts as the recorder thread.
+    template <typename F>
+    void RunOnRecorderB(F& f) {
+        baton_ctx = &f;
+        baton_call = [](void* c) { (*static_cast<F*>(c))(); };
+        const u64 seq = baton_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
+        baton_seq.notify_one();
+        for (u32 spin = 0;; ++spin) {
+            const u64 done = baton_done.load(std::memory_order_acquire);
+            if (done == seq) break;
+            if (spin < 16384) {
+                RecorderBPause();
+            } else {
+                baton_done.wait(done, std::memory_order_acquire);
+            }
+        }
+        if (baton_error) {
+            std::rethrow_exception(std::exchange(baton_error, nullptr));
+        }
+    }
+
+private:
+    static void RecorderBPause();
+    void RecorderBApply(const QueuedDraw& draw);
+    void RecorderBThread(std::stop_token stop);
+    void RecorderBBatonThread();
+    std::thread baton_thread;
+    std::atomic<u64> baton_seq{0}, baton_done{0};
+    std::atomic<bool> baton_quit{false};
+    void* baton_ctx = nullptr;
+    void (*baton_call)(void*) = nullptr;
+    std::exception_ptr baton_error;
+    std::unique_ptr<RecorderState> b_state; ///< FEAT-SGT-079
+    u64 b_applied_seq = 0;                  ///< the last draw whose delta B's registers hold
+    u64 queued_draw_seq = 0;                ///< command thread
+    u64 push_pass = 0, push_key = 0;        ///< command thread: the deal at push
+    const QueuedDraw* running_queued_draw = nullptr; ///< recorder thread
+    // SHADGT_RECORDER_B=4: recorder B's thread and its queue (every draw and dispatch, in order).
+    std::mutex b_mutex;
+    std::condition_variable_any b_wake;
+    std::deque<std::shared_ptr<QueuedDraw>> b_queue;
+    std::jthread b_thread;
     std::unique_ptr<DrawPipe> draw_pipe;
     // PERF-063: early fences. The work queued since the last fence ("window") reads guest
     // memory through a capture taken at decode; when all of it does, the fence that ends the

@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/diagnostics.h"
 #include "common/game_title.h"
 #include "common/guest_clock.h"
 #include "common/thread.h"
@@ -18,6 +19,9 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "ryty_gpu/ryty_diag.h"
+namespace Vulkan {
+std::atomic<int>& SubmitAbArm(); // DIAG-SGT-076
+}
 #ifdef RYTY_GPU
 #include "ryty_gpu/ryty_pro_mode.h"
 #endif
@@ -629,22 +633,30 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     // frame and every stall longer than a frame shows. With the target met, flips come a vblank
     // apart; above it 1 ms sooner (the queue drains); below it 0.5 ms later, so a game running
     // at 60 refills it in about half a second a frame. Implies PERF-GTS-406's timing.
-    static const u32 buffer_frames = [] {
+    static const u32 buffer_frames_set = [] {
         const char* env = std::getenv("SHADGT_FLIP_BUFFER_FRAMES");
         const unsigned long value = env && *env ? std::strtoul(env, nullptr, 10) : 1;
         return static_cast<u32>(std::min<unsigned long>(value, 2));
     }();
+    // FEAT-SGT-079 (diagnostics builds, SHADGT_DIAG_FLIP_BUFFER_AB=1): no frame queued in arm 1 of
+    // the 2 s A/B, the set count in arm 0, for an A/B of the flip queue in one drive.
+    static const bool buffer_ab = Common::DiagEnv("SHADGT_DIAG_FLIP_BUFFER_AB") != nullptr;
+    const auto frames_queued = [] {
+        return buffer_ab && ::Vulkan::SubmitAbArm().load(std::memory_order_relaxed) == 1
+                   ? 0u
+                   : buffer_frames_set;
+    };
     // `depth`: the flips queued, the one to flip next included.
     const auto flip_interval = [&](u32 depth) -> std::chrono::nanoseconds {
         const int rate = current_flip_rate();
-        if (buffer_frames == 0) {
+        if (frames_queued() == 0) {
             return FastFlipInterval(vblank_period, rate);
         }
         const std::chrono::nanoseconds whole = vblank_period * (rate + 1);
-        if (depth > buffer_frames + 1) {
+        if (depth > frames_queued() + 1) {
             return whole - std::chrono::milliseconds{1};
         }
-        return depth == buffer_frames + 1 ? whole : whole + std::chrono::microseconds{500};
+        return depth == frames_queued() + 1 ? whole : whole + std::chrono::microseconds{500};
     };
     const auto flip_allowed_at = [&] {
         return last_flip_time + flip_interval(request_depth.load(std::memory_order_acquire));
@@ -664,7 +676,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                          flip_interval(request_depth.load(std::memory_order_acquire) + 1);
         const auto began = Clock::now();
         Flip(request);
-        if (!pace_exact && buffer_frames == 0) {
+        if (!pace_exact && frames_queued() == 0) {
             last_flip_time = Clock::now();
         } else if (began >= due && began - due <= std::chrono::milliseconds{2}) {
             last_flip_time = due;

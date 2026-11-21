@@ -203,6 +203,17 @@ public:
     /// OPT-012: on the command thread, whether a job thread prepared the draw at the packet
     /// (with its stages): then the command thread doesn't select its pipeline.
     bool HasPrepared(const void* packet);
+    /// PERF-SGT-081: the prepared draw kept for `packet` (null: none), as a prefetch hint only:
+    /// it may be taken, freed or replaced at any time after this returns.
+    const void* PreparedAddress(const void* packet);
+    /// PERF-SGT-081 (SHADGT_PREPARED_PREFETCH: 1 on, 2 in arm 1 of the 2 s A/B, else off): the
+    /// recorder asks for a draw's prepared draw a job ahead, and for what it points to once taken.
+    static bool PreparedPrefetchOn();
+    static size_t PreparedPrefetchBytes();
+    /// FEAT-SGT-079 step 4: recorder B's thread, ahead of A, on one of its draws (a
+    /// Liverpool::QueuedDraw): the checks of its prepared draw on B's registers. Sets its
+    /// b_result unless A got there first.
+    void RecorderBPrepare(void* queued_draw, const AmdGpu::Regs& regs);
     /// FIX-GTS-492: whether a prepared draw ends with the command memory it was made from
     /// (SHADGT_PREPARED_LIFETIME=0: it stays until a draw takes it, as before).
     static bool PreparedLifetimeOn();
@@ -1251,6 +1262,8 @@ private:
     void PassDiagSampled(const DrawBindings& b); ///< DIAG-SGT-061: sampled pictures of a draw
     void PassDiagWritten(const void* entry);     ///< DIAG-SGT-061: a picture written by this pass
     bool PassDiagOn() const;           ///< DIAG-SGT-061
+    void PassAuditBegin(bool render); ///< DIAG-SGT-075 (diagnostics builds): a pass starts
+    void PassAuditDraw(u64 ns);       ///< DIAG-SGT-075: a draw or dispatch ended
     /// FIX-GT7-090: BindStages again when a region made while binding took in one an earlier
     /// binding of the same draw or dispatch was given (its writes would go to the old buffer).
     void BindStagesStable(std::span<const Shader::Info* const> stages, const AmdGpu::Regs& regs,
@@ -1867,6 +1880,7 @@ private:
                        const vk::DescriptorBufferInfo& info);
     /// The prepared draw for the packet, taken out of the table (none if there is none).
     PreparedDraw* TakePrepared(const void* packet);
+    void PrefetchPreparedParts(const PreparedDraw& p); ///< PERF-SGT-081
     bool PrepareBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs,
                         Shader::Backend::Bindings& binding, PreparedDraw& p);
     bool PrepareTextures(const Shader::Info& stage, const AmdGpu::Regs& regs,
@@ -1994,6 +2008,7 @@ private:
             bool queueing = false;
             bool armed = false; ///< generations taken at the first queued op
             bool dispatch_run = false; ///< the current pass is a run of dispatches
+            bool binding = false; ///< DIAG-SGT-075 (diagnostics builds): inside BindStages
             u64 buffer_generation = 0, hard_generation = 0, registry_generation = 0,
                 unmap_generation = 0;
             std::vector<CommitOp> ops;
@@ -2005,6 +2020,26 @@ private:
     /// A plain member, not behind a pointer: Ctx() then compiles to what the members did (a
     /// unique_ptr adds a load on every access and keeps the members out of registers).
     RecordContext main_record_context;
+    /// FEAT-SGT-079 step 2 (SHADGT_RECORDER_B=3): recorder B's own context (streams, lists,
+    /// bindings scratch, memos). On the recorder thread for now: runs of passes are dealt to it
+    /// and its list is spliced in order at each hand-over.
+    RecordContext b_record_context;
+    RecordContext* current_context = &main_record_context;
+    struct RecorderBDealState {
+        u64 frame = ~u64{0};
+        u64 pass = 0;
+        u64 key = 0;
+        u64 switches = 0, b_draws = 0, draws = 0; // diagnostics
+    } b_deal;
+    /// FEAT-SGT-079: at a draw's or dispatch's start, before anything is recorded for it: the
+    /// context its run of passes is dealt to (a hand-over splices the open list first).
+    void RecorderBDeal(bool dispatch, const AmdGpu::Regs& regs);
+    /// FEAT-SGT-079 step 3 (diagnostics): recorder B's dry run of its next run, from the queue.
+    void RecorderBDryRun(u64 key);
+    std::unordered_set<const void*> b_accepted; ///< packets B's dry run took (diagnostics)
+    const char* a_prepared_why = nullptr; ///< FEAT-SGT-079 (diagnostics): why A's draw went without
+    /// FEAT-SGT-079: the prepared draw for a packet, left where it is (null: none).
+    const PreparedDraw* PeekPrepared(const void* packet);
     /// FEAT-SGT-022: the bindings scratch for the next draw or dispatch (a slot no binder job
     /// still reads).
     DrawBindings& NextBindings();
@@ -2036,10 +2071,10 @@ private:
     /// a wrong hand-off from a race), 0 off.
     int binder_mode = 0;
     RecordContext& Ctx() {
-        return main_record_context;
+        return *current_context;
     }
     const RecordContext& Ctx() const {
-        return main_record_context;
+        return *current_context;
     }
     u64 frame = 0;
     u64 timing_tick = 0; ///< OPT-001

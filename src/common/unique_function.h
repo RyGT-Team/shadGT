@@ -26,8 +26,11 @@ class UniqueFunction {
     public:
         virtual ~CallableBase() = default;
         /// PERF-GT7-126: memory the callable will read that lies behind its captures' pointers.
-        const void* hint_at[2]{};
-        std::uint32_t hint_bytes[2]{};
+        const void* hint_at[3]{}; ///< PERF-SGT-081: a third, the draw's prepared draw
+        std::uint32_t hint_bytes[3]{};
+        /// FEAT-SGT-079: what a queued job is, for a consumer looking ahead (0: not told).
+        std::uint64_t tag = 0;
+        const void* info = nullptr; ///< FEAT-SGT-079: owned by the callable's captures
         virtual ResultType operator()(Args&&...) = 0;
 
         // PERF-056: callables are often made on one thread and destroyed on another.
@@ -109,10 +112,24 @@ public:
     /// PERF-GT7-126: names up to two blocks the callable reads through its captures' pointers.
     /// The blocks must stay valid until the callable has run. Called by who made the callable.
     void SetPrefetchHint(std::size_t slot, const void* at, std::size_t bytes) noexcept {
-        if (callable && slot < 2) {
+        if (callable && slot < 3) {
             callable->hint_at[slot] = at;
             callable->hint_bytes[slot] = static_cast<std::uint32_t>(bytes);
         }
+    }
+
+    /// FEAT-SGT-079: a tag the consumer can read without running the callable.
+    void SetTag(std::uint64_t value) noexcept {
+        if (callable) callable->tag = value;
+    }
+    std::uint64_t Tag() const noexcept {
+        return callable ? callable->tag : 0;
+    }
+    void SetInfo(const void* value) noexcept {
+        if (callable) callable->info = value;
+    }
+    const void* Info() const noexcept {
+        return callable ? callable->info : nullptr;
     }
 
     /// PERF-GT7-126: asks for the hinted blocks. It reads the callable itself, so it is best
@@ -122,7 +139,7 @@ public:
         if (!callable) {
             return;
         }
-        for (std::size_t slot = 0; slot < 2; ++slot) {
+        for (std::size_t slot = 0; slot < 3; ++slot) {
             const char* const at = static_cast<const char*>(callable->hint_at[slot]);
             for (std::size_t offset = 0; at && offset < callable->hint_bytes[slot]; offset += 64) {
                 _mm_prefetch(at + offset, _MM_HINT_T0);

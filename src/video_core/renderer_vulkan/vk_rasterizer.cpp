@@ -1364,6 +1364,7 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
 #ifndef NDEBUG
             ++stats.ahead;
 #endif
+            if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("selection used", {}); // DIAG-SGT-076
             // Every 64th selection is checked against one made here, from the recorder's
             // registers and memory; a difference is reported and this one used.
             static const bool verify = !Common::LeanRun();
@@ -1416,10 +1417,12 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
 #ifndef NDEBUG
         ++stats.mismatched;
 #endif
+        if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("selection redone", {}); // DIAG-SGT-076
     } else {
 #ifndef NDEBUG
         ++stats.recorder;
 #endif
+        if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("no selection", {}); // DIAG-SGT-076
     }
     if (const GraphicsPipeline* built = AcquireBuiltPipelineShared(params, owner)) {
         return built; // PERF-415
@@ -3268,6 +3271,15 @@ static s64 NativeFenceBatchInterval() {
         const char* value = std::getenv("SHADGT_NATIVE_FENCE_BATCH_MS");
         return NativeFenceBatchNs(value ? value : "");
     }();
+    if constexpr (Common::DiagnosticsBuilt) {
+        // DIAG-SGT-076 (SHADGT_DIAG_FENCE_BATCH_AB=<ms>, diagnostics builds): the interval and
+        // this one in turns every 2 s (B = this one), for an A/B within one drive.
+        static const char* ab = Common::DiagEnv("SHADGT_DIAG_FENCE_BATCH_AB");
+        if (ab && *ab) {
+            static const s64 other = NativeFenceBatchNs(ab);
+            return SubmitAbArm().load(std::memory_order_relaxed) ? other : interval;
+        }
+    }
     return interval;
 }
 #endif

@@ -5,6 +5,7 @@
 
 #include <condition_variable>
 #include <mutex>
+#include <atomic>
 #include <source_location>
 #include <thread>
 #include <queue>
@@ -371,6 +372,20 @@ struct DynamicState {
 
 using SessionFunc = Common::UniqueFunction<void>;
 using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
+
+/// DIAG-SGT-076 (diagnostics builds, SHADGT_DIAG_SUBMITS=1): counts a submit or splice by caller.
+void NoteSubmitSite(const char* what, const std::source_location& loc);
+/// DIAG-SGT-076: the arm of an A/B that alternates every 2 s (0 or 1; 0 when none runs).
+std::atomic<int>& SubmitAbArm();
+/// DIAG-SGT-074: when the command thread submitted a tick to the queue (0: not known), for the
+/// split of the EOP tail into our submit and the GPU's run. Diagnostics builds only.
+void NoteTickSubmitted(u64 tick);
+s64 TickSubmittedNs(u64 tick);
+/// DIAG-SGT-074: a frame started (the game's first submit after an EOP) at `ns`; the next list
+/// submitted to the queue measures how long the GPU waited for the frame's first work.
+void NoteFrameStart(s64 ns);
+/// DIAG-SGT-074: frames measured and the sum and max of their first-list delays (ns), reset.
+std::array<s64, 3> TakeFirstListStats();
 
 class Scheduler {
 public:

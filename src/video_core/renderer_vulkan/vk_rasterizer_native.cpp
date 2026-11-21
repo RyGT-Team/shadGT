@@ -3857,6 +3857,7 @@ static bool RecorderBOwnRing() {
 }
 
 void NativeRenderer::AcquireList(Stream& s) {
+    SHADGT_B_TOUCH("AcquireList"); // DIAG-SGT-089
     if (&s == &b_record_context.stream && RecorderBRawLists()) { // FEAT-SGT-079 step 7
         // Not ApplyRingPriority: the command thread's priority follows A's lists.
         s.list = device->AcquireCommandList(Native::Rhi::CommandListLevel::Secondary);
@@ -3929,6 +3930,7 @@ CmdBuf NativeRenderer::CmdOf(Native::Rhi::CommandList& list) const {
 }
 
 NativeRenderer::Stream& NativeRenderer::Begin() {
+    SHADGT_B_TOUCH("Begin"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::Begin}; // DIAG-SGT-023
     // DLSS-GT7-001: work other than a HUD draw of the open batch runs after the batch.
     if (temporal.hud_batch_open && !temporal.display_draw_now) {
@@ -4255,6 +4257,7 @@ void NativeRenderer::BindGraphics(Stream& s, const GraphicsPipeline& pipeline,
 }
 
 void NativeRenderer::FlushLdsReaders(u32) {
+    SHADGT_B_TOUCH("FlushLdsReaders"); // DIAG-SGT-089
     Stream& s = Ctx().stream;
     if (s.lds_readers.empty()) return;
     auto readers = std::move(s.lds_readers);
@@ -4581,6 +4584,7 @@ void DiagNotePassEnd(std::source_location where) {
 #endif
 
 void NativeRenderer::GlobalBarrier([[maybe_unused]] std::source_location where) {
+    SHADGT_B_TOUCH("GlobalBarrier"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::GlobalBarrier}; // DIAG-SGT-023
     if constexpr (Common::DiagnosticsBuilt) AuditCount(AuditBarrier); // DIAG-SGT-075
 #if !defined(NDEBUG)
@@ -4618,6 +4622,7 @@ void NativeRenderer::GlobalBarrier([[maybe_unused]] std::source_location where) 
 }
 
 void NativeRenderer::PassBarrier(std::source_location where) {
+    SHADGT_B_TOUCH("PassBarrier"); // DIAG-SGT-089
     Stream& s = Ctx().stream;
     EndRendering(0, where);
     constexpr auto stages = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
@@ -5275,6 +5280,7 @@ void NativeRenderer::FlushWritebacks() {
 }
 
 void NativeRenderer::PrepareImages(std::span<const Native::ImageEntry* const> bound) {
+    SHADGT_B_TOUCH("PrepareImages"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::PrepareImages}; // DIAG-SGT-023
     AmdGpu::RecorderParts::Scope part{AmdGpu::RecorderParts::Part::Uploads}; // DIAG-GT7-005
     Native::SlowCallTrace<6> trace{t_timed, "prepare-images",
@@ -5316,6 +5322,7 @@ void NativeRenderer::PrepareImages(std::span<const Native::ImageEntry* const> bo
 }
 
 void NativeRenderer::PrepareImages(const DrawBindings& b) {
+    SHADGT_B_TOUCH("PrepareImages"); // DIAG-SGT-089
     // PERF-109: the pictures the work samples and stores into.
     boost::container::small_vector<const Native::ImageEntry*, 32> bound;
     bound.insert(bound.end(), b.sampled.begin(), b.sampled.end());
@@ -5831,6 +5838,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
 }
 
 void NativeRenderer::SortRegionWrites() {
+    SHADGT_B_TOUCH("SortRegionWrites"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::SortRegionWrites}; // DIAG-SGT-023
     if (!has_pending_region_writes.exchange(false, std::memory_order_acq_rel)) {
         return;
@@ -6052,6 +6060,7 @@ bool NativeRenderer::IsDynamic(VAddr begin, VAddr end, u64* blocked_granule, u64
 static thread_local u8 g_mirror_miss = 0;
 
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr address, u64 size) {
+    SHADGT_B_TOUCH("MirrorBuffer"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::MirrorBuffer}; // DIAG-SGT-023
     g_mirror_miss = 0;
     static const bool enabled = [] {
@@ -6129,6 +6138,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr add
 }
 
 bool NativeRenderer::RefreshMirror(Mirror& mirror) {
+    SHADGT_B_TOUCH("RefreshMirror"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::RefreshMirror}; // DIAG-SGT-023
     { Native::CpuStackRegistry::Lease lease{Native::CpuStacks()};
       if (!lease.Allowed(mirror.begin, mirror.end)) return false; }
@@ -6806,6 +6816,7 @@ void NativeRenderer::RecordRegionWriteback(const std::shared_ptr<WritebackPlan>&
 }
 
 void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
+    SHADGT_B_TOUCH("RefreshRegion"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::RefreshRegion}; // DIAG-SGT-023
     SortRegionWrites();
     auto& dirty = region.dirty_pages;
@@ -9825,6 +9836,7 @@ bool NativeRenderer::TargetsFromMemo(const AmdGpu::Regs& regs, const GraphicsPip
 
 bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline,
                                     Targets& out) {
+    SHADGT_B_TOUCH("ResolveTargets"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::Targets}; // DIAG-SGT-023
     static const bool reuse = [] {
         const char* env = std::getenv("SHADGT_NATIVE_REUSE");
@@ -11150,6 +11162,7 @@ void NativeRenderer::CompareRegion(VAddr base, u64 size, u32 stride, vk::Buffer 
 
 void NativeRenderer::CaptureImage(const Native::ImageEntry& entry, u64 at_frame,
                                   const std::string& what) {
+    SHADGT_B_TOUCH("CaptureImage"); // DIAG-SGT-089
     // DIAG-212 (diagnosis): mip 0 layer 0 of a 32-bit picture, copied where the work stands now.
     if (!entry.image || entry.info.num_bits != 32 || captures.size() >= 12) {
         return;
@@ -13185,6 +13198,7 @@ vk::ImageView NativeRenderer::DepthStandIn(bool array, bool may_create) {
 }
 
 void NativeRenderer::EnsureAheadArena() {
+    SHADGT_B_TOUCH("EnsureAheadArena"); // DIAG-SGT-089
     if (ahead_arena.tried) return;
     ahead_arena.tried = true;
     // PERF-GTS-377 (SHADGT_AHEAD_UPLOAD_MB, 0 = off): a race draw's constants (about 550 bytes,
@@ -13687,6 +13701,7 @@ void NativeRenderer::RunBindJob(void* owner, BindJob& job, CommandRing&) {
 
 void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoint bind_point,
                                   DrawBindings& b) {
+    SHADGT_B_TOUCH("PushBindings"); // DIAG-SGT-089
     LongSetsUpkeep();
     Stream& s = Ctx().stream;
     RecordContext& c = Ctx();
@@ -14351,6 +14366,7 @@ bool NativeRenderer::MirrorKind(char kind) {
 
 void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
                                           const AmdGpu::Regs& regs, VertexIndexState& v) {
+    SHADGT_B_TOUCH("ResolveVertexBuffers"); // DIAG-SGT-089
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
     VertexInputs<AmdGpu::Buffer> guest_buffers;
     pipeline.GetVertexInputs(v.attributes, v.input_bindings, divisors, guest_buffers,
@@ -14656,6 +14672,7 @@ void NativeRenderer::CheckMirrorBind(Mirror& mirror, VAddr base, u64 size) {
 
 bool NativeRenderer::ResolveIndices(const AmdGpu::Regs& regs, bool is_indexed, u32 index_offset,
                                     bool quad_triangles, VertexIndexState& v) {
+    SHADGT_B_TOUCH("ResolveIndices"); // DIAG-SGT-089
     const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
     const u32 index_size = is_index16 ? sizeof(u16) : sizeof(u32);
     v.index_type = is_index16 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
@@ -14726,6 +14743,7 @@ bool NativeRenderer::ResolveIndices(const AmdGpu::Regs& regs, bool is_indexed, u
 }
 
 void NativeRenderer::RecordVertexIndex(const VertexIndexState& v) {
+    SHADGT_B_TOUCH("RecordVertexIndex"); // DIAG-SGT-089
     Stream& s = Ctx().stream;
     const CmdBuf cmdbuf{s.cmd};
     const bool dynamic_input = r.instance.IsVertexInputDynamicState();
@@ -15161,6 +15179,7 @@ u64 NativeRenderer::WholeVersion(Native::ImageEntry& source) {
 }
 
 void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
+    SHADGT_B_TOUCH("RefreshSources"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::RefreshSources}; // DIAG-SGT-023
     // NAT-111: only when one of its targets was drawn since the last time.
     const bool traced = Rasterizer::Traced(texture.info.guest_address, texture.info.guest_size);
@@ -15481,6 +15500,7 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
 
 
 void NativeRenderer::SyncDepthTwin(Native::ImageEntry& entry) {
+    SHADGT_B_TOUCH("SyncDepthTwin"); // DIAG-SGT-089
     // FIX-212: on the PS4 a depth buffer and a colour picture of its layout at its address are
     // the same memory. GT7 double-buffers its 5120x5120 static shadow map (D16 at 0x2900000000
     // and 0x2920000000): each frame a compute pass reprojects the last map into the other
@@ -16076,6 +16096,7 @@ struct PixelTrace {
 #endif
 
 void NativeRenderer::YieldToMappingChanges() {
+    SHADGT_B_TOUCH("YieldToMappingChanges"); // DIAG-SGT-089
     // PERF-GTS-368: the recorder takes `mutex` for each draw and dispatch and took it straight
     // back after each one, so a game thread unmapping memory (OnUnmap) waited out whole
     // stretches of recording: 250 to 390 ms at the Autopolis start (no CPU time used), and
@@ -16541,17 +16562,48 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::DrawTotal}; // DIAG-SGT-023
     YieldToMappingChanges(); // PERF-GTS-368
     std::unique_lock<decltype(mutex)> lock{mutex, std::defer_lock};
-    if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-088: B's thread's wait for the lock
-        if (OnRecorderBThread()) {
+    // DIAG-SGT-089: the overlap's lock times (diagnostics builds, SHADGT_RECORDER_B_OVERLAP on).
+    static const bool lock_timed = Common::DiagnosticsBuilt && [] {
+        const char* env = std::getenv("SHADGT_RECORDER_B_OVERLAP");
+        return env && (env[0] == '1' || env[0] == '2');
+    }();
+    struct LockedTime {
+        NativeRenderer* self = nullptr;
+        u32 thread = 0;
+        std::chrono::steady_clock::time_point start{};
+        ~LockedTime() {
+            if (!self) return;
+            const auto now = std::chrono::steady_clock::now();
+            const auto mid = t_draw_in_record ? record_start : now;
+            self->draw_locked_ns[thread][0].fetch_add(
+                u64(std::chrono::duration_cast<std::chrono::nanoseconds>(mid - start).count()),
+                std::memory_order_relaxed);
+            self->draw_locked_ns[thread][1].fetch_add(
+                u64(std::chrono::duration_cast<std::chrono::nanoseconds>(now - mid).count()),
+                std::memory_order_relaxed);
+            self->draw_locked_count[thread].fetch_add(1, std::memory_order_relaxed);
+            t_draw_in_record = false;
+        }
+        std::chrono::steady_clock::time_point record_start{};
+    } locked_time;
+    if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-088/089: the threads' waits for the lock
+        const bool b = OnRecorderBThread();
+        if (b || (lock_timed && b_outstanding.load(std::memory_order_relaxed))) {
             const auto from = std::chrono::steady_clock::now();
             lock.lock();
-            b_mutex_wait_ns.fetch_add(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - from)
-                    .count(),
-                std::memory_order_relaxed);
+            (b ? b_mutex_wait_ns : a_mutex_wait_ns)
+                .fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now() - from)
+                               .count(),
+                           std::memory_order_relaxed);
         } else {
             lock.lock();
+        }
+        if (lock_timed) {
+            t_draw_in_record = false;
+            locked_time.self = this;
+            locked_time.thread = b ? 1 : 0;
+            locked_time.start = std::chrono::steady_clock::now();
         }
     } else {
         lock.lock();
@@ -18074,6 +18126,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     Native::OrderedTiming::NoteResolve(resolve_recorded); // DIAG-SGT-023
     // DIAG-SGT-023: the rest of the draw is the encode side (ends with the draw's scope).
     Native::OrderedTiming::Scope encode_phase{Native::OrderedTiming::EncodePhase};
+    if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-089: the encode side's share of the lock
+        if (locked_time.self) {
+            locked_time.record_start = std::chrono::steady_clock::now();
+            t_draw_in_record = true;
+        }
+    }
     auto* parallel=FindParallelRuntime(this);
     const auto partition_mode=parallel && parallel->applied_mode.Enabled()?1u:0u;
     RecordPartitionEndGuard end_partition_guard{parallel?&parallel->record_partition[partition_mode][4]:nullptr};
@@ -20592,6 +20650,7 @@ bool NativeRenderer::TemporalKeepsResolved() {
 }
 
 void NativeRenderer::CopyPicture(const Native::ImageEntry& from, const Native::ImageEntry& to) {
+    SHADGT_B_TOUCH("CopyPicture"); // DIAG-SGT-089
     Stream& s = Begin();
     GlobalBarrier();
     const vk::ImageSubresourceLayers layers{.aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -21048,6 +21107,7 @@ NativeRenderer::PreparedDraw* NativeRenderer::NewPrepared() {
 }
 
 void NativeRenderer::ReleaseBinderHeld() {
+    SHADGT_B_TOUCH("ReleaseBinderHeld"); // DIAG-SGT-089
     // FEAT-SGT-022: prepared draws whose binder jobs have run go back now (in order: jobs run
     // in order, so the first one still running stops the walk).
     // FEAT-SGT-079: with a binder per context, jobs run in order per binder only: every held
@@ -21062,6 +21122,7 @@ void NativeRenderer::ReleaseBinderHeld() {
 }
 
 void NativeRenderer::FreePrepared(PreparedDraw* draw) {
+    SHADGT_B_TOUCH("FreePrepared"); // DIAG-SGT-089
     // FEAT-SGT-022: a draw whose binds the binder still makes keeps its bindings until then
     // (only the recorder gives back drawn prepared draws; others never had a job).
     if (draw->binder_job != 0 && binders[draw->binder_index] &&
@@ -21255,6 +21316,7 @@ void NativeRenderer::PrefetchPreparedParts(const PreparedDraw& p) {
 }
 
 const GraphicsPipeline* NativeRenderer::InstallPrepared(PreparedDraw& p) {
+    SHADGT_B_TOUCH("InstallPrepared"); // DIAG-SGT-089
     // As AcquireGraphicsPipeline with the command thread's selection: the stages' user data
     // and flattened user data, the flattened buffers moved in (and the old ones kept here).
     std::array<Rasterizer::SelectedStage, Shader::MaxStageTypes> selected{};
@@ -21282,6 +21344,7 @@ const GraphicsPipeline* NativeRenderer::InstallPrepared(PreparedDraw& p) {
 }
 
 NativeRenderer::PreparedDraw* NativeRenderer::TakePrepared(const void* packet) {
+    SHADGT_B_TOUCH("TakePrepared"); // DIAG-SGT-089
     if (!packet) {
         return nullptr;
     }
@@ -23186,6 +23249,7 @@ bool NativeRenderer::CommitPreparedVertices(PreparedDraw& p, const GraphicsPipel
                                             const AmdGpu::Regs& regs, bool is_indexed,
                                             u32 index_offset, bool quad_triangles,
                                             bool trusted) {
+    SHADGT_B_TOUCH("CommitPreparedVertices"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::CommitPrepared}; // DIAG-SGT-023
     // (The ranges were checked with the bindings'.)
     const auto reject = [&] {
@@ -23229,6 +23293,7 @@ bool NativeRenderer::CommitPreparedVertices(PreparedDraw& p, const GraphicsPipel
 
 bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pipeline,
                                     const AmdGpu::Regs& regs, bool trusted) {
+    SHADGT_B_TOUCH("CommitPrepared"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::CommitPrepared}; // DIAG-SGT-023
     Native::SlowCallTrace<8> trace{t_timed, "commit-prepared",
         {"stage-validation", "image-freshness", "sort-cpu-writes", "buffer-freshness",
@@ -23742,6 +23807,7 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
 }
 
 void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
+    SHADGT_B_TOUCH("ApplyRewrite"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::ApplyRewrite}; // DIAG-SGT-023
     registry->QueueUploadForUse(entry);
     using Rewrite = Native::ImageEntry::Rewrite;
@@ -24577,6 +24643,7 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 }
 
 void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
+    SHADGT_B_TOUCH("ResolveDraw"); // DIAG-SGT-089
     if (UiHires::Enabled()) {
         ResolveUiDisplay(regs.color_buffers[0].Address(), true);
         ResolveUiDisplay(regs.color_buffers[1].Address(), false);
@@ -26209,6 +26276,7 @@ static std::array<std::atomic<u64>, 5> g_fault_part_ns{};
 static std::atomic<u64> g_fault_count{};
 
 void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
+    SHADGT_B_TOUCH("OnCpuWrite"); // DIAG-SGT-089
     SnapshotLease::MarkUnsafe(address, std::max<u64>(size, 1), 2);
     // DIAG-194 (diagnosis, SHADGT_DIAG_FAULT_COST=1)
     static const bool timed = [] {
@@ -26417,6 +26485,7 @@ u32 NativeRenderer::ReadGds(u32 gds_offset) {
 }
 
 void NativeRenderer::Splice(std::source_location where) {
+    SHADGT_B_TOUCH("Splice"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::Splice}; // DIAG-SGT-023
     std::scoped_lock lock{mutex};
     AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Splices};

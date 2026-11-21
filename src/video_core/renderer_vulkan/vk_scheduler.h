@@ -385,6 +385,22 @@ inline thread_local bool t_on_recorder_b = false; ///< FEAT-SGT-079: set by Mark
 inline bool OnRecorderBThread() {
     return t_on_recorder_b;
 }
+/// DIAG-SGT-089: this thread's draw is in its encode side (DIAG-SGT-023) (diagnostics builds, overlap on).
+inline thread_local bool t_draw_in_record = false;
+/// DIAG-SGT-089 (diagnostics builds, SHADGT_DIAG_SUBMITS=1 and SHADGT_DIAG_B_TOUCH=1): B's thread reached a renderer
+/// entry point that may touch shared state, counted by name, phase and caller: what B's draws need
+/// before they can record without the renderer's lock.
+#define SHADGT_B_TOUCH(name)                                                                       \
+    do {                                                                                           \
+        if constexpr (Common::DiagnosticsBuilt) {                                                  \
+            static const bool b_touch_on = ::Common::DiagEnv("SHADGT_DIAG_B_TOUCH") != nullptr;   \
+            if (b_touch_on && ::Vulkan::OnRecorderBThread()) {                                     \
+                ::Vulkan::NoteSubmitSite(::Vulkan::t_draw_in_record ? "B touch in encode: " name   \
+                                                                    : "B touch before encode: " name, \
+                                         std::source_location::current());                         \
+            }                                                                                      \
+        }                                                                                          \
+    } while (false)
 /// FEAT-SGT-079 step 19: recorder B holds handed work (set by the recorder).
 inline std::atomic<bool> g_b_outstanding{false};
 void NoteRecorderBMain(const char* what, const std::source_location& loc);

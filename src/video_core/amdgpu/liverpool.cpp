@@ -2084,9 +2084,19 @@ void Liverpool::ReportOverlapCost() {
     if (now - c.since < 5'000'000'000) return;
     const double secs = double(now - c.since) / 1e9;
     u64 b_wait = 0;
+    u64 a_wait = 0;                     // DIAG-SGT-089
+    std::array<std::array<u64, 2>, 2> locked{};
+    std::array<u64, 2> locked_draws{};
 #ifdef RYTY_GPU
     if (auto* native = rasterizer ? rasterizer->Native() : nullptr) {
         b_wait = native->b_mutex_wait_ns.exchange(0, std::memory_order_relaxed);
+        a_wait = native->a_mutex_wait_ns.exchange(0, std::memory_order_relaxed);
+        for (u32 t = 0; t < 2; ++t) {
+            locked_draws[t] = native->draw_locked_count[t].exchange(0, std::memory_order_relaxed);
+            for (u32 p = 0; p < 2; ++p) {
+                locked[t][p] = native->draw_locked_ns[t][p].exchange(0, std::memory_order_relaxed);
+            }
+        }
     }
 #endif
     LOG_INFO(Render, "DIAG-SGT-088: overlap in {:.1f} s: {} jobs to B, {} kept, {} syncs; the "
@@ -2095,6 +2105,16 @@ void Liverpool::ReportOverlapCost() {
              "{:.1f} ms/s",
              secs, c.jobs, c.kept, c.syncs, c.sync_wait / 1e6 / secs, c.prepare / 1e6 / secs,
              c.handoff / 1e6 / secs, c.commit / 1e6 / secs, b_wait / 1e6 / secs);
+    const auto per_draw = [&](u32 t, u32 p) {
+        return locked_draws[t] ? double(locked[t][p]) / 1e3 / double(locked_draws[t]) : 0.0;
+    };
+    LOG_INFO(Render, "DIAG-SGT-089: in Draw with the renderer's lock: the recorder {} draws, "
+             "{:.1f} ms/s before the encode side + {:.1f} ms/s in it ({:.2f} + {:.2f} us a draw), "
+             "waiting for the lock while B holds work {:.1f} ms/s; B {} draws, {:.1f} + {:.1f} "
+             "ms/s ({:.2f} + {:.2f} us a draw)",
+             locked_draws[0], locked[0][0] / 1e6 / secs, locked[0][1] / 1e6 / secs, per_draw(0, 0),
+             per_draw(0, 1), a_wait / 1e6 / secs, locked_draws[1], locked[1][0] / 1e6 / secs,
+             locked[1][1] / 1e6 / secs, per_draw(1, 0), per_draw(1, 1));
     c = {};
     c.since = now;
 }

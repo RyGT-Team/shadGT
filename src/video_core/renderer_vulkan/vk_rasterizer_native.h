@@ -237,6 +237,12 @@ public:
         g_b_outstanding.store(on, std::memory_order_release);
     }
     std::atomic<u64> b_mutex_wait_ns{0}; ///< DIAG-SGT-088: B's thread waiting for `mutex` in Draw
+    /// DIAG-SGT-089 (diagnostics builds, overlap on): the recorder's wait for `mutex` in Draw while B
+    /// holds work, and each thread's (0 recorder, 1 B) time in Draw with the lock held, before and
+    /// in the encode side (DIAG-SGT-023), and its draws.
+    std::atomic<u64> a_mutex_wait_ns{0};
+    std::array<std::array<std::atomic<u64>, 2>, 2> draw_locked_ns{};
+    std::array<std::atomic<u64>, 2> draw_locked_count{};
     std::atomic<bool> b_outstanding{false};
     /// DIAG-SGT-086: the recorder's time since B's last run before it first needed what that run
     /// drew (all of it when it never did), and the segment's counts noted; a new segment starts.

@@ -22631,6 +22631,27 @@ static bool RecorderBRawLists() {
     const int mode = RecorderBMode();
     return mode == 7 || (mode == 8 && SubmitAbArm().load(std::memory_order_relaxed) == 1);
 }
+// FEAT-SGT-079 step 22 (SHADGT_RECORDER_B_UNLOCKED): recorder B's draws the recorder readied
+// commit their prepared draw read only (they reject it when anything is to be done: the recorder
+// did it at the hand-over). 1: under the renderer's lock; 2: without it (B holds b_pin).
+static int RecorderBUnlocked() {
+    static const int mode = [] {
+        const char* env = std::getenv("SHADGT_RECORDER_B_UNLOCKED");
+        return env && (env[0] == '1' || env[0] == '2') ? env[0] - '0' : 0;
+    }();
+    return mode;
+}
+
+// Step 22b (diagnosis): which of the window's skips run (SHADGT_RECORDER_B_UNLOCKED_SKIP, a mask:
+// 1 CPU writes sorted, 2 regions, 4 pictures, 8 mirrors and in-place ranges; all by default).
+static u32 BWindowSkips() {
+    static const u32 mask = [] {
+        const char* env = std::getenv("SHADGT_RECORDER_B_UNLOCKED_SKIP");
+        return env && *env ? u32(std::strtoul(env, nullptr, 0)) : 15u;
+    }();
+    return mask;
+}
+
 static bool RecorderBSplit() {
     const int mode = RecorderBMode();
     return mode == 2 ? SubmitAbArm().load(std::memory_order_relaxed) == 1 : mode != 0;
@@ -23311,6 +23332,21 @@ bool NativeRenderer::CommitPreparedVertices(PreparedDraw& p, const GraphicsPipel
     }
     // The ordered part: pages the CPU wrote into the mirrors, and the ranges read in place
     // (noted as mirror candidates).
+    if (t_b_window && RecorderBUnlocked() != 0 && BindCommitMode() == 0 &&
+        (BWindowSkips() & 8)) { // step 22b: read only
+        for (const Mirror* mirror : p.mirrors) {
+            if (mirror && !mirror->dirty_pages.empty()) {
+                if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B window: mirror", {});
+                return reject();
+            }
+        }
+        if (!p.in_place.empty()) {
+            if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B window: in place", {});
+            return reject();
+        }
+        NATIVE_DIAGNOSTIC(++stats.prepared_vertices);
+        return true;
+    }
     for (Mirror* mirror : p.mirrors) {
         if (!RefreshMirror(*mirror)) return reject();
         mirror->used_frame = frame;
@@ -23321,6 +23357,76 @@ bool NativeRenderer::CommitPreparedVertices(PreparedDraw& p, const GraphicsPipel
     }
     NATIVE_DIAGNOSTIC(++stats.prepared_vertices);
     return true;
+}
+
+bool NativeRenderer::BWindowWritesPending(const PreparedDraw& p) {
+    if (!has_pending_region_writes.load(std::memory_order_acquire)) return false;
+    const auto over = [&](VAddr begin, VAddr end) {
+        for (const auto& use : p.regions) {
+            if (use.address < end && use.address + use.size > begin) return true;
+        }
+        for (const Mirror* m : p.mirrors) {
+            if (m && m->begin < end && m->end > begin) return true;
+        }
+        return false;
+    };
+    std::scoped_lock lock{region_dirty_mutex};
+    for (const auto& [begin, end] : pending_region_writes) {
+        if (over(begin, end)) return true;
+    }
+    for (const auto& [begin, end] : pending_stack_retirements) {
+        if (over(begin, end)) return true;
+    }
+    return false;
+}
+
+bool NativeRenderer::BWindowPictureClean(const Native::ImageEntry& e) {
+    using Rewrite = Native::ImageEntry::Rewrite;
+    const auto no = [](const char* why) {
+        if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite(why, {});
+        return false;
+    };
+    if (e.rewrite != Rewrite::None) return no("B window picture: rewrite");
+    if (e.stencil_clear_pending) return no("B window picture: stencil clear");
+    if (e.sources_dirty.load(std::memory_order_relaxed)) return no("B window picture: sources");
+    if (e.needs_upload.load(std::memory_order_acquire)) return no("B window picture: upload");
+    const auto& info = e.info;
+    if (e.from_cpu) { // RewrittenSmall's and LayersRewritten's (large layered) are the recorder's
+        if (e.gpu_rewritten.load(std::memory_order_relaxed) > e.rewrite_seen) {
+            return no("B window picture: small rewrite");
+        }
+        // LayersRewritten's (large layered): nothing to do once checked this frame with no
+        // change found since, or once the GPU wrote it.
+        if (info.resources.layers >= 16 && info.guest_size > (4ull << 20) &&
+            !e.gpu_backing_written.load(std::memory_order_acquire)) {
+            const auto& shared = *e.layer_hash;
+            if (shared.changed.load(std::memory_order_acquire) ||
+                shared.checked_frame.load(std::memory_order_acquire) != frame) {
+                return no("B window picture: layered");
+            }
+        }
+        return true;
+    }
+    // SyncDepthTwin's: a twin written since.
+    if (!e.image || info.num_samples != 1 || info.props.has_stencil ||
+        (!info.props.is_depth && !LiverpoolToVK::IsFormatDepthCompatible(info.pixel_format))) {
+        return true;
+    }
+    const Native::ImageEntry* twin =
+        registry->FindExisting(info.guest_address, [&](const Native::ImageEntry& other) {
+            const auto& o = other.info;
+            return &other != &e && !other.from_cpu && other.image &&
+                   o.props.is_depth != info.props.is_depth && !o.props.has_stencil &&
+                   o.num_samples == 1 && o.num_bits == info.num_bits &&
+                   o.size.width == info.size.width && o.size.height == info.size.height &&
+                   o.resources.levels == info.resources.levels &&
+                   o.resources.layers == info.resources.layers && o.type == info.type &&
+                   (o.props.is_depth || LiverpoolToVK::IsFormatDepthCompatible(o.pixel_format));
+        });
+    if (!twin) return true;
+    const u64 version = twin->write_version.load(std::memory_order_relaxed);
+    if (version == 0 || version <= e.write_version.load(std::memory_order_relaxed)) return true;
+    return no("B window picture: depth twin");
 }
 
 bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pipeline,
@@ -23369,6 +23475,8 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         return false;
     };
     const bool split = RecorderBSplit(); // FEAT-SGT-079
+    // FEAT-SGT-079 step 22b: B's window commits read only (the recorder readied the draw).
+    const bool window = t_b_window && RecorderBUnlocked() != 0 && BindCommitMode() == 0;
     if (p.pipeline != &pipeline) {
         return reject(0);
     }
@@ -23419,8 +23527,11 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         return reject(3);
     }
     trace.Next(2);
-    if (!split) {
+    if (!split && !(window && (BWindowSkips() & 1))) {
         SortRegionWrites(); // CPU writes since (may drop mirrors)
+    } else if (!split && BWindowWritesPending(p)) { // step 22b: read only
+        if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B window: CPU writes", {});
+        return reject(4);
     }
     trace.Next(3);
     // A successful first scan certifies history through this earlier checkpoint;
@@ -23519,9 +23630,23 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     }
     // The ordered part, as BindBuffers and BindTextures do it.
     trace.Next(4);
-    for (const auto& use : p.regions) {
-        RefreshRegion(*use.region, use.address, use.size);
-        NATIVE_DIAGNOSTIC(++stats.region_binds);
+    if (window && (BWindowSkips() & 2)) { // step 22b: no page the draw reads waits for a refresh
+        for (const auto& use : p.regions) {
+            if (!use.region || use.region->dirty_pages.empty()) continue;
+            const VAddr begin = Common::AlignDown(std::max(use.address, use.region->begin), 4096);
+            const VAddr end = std::min(use.region->end, use.address + use.size);
+            for (const VAddr page : use.region->dirty_pages) {
+                if (page >= begin && page < end) {
+                    if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B window: region", {});
+                    return reject(4);
+                }
+            }
+        }
+    } else {
+        for (const auto& use : p.regions) {
+            RefreshRegion(*use.region, use.address, use.size);
+            NATIVE_DIAGNOSTIC(++stats.region_binds);
+        }
     }
     if (!split) {
         trace.Next(5);
@@ -23534,12 +23659,30 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         {"stored", "last-use", "layers", "rewrite", "depth-twin", "small-rewrite", "sources"}};
     checks.AccumulateInto(stats.image_check_ns, stats.image_check_calls);
     if (t_timed) stats.image_check_pictures += p.bindings.stored.size() + p.bindings.sampled.size();
+    const bool window_pictures = window && (BWindowSkips() & 4);
+    if (window_pictures) { // step 22b: read only; a picture with something to do turns it down
+        for (const auto* list : {&p.bindings.stored, &p.bindings.sampled}) {
+            for (const auto* e : *list) {
+                if (!BWindowPictureClean(*e)) {
+                    if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B window: picture", {});
+                    return reject(3);
+                }
+            }
+        }
+        for (const auto* list : {&p.bindings.stored, &p.bindings.sampled}) {
+            for (const auto* e : *list) {
+                const_cast<Native::ImageEntry*>(e)->last_use.store(frame, std::memory_order_relaxed);
+            }
+        }
+    }
+    if (!window_pictures)
     for (const auto* stored : p.bindings.stored) {
         auto& entry = *const_cast<Native::ImageEntry*>(stored);
         entry.last_use.store(frame, std::memory_order_relaxed);
         ApplyRewrite(entry); // NAT-120
         SyncDepthTwin(entry); // FIX-212
     }
+    if (!window_pictures)
     for (const auto* sampled : p.bindings.sampled) {
         auto& entry = *const_cast<Native::ImageEntry*>(sampled);
         checks.Next(1);

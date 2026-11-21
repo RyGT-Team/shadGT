@@ -1963,6 +1963,12 @@ private:
                                                              PreparedDraw& p);
     /// Recorder: whether the prepared draw holds for the draw being recorded (its ordered part
     /// is then done).
+    /// FEAT-SGT-079 step 22b: in B's window, a picture needs nothing done before the draw (no
+    /// rewrite, stencil clear, upload, sources, depth twin, layer or small rewrite): read only.
+    bool BWindowPictureClean(const Native::ImageEntry& entry);
+    /// Step 22b: a CPU write (or stack retirement) not sorted in yet lies over memory the prepared
+    /// draw reads through a region or mirror (SortRegionWrites would make work of it).
+    bool BWindowWritesPending(const PreparedDraw& p);
     bool CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pipeline,
                         const AmdGpu::Regs& regs, bool trusted);
     /// OPT-012: installs the prepared draw's stages for its pipeline (nullptr if they don't

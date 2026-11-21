@@ -19560,7 +19560,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     }
     const u32 index_count = vi->index_count;
     const CmdBuf cmdbuf{s.cmd};
-    SHADGT_B_TOUCH("retired_pipeline_owners"); retired_pipeline_owners.Hold(pipeline_owner);
+    SHADGT_B_TOUCH("retired_pipeline_owners"); retired_pipeline_owners.Hold(pipeline_owner); drawn_pipelines.try_emplace(pipeline, frame); // step 24
     {
         PhaseClock part{stats.record_ns[4]};
         if (!parallel_draw) BindGraphics(s, *pipeline, pipeline_owner);
@@ -22912,6 +22912,16 @@ bool NativeRenderer::RecorderBCanTake(const void* packet, bool hoist) {
         if (const auto it = shard.draws.find(packet); it != shard.draws.end()) p = it->second;
     }
     if (!p) return keep("B draw kept by A: no prepared draw");
+    static const bool seen = [] { // FEAT-SGT-079 step 24
+        const char* env = std::getenv("SHADGT_RECORDER_B_SEEN");
+        return env && env[0] == '1';
+    }();
+    if (seen) {
+        const auto it = drawn_pipelines.find(p->pipeline);
+        if (it == drawn_pipelines.end() || it->second == frame) {
+            return keep("B draw kept by A: pipeline first drawn this frame");
+        }
+    }
     // Its pointers (regions, mirrors, pictures) hold only while nothing they point at went: the
     // checks CommitPrepared makes first, before any of them is read.
     const auto still_holds = [&] {

@@ -241,6 +241,9 @@ public:
         g_b_outstanding.store(on, std::memory_order_release);
     }
     std::atomic<u64> b_mutex_wait_ns{0}; ///< DIAG-SGT-088: B's thread waiting for `mutex` in Draw
+    /// FEAT-SGT-079 step 24 (SHADGT_RECORDER_B_SEEN=1; with `mutex`): the frame each pipeline was
+    /// first drawn with; B gets only draws whose pipeline was drawn with in an earlier frame.
+    std::unordered_map<const void*, u64> drawn_pipelines;
     /// DIAG-SGT-089 (diagnostics builds, overlap on): the recorder's wait for `mutex` in Draw while B
     /// holds work, and each thread's (0 recorder, 1 B) time in Draw with the lock held, before and
     /// in the encode side (DIAG-SGT-023), and its draws.

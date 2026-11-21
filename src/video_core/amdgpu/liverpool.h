@@ -504,6 +504,12 @@ private:
     /// EOP (command thread), and the open pass's key-and-occurrence hash.
     std::unordered_map<u64, u32> push_occurrences;
     u64 push_occurrence_hash = 0;
+    /// FEAT-SGT-079 step 24 (SHADGT_RECORDER_B_SEEN=1, command thread): the frame of each draw's
+    /// first push, by pass occurrence and index in the pass; B gets only draws seen in an
+    /// earlier frame (a first-seen draw's first-time work stays in the recorder's order).
+    std::unordered_map<u64, u64> push_seen;
+    u64 push_frame = 0;
+    static bool RecorderBSeen();
     static bool RecorderBLearned();
     /// FEAT-SGT-079 step 18 (SHADGT_RECORDER_B_CHUNK=<draws>): within each pass, chunks of that
     /// many draws go to A and B in turns (draws of one pass do not read each other's output; the

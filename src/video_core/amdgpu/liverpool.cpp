@@ -1366,14 +1366,39 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
                 const char* env = std::getenv("SHADGT_RECORDER_B_CHUNK_AB");
                 return env && env[0] == '1';
             }();
+            // Diagnosis (SHADGT_RECORDER_B_DEPTH_ONLY): 1, B only in passes with a depth buffer;
+            // 2, only in those that also draw colour (not shadow maps); 3, only in depth-only ones.
+            static const int depth_only = [] {
+                const char* env = std::getenv("SHADGT_RECORDER_B_DEPTH_ONLY");
+                return env && env[0] >= '1' && env[0] <= '3' ? env[0] - '0' : 0;
+            }();
+            const bool has_color = std::ranges::any_of(
+                regs.color_buffers, [](const auto& cb) { return bool(cb); });
+            const bool depth_ok = !depth_only ||
+                                  (regs.depth_buffer.DepthValid() &&
+                                   (depth_only == 1 || (depth_only == 2) == has_color));
             queued_draw->to_b = !compute && (push_draw_in_pass / chunk) % 2 == 1 &&
                                 !(chunk_ab &&
-                                  ::Vulkan::SubmitAbArm().load(std::memory_order_relaxed) == 0);
+                                  ::Vulkan::SubmitAbArm().load(std::memory_order_relaxed) == 0) &&
+                                depth_ok;
         }
         ++push_draw_in_pass;
         if (pass_start) {
             push_occurrence_hash =
                 Vulkan::NativeRenderer::PassOccurrenceHash(tag, push_occurrences[tag]++);
+        }
+        if (RecorderBSeen() && !compute) { // FEAT-SGT-079 step 24: first-seen draws are A's
+            const u64 key = push_occurrence_hash ^ (u64(push_draw_in_pass) * 0x9E3779B97F4A7C15ULL);
+            if (push_seen.size() > (1u << 20)) push_seen.clear();
+            const auto [it, first] = push_seen.try_emplace(key, push_frame);
+            if (first || it->second == push_frame) {
+                queued_draw->to_b = false;
+                if constexpr (Common::DiagnosticsBuilt) {
+                    if (RecorderBChunk() != 0 && (push_draw_in_pass - 1) / RecorderBChunk() % 2 == 1) {
+                        ::Vulkan::NoteSubmitSite("B draw kept by A: first seen", {});
+                    }
+                }
+            }
         }
         if (RecorderBLearned()) {
             auto* native = rasterizer ? rasterizer->Native() : nullptr;
@@ -2219,6 +2244,14 @@ void Liverpool::RecorderBSync() {
                                    .count() -
                                commit_from;
     }
+}
+
+bool Liverpool::RecorderBSeen() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_RECORDER_B_SEEN");
+        return env && env[0] == '1';
+    }();
+    return on;
 }
 
 u32 Liverpool::RecorderBChunk() {
@@ -3659,6 +3692,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (frame_eop) {
                     push_occurrences.clear(); // FEAT-SGT-079 step 17: a frame ends
                     push_key = 0;
+                    ++push_frame; // step 24
                 }
                 // FIX-GTS-492: when this event raises the interrupt, the game takes back the
                 // command memory decoded so far (whole buffers, the rest of this one included):

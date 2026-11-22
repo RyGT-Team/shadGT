@@ -7542,6 +7542,18 @@ void PipelineCache::PrewarmRead(std::stop_token stop) {
     }
 }
 
+// FIX-SGT-099: SHADGT_PRECOMPILE_HOLD_MAX_S=<seconds> shortens the hold's 15 minutes, to see what
+// its end does to the work still running. It can't lengthen them.
+static std::chrono::seconds PrecompileHoldLimit() {
+    static const std::chrono::seconds limit = [] {
+        constexpr unsigned long most = 15 * 60;
+        const char* env = std::getenv("SHADGT_PRECOMPILE_HOLD_MAX_S");
+        const unsigned long asked = env ? std::strtoul(env, nullptr, 10) : 0;
+        return std::chrono::seconds{asked ? std::min(asked, most) : most};
+    }();
+    return limit;
+}
+
 void PipelineCache::IdlePrewarm(bool splash) {
     if (!prewarm_enabled) {
         ReleasePrecompileHold();
@@ -7581,11 +7593,11 @@ void PipelineCache::IdlePrewarm(bool splash) {
             install_us_at = install_us;
         }
     }
-    // PERF-102: released once every stored pipeline is built (or after 15 minutes at most).
+    // PERF-102: released once every stored pipeline is built (or after PrecompileHoldLimit at most).
     static const auto first_call = std::chrono::steady_clock::now();
     if (PrecompileHoldsGame() &&
         ((prewarm_reader_done && !GetPrecompileProgress().active) ||
-         std::chrono::steady_clock::now() - first_call > std::chrono::minutes{15})) {
+         std::chrono::steady_clock::now() - first_call > PrecompileHoldLimit())) {
         ReleasePrecompileHold();
     }
     if (build_workers) {

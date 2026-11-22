@@ -1933,6 +1933,11 @@ private:
         std::array<u64, BindingSlots> binding_jobs{}; ///< each slot's last binder job
         u32 binding_next = 0;
         std::array<BufferMemo, 16384> buffer_memos{}; ///< OPT-006: 2048 thrashed
+        /// PERF-SGT-120: the frame before's GuestBuffer results in call order, this frame's so
+        /// far, the next one expected, and a range's hash -> its place in order_last (~0u: none).
+        std::vector<BufferMemo> order_last, order_now;
+        size_t order_cursor = 0;
+        std::vector<u32> order_index;
         std::array<TextureMemo, 16384> texture_memos{}; ///< OPT-006
         TargetsMemo targets_memo;
         Bound last_bound = Bound::InPlace;
@@ -1977,6 +1982,9 @@ private:
     RecordContext& Ctx() {
         return main_record_context;
     }
+    static bool BufferOrderOn(); ///< PERF-SGT-120
+    static u64 BufferOrderHash(const std::array<u64, 3>& key);
+    void BufferOrderFrame(); ///< PERF-SGT-120: at the frame's end
     const RecordContext& Ctx() const {
         return main_record_context;
     }

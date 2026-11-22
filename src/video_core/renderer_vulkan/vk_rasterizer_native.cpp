@@ -8643,9 +8643,39 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
     // OPT-003: the range's last result, when nothing it depends on changed.
     const u32 flags = u32(write) | (u32(mirror) << 1);
     const std::array<u64, 3> memo_key{address, size, flags};
-    const u64 slot = NextMemoEnabled() ? MemoHash(memo_key.data(), memo_key.size(), 0)
-                                      : XXH3_64bits(memo_key.data(), sizeof(memo_key));
-    BufferMemo& memo = Ctx().buffer_memos[slot & (Ctx().buffer_memos.size() - 1)];
+    // PERF-SGT-120: GT7 binds nearly the same ranges in nearly the same order every frame (92-95%
+    // of calls are the next one of the frame before's). The frame before's results are read in
+    // order (the prefetcher sees it coming); a range out of order is found again through a small
+    // index. Only then the hashed memo: a cache miss each, and with about 10,000 ranges a frame
+    // in 16384 slots, half of them held another range.
+    const bool order_on = BufferOrderOn();
+    BufferMemo* order_entry = nullptr;
+    if (order_on) {
+        auto& c = Ctx();
+        const size_t n = c.order_last.size();
+        for (size_t ahead = 0; ahead <= 8 && c.order_cursor + ahead < n; ++ahead) {
+            BufferMemo& e = c.order_last[c.order_cursor + ahead];
+            if (e.Matches(address, size, flags)) {
+                order_entry = &e;
+                c.order_cursor += ahead + 1;
+                break;
+            }
+        }
+        if (!order_entry && !c.order_index.empty()) {
+            const u32 at = c.order_index[BufferOrderHash(memo_key) & (c.order_index.size() - 1)];
+            if (at < n && c.order_last[at].Matches(address, size, flags)) {
+                order_entry = &c.order_last[at];
+                c.order_cursor = size_t(at) + 1;
+            }
+        }
+    }
+    BufferMemo* memo_at = order_entry;
+    if (!memo_at) {
+        const u64 slot = NextMemoEnabled() ? MemoHash(memo_key.data(), memo_key.size(), 0)
+                                          : XXH3_64bits(memo_key.data(), sizeof(memo_key));
+        memo_at = &Ctx().buffer_memos[slot & (Ctx().buffer_memos.size() - 1)];
+    }
+    BufferMemo& memo = *memo_at;
     // PERF-GT7-047 (Will Scarlett): unrelated region/mirror changes do not
     // invalidate owned-range memos. In-place reads still take the full lookup.
     if (memo.Matches(address, size, flags) && memo.generation != buffer_generation) {
@@ -8708,6 +8738,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
                                                              : 4,
                                frame);
             }
+            if (order_on) Ctx().order_now.push_back(memo); // PERF-SGT-120
             return std::pair{memo.buffer, memo.Offset()};
         }
     }
@@ -8752,8 +8783,52 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
             .owner = keep_region ? static_cast<void*>(keep_region)
                                  : static_cast<void*>(keep_mirror),
         };
+        if (order_on) Ctx().order_now.push_back(memo); // PERF-SGT-120
+    } else if (order_on) {
+        // PERF-SGT-120: not memoized: the key alone keeps the order; it never passes as fresh
+        // (no owner to revalidate, a generation never reached).
+        Ctx().order_now.push_back(BufferMemo{.address = address, .size = size,
+                                             .offset_meta = BufferMemo::Pack(0, flags, Bound::InPlace,
+                                                                             nullptr, nullptr)});
     }
     return result;
+}
+
+// PERF-SGT-120 (on by default; SHADGT_NATIVE_BUFFER_ORDER=0 turns it off). GT7 Tokyo replay,
+// Release ThinLTO+PGO under nsys, chase cam, 2 s A/B: the recorder 14.58 -> 13.49 ms a frame
+// (-7.5%), GuestBuffer's share of it 17.8% -> 10.8%, memo hits 44-65% -> 92-95%.
+bool NativeRenderer::BufferOrderOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_NATIVE_BUFFER_ORDER");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+u64 NativeRenderer::BufferOrderHash(const std::array<u64, 3>& key) {
+    // Cheap: three multiplies; the index only needs to spread the ranges.
+    u64 h = key[0] * 0x9E3779B97F4A7C15ull;
+    h ^= (key[1] + 0x632BE59BD9B4E019ull) * 0xC2B2AE3D27D4EB4Full;
+    h ^= (key[2] + 1) * 0x165667B19E3779F9ull;
+    return h ^ (h >> 29);
+}
+
+void NativeRenderer::BufferOrderFrame() {
+    if (!BufferOrderOn()) return;
+    auto& c = Ctx();
+    c.order_last.swap(c.order_now);
+    c.order_now.clear();
+    c.order_now.reserve(c.order_last.size() + c.order_last.size() / 4);
+    c.order_cursor = 0;
+    // 4 slots a range (at most 2^20); 4 bytes each, so 65536 slots are 256 KB.
+    const size_t want = std::bit_ceil(std::max<size_t>(c.order_last.size() * 4, 4096));
+    const size_t slots = std::min<size_t>(want, size_t{1} << 20);
+    c.order_index.assign(slots, ~0u);
+    for (u32 i = u32(c.order_last.size()); i-- > 0;) { // the first place of a range wins
+        const auto& e = c.order_last[i];
+        const std::array<u64, 3> key{e.address, e.size, e.Flags()};
+        c.order_index[BufferOrderHash(key) & (slots - 1)] = i;
+    }
 }
 
 static VAddr NativeInplaceFrom() {
@@ -24918,6 +24993,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     }
     frame_writebacks.clear();
     ++frame;
+    BufferOrderFrame(); // PERF-SGT-120
     TrimIdleChunks();
     {
         std::scoped_lock watch_lock{fill_watch_mutex};

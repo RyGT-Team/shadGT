@@ -44,6 +44,7 @@
 #include "ryty_gpu/ryty_input_bridge.h"
 #include "ryty_gpu/ryty_library.h"
 #include "ryty_gpu/ryty_pro_mode.h"
+#include "ryty_gpu/ryty_trophy.h"
 
 namespace Ryty {
 static void (*g_overlay_draw)() = nullptr;
@@ -100,7 +101,14 @@ Emulator::Emulator() : memory{}, controllers{}, linker{} {
         npbind_data.assign(std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{});
     }
     if (!npbind_data.empty() && npbind.Load(npbind_data)) {
-        const auto np_comm_ids = npbind.GetNpCommIds();
+        auto np_comm_ids = npbind.GetNpCommIds();
+        if (!std::all_of(np_comm_ids.begin(), np_comm_ids.end(),
+                         [](const std::string& id) { return Ryty::IsValidNpCommId(id); })) {
+            LOG_WARNING(Loader,
+                        "FIX-GT7-175: npbind.dat has a communication ID that is not "
+                        "AAAA00000_00; trophies off");
+            np_comm_ids.clear();
+        }
         game_info.SetNpCommIds(np_comm_ids);
         for (const auto& path :
              Ryty::App0ListFiles(root, app0_roots, std::filesystem::path("sce_sys") / "trophy")) {

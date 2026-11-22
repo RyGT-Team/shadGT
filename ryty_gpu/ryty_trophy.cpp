@@ -128,6 +128,41 @@ std::set<std::string> g_prepared;
 
 } // namespace
 
+bool IsValidNpCommId(std::string_view id) {
+    if (id.size() != 12 || id[9] != '_') {
+        return false;
+    }
+    for (std::size_t i = 0; i < 4; ++i) {
+        if (id[i] < 'A' || id[i] > 'Z') {
+            return false;
+        }
+    }
+    for (const std::size_t i : {4, 5, 6, 7, 8, 10, 11}) {
+        if (id[i] < '0' || id[i] > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool IsInsideDir(const std::filesystem::path& base, const std::filesystem::path& target) {
+    std::error_code error;
+    const auto base_full = std::filesystem::weakly_canonical(base, error);
+    if (error) {
+        return false;
+    }
+    const auto target_full = std::filesystem::weakly_canonical(target, error);
+    if (error) {
+        return false;
+    }
+    const auto relative = target_full.lexically_relative(base_full);
+    if (relative.empty() || relative == ".") {
+        return false;
+    }
+    const auto first = *relative.begin();
+    return first != ".." && !relative.is_absolute();
+}
+
 s64 TrophyUserFolder(s64 user_id) {
     if (user_id >= RytyFirstUserId && user_id < RytyFirstUserId + MaxSlots) {
         return ShadFirstUserId + (user_id - RytyFirstUserId);
@@ -176,6 +211,15 @@ void PrepareTrophies(const std::string& np_comm_id, u32 service_label,
     std::error_code error;
     const auto tropconf = extract_dir / "Xml" / "TROPCONF.XML";
 
+    if (!IsValidNpCommId(np_comm_id) ||
+        !IsInsideDir(Common::FS::GetUserPath(Common::FS::PathType::TrophyDir), extract_dir)) {
+        LOG_ERROR(Lib_NpTrophy,
+                  "FEAT-GT7-185 fail: trophy folder {} is not inside the trophy directory; "
+                  "trophies off for this set",
+                  U8(extract_dir));
+        return;
+    }
+
     if (!g_prepared.contains(np_comm_id)) {
         g_prepared.insert(np_comm_id);
         if (std::filesystem::is_regular_file(tropconf, error)) {
@@ -207,7 +251,11 @@ void PrepareTrophies(const std::string& np_comm_id, u32 service_label,
                               "FEAT-GT7-185 fail: {} is not <trophyconf> (wrong trophy key?); "
                               "removed",
                               U8(tropconf));
-                    std::filesystem::remove_all(extract_dir, error);
+                    if (IsInsideDir(
+                            Common::FS::GetUserPath(Common::FS::PathType::TrophyDir),
+                            extract_dir)) {
+                        std::filesystem::remove_all(extract_dir, error);
+                    }
                 } else {
                     LOG_INFO(Lib_NpTrophy, "FEAT-GT7-185 ok: {} ({}) extracted into {}",
                              np_comm_id, U8(trp_path), U8(extract_dir));

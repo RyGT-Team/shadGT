@@ -479,7 +479,7 @@ FrontendHandle TranslateProgramFront(const std::span<const u32>& code, Pools& po
 #endif
     auto resources = Shader::Optimization::ResourceDiscoverPass(program, profile);
     Shader::Optimization::LowerDynamicReadConstPass(program, resources);
-    Shader::Optimization::FlattenExtendedUserdataPass(program);
+    Shader::Optimization::FlattenExtendedUserdataPass(program, resources);
 #ifndef NDEBUG
     Shader::IR::DumpProgram(program, info, "pre-res-patch.");
 #endif

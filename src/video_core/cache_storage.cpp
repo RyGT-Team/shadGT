@@ -200,6 +200,13 @@ void DataBase::Open() {
                     !(env && env[0] == '0')) {
                     parts += ", lds spread";
                 }
+                // FIX-SGT-115: stored walkers empty the descriptors of branches that are off.
+                // Switched off, such translations must not be read: a store of its own. Unset,
+                // the version is unchanged and existing stores stay in use.
+                if (const char* env = std::getenv("SHADGT_BRANCH_OFF_DESCRIPTORS");
+                    env && env[0] == '0') {
+                    parts += ", branch-off descriptors read";
+                }
                 // PERF-GTS-473: direct buffer reads that share one branch per run of reads.
                 if (Shader::Backend::SPIRV::DirectLoadGroupsEnabled()) {
                     parts += ", direct groups";

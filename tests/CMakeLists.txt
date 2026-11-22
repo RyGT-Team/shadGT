@@ -254,6 +254,20 @@ if(WIN32)
     add_test(NAME compile_thread_policy_late COMMAND ${CMAKE_COMMAND} -E env SHADGT_POLICY_TEST_LATE=1
         $<TARGET_FILE:shadps4_compile_thread_policy_test>)
 endif()
+# FIX-SGT-099: the pre-translation's workers when the splash hold ends.
+add_executable(shadgt_pretranslate_crew_test test_pretranslate_crew.cpp)
+target_include_directories(shadgt_pretranslate_crew_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadgt_pretranslate_crew_test PRIVATE cxx_std_23)
+target_link_libraries(shadgt_pretranslate_crew_test PRIVATE GTest::gtest_main)
+if(WIN32)
+    target_sources(shadgt_pretranslate_crew_test PRIVATE test_compile_thread_stubs.cpp
+        ${CMAKE_SOURCE_DIR}/src/common/thread.cpp)
+    target_link_libraries(shadgt_pretranslate_crew_test PRIVATE fmt::fmt)
+    # As the renderer's build: with the SDK's newest version, thread.cpp's ntapi.h doesn't compile.
+    target_compile_definitions(shadgt_pretranslate_crew_test PRIVATE
+        NTDDI_VERSION=0x0A000006 _WIN32_WINNT=0x0A00 WINVER=0x0A00)
+endif()
+gtest_discover_tests(shadgt_pretranslate_crew_test)
 add_executable(shadps4_exit_save_registry_test test_exit_save_registry.cpp)
 target_include_directories(shadps4_exit_save_registry_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(shadps4_exit_save_registry_test PRIVATE cxx_std_23)

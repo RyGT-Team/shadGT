@@ -405,6 +405,12 @@ void AllowAllCores() {
     SetWideCores(GetCurrentThread());
 }
 
+void MoveThreadToBackground(std::thread& thread) {
+    const HANDLE handle = thread.native_handle();
+    SetThreadPriority(handle, THREAD_PRIORITY_BELOW_NORMAL); // as ThreadPriority::Low
+    CallSetThreadSelectedCpuSets(handle, nullptr, 0);
+}
+
 // PERF-GT7-048 (SHADGT_CORE_OWNERS=<mask>: 1 command processor, 2 recorder, 4 Vulkan commands; 0 none,
 // the default): a renderer thread gets a physical core of its own, both hardware threads, from the
 // last of the cores that aren't the compile cores; the process's threads without a CPU set of their
@@ -1063,6 +1069,7 @@ void PreferPerformanceCores() {}
 void PreferEfficiencyCores() {}
 
 void AllowAllCores() {}
+void MoveThreadToBackground(std::thread&) {}
 
 int CurrentCoreIsFast() {
     return -1;

@@ -7,9 +7,11 @@
 #include "core/emulator_settings.h"
 #include "video_core/host_shaders/fs_tri_vert.h"
 #include "video_core/host_shaders/post_process_frag.h"
+#include "video_core/renderer_vulkan/hdr_rolloff_policy.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/title_defaults.h"
 #ifdef RYTY_GPU
 #include "ryty_gpu/ryty_pro_mode.h"
 #endif
@@ -19,6 +21,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <boost/container/static_vector.hpp>
 #include <cstring>
 #include <vk_mem_alloc.h>
@@ -413,7 +416,9 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
 #ifdef RYTY_GPU
     {
         // The HDR settings are read again every 2 seconds, so they can be tuned while playing.
-        static float peak_nits = 1000.0f, gain = 1.0f, sdr_white = 200.0f;
+        static const float default_peak = VideoCore::CurrentTitleDefaults().hdr_rolloff_nits;
+        static const char* const peak_override = std::getenv("SHADGT_HDR_ROLLOFF_NITS");
+        static float peak_nits = default_peak, gain = 1.0f, sdr_white = 200.0f;
         static bool input_709 = false;
         static float ui_white = 250.0f;
         static float saturation = 1.0f;
@@ -421,7 +426,9 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         static auto next_read = std::chrono::steady_clock::time_point{};
         if (const auto now = std::chrono::steady_clock::now(); now >= next_read) {
             next_read = now + std::chrono::seconds(2);
-            peak_nits = static_cast<float>(Ryty::ConfigNumber("hdr_peak_nits", 1000.0));
+            // FIX-GT7-255: without the key, the title's default.
+            const double configured_peak = Ryty::ConfigNumber("hdr_peak_nits", default_peak);
+            peak_nits = HdrRolloffNits(peak_override, static_cast<float>(configured_peak));
             gain = static_cast<float>(Ryty::ConfigNumber("hdr_brightness", 100.0) / 100.0);
             sdr_white = static_cast<float>(Ryty::ConfigNumber("hdr_sdr_white_nits", 200.0));
             input_709 = Ryty::ConfigTrue("hdr_input_709");

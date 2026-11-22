@@ -83,6 +83,12 @@ const mat3 bt709_to_bt2020 = mat3(0.6274, 0.0691, 0.0164,
                                   0.3293, 0.9195, 0.0880,
                                   0.0433, 0.0114, 0.8956);
 vec3 hdr_adjust(vec3 pq) {
+    // FIX-GT7-255: nothing to adjust (GT7's default): the game's codes as they are. Through nits and
+    // back, the dark channels of saturated colours moved by up to 2 of 1023 codes.
+    if (pp.hdr_peak_nits <= 0.0 && pp.hdr_gain == 1.0 && pp.hdr_saturation == 1.0 &&
+        pp.hdr_input_709 == 0u) {
+        return pq;
+    }
     vec3 nits = vec3(pq_to_nits(pq.r), pq_to_nits(pq.g), pq_to_nits(pq.b)) * pp.hdr_gain;
     // Saturation around the BT.2020 luminance.
     float lum = dot(nits, vec3(0.2627, 0.6780, 0.0593));

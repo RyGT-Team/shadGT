@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 #include "common/game_title.h"
+#include "video_core/renderer_vulkan/hdr_rolloff_policy.h"
 #include "video_core/renderer_vulkan/native_chunk_policy.h"
 #include "video_core/title_defaults.h"
 
@@ -44,6 +45,22 @@ static_assert(VideoCore::TitleDefaultsOf(GameTitle::GtSport).driver_cache_rotate
 static_assert(VideoCore::TitleDefaultsOf(GameTitle::Gt7).driver_cache_follows_pipeline_cache);
 static_assert(VideoCore::TitleDefaultsOf(GameTitle::Gt7).kept_textures_from_vram_setting);
 static_assert(!VideoCore::TitleDefaultsOf(GameTitle::Gt7).so_blend_on_nvidia);
+// FIX-SGT-113: both games tone map to the display's peak themselves, so no roll-off by default.
+static_assert(Vulkan::HdrRolloffDefaultNits == 0.0f);
+
+TEST(TitleDefaults, HdrRolloffIsOffUnlessAskedFor) {
+    constexpr float off = Vulkan::HdrRolloffDefaultNits;
+    EXPECT_EQ(Vulkan::HdrRolloffNits(nullptr, off), 0.0f);
+    EXPECT_EQ(Vulkan::HdrRolloffNits(nullptr, 1280.0f), 1280.0f); // the settings file's value
+    // The switch overrides both ways, and only with a number in range.
+    EXPECT_EQ(Vulkan::HdrRolloffNits("1000", off), 1000.0f); // GT Sport's picture before
+    EXPECT_EQ(Vulkan::HdrRolloffNits("0", 1280.0f), 0.0f);
+    EXPECT_EQ(Vulkan::HdrRolloffNits("10000", off), 10000.0f);
+    for (const char* refused : {"", "-1", "10001", "nan", "inf", "800x", "off"}) {
+        EXPECT_EQ(Vulkan::HdrRolloffNits(refused, off), 0.0f) << refused;
+        EXPECT_EQ(Vulkan::HdrRolloffNits(refused, 1280.0f), 1280.0f) << refused;
+    }
+}
 
 TEST(TitleDefaults, ChunkSizeWithoutTheSwitchIsTheTitles) {
     constexpr std::uint64_t mb = 1024 * 1024;

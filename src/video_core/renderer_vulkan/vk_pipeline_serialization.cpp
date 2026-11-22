@@ -9,6 +9,7 @@
 #include <map>
 #include <mutex>
 
+#include "common/recoverable.h"
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -295,7 +296,7 @@ bool WriteStoredGraphicsPipeline(const std::filesystem::path& file, const Graphi
     return !ec;
 }
 
-bool PeekShaderMeta(std::vector<u8>&& blob, u64& pgm_hash, size_t& perm_idx) {
+static bool DecodeShaderMetaName(std::vector<u8>&& blob, u64& pgm_hash, size_t& perm_idx) {
     // The layout LoadShaderMeta reads: versions, permutation hash and index, the
     // specialization, then the shader info, which starts with InfoPersistent.
     Serialization::Archive ar{std::move(blob)};
@@ -321,6 +322,24 @@ bool PeekShaderMeta(std::vector<u8>&& blob, u64& pgm_hash, size_t& perm_idx) {
     return true;
 }
 
+// FIX-SGT-097: a store file can be absent (read as nothing) or cut short, and the recipe export
+// and import read them on threads where the deserializer's assertion ended the game. Both readers
+// answer false when what they decode is missing. This one decodes only up to InfoPersistent: a
+// blob cut short after that still has its name, and LoadShaderMeta's callers refuse it.
+bool PeekShaderMeta(std::vector<u8>&& blob, u64& pgm_hash, size_t& perm_idx) {
+    constexpr size_t least =
+        2 * sizeof(u32) + sizeof(u64) + sizeof(size_t) + sizeof(Shader::InfoPersistent);
+    if (blob.size() < least) {
+        return false;
+    }
+    try {
+        Common::RecoverableScope recoverable;
+        return DecodeShaderMetaName(std::move(blob), pgm_hash, perm_idx);
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 bool LoadStoredGraphicsPipeline(std::vector<u8>&& blob, GraphicsPipelineKey& key,
                                 GraphicsPipeline::SerializationSupport& sdata) {
     if (blob.size() < 2 * sizeof(u32) + sizeof(GraphicsPipelineKey)) {
@@ -338,8 +357,13 @@ bool LoadStoredGraphicsPipeline(std::vector<u8>&& blob, GraphicsPipelineKey& key
     if (is_compute != 0) {
         return false;
     }
-    key.Deserialize(ar);
-    return sdata.Deserialize(ar);
+    try { // FIX-SGT-097, as PeekShaderMeta
+        Common::RecoverableScope recoverable;
+        key.Deserialize(ar);
+        return sdata.Deserialize(ar);
+    } catch (const std::exception&) {
+        return false;
+    }
 }
 
 namespace {
@@ -454,13 +478,13 @@ void CountTranslation(const Shader::Info& info, const Shader::StageSpecializatio
 }
 } // namespace
 
-void RegisterShaderMeta(const Shader::Info& info,
+bool RegisterShaderMeta(const Shader::Info& info,
                         const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                         const Shader::StageSpecialization& spec, size_t perm_hash,
-                        size_t perm_idx) {
+                        size_t perm_idx, bool now) {
     CountTranslation(info, spec); // SHD-006
     if (!Storage::DataBase::Instance().IsOpened()) {
-        return;
+        return false;
     }
 
     Serialization::Archive ar;
@@ -477,18 +501,18 @@ void RegisterShaderMeta(const Shader::Info& info,
     info.Serialize(ar);
     WriteResourceUsage(meta, info);
 
-    Storage::DataBase::Instance().Save(Storage::BlobType::ShaderMeta,
-                                       fmt::format("{:#018x}", perm_hash), ar.TakeOff());
+    return Storage::DataBase::Instance().Save(
+        Storage::BlobType::ShaderMeta, fmt::format("{:#018x}", perm_hash), ar.TakeOff(), now);
 }
 
-void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx) {
+bool RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx, bool now) {
     if (!Storage::DataBase::Instance().IsOpened()) {
-        return;
+        return false;
     }
 
-    Storage::DataBase::Instance().Save(Storage::BlobType::ShaderBinary,
-                                       fmt::format("{:#018x}_{}", pgm_hash, perm_idx),
-                                       std::move(spv));
+    return Storage::DataBase::Instance().Save(Storage::BlobType::ShaderBinary,
+                                              fmt::format("{:#018x}_{}", pgm_hash, perm_idx),
+                                              std::move(spv), now);
 }
 
 bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,

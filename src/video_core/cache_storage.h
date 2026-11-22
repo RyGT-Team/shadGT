@@ -49,8 +49,10 @@ public:
     [[nodiscard]] const std::filesystem::path& StorePath() const { return cache_path; }
     void FinishPreload();
 
-    bool Save(BlobType type, const std::string& name, std::vector<u8>&& data);
-    bool Save(BlobType type, const std::string& name, std::vector<u32>&& data);
+    /// Queued for the store's writer. FIX-SGT-097: with `now` (a directory store only), written on
+    /// the caller's thread instead; true then means that the file is in place (not flushed).
+    bool Save(BlobType type, const std::string& name, std::vector<u8>&& data, bool now = false);
+    bool Save(BlobType type, const std::string& name, std::vector<u32>&& data, bool now = false);
 
     void Load(BlobType type, const std::string& name, std::vector<u8>& data);
     void Load(BlobType type, const std::string& name, std::vector<u32>& data);

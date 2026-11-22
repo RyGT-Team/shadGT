@@ -35,7 +35,7 @@ namespace {
 
 Storage::DeferredTaskQueue<std::packaged_task<void()>> requests;
 std::atomic_bool directory_writes_paused{};
-bool reported_blob_error{}; // Only the I/O worker uses this after Open.
+std::atomic_bool reported_blob_error{}; // FIX-SGT-097: not only the I/O worker writes blobs.
 
 mz_zip_archive zip_ar{};
 bool ar_is_read_only{true};
@@ -265,10 +265,37 @@ void DataBase::Close() {
     LOG_INFO(Render, "Cache dumped");
 }
 
+/// One blob of a directory store, published at once. True: it is on disk.
 template <typename T>
-bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector<T>&& v, bool archived) {
+bool PublishBlob(const std::filesystem::path& path, const std::vector<T>& data) {
+    if (directory_writes_paused.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    const auto error = PublishShaderBlob(path, [&](std::FILE* file) {
+        return data.empty() || std::fwrite(data.data(), sizeof(T), data.size(), file) == data.size();
+    });
+    if (error == std::errc::no_space_on_device) {
+        directory_writes_paused = true;
+        LOG_WARNING(Render, "Shader cache write failed for {} ({}); pausing cache "
+                            "writes for this session. Rendering and cache reads continue.",
+                    path.string(), error.message());
+    } else if (error && !reported_blob_error.exchange(true)) {
+        // A reader or antivirus can briefly lock a single destination on Windows.
+        LOG_WARNING(Render, "Skipping shader cache entry {} ({}); other entries will "
+                            "still be written.", path.string(), error.message());
+    }
+    return !error;
+}
+
+template <typename T>
+bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector<T>&& v, bool archived,
+                 bool now) {
     if (!archived && directory_writes_paused.load(std::memory_order_relaxed)) {
         return false;
+    }
+    if (now && !archived) { // FIX-SGT-097 (the archive has one writer: always queued)
+        path_.replace_extension(GetBlobFileExtension(type));
+        return PublishBlob(path_, v);
     }
     {
         auto request = std::packaged_task<void()>{[type, path=std::move(path_), data=std::move(v), archived]() mutable {
@@ -280,22 +307,8 @@ bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector
                                            data.size() * sizeof(T), MZ_BEST_COMPRESSION)) {
                     LOG_ERROR(Render, "Failed to add {} to the archive", path.string().c_str());
                 }
-            } else if (!directory_writes_paused.load(std::memory_order_relaxed)) {
-                const auto error = PublishShaderBlob(path, [&](std::FILE* file) {
-                    return data.empty() ||
-                           std::fwrite(data.data(), sizeof(T), data.size(), file) == data.size();
-                });
-                if (error == std::errc::no_space_on_device) {
-                    directory_writes_paused = true;
-                    LOG_WARNING(Render, "Shader cache write failed for {} ({}); pausing cache "
-                                        "writes for this session. Rendering and cache reads continue.",
-                                path.string(), error.message());
-                } else if (error && !reported_blob_error) {
-                    // A reader or antivirus can briefly lock a single destination on Windows.
-                    reported_blob_error = true;
-                    LOG_WARNING(Render, "Skipping shader cache entry {} ({}); other entries will "
-                                        "still be written.", path.string(), error.message());
-                }
+            } else {
+                PublishBlob(path, data);
             }
         }};
         requests.Push(std::move(request));
@@ -326,24 +339,24 @@ void LoadVector(BlobType type, std::filesystem::path& path, std::vector<T>& v, b
     }
 }
 
-bool DataBase::Save(BlobType type, const std::string& name, std::vector<u8>&& data) {
+bool DataBase::Save(BlobType type, const std::string& name, std::vector<u8>&& data, bool now) {
     if (!opened) {
         return false;
     }
 
     auto path = archived ? std::filesystem::path{name}
                                                            : cache_path / name;
-    return WriteVector(type, std::move(path), std::move(data), archived);
+    return WriteVector(type, std::move(path), std::move(data), archived, now);
 }
 
-bool DataBase::Save(BlobType type, const std::string& name, std::vector<u32>&& data) {
+bool DataBase::Save(BlobType type, const std::string& name, std::vector<u32>&& data, bool now) {
     if (!opened) {
         return false;
     }
 
     auto path = archived ? std::filesystem::path{name}
                                                            : cache_path / name;
-    return WriteVector(type, std::move(path), std::move(data), archived);
+    return WriteVector(type, std::move(path), std::move(data), archived, now);
 }
 
 void DataBase::Load(BlobType type, const std::string& name, std::vector<u8>& data) {

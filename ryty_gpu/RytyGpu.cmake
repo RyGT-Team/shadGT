@@ -16,7 +16,7 @@ if (RYGT_PGO_TRAIN)
     set_property(SOURCE ryty_gpu/ryty_entry.cpp APPEND PROPERTY COMPILE_DEFINITIONS RYGT_PGO_TRAIN=1)
 endif()
 
-# PERF-SGT-121: Release builds of the libraries below with ThinLTO and the checked-in profile
+# PERF-SGT-122: Release builds of the libraries below with ThinLTO and the checked-in profile
 # (pgo/renderer.profdata: instrumented IR PGO, merged from RYGT_PGO_TRAIN runs of GT7 and GT Sport
 # with LLVM 23.1.3, the CI's compiler). GT7 Tokyo replay, chase cam: about +3% against plain
 # Release. A profile older than the code is still used where it matches; the rest compiles as
@@ -33,7 +33,7 @@ if (RYGT_RELEASE_LTO_PGO AND NOT RYGT_PGO_TRAIN AND NOT rygt_release_diagnostics
     CMAKE_BUILD_TYPE STREQUAL "Release" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND
     NOT CMAKE_CXX_FLAGS MATCHES "fprofile-")
     if (NOT CMAKE_LINKER MATCHES "lld")
-        message(STATUS "PERF-SGT-121: ThinLTO and PGO off (the linker is not lld: ${CMAKE_LINKER})")
+        message(STATUS "PERF-SGT-122: ThinLTO and PGO off (the linker is not lld: ${CMAKE_LINKER})")
     else()
         set(RYGT_LTO_PGO_FLAGS -flto=thin)
         if (EXISTS "${RYGT_PGO_PROFILE}")
@@ -44,12 +44,12 @@ if (RYGT_RELEASE_LTO_PGO AND NOT RYGT_PGO_TRAIN AND NOT rygt_release_diagnostics
                  "SHELL:-mllvm -static-func-full-module-prefix=false"
                  -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-backend-plugin)
         else()
-            message(WARNING "PERF-SGT-121: ${RYGT_PGO_PROFILE} is missing; ThinLTO without PGO")
+            message(WARNING "PERF-SGT-122: ${RYGT_PGO_PROFILE} is missing; ThinLTO without PGO")
         endif()
         foreach (flag IN LISTS RYGT_LTO_PGO_FLAGS)
             add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:${flag}>")
         endforeach()
-        message(STATUS "PERF-SGT-121: Release with ${RYGT_LTO_PGO_FLAGS}")
+        message(STATUS "PERF-SGT-122: Release with ${RYGT_LTO_PGO_FLAGS}")
     endif()
 endif()
 

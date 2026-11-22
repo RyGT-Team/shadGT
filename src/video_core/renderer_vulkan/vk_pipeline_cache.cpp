@@ -7871,9 +7871,20 @@ bool PipelineCache::InstallPrewarmRecord(PrewarmRecord& record) {
     S().modules.fill(nullptr);
     S().fetch_shader = nullptr;
     if (record.pgm[u32(SwStage::Fragment)] == 0) {
-        // FIX-SGT-116: not what the last draw left. The reader took this record because its build
-        // can't depend on it (StoredBuildIgnoresPixelInfo, and VertexStageMayClip below); the
-        // caller restores the draws' own.
+        // FIX-SGT-116: a draw's build of it may have had the clip distance emulation's discard
+        // shader, which isn't stored. It only discards anything when the vertex stage outputs clip
+        // distances: told from the vertex permutation's stored runtime info, before any stage's
+        // module is made below (a refused record made none).
+        const u32 vs = u32(SwStage::Vertex);
+        const auto vertex = program_cache.find(record.pgm[vs]);
+        if (vertex == program_cache.end() || record.perm[vs] >= vertex->second->modules.size() ||
+            VertexStageMayClip(vertex->second->modules[record.perm[vs]].spec.runtime_info,
+                               profile.needs_clip_distance_emulation)) {
+            return false;
+        }
+        // Not what the last draw left. The reader took this record because its build can't depend
+        // on it (StoredBuildIgnoresPixelInfo, and VertexStageMayClip above); the caller restores
+        // the draws' own.
         S().runtime_infos[u32(SwStage::Fragment)].Initialize(HwStage::Fragment, SwStage::Fragment);
     }
     for (u32 stage = 0; stage < MaxShaderStages; ++stage) {
@@ -7919,13 +7930,6 @@ bool PipelineCache::InstallPrewarmRecord(PrewarmRecord& record) {
         if (auto& fetch = permutation.spec.fetch_shader_data; !fetch.Empty()) {
             S().fetch_shader = &fetch;
         }
-    }
-    // FIX-SGT-116: a draw's build of it may have had the clip distance emulation's discard shader,
-    // which isn't stored. It only discards anything when the vertex stage outputs clip distances.
-    if (record.pgm[u32(SwStage::Fragment)] == 0 &&
-        VertexStageMayClip(S().runtime_infos[u32(SwStage::Vertex)],
-                           profile.needs_clip_distance_emulation)) {
-        return false;
     }
     S().graphics_key = record.key;
     auto build = MakePipelineBuild();

@@ -4,6 +4,7 @@
 #include <fstream>
 #include <atomic>
 #include <chrono>
+#include <thread>
 #include <boost/container/small_vector.hpp>
 
 #include "common/perf_monitor.h"
@@ -332,8 +333,15 @@ bool ComputePipeline::WarmFromRecipe(const Instance& instance, const Shader::Pro
     };
     const bool gate = Common::PerfFeatureEnabled(79);
     if (gate) {
-        while (!HeavyPipelineGate().try_acquire_for(std::chrono::milliseconds{50}))
+        // FIX-SGT-114: a free gate is taken at once; a full one is retried every 2 ms. No
+        // try_acquire_for: MSVC's timed semaphore waits call msvcp140_atomic_wait's
+        // __std_atomic_wait_get_deadline and _get_remaining_timeout, which Wine and Proton only
+        // stub, so the first compute warm-up (shadGT:WarmCompute) aborted the game under Proton
+        // without the native VC++ runtime (RyGT issue 77). Sleep is a plain kernel32 call there.
+        while (!HeavyPipelineGate().try_acquire()) {
             if (stop.stop_requested()) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        }
     }
     SCOPE_EXIT { if (gate) HeavyPipelineGate().release(); };
     if (stop.stop_requested()) return false;

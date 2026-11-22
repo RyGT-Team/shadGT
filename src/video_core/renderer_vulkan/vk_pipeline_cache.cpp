@@ -3195,6 +3195,13 @@ static bool DriverCacheFileEnabled() {
     const char* env = std::getenv("SHADGT_DRIVER_CACHE");
     if (VideoCore::CurrentTitleDefaults().driver_cache_follows_pipeline_cache &&
         !EmulatorSettings.IsPipelineCacheEnabled()) {
+        // FIX-SGT-112: say why. Nothing was logged, so a GT7 player on the launcher's 16 GB
+        // memory setting (which turns pipeline_cache_enabled off) saw every pipeline compile
+        // again at each start with no hint (RyGT issue 58). Called once, at startup.
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-SGT-112: driver pipeline cache file off: pipeline_cache_enabled is "
+                    "false (the launcher's 16 GB System memory setting); pipelines compile again "
+                    "at every start. The 32 GB+ setting keeps the file");
         return false; // TITLE-001: GT7, as shadgt7
     }
     return (!env || env[0] != '0') && DriverCacheMaxBytes() != 0; // PERF-167: 0 turns it off

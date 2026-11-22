@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -10,7 +11,22 @@
 
 namespace Ryty {
 
-bool IsValidNpCommId(std::string_view id);
+inline bool IsValidNpCommId(std::string_view id) {
+    if (id.size() != 12 || id[9] != '_') {
+        return false;
+    }
+    for (std::size_t i = 0; i < 4; ++i) {
+        if (id[i] < 'A' || id[i] > 'Z') {
+            return false;
+        }
+    }
+    for (const std::size_t i : {4, 5, 6, 7, 8, 10, 11}) {
+        if (id[i] < '0' || id[i] > '9') {
+            return false;
+        }
+    }
+    return true;
+}
 
 bool IsInsideDir(const std::filesystem::path& base, const std::filesystem::path& target);
 

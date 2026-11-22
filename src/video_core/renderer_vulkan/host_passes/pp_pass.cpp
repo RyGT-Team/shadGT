@@ -11,7 +11,6 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
-#include "video_core/title_defaults.h"
 #ifdef RYTY_GPU
 #include "ryty_gpu/ryty_pro_mode.h"
 #endif
@@ -416,9 +415,8 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
 #ifdef RYTY_GPU
     {
         // The HDR settings are read again every 2 seconds, so they can be tuned while playing.
-        static const float default_peak = VideoCore::CurrentTitleDefaults().hdr_rolloff_nits;
         static const char* const peak_override = std::getenv("SHADGT_HDR_ROLLOFF_NITS");
-        static float peak_nits = default_peak, gain = 1.0f, sdr_white = 200.0f;
+        static float peak_nits = HdrRolloffDefaultNits, gain = 1.0f, sdr_white = 200.0f;
         static bool input_709 = false;
         static float ui_white = 250.0f;
         static float saturation = 1.0f;
@@ -426,8 +424,9 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         static auto next_read = std::chrono::steady_clock::time_point{};
         if (const auto now = std::chrono::steady_clock::now(); now >= next_read) {
             next_read = now + std::chrono::seconds(2);
-            // FIX-GT7-255: without the key, the title's default.
-            const double configured_peak = Ryty::ConfigNumber("hdr_peak_nits", default_peak);
+            // FIX-SGT-113: without the key, no roll-off.
+            const double configured_peak =
+                Ryty::ConfigNumber("hdr_peak_nits", HdrRolloffDefaultNits);
             peak_nits = HdrRolloffNits(peak_override, static_cast<float>(configured_peak));
             gain = static_cast<float>(Ryty::ConfigNumber("hdr_brightness", 100.0) / 100.0);
             sdr_white = static_cast<float>(Ryty::ConfigNumber("hdr_sdr_white_nits", 200.0));

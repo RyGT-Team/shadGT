@@ -45,22 +45,20 @@ static_assert(VideoCore::TitleDefaultsOf(GameTitle::GtSport).driver_cache_rotate
 static_assert(VideoCore::TitleDefaultsOf(GameTitle::Gt7).driver_cache_follows_pipeline_cache);
 static_assert(VideoCore::TitleDefaultsOf(GameTitle::Gt7).kept_textures_from_vram_setting);
 static_assert(!VideoCore::TitleDefaultsOf(GameTitle::Gt7).so_blend_on_nvidia);
-// FIX-GT7-255: GT7 tone maps to the display's peak itself; GT Sport keeps the renderer's roll-off.
-static_assert(VideoCore::TitleDefaultsOf(GameTitle::Gt7).hdr_rolloff_nits == 0.0f);
-static_assert(VideoCore::TitleDefaultsOf(GameTitle::GtSport).hdr_rolloff_nits == 1000.0f);
+// FIX-SGT-113: both games tone map to the display's peak themselves, so no roll-off by default.
+static_assert(Vulkan::HdrRolloffDefaultNits == 0.0f);
 
-TEST(TitleDefaults, HdrRolloffWithoutTheSwitchIsTheSettings) {
-    const auto gt7 = VideoCore::TitleDefaultsOf(GameTitle::Gt7).hdr_rolloff_nits;
-    const auto sport = VideoCore::TitleDefaultsOf(GameTitle::GtSport).hdr_rolloff_nits;
-    EXPECT_EQ(Vulkan::HdrRolloffNits(nullptr, gt7), 0.0f);
-    EXPECT_EQ(Vulkan::HdrRolloffNits(nullptr, sport), 1000.0f);
+TEST(TitleDefaults, HdrRolloffIsOffUnlessAskedFor) {
+    constexpr float off = Vulkan::HdrRolloffDefaultNits;
+    EXPECT_EQ(Vulkan::HdrRolloffNits(nullptr, off), 0.0f);
     EXPECT_EQ(Vulkan::HdrRolloffNits(nullptr, 1280.0f), 1280.0f); // the settings file's value
     // The switch overrides both ways, and only with a number in range.
-    EXPECT_EQ(Vulkan::HdrRolloffNits("1000", gt7), 1000.0f);
-    EXPECT_EQ(Vulkan::HdrRolloffNits("0", sport), 0.0f);
-    EXPECT_EQ(Vulkan::HdrRolloffNits("10000", gt7), 10000.0f);
+    EXPECT_EQ(Vulkan::HdrRolloffNits("1000", off), 1000.0f); // GT Sport's picture before
+    EXPECT_EQ(Vulkan::HdrRolloffNits("0", 1280.0f), 0.0f);
+    EXPECT_EQ(Vulkan::HdrRolloffNits("10000", off), 10000.0f);
     for (const char* refused : {"", "-1", "10001", "nan", "inf", "800x", "off"}) {
-        EXPECT_EQ(Vulkan::HdrRolloffNits(refused, sport), 1000.0f) << refused;
+        EXPECT_EQ(Vulkan::HdrRolloffNits(refused, off), 0.0f) << refused;
+        EXPECT_EQ(Vulkan::HdrRolloffNits(refused, 1280.0f), 1280.0f) << refused;
     }
 }
 

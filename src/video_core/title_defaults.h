@@ -42,13 +42,6 @@ struct TitleDefaults {
     // SHADGT_SO_SKIP unset, on NVIDIA: blended draws on shader objects (GT Sport, FIX-GTS-449)
     // or kept off them (GT7, SO-017). Other vendors keep them off for both games.
     bool so_blend_on_nvidia;
-    // FIX-GT7-255 (GPU.hdr_peak_nits, SHADGT_HDR_ROLLOFF_NITS): the peak the post-process pass
-    // rolls an HDR picture's highlights off to, 0 for none. GT7: 0, it already tone maps to the
-    // display's peak (it asks sceSystemServiceGetHdrToneMapLuminance, FIX-GT7-141: 798 nits in
-    // its picture for 800 told), and a second curve shows its 1000 nits at 713. GT Sport: 1000,
-    // as before. It has a peak setting of its own in game, so this curve may be one too many
-    // there as well: not measured.
-    float hdr_rolloff_nits;
 };
 
 constexpr TitleDefaults TitleDefaultsOf(Common::GameTitle title) {
@@ -63,7 +56,6 @@ constexpr TitleDefaults TitleDefaultsOf(Common::GameTitle title) {
             .driver_cache_follows_pipeline_cache = true,
             .kept_textures_from_vram_setting = true,
             .so_blend_on_nvidia = false,
-            .hdr_rolloff_nits = 0.0f,
         };
     case Common::GameTitle::GtSport:
     default:
@@ -76,7 +68,6 @@ constexpr TitleDefaults TitleDefaultsOf(Common::GameTitle title) {
             .driver_cache_follows_pipeline_cache = false,
             .kept_textures_from_vram_setting = false,
             .so_blend_on_nvidia = true,
-            .hdr_rolloff_nits = 1000.0f,
         };
     }
 }

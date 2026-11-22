@@ -2155,6 +2155,52 @@ static bool PretranslateWritesNow() {
     return on;
 }
 
+// FEAT-SGT-118 (SHADGT_PRECOMPILE_COMPUTE=1; off by default): while the splash holds the game for
+// the start-up pre-translation, its compute translations are built once each and dropped, so the
+// driver's cache has them when the game first dispatches them. Compute pipelines have no recipe a
+// list could ship (warm recipes hold SPIR-V): this is how a first launch gets them ahead. Built by
+// code and layout, not by key: the game often asks for the same code under another permutation.
+static bool PrecompileComputeOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_PRECOMPILE_COMPUTE");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
+static void PrecompileCompute(const Instance& instance, const Shader::Profile& profile,
+                              vk::PipelineCache cache, const std::vector<std::vector<u32>>& recipes,
+                              std::stop_token stop) {
+    const auto started = std::chrono::steady_clock::now();
+    std::unordered_map<u64, const std::vector<u32>*> distinct;
+    for (const auto& words : recipes) {
+        distinct.try_emplace(XXH3_64bits(words.data(), words.size() * sizeof(u32)), &words);
+    }
+    g_pretranslate_total += distinct.size(); // the splash's bar and hold go on through this
+    u32 built = 0, failed = 0, left = 0;
+    for (const auto& [hash, words] : distinct) {
+        // Only while the game is held: a compile in play would cost frames.
+        if (stop.stop_requested() || !PrecompileHoldsGame()) {
+            ++left;
+            ++g_pretranslate_done;
+            continue;
+        }
+        bool ok = false;
+        try {
+            ok = ComputePipeline::WarmFromWords(instance, profile, cache, *words, stop);
+        } catch (const std::exception& e) {
+            LOG_WARNING(Render_Vulkan, "FEAT-SGT-118: compute code not built ahead: {}", e.what());
+        }
+        ++g_pretranslate_done;
+        ++(ok ? built : failed);
+    }
+    LOG_WARNING(Render_Vulkan,
+                "FEAT-SGT-118: compute ahead: {} translations, {} distinct, {} built, {} failed, {} "
+                "left once the game was released, in {:.1f} s",
+                recipes.size(), distinct.size(), built, failed, left,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+}
+
 // FIX-SGT-097: whether the store has a program. An end or a failed write between a permutation's
 // two writes leaves its SPIR-V alone in a slot, which is never given again: looked past, or that
 // program would be translated again into one more slot at every start.
@@ -2208,6 +2254,10 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
     std::vector<std::array<u64, 3>> recipe_perms;
     std::unordered_set<u64> unwritten; // FIX-SGT-097: permutations reserved, not (yet) on disk
     const bool write_now = PretranslateWritesNow();
+    // FEAT-SGT-118: only for a start the splash holds for.
+    const bool compute_ahead = PrecompileComputeOn() && PrecompileHoldsGame();
+    std::vector<std::vector<u32>> compute_recipes;
+    std::mutex compute_mutex;
     std::unordered_map<u64, Stored> programs;
     // FEAT-GTS-469: while the splash precompile holds the game for it, every logical processor
     // translates at normal priority; during play a few low-priority threads, as before.
@@ -2274,6 +2324,12 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
             info->pin_fetch_sharps = false;
             if (!Common::PerfFeatureEnabled(44)) {
                 info->resource_usage_known = false;
+            }
+            if (compute_ahead && r.hw_stage == u32(Shader::HwStage::Compute)) {
+                // FEAT-SGT-118: before the duplicate check: equal code is built once anyway.
+                auto words = ComputePipeline::AheadRecipe(instance, profile, *info, spv);
+                std::scoped_lock compute_lock{compute_mutex};
+                compute_recipes.push_back(std::move(words));
             }
             std::unique_lock lk{mutex};
             auto& program = programs[r.hash];
@@ -2371,6 +2427,11 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count(),
                 count, stored.load(), already.load(), duplicate.load(), unreplayed.load(),
                 no_code.load(), failed.load(), in_use.load(), foreign.load());
+    if (compute_ahead && !compute_recipes.empty() && !stop.stop_requested()) { // FEAT-SGT-118
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Normal);
+        Common::AllowAllCores();
+        PrecompileCompute(instance, profile, *pipeline_cache, compute_recipes, stop);
+    }
 }
 
 // PERF-GT7-108: builds one recipe's shader objects and writes them to the SO-009 cache file the

@@ -919,8 +919,9 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
 
 // The renderer write-protects guest pages it caches on the GPU. Ryty's exception handler offers
 // each guest write fault here first; true means the renderer owned the page, dropped its cached
-// copy and unprotected it, so the write can be retried.
-extern "C" __declspec(dllexport) int RytyGpuHandleWriteFault(void* exception_pointers) {
+// copy and unprotected it, so the write can be retried. FIX-SGT-121: exported as
+// RytyGpuHandleWriteFault by ryty_fault_xstate.cpp, which keeps the guest's AVX state around it.
+extern "C" int RytyGpuHandleWriteFaultBody(void* exception_pointers) {
     auto* pointers = static_cast<EXCEPTION_POINTERS*>(exception_pointers);
     if (pointers == nullptr || pointers->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
         pointers->ExceptionRecord->NumberParameters < 2) {

@@ -115,6 +115,8 @@ ryty_add_library(ryty_gpu libSceVideoOut
         ${INPUT}
         src/core/debug_state.cpp
         ryty_gpu/ryty_entry.cpp
+        # FIX-SGT-121: the write-fault export, which keeps the guest's AVX state (built without AVX below).
+        ryty_gpu/ryty_fault_xstate.cpp
         ryty_gpu/ryty_input_bridge.cpp
         ryty_gpu/ryty_controller_overlay.cpp
         ryty_gpu/ryty_camera_overlay.cpp
@@ -165,6 +167,11 @@ ryty_add_library(ryty_gpu libSceVideoOut
 # its AVX-512 implementation only after checking CPU and OS vector state.
 if (CMAKE_C_COMPILER_ID MATCHES "Clang|GNU" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i.86)$")
     set_source_files_properties(ryty_gpu/native/native_xxh512.c PROPERTIES COMPILE_OPTIONS "-march=x86-64")
+endif()
+# FIX-SGT-121: nothing may run AVX code before the write-fault export has saved the guest's AVX
+# state, so this translation unit is built for the x86-64 baseline (XSAVE by target attribute).
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i.86)$")
+    set_source_files_properties(ryty_gpu/ryty_fault_xstate.cpp PROPERTIES COMPILE_OPTIONS "-march=x86-64")
 endif()
 # RYTY_DIAG: this library holds the stutter diagnostics (ryty_diag.h), when the build has them.
 target_compile_definitions(ryty_gpu PRIVATE RYTY_HAS_CPU_PATCHES=1

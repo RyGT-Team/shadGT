@@ -2130,6 +2130,36 @@ static void NormalizeForeignRecord(ManifestRecord& r, const Shader::Profile& pro
     if (!profile.needs_clip_distance_emulation) fs.clip_distance_emulation = false;
 }
 
+// FIX-SGT-097: pre-translation writes each translation itself, before recipe-perms.txt names it and
+// before the precompile stops waiting for it. Queued for the store's one writer, 26,624 of 73,754
+// translations were still missing when the game stopped, some 76 s after it said it was done, and
+// the precompile had skipped 2,224 of 2,987 pipelines (one run on an RTX 4070 / Ryzen 7 8700G,
+// with other builds running meanwhile). SHADGT_PRETRANSLATE_WRITE_NOW=0: queued as before.
+static bool PretranslateWritesNow() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_PRETRANSLATE_WRITE_NOW");
+        return !(env && env[0] == '0') && !EmulatorSettings.IsPipelineCacheArchived();
+    }();
+    return on;
+}
+
+// FIX-SGT-097: whether the store has a program. An end or a failed write between a permutation's
+// two writes leaves its SPIR-V alone in a slot, which is never given again: looked past, or that
+// program would be translated again into one more slot at every start.
+static bool StoreHasProgram(u64 pgm_hash) {
+    const auto& store = Storage::DataBase::Instance();
+    for (u64 idx = 0;; ++idx) {
+        if (store.Exists(Storage::BlobType::ShaderMeta,
+                         fmt::format("{:#018x}", HashCombine(pgm_hash, idx)))) {
+            return true;
+        }
+        if (!store.Exists(Storage::BlobType::ShaderBinary,
+                          fmt::format("{:#018x}_{}", pgm_hash, idx))) {
+            return false;
+        }
+    }
+}
+
 void PipelineCache::PretranslateManifest(std::stop_token stop) {
     Common::SetCurrentThreadName("shadGT:Pretranslate");
     SCOPE_EXIT { g_pretranslate_pending = false; }; // FEAT-GTS-469
@@ -2165,6 +2195,8 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
     // FEAT-GTS-470: which local permutation each record became (program, the record's SPIR-V
     // hash, permutation), for importing other GPUs' pipelines (ImportForeignPipelines).
     std::vector<std::array<u64, 3>> recipe_perms;
+    std::unordered_set<u64> unwritten; // FIX-SGT-097: permutations reserved, not (yet) on disk
+    const bool write_now = PretranslateWritesNow();
     std::unordered_map<u64, Stored> programs;
     // FEAT-GTS-469: while the splash precompile holds the game for it, every logical processor
     // translates at normal priority; during play a few low-priority threads, as before.
@@ -2191,9 +2223,7 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
             {
                 std::scoped_lock lk{mutex};
                 auto [it, added] = programs.try_emplace(r.hash);
-                if (added && Storage::DataBase::Instance().Exists(
-                                 Storage::BlobType::ShaderMeta,
-                                 fmt::format("{:#018x}", HashCombine(r.hash, u64{0})))) {
+                if (added && StoreHasProgram(r.hash)) {
                     it->second.next_idx = ~0u; // the store has this program: left alone
                 }
                 if (it->second.next_idx == ~0u) {
@@ -2226,7 +2256,7 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
             if (!Common::PerfFeatureEnabled(44)) {
                 info->resource_usage_known = false;
             }
-            std::scoped_lock lk{mutex};
+            std::unique_lock lk{mutex};
             auto& program = programs[r.hash];
             if (program.next_idx == ~0u) {
                 ++in_use; // the game took the program up meanwhile: left alone from here
@@ -2256,12 +2286,22 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
                 end = perm_idx + 1;
             }
             program.next_idx = u32(perm_idx + 1);
-            RegisterShaderMeta(*info, spec->fetch_shader_data, *spec,
-                               HashCombine(r.hash, u64{perm_idx}), perm_idx);
-            RegisterShaderBinary(std::move(spv), r.hash, perm_idx);
-            program.specs.push_back(std::move(*spec));
+            program.specs.push_back(*spec);
             program.perms.push_back(perm_idx);
             recipe_perms.push_back({r.hash, r.spv_xxh, perm_idx});
+            const u64 perm_hash = HashCombine(r.hash, u64{perm_idx});
+            unwritten.insert(perm_hash);
+            lk.unlock();
+            // FIX-SGT-097: outside the lock, the workers write side by side. The metadata is last:
+            // it is what says the permutation is stored.
+            if (!RegisterShaderBinary(std::move(spv), r.hash, perm_idx, write_now) ||
+                !RegisterShaderMeta(*info, spec->fetch_shader_data, *spec, perm_hash, perm_idx,
+                                    write_now)) {
+                ++failed;
+                continue;
+            }
+            lk.lock();
+            unwritten.erase(perm_hash);
             ++stored;
         }
     };
@@ -2279,6 +2319,11 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
     }
     for (auto& thread : threads) {
         thread.join();
+    }
+    if (!unwritten.empty()) { // FIX-SGT-097: no recipe is mapped to a file that isn't there
+        std::erase_if(recipe_perms, [&](const auto& line) {
+            return unwritten.contains(HashCombine(line[0], line[2]));
+        });
     }
     if (!recipe_perms.empty()) {
         // FEAT-GTS-470: appended; a later start finds these programs stored and skips them.
@@ -7028,6 +7073,18 @@ void PipelineCache::ImportForeignPipelines(std::stop_token stop) {
     const fs::path marker = local / "recipe-imports.txt";
     std::string done = read_text(marker);
     enum class Installed { Imported, Present, Unresolved, Failed };
+    // FIX-SGT-097: recipe-perms.txt of a start that ended before its writes names permutations the
+    // store doesn't have; a recipe mapped to one is unresolved, not imported.
+    const bool check_stored = PretranslateWritesNow();
+    std::unordered_map<u64, bool> perm_stored;
+    const auto on_disk = [&](u64 perm_hash) {
+        if (!check_stored) return true;
+        const auto [it, added] = perm_stored.try_emplace(perm_hash, false);
+        if (added) {
+            it->second = store.Exists(Storage::BlobType::ShaderMeta, fmt::format("{:#018x}", perm_hash));
+        }
+        return it->second;
+    };
     // FEAT-GTS-471: key's shaders, named by program and record SPIR-V hash, renumbered to this
     // store's permutations (recipe-perms.txt) and stored as this GPU's pipeline.
     const auto install = [&](GraphicsPipelineKey& key, GraphicsPipeline::SerializationSupport& sdata,
@@ -7037,6 +7094,7 @@ void PipelineCache::ImportForeignPipelines(std::stop_token stop) {
             const auto mapped = local_perm.find(HashCombine(names[i].first, names[i].second));
             if (names[i].first == 0 || mapped == local_perm.end()) return Installed::Unresolved;
             key.stage_hashes[i] = HashCombine(names[i].first, u64{mapped->second});
+            if (!on_disk(key.stage_hashes[i])) return Installed::Unresolved;
         }
         const u64 hash = std::hash<GraphicsPipelineKey>{}(key);
         const auto target = local / fmt::format("g_{:#018x}.key", hash);

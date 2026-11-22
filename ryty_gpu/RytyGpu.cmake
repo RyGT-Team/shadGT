@@ -16,6 +16,43 @@ if (RYGT_PGO_TRAIN)
     set_property(SOURCE ryty_gpu/ryty_entry.cpp APPEND PROPERTY COMPILE_DEFINITIONS RYGT_PGO_TRAIN=1)
 endif()
 
+# PERF-SGT-121: Release builds of the libraries below with ThinLTO and the checked-in profile
+# (pgo/renderer.profdata: instrumented IR PGO, merged from RYGT_PGO_TRAIN runs of GT7 and GT Sport
+# with LLVM 23.1.3, the CI's compiler). GT7 Tokyo replay, chase cam: about +3% against plain
+# Release. A profile older than the code is still used where it matches; the rest compiles as
+# without one. RYGT_RELEASE_LTO_PGO=OFF builds plain Release. Not with RYGT_PGO_TRAIN or diagnostics.
+option(RYGT_RELEASE_LTO_PGO "ThinLTO and the checked-in PGO profile for Release builds" ON)
+set(RYGT_PGO_PROFILE "${CMAKE_CURRENT_SOURCE_DIR}/pgo/renderer.profdata" CACHE FILEPATH
+    "The PGO profile Release builds use (RYGT_RELEASE_LTO_PGO)")
+# Diagnostics are on in Release only when asked for (SHADGT_DIAGNOSTICS=ON; AUTO is off there).
+set(rygt_release_diagnostics OFF)
+if (NOT SHADGT_DIAGNOSTICS STREQUAL "AUTO" AND SHADGT_DIAGNOSTICS)
+    set(rygt_release_diagnostics ON)
+endif()
+if (RYGT_RELEASE_LTO_PGO AND NOT RYGT_PGO_TRAIN AND NOT rygt_release_diagnostics AND
+    CMAKE_BUILD_TYPE STREQUAL "Release" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND
+    NOT CMAKE_CXX_FLAGS MATCHES "fprofile-")
+    if (NOT CMAKE_LINKER MATCHES "lld")
+        message(STATUS "PERF-SGT-121: ThinLTO and PGO off (the linker is not lld: ${CMAKE_LINKER})")
+    else()
+        set(RYGT_LTO_PGO_FLAGS -flto=thin)
+        if (EXISTS "${RYGT_PGO_PROFILE}")
+            # The profile names a file's static and anonymous-namespace functions by the file's
+            # name only (it was trained with the same option), not its full path: it matches
+            # wherever the sources are, and holds no paths of the machine that trained it.
+            list(APPEND RYGT_LTO_PGO_FLAGS "-fprofile-use=${RYGT_PGO_PROFILE}"
+                 "SHELL:-mllvm -static-func-full-module-prefix=false"
+                 -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-backend-plugin)
+        else()
+            message(WARNING "PERF-SGT-121: ${RYGT_PGO_PROFILE} is missing; ThinLTO without PGO")
+        endif()
+        foreach (flag IN LISTS RYGT_LTO_PGO_FLAGS)
+            add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:${flag}>")
+        endforeach()
+        message(STATUS "PERF-SGT-121: Release with ${RYGT_LTO_PGO_FLAGS}")
+    endif()
+endif()
+
 # Emulator-core pieces every library needs, with Ryty stand-ins for the rest.
 set(RYTY_COMMON_SOURCES
     ${COMMON}

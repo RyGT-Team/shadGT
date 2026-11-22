@@ -51,6 +51,8 @@ std::vector<u8> ReadTrophyKey() {
     if (std::ifstream file{key_path, std::ios::binary}) {
         text.assign(std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{});
     }
+    std::error_code remove_error;
+    std::filesystem::remove(key_path, remove_error);
     std::string hex;
     for (const char c : text) {
         if (!std::isspace(static_cast<unsigned char>(c))) {

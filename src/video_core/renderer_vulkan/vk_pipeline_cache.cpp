@@ -2206,6 +2206,45 @@ static bool StoreHasProgram(u64 pgm_hash) {
     }
 }
 
+// FIX-SGT-119 (on unless SHADGT_PRETRANSLATE_STORED=0): a program the store already has is not left
+// alone any more. A start once skipped every record of such a program, so no recipe was mapped to
+// it, and ImportForeignPipelines left those recipes unresolved: a preparation run stores its menus'
+// translations, and 920 of a list's 1,661 recipes named one of those programs (GT7, 13.71). Now a
+// record is skipped only when recipe-perms.txt already maps it to a permutation the store still
+// has; otherwise it is replayed, and mapped to a stored permutation of the same specialization,
+// or stored as a new one beside them. Off: the old rule.
+static bool PretranslateStoredOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_PRETRANSLATE_STORED");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+// PERF-GTS-490: a stored translation keeps its direct paths though the learned file says a buffer
+// is never read in place (SHADGT_KEEP_DIRECT_TRANSLATIONS=0: refused, PERF-GTS-479's strict rule).
+static bool KeepDirectTranslations() {
+    static const bool keep = [] {
+        const char* env = std::getenv("SHADGT_KEEP_DIRECT_TRANSLATIONS");
+        return !(env && env[0] == '0');
+    }();
+    return keep;
+}
+
+// FIX-SGT-119: what earlier starts mapped (recipe-perms.txt: program, record SPIR-V hash, permutation).
+static std::unordered_map<u64, std::vector<std::pair<u64, size_t>>> ReadRecipePerms() {
+    std::unordered_map<u64, std::vector<std::pair<u64, size_t>>> mapped;
+    const auto path = Storage::DataBase::Instance().StorePath() / "recipe-perms.txt";
+    if (std::FILE* f = std::fopen(path.string().c_str(), "rb")) {
+        unsigned long long pgm{}, spv{}, perm{};
+        while (std::fscanf(f, "%llx %llx %llu", &pgm, &spv, &perm) == 3) {
+            mapped[u64(pgm)].emplace_back(u64(spv), size_t(perm));
+        }
+        std::fclose(f);
+    }
+    return mapped;
+}
+
 void PipelineCache::PretranslateManifest(std::stop_token stop) {
     Common::SetCurrentThreadName("shadGT:Pretranslate");
     SCOPE_EXIT { g_pretranslate_pending = false; }; // FEAT-GTS-469
@@ -2230,13 +2269,21 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
     SCOPE_EXIT { g_pretranslate_active = false; };
     const auto start_time = std::chrono::steady_clock::now();
     std::atomic<u32> stored{0}, already{0}, unreplayed{0}, failed{0}, no_code{0}, duplicate{0};
-    std::atomic<u32> in_use{0}, foreign{0};
+    std::atomic<u32> in_use{0}, foreign{0}, matched{0}, matched_direct{0};
     std::mutex mutex;
     struct Stored {
         u32 next_idx = 0;
         std::vector<Shader::StageSpecialization> specs;
         std::vector<size_t> perms; // FEAT-GTS-470: the permutation each spec was stored at
+        // FIX-SGT-119: a program the store had at the start, and its stored permutations' specs.
+        bool in_store = false;
+        std::once_flag listed;
+        std::vector<std::pair<size_t, Shader::StageSpecialization>> stored;
     };
+    const bool keep_stored = PretranslateStoredOn();
+    const auto mapped = keep_stored ? ReadRecipePerms()
+                                    : std::unordered_map<u64, std::vector<std::pair<u64, size_t>>>{};
+    static const Shader::Info peek_info{}; // a spec compares only with an info set (Valid)
     // FEAT-GTS-470: which local permutation each record became (program, the record's SPIR-V
     // hash, permutation), for importing other GPUs' pipelines (ImportForeignPipelines).
     std::vector<std::array<u64, 3>> recipe_perms;
@@ -2273,16 +2320,63 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
                 NormalizeForeignRecord(r, profile);
                 ++foreign;
             }
+            if (keep_stored) {
+                // FIX-SGT-119: mapped by an earlier start, to a permutation the store still has.
+                const auto it = mapped.find(r.hash);
+                if (it != mapped.end() &&
+                    std::ranges::any_of(it->second, [&](const auto& line) {
+                        return line.first == r.spv_xxh &&
+                               Storage::DataBase::Instance().Exists(
+                                   Storage::BlobType::ShaderMeta,
+                                   fmt::format("{:#018x}", HashCombine(r.hash, u64{line.second})));
+                    })) {
+                    ++already;
+                    continue;
+                }
+            }
+            Stored* entry = nullptr;
             {
                 std::scoped_lock lk{mutex};
                 auto [it, added] = programs.try_emplace(r.hash);
                 if (added && StoreHasProgram(r.hash)) {
-                    it->second.next_idx = ~0u; // the store has this program: left alone
+                    if (keep_stored) {
+                        it->second.in_store = true; // FIX-SGT-119: mapped onto what it has
+                    } else {
+                        it->second.next_idx = ~0u; // the store has this program: left alone
+                    }
                 }
                 if (it->second.next_idx == ~0u) {
                     ++already;
                     continue;
                 }
+                entry = &it->second;
+            }
+            if (entry->in_store) {
+                // FIX-SGT-119: its stored permutations' specs, read once, outside the lock.
+                std::call_once(entry->listed, [&] {
+                    auto& store = Storage::DataBase::Instance();
+                    u32 missing = 0;
+                    for (size_t idx = 0; idx < 512 && missing < 8; ++idx) {
+                        const auto name = fmt::format("{:#018x}", HashCombine(r.hash, u64{idx}));
+                        if (!store.Exists(Storage::BlobType::ShaderMeta, name)) {
+                            ++missing;
+                            continue;
+                        }
+                        missing = 0;
+                        if (!store.Exists(Storage::BlobType::ShaderBinary,
+                                          fmt::format("{:#018x}_{}", r.hash, idx))) {
+                            continue;
+                        }
+                        std::vector<u8> blob;
+                        store.Load(Storage::BlobType::ShaderMeta, name, blob);
+                        Shader::StageSpecialization spec{};
+                        spec.info = &peek_info;
+                        size_t stored_idx{};
+                        if (PeekShaderSpec(std::move(blob), spec, stored_idx) && stored_idx == idx) {
+                            entry->stored.emplace_back(idx, std::move(spec));
+                        }
+                    }
+                });
             }
             const auto code =
                 ReadRecordCode(r.hash, r.code_xxh, r.code_words); // FEAT-GTS-470
@@ -2309,10 +2403,46 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
             if (!Common::PerfFeatureEnabled(44)) {
                 info->resource_usage_known = false;
             }
+            // FIX-SGT-119: a stored permutation of the same specialization serves (stored on the
+            // left, as a draw's lookup compares). The listing is complete once call_once returned
+            // and never changes, so it is read outside the lock.
+            const auto stored_perm = [&](const Shader::StageSpecialization& s) -> std::optional<size_t> {
+                const auto same = std::ranges::find_if(
+                    entry->stored, [&](const auto& stored) { return stored.second == s; });
+                return same != entry->stored.end() ? std::optional{same->first} : std::nullopt;
+            };
+            auto same_stored = entry->in_store ? stored_perm(*spec) : std::nullopt;
+            // A store made before the learned file (PERF-GTS-479) translated this program with
+            // every direct path; a draw takes that permutation first, and keeps its direct paths
+            // (PERF-GTS-490). So when the learned translation matches none, the record is replayed
+            // once more as that store did. In GT7, a kept folder's preparation had learned 298
+            // shaders: 251 of 1,466 records of stored programs matched only this way, the bar
+            // built their pipelines on a new permutation, and the race built about 120 again.
+            if (!same_stored && entry->in_store && KeepDirectTranslations() &&
+                std::ranges::any_of(info->buffers, [](const auto& b) { return b.NoDirect(); })) {
+                r.spans = std::move(log.spans); // the replay took them
+                r.bytes = std::move(log.bytes);
+                Shader::DirectLearning::IgnoreLearned every_direct_path;
+                std::unique_ptr<Shader::Info> direct_info;
+                std::vector<u32> direct_spv;
+                std::optional<Shader::StageSpecialization> direct_spec;
+                Common::GuestReadLog direct_log;
+                if (ReplayManifestRecord(profile, pools, r, code, user_data, direct_info,
+                                         direct_spv, direct_spec, direct_log) &&
+                    direct_log.misses == 0 && direct_log.next == direct_log.spans.size()) {
+                    same_stored = stored_perm(*direct_spec);
+                    matched_direct += same_stored.has_value();
+                }
+            }
             std::unique_lock lk{mutex};
             auto& program = programs[r.hash];
             if (program.next_idx == ~0u) {
                 ++in_use; // the game took the program up meanwhile: left alone from here
+                continue;
+            }
+            if (same_stored) {
+                recipe_perms.push_back({r.hash, r.spv_xxh, *same_stored});
+                ++matched;
                 continue;
             }
             if (const auto same = std::ranges::find(program.specs, *spec);
@@ -2400,11 +2530,13 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
                 "PERF-GT7-117: {} records in {:.1f} s on {} threads: {} translations stored, {} "
                 "for programs already stored or in use, {} duplicates, {} with reads not replayed "
                 "as recorded (not stored), {} without local code, {} failed or unusable; {} "
-                "programs in use left alone; {} records from other GPUs (FEAT-GTS-470)",
+                "programs in use left alone; {} records from other GPUs (FEAT-GTS-470); {} matched "
+                "to stored translations, {} of them replayed with every direct path (FIX-SGT-119)",
                 files.size(),
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count(),
                 count, stored.load(), already.load(), duplicate.load(), unreplayed.load(),
-                no_code.load(), failed.load(), in_use.load(), foreign.load());
+                no_code.load(), failed.load(), in_use.load(), foreign.load(), matched.load(),
+                matched_direct.load());
 }
 
 // PERF-GT7-108: builds one recipe's shader objects and writes them to the SO-009 cache file the
@@ -6949,10 +7081,7 @@ static bool LearnedDirectMatches(const Shader::Info& info, const Shader::Profile
     if (!profile.direct_buffers) {
         return true;
     }
-    static const bool keep_direct = [] {
-        const char* env = std::getenv("SHADGT_KEEP_DIRECT_TRANSLATIONS");
-        return !(env && env[0] == '0');
-    }();
+    const bool keep_direct = KeepDirectTranslations();
     for (u32 i = 0; i < info.buffers.size(); ++i) {
         const auto& buffer = info.buffers[i];
         if (!buffer.IsDirectCandidate()) {

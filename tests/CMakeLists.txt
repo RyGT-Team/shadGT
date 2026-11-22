@@ -198,6 +198,12 @@ target_include_directories(shadps4_buffer_resource_test PRIVATE ${CMAKE_SOURCE_D
 target_link_libraries(shadps4_buffer_resource_test PRIVATE GTest::gtest_main fmt::fmt)
 gtest_discover_tests(shadps4_buffer_resource_test)
 
+add_executable(shadps4_direct_learning_ignore_test test_direct_learning_ignore.cpp)
+target_include_directories(shadps4_direct_learning_ignore_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_direct_learning_ignore_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_direct_learning_ignore_test PRIVATE GTest::gtest_main fmt::fmt tsl::robin_map xxHash::xxhash)
+gtest_discover_tests(shadps4_direct_learning_ignore_test)
+
 add_executable(shadps4_sampler_sharp_test test_sampler_sharp.cpp)
 target_include_directories(shadps4_sampler_sharp_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(shadps4_sampler_sharp_test PRIVATE GTest::gtest_main fmt::fmt)

@@ -515,29 +515,30 @@ bool RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx,
                                               std::move(spv), now);
 }
 
-bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
-                    Shader::StageSpecialization& spec, size_t& perm_idx,
-                    bool* other_cube_sampling) {
+// The header and the specialization of stored shader metadata, as every reader takes them.
+struct ShaderMetaHead {
+    u32 meta_version{};
+    u32 binary_version{};
+    bool face_cubes{};
+    u64 perm_hash{};
+};
+static bool ReadShaderMetaHead(Serialization::Archive& ar, Shader::StageSpecialization& spec,
+                               size_t& perm_idx, ShaderMetaHead& head) {
     Serialization::Reader meta{ar};
 
-    u32 meta_version{};
-    meta.Read(meta_version);
-    const bool no_explicit_lod =
-        meta_version == Serialization::ShaderMetaVersionNoExplicitLod; // FIX-GT7-182
-    if (!IsReadableShaderMetaVersion(meta_version)) {
+    meta.Read(head.meta_version);
+    if (!IsReadableShaderMetaVersion(head.meta_version)) {
         return false;
     }
 
-    u32 binary_version{};
-    meta.Read(binary_version);
-    const bool face_cubes = (binary_version & ClassicCubeTag) != 0;
-    binary_version = UntagCubeVersion(binary_version);
-    if (!IsKnownShaderBinaryVersion(binary_version)) {
+    meta.Read(head.binary_version);
+    head.face_cubes = (head.binary_version & ClassicCubeTag) != 0;
+    head.binary_version = UntagCubeVersion(head.binary_version);
+    if (!IsKnownShaderBinaryVersion(head.binary_version)) {
         return false;
     }
 
-    u64 perm_hash_ar{};
-    meta.Read(perm_hash_ar);
+    meta.Read(head.perm_hash);
     meta.Read(perm_idx);
 
     spec.Deserialize(ar);
@@ -546,15 +547,46 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
         spec.runtime_info.hw.fs.vertex_order_check = false; // AMD-307
     }
     if (spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
-        binary_version != Serialization::ShaderBinaryVersionSingleSampleBarycentric) {
+        head.binary_version != Serialization::ShaderBinaryVersionSingleSampleBarycentric) {
         // This byte was padding in every older metadata revision.
         spec.runtime_info.hw.fs.single_sample_barycentric = false;
     }
-    if ((binary_version | 0x100u) == Serialization::ShaderBinaryVersion &&
+    if ((head.binary_version | 0x100u) == Serialization::ShaderBinaryVersion &&
         spec.runtime_info.hw_stage == Shader::HwStage::Fragment) {
         // This byte was padding before quad-mask emulation, and need not have been zero.
         spec.runtime_info.hw.fs.quad_sample_mask = false;
     }
+    return true;
+}
+
+bool PeekShaderSpec(std::vector<u8>&& blob, Shader::StageSpecialization& spec, size_t& perm_idx) {
+    if (blob.size() < 24) {
+        return false;
+    }
+    Serialization::Archive ar{std::move(blob)};
+    ShaderMetaHead head;
+    try {
+        Common::RecoverableScope recoverable;
+        return ReadShaderMetaHead(ar, spec, perm_idx, head);
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
+                    Shader::StageSpecialization& spec, size_t& perm_idx,
+                    bool* other_cube_sampling) {
+    ShaderMetaHead head;
+    if (!ReadShaderMetaHead(ar, spec, perm_idx, head)) {
+        return false;
+    }
+    Serialization::Reader meta{ar};
+    const u32 meta_version = head.meta_version;
+    const u32 binary_version = head.binary_version;
+    const bool face_cubes = head.face_cubes;
+    const u64 perm_hash_ar = head.perm_hash;
+    const bool no_explicit_lod =
+        meta_version == Serialization::ShaderMetaVersionNoExplicitLod; // FIX-GT7-182
     if (!info.Deserialize(ar, perm_hash_ar,
                           meta_version != Serialization::ShaderMetaVersionWithoutAttributeFlags))
         return false;

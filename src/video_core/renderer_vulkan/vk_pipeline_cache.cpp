@@ -86,6 +86,7 @@
 #include "video_core/renderer_vulkan/compile_pack_pipeline.h"
 #include "video_core/renderer_vulkan/shader_object_cache.h"
 #include "video_core/renderer_vulkan/compiler_worker_budget.h"
+#include "video_core/renderer_vulkan/pretranslate_crew.h"
 #include "video_core/renderer_vulkan/translation_priority.h"
 #include "video_core/renderer_vulkan/translation_retry.h"
 #include "video_core/renderer_vulkan/single_sample_barycentric.h"
@@ -1013,6 +1014,17 @@ static void ReleasePrecompileHold() {
         LOG_WARNING(Render_Vulkan, "PERF-102: precompile done after {:.1f} s; the game continues",
                     since ? double(now - since) / 1000.0 : 0.0);
     }
+}
+
+// FIX-SGT-099: the hold can end before the pre-translation does (15 minutes at most), and its
+// workers kept every logical CPU at normal priority while the game played. They follow the hold
+// now. SHADGT_PRETRANSLATE_FOLLOW_HOLD=0: as they started, as before.
+static bool PretranslateFollowsHold() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_PRETRANSLATE_FOLLOW_HOLD");
+        return !(env && env[0] == '0');
+    }();
+    return on;
 }
 
 // PERF-103: compile slow motion. While draws are skipped because their pipeline is still being
@@ -2183,7 +2195,6 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
     g_pretranslate_active = !files.empty();
     SCOPE_EXIT { g_pretranslate_active = false; };
     const auto start_time = std::chrono::steady_clock::now();
-    std::atomic<size_t> next{0};
     std::atomic<u32> stored{0}, already{0}, unreplayed{0}, failed{0}, no_code{0}, duplicate{0};
     std::atomic<u32> in_use{0}, foreign{0};
     std::mutex mutex;
@@ -2200,18 +2211,26 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
     std::unordered_map<u64, Stored> programs;
     // FEAT-GTS-469: while the splash precompile holds the game for it, every logical processor
     // translates at normal priority; during play a few low-priority threads, as before.
-    const bool held = PrecompileHoldsGame();
+    // FIX-SGT-099: and from the hold's end as during play.
+    PretranslateCrew crew{std::thread::hardware_concurrency(), PrecompileHoldsGame(),
+                          PretranslateFollowsHold(), files.size()};
     const auto work = [&] {
-        Common::SetCurrentThreadPriority(held ? Common::ThreadPriority::Normal
-                                              : Common::ThreadPriority::Low);
-        // FEAT-GTS-470: and on every core (without a set of its own a thread runs on the
-        // process default, the game's cores only when a core owner is set, PERF-GT7-048).
-        if (held) Common::AllowAllCores();
+        PretranslateCrew::Worker worker{
+            crew,
+            [] {
+                Common::SetCurrentThreadPriority(Common::ThreadPriority::Normal);
+                // FEAT-GTS-470: and on every core (without a set of its own a thread runs on the
+                // process default, the game's cores only when a core owner is set, PERF-GT7-048).
+                Common::AllowAllCores();
+            },
+            [] { Common::SetCurrentThreadPriority(Common::ThreadPriority::Low); }};
         Shader::Pools pools;
-        for (size_t i = next++; i < files.size() && !stop.stop_requested(); i = next++) {
+        while (!stop.stop_requested()) {
+            const auto taken = worker.TakeRecord();
+            if (!taken) break;
             ++g_pretranslate_done; // FEAT-GTS-469: counted as taken up
             ManifestRecord r;
-            if (!ReadManifestRecord(files[i], r) || !ManifestRecordUsable(r)) {
+            if (!ReadManifestRecord(files[*taken], r) || !ManifestRecordUsable(r)) {
                 ++failed;
                 continue;
             }
@@ -2305,8 +2324,7 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
             ++stored;
         }
     };
-    const u32 count = held ? std::max(1u, std::thread::hardware_concurrency())
-                           : std::clamp<u32>(std::thread::hardware_concurrency() / 4, 1, 4);
+    const u32 count = crew.Threads();
     std::vector<std::thread> threads;
     for (u32 t = 0; t < count; ++t) {
         threads.emplace_back([&work] {
@@ -2317,6 +2335,13 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
             }
         });
     }
+    crew.Watch(PrecompileHoldsGame, [&](u32 kept) {
+        for (auto& thread : threads) Common::MoveThreadToBackground(thread);
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-SGT-099: the game is no longer held with {} of {} records taken up: "
+                    "pre-translation goes on at low priority, {} of its {} threads",
+                    g_pretranslate_done.load(), files.size(), kept, count);
+    });
     for (auto& thread : threads) {
         thread.join();
     }
@@ -7575,6 +7600,18 @@ void PipelineCache::PrewarmRead(std::stop_token stop) {
     }
 }
 
+// FIX-SGT-099: SHADGT_PRECOMPILE_HOLD_MAX_S=<seconds> shortens the hold's 15 minutes, to see what
+// its end does to the work still running. It can't lengthen them.
+static std::chrono::seconds PrecompileHoldLimit() {
+    static const std::chrono::seconds limit = [] {
+        constexpr unsigned long most = 15 * 60;
+        const char* env = std::getenv("SHADGT_PRECOMPILE_HOLD_MAX_S");
+        const unsigned long asked = env ? std::strtoul(env, nullptr, 10) : 0;
+        return std::chrono::seconds{asked ? std::min(asked, most) : most};
+    }();
+    return limit;
+}
+
 void PipelineCache::IdlePrewarm(bool splash) {
     if (!prewarm_enabled) {
         ReleasePrecompileHold();
@@ -7614,11 +7651,11 @@ void PipelineCache::IdlePrewarm(bool splash) {
             install_us_at = install_us;
         }
     }
-    // PERF-102: released once every stored pipeline is built (or after 15 minutes at most).
+    // PERF-102: released once every stored pipeline is built (or after PrecompileHoldLimit at most).
     static const auto first_call = std::chrono::steady_clock::now();
     if (PrecompileHoldsGame() &&
         ((prewarm_reader_done && !GetPrecompileProgress().active) ||
-         std::chrono::steady_clock::now() - first_call > std::chrono::minutes{15})) {
+         std::chrono::steady_clock::now() - first_call > PrecompileHoldLimit())) {
         ReleasePrecompileHold();
     }
     if (build_workers) {

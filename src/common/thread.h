@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <functional>
+#include <thread>
 #include "common/types.h"
 
 namespace Common {
@@ -47,6 +48,10 @@ void ReleaseCompileCores();
 void UpdateCoreOwner(u32 slot, bool wanted); ///< PERF-GT7-048
 
 void AllowAllCores();
+
+/// FIX-SGT-099: moves a running thread of ours to low priority and the process's default cores,
+/// where a new background thread that selected none runs. Undoes AllowAllCores for it.
+void MoveThreadToBackground(std::thread& thread);
 
 /// PERF-088: the CPU has fast and slow cores.
 bool HybridCpu();

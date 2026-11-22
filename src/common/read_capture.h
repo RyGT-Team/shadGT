@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstring>
 #include <memory>
+#include <utility>
 #include <vector>
 #include "common/types.h"
 
@@ -118,6 +119,8 @@ extern thread_local const ReadCapture* t_read_capture;
 } // namespace Common
 namespace Core::RytyMemory {
 bool GuardedCopy(void* dest, const void* source, size_t size);
+/// FEAT-SGT-117: the guest arena (FIX-055's GuestRangeOf), first and past-the-end addresses.
+std::pair<u64, u64> GuestArena();
 }
 namespace Common {
 #endif

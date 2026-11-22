@@ -532,8 +532,13 @@ struct GuestRange {
     VAddr end;
 };
 
+constexpr GuestRange Arena{0x200000000, 0xFC00000000};
+
+std::pair<u64, u64> GuestArena() { // FEAT-SGT-117
+    return {Arena.start, Arena.end};
+}
+
 static std::optional<GuestRange> GuestRangeOf(VAddr address) {
-    constexpr GuestRange Arena{0x200000000, 0xFC00000000};
     if (address >= Arena.start && address < Arena.end) {
         return Arena;
     }

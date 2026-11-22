@@ -2,6 +2,7 @@
 #include "video_core/renderer_vulkan/shared_pipeline_policy.h"
 #include "common/geometry_trace.h"
 #include "video_core/renderer_vulkan/oneshot_shader.h"
+#include "video_core/renderer_vulkan/shader_capture.h"
 #include "video_core/renderer_vulkan/ordered_parallel_read.h"
 #include "video_core/renderer_vulkan/bounded_read_cache.h"
 #include "video_core/renderer_vulkan/driver_cache_snapshot.h"
@@ -3227,6 +3228,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                 LOG_WARNING(Render_Vulkan, "PERF-GT7-111: verification unavailable: {}", e.what());
             }
         }
+        // FEAT-SGT-117: a preparation run captures the recorded programs' code, into the folder
+        // pre-translation reads.
+        ShaderCapture::Start(g_programs_dir, g_manifest_dir, g_capture_dir);
     }
     // PERF-032: the shader store is used again, without the startup precompile Lance had removed:
     // a program's stored translations are read when a draw first uses it, and new translations

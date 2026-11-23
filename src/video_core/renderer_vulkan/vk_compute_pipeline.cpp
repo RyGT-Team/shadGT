@@ -11,6 +11,7 @@
 #include "common/scope_exit.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/lane_read_policy.h"
+#include "video_core/renderer_vulkan/compute_ahead.h"
 #include "video_core/renderer_vulkan/compute_warm_recipe.h"
 #include "video_core/renderer_vulkan/compiler_worker_budget.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
@@ -271,7 +272,7 @@ std::vector<u32> ComputePipeline::AheadRecipe(const Instance& instance,
 
 bool ComputePipeline::WarmFromWords(const Instance& instance, const Shader::Profile& profile,
                                     vk::PipelineCache cache, std::span<const u32> words,
-                                    std::stop_token stop) {
+                                    std::stop_token stop, bool (*wanted)()) {
     if (!ValidateComputeWarmRecipe(words, RecipeSignature(instance, profile),
         instance.MaxPushDescriptors(), profile.supported_spirv,
         instance.IsIntel() && instance.IsSubgroupSizeControlSupported() && instance.SubgroupSize() == 32,
@@ -351,6 +352,10 @@ bool ComputePipeline::WarmFromWords(const Instance& instance, const Shader::Prof
             },
         .layout = *layout,
     };
+    // FEAT-SGT-118: `wanted` (the splash's hold, for a build ahead of the game) is asked as `stop`
+    // is, while waiting at the gate and once through it: a build that waited across the game's
+    // release never reaches the driver.
+    const auto still_wanted = [wanted] { return !wanted || wanted(); };
     const bool gate = Common::PerfFeatureEnabled(79);
     if (gate) {
         // FIX-SGT-114: a free gate is taken at once; a full one is retried every 2 ms. No
@@ -358,13 +363,14 @@ bool ComputePipeline::WarmFromWords(const Instance& instance, const Shader::Prof
         // __std_atomic_wait_get_deadline and _get_remaining_timeout, which Wine and Proton only
         // stub, so the first compute warm-up (shadGT:WarmCompute) aborted the game under Proton
         // without the native VC++ runtime (RyGT issue 77). Sleep is a plain kernel32 call there.
-        while (!HeavyPipelineGate().try_acquire()) {
-            if (stop.stop_requested()) return false;
-            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        if (!TakeHeavyGate(HeavyPipelineGate(), stop, still_wanted,
+                           [] { std::this_thread::sleep_for(std::chrono::milliseconds{2}); })) {
+            return false;
         }
+    } else if (stop.stop_requested() || !still_wanted()) {
+        return false;
     }
     SCOPE_EXIT { if (gate) HeavyPipelineGate().release(); };
-    if (stop.stop_requested()) return false;
     auto [pipeline_result, pipeline] = device.createComputePipelineUnique(cache, pipeline_ci);
     return pipeline_result == vk::Result::eSuccess;
 }

@@ -8,6 +8,7 @@
 #include "video_core/renderer_vulkan/pipeline_cleanup_worker.h"
 #include "video_core/renderer_vulkan/draw_preparation_options.h"
 #include "video_core/renderer_vulkan/compile_cpu_batch.h"
+#include "video_core/renderer_vulkan/compute_ahead.h"
 #include "video_core/renderer_vulkan/stale_pipeline_builds.h"
 #include "video_core/renderer_vulkan/skipped_picture_read.h"
 #include "video_core/renderer_vulkan/read_ahead_budget.h"
@@ -1110,6 +1111,18 @@ PrecompileProgress GetPretranslateProgress() {
     return {total, done, g_pretranslate_active.load(std::memory_order_relaxed)};
 }
 
+// FEAT-SGT-118: the splash's compute builds, a step of their own on its bar. Added to the
+// translations' count, they took the bar back from 100%.
+static std::atomic<u64> g_compute_ahead_total{};
+static std::atomic<u64> g_compute_ahead_done{};
+static std::atomic<bool> g_compute_ahead_active{};
+
+PrecompileProgress GetComputeAheadProgress() {
+    const u64 total = g_compute_ahead_total.load(std::memory_order_relaxed);
+    const u64 done = std::min(total, g_compute_ahead_done.load(std::memory_order_relaxed));
+    return {total, done, g_compute_ahead_active.load(std::memory_order_relaxed)};
+}
+
 PrecompileProgress GetPrecompileProgress() {
     const u64 total = g_precompile_total.load(std::memory_order_relaxed);
     const u64 done = std::min(total, g_precompile_done.load(std::memory_order_relaxed));
@@ -2168,36 +2181,39 @@ static bool PrecompileComputeOn() {
     return on;
 }
 
+// Only while the game is held: a compile in play would cost frames. The hold usually outlasts the
+// pre-translation (the precompile waits for it); only its time limit ends it during these builds.
+static bool ComputeAheadWanted() {
+    return PrecompileHoldsGame();
+}
+
+// The splash's step of its own (GetComputeAheadProgress), built once the translations are made.
 static void PrecompileCompute(const Instance& instance, const Shader::Profile& profile,
-                              vk::PipelineCache cache, const std::vector<std::vector<u32>>& recipes,
+                              vk::PipelineCache cache, ComputeAheadQueue& queue, u32 offered,
                               std::stop_token stop) {
     const auto started = std::chrono::steady_clock::now();
-    std::unordered_map<u64, const std::vector<u32>*> distinct;
-    for (const auto& words : recipes) {
-        distinct.try_emplace(XXH3_64bits(words.data(), words.size() * sizeof(u32)), &words);
-    }
-    g_pretranslate_total += distinct.size(); // the splash's bar and hold go on through this
-    u32 built = 0, failed = 0, left = 0;
-    for (const auto& [hash, words] : distinct) {
-        // Only while the game is held: a compile in play would cost frames.
-        if (stop.stop_requested() || !PrecompileHoldsGame()) {
-            ++left;
-            ++g_pretranslate_done;
-            continue;
-        }
-        bool ok = false;
-        try {
-            ok = ComputePipeline::WarmFromWords(instance, profile, cache, *words, stop);
-        } catch (const std::exception& e) {
-            LOG_WARNING(Render_Vulkan, "FEAT-SGT-118: compute code not built ahead: {}", e.what());
-        }
-        ++g_pretranslate_done;
-        ++(ok ? built : failed);
-    }
+    const size_t distinct = queue.Size();
+    g_compute_ahead_done = 0;
+    g_compute_ahead_total = distinct;
+    g_compute_ahead_active = true;
+    SCOPE_EXIT { g_compute_ahead_active = false; };
+    const auto counts = queue.Run(
+        [&] { return !stop.stop_requested() && ComputeAheadWanted(); },
+        [&](const std::vector<u32>& words) {
+            try {
+                return ComputePipeline::WarmFromWords(instance, profile, cache, words, stop,
+                                                      &ComputeAheadWanted);
+            } catch (const std::exception& e) {
+                LOG_WARNING(Render_Vulkan, "FEAT-SGT-118: compute code not built ahead: {}",
+                            e.what());
+                return false;
+            }
+        },
+        g_compute_ahead_done);
     LOG_WARNING(Render_Vulkan,
-                "FEAT-SGT-118: compute ahead: {} translations, {} distinct, {} built, {} failed, {} "
-                "left once the game was released, in {:.1f} s",
-                recipes.size(), distinct.size(), built, failed, left,
+                "FEAT-SGT-118: compute ahead: {} translations, {} distinct, {} built, {} failed or "
+                "refused, {} left once the game was released, in {:.1f} s",
+                offered, distinct, counts.built, counts.failed, counts.left,
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
 }
 
@@ -2254,10 +2270,10 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
     std::vector<std::array<u64, 3>> recipe_perms;
     std::unordered_set<u64> unwritten; // FIX-SGT-097: permutations reserved, not (yet) on disk
     const bool write_now = PretranslateWritesNow();
-    // FEAT-SGT-118: only for a start the splash holds for.
+    // FEAT-SGT-118: only for a start the splash holds for, and only as long as it holds.
     const bool compute_ahead = PrecompileComputeOn() && PrecompileHoldsGame();
-    std::vector<std::vector<u32>> compute_recipes;
-    std::mutex compute_mutex;
+    ComputeAheadQueue compute_queue;
+    std::atomic<u32> compute_offered{0};
     std::unordered_map<u64, Stored> programs;
     // FEAT-GTS-469: while the splash precompile holds the game for it, every logical processor
     // translates at normal priority; during play a few low-priority threads, as before.
@@ -2325,11 +2341,12 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
             if (!Common::PerfFeatureEnabled(44)) {
                 info->resource_usage_known = false;
             }
-            if (compute_ahead && r.hw_stage == u32(Shader::HwStage::Compute)) {
-                // FEAT-SGT-118: before the duplicate check: equal code is built once anyway.
-                auto words = ComputePipeline::AheadRecipe(instance, profile, *info, spv);
-                std::scoped_lock compute_lock{compute_mutex};
-                compute_recipes.push_back(std::move(words));
+            if (compute_ahead && r.hw_stage == u32(Shader::HwStage::Compute) &&
+                ComputeAheadWanted()) {
+                // FEAT-SGT-118: before the duplicate check: equal code is kept once anyway.
+                ++compute_offered;
+                compute_queue.Add(ComputePipeline::AheadRecipe(instance, profile, *info, spv),
+                                  ComputeAheadWanted);
             }
             std::unique_lock lk{mutex};
             auto& program = programs[r.hash];
@@ -2427,10 +2444,13 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count(),
                 count, stored.load(), already.load(), duplicate.load(), unreplayed.load(),
                 no_code.load(), failed.load(), in_use.load(), foreign.load());
-    if (compute_ahead && !compute_recipes.empty() && !stop.stop_requested()) { // FEAT-SGT-118
+    // FEAT-SGT-118: the game still held, or nothing more (the queue goes with this function).
+    if (compute_ahead && compute_queue.Size() != 0 && !stop.stop_requested() &&
+        ComputeAheadWanted()) {
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Normal);
         Common::AllowAllCores();
-        PrecompileCompute(instance, profile, *pipeline_cache, compute_recipes, stop);
+        PrecompileCompute(instance, profile, *pipeline_cache, compute_queue,
+                          compute_offered.load(), stop);
     }
 }
 

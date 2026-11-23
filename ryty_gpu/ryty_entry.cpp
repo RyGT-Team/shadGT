@@ -309,14 +309,21 @@ void DrawPrecompileProgress() {
     // import, so the steps are counted one after the other, named, and the bar stays up for as
     // long as the game is held on the splash screen: before, it reached 100% and said "Shaders
     // ready" after the translations, while thousands of pipelines were still to be compiled.
+    // FEAT-SGT-118: the compute builds that follow the translations have their own count (the
+    // translation step is still active while they run, so they come first here).
     const auto compile = Vulkan::GetPrecompileProgress();
     const auto translate = Vulkan::GetPretranslateProgress();
+    const auto compute = Vulkan::GetComputeAheadProgress();
     const bool held = Vulkan::PrecompileHoldsGame();
     static bool translated = false; // a translation step ran: the compile step is step 2 of 2
     static ProgressBarState state;
     const char* doing = "Compiling shaders";
     Vulkan::PrecompileProgress shown{1, 1, false};
-    if (translate.active) {
+    if (compute.active) {
+        translated = translated || held;
+        shown = compute;
+        doing = "Compiling shaders  -  step 1 of 2: building compute shaders";
+    } else if (translate.active) {
         translated = translated || held;
         shown = translate;
         doing = held ? "Compiling shaders  -  step 1 of 2: translating"

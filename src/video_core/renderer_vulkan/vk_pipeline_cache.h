@@ -111,6 +111,9 @@ PrecompileProgress GetPrecompileProgress();
 /// FEAT-GTS-469: progress of the manifest pre-translation (PERF-GT7-117), which runs in the
 /// background while the game does (records looked at of the manifest's records).
 PrecompileProgress GetPretranslateProgress();
+/// FEAT-SGT-118: progress of the splash's compute builds (SHADGT_PRECOMPILE_COMPUTE=1), made once
+/// the pre-translation's translations are.
+PrecompileProgress GetComputeAheadProgress();
 /// PERF-102: the game waits on the splash screen for the precompile.
 bool PrecompileHoldsGame();
 /// PERF-103: the game runs in slow motion while pipelines it needs are compiled.

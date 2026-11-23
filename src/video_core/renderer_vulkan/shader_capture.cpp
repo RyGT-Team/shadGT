@@ -312,6 +312,18 @@ bool ScanNowAndWait() {
     return g_last_scanned;
 }
 
+namespace {
+std::atomic<bool> g_hold_translations{false}; // FEAT-SGT-127
+} // namespace
+
+void HoldTranslations(bool on) {
+    g_hold_translations.store(on && Enabled(), std::memory_order_relaxed);
+}
+
+bool HoldsTranslations() {
+    return g_hold_translations.load(std::memory_order_relaxed) && !RytyRaceRunning();
+}
+
 } // namespace Vulkan::ShaderCapture
 
 #else
@@ -332,6 +344,10 @@ void Start(const std::filesystem::path&, const std::filesystem::path&, const std
     }
 }
 bool ScanNowAndWait() {
+    return false;
+}
+void HoldTranslations(bool) {}
+bool HoldsTranslations() {
     return false;
 }
 } // namespace Vulkan::ShaderCapture

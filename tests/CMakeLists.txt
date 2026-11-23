@@ -490,6 +490,12 @@ if(WIN32)
   gtest_discover_tests(shadps4_geometry_trace_test)
 endif()
 
+add_executable(shadps4_prepare_tour_test test_prepare_tour.cpp)
+target_include_directories(shadps4_prepare_tour_test PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_features(shadps4_prepare_tour_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_prepare_tour_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_prepare_tour_test)
+
 add_executable(shadps4_menu_capture_compile_guard_test menu_capture_compile_guard_test.cpp)
 target_include_directories(shadps4_menu_capture_compile_guard_test PRIVATE ${CMAKE_SOURCE_DIR})
 target_compile_features(shadps4_menu_capture_compile_guard_test PRIVATE cxx_std_23)

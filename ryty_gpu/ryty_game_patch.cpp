@@ -20,10 +20,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwctype>
+#include <filesystem>
 #include <intrin.h>
 #include <iterator>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -48,6 +50,9 @@
 #include "input/telemetry_haptics_output.h"
 #include "input/trigger_feedback.h"
 #include "ryty_gpu/ryty_dlssg.h"
+#include "common/thread.h"
+#include "ryty_gpu/prepare_tour.h"
+#include "video_core/renderer_vulkan/shader_capture.h"
 #include "core/file_format/psf.h"
 #include "common/ryty_param_sfo.h"
 #include "ryty_gpu/gt7_preset_options.h"
@@ -461,12 +466,14 @@ bool PS4_SYSV_ABI KeyValueLookupHook(void* store, const char* key, s64* value) {
     return found;
 }
 
-// Points the rel32 call at `call_rva` (which must call `target_rva`) at `hook` through a stub.
+// Points the rel32 call or tail jump at `call_rva` (which must go to `target_rva`) at `hook` through
+// a stub. A hook on a tail jump calls the target itself and returns to the caller's caller, as the
+// target would have (FEAT-SGT-127: the scene's load commands end in tail jumps).
 bool RedirectCall(u8* base, u8* stub, u64 call_rva, u64 target_rva, void* hook, const char* name) {
     u8* call = base + call_rva + kTextRvaShift;
     s32 rel = 0;
     std::memcpy(&rel, call + 1, 4);
-    if (call[0] != 0xe8 || call + 5 + rel != base + target_rva + kTextRvaShift) {
+    if ((call[0] != 0xe8 && call[0] != 0xe9) || call + 5 + rel != base + target_rva + kTextRvaShift) {
         std::fprintf(stderr, "[patch] %s: call at %#llx differs, not applied\n", name,
                      static_cast<unsigned long long>(call_rva));
         return false;
@@ -1148,6 +1155,8 @@ struct ArcadeSite {
     void (*make)(AdhocCode&, const ArcadeSite&);
     u32 local; // ctx or ctrl
     u32 after; // what follows the code once it found what it wanted
+    // What the added code needs on top of the function's own (FEAT-SGT-127 needs more statics).
+    u32 extra_stack = 8, extra_locals = 4, extra_statics = 2;
 };
 
 // if (!courseInfo_.nickName_) { <here> list = GetCourseList(); ... }
@@ -1255,10 +1264,291 @@ const ArcadeSite kArcadeSites[] = {
     {kArcadeTop, "updateCarInfo", 259, 15, 18, 16, MakeArcadeSave, 3, 0},
 };
 
+// FEAT-SGT-127: the preparation tour (SHADGT_PREPARE_SHADERS=1, GT7 1.71). A car change in a menu runs
+// the next slice. Every menu that shows a car (the dealership, Arcade, the garage) goes through the
+// common SceneFaceEventProtocol.ExecChangeCarCommand. After the menu's own car command and before
+// its completion signal, the slice's loads are queued:
+//   0. cars [0, 500) of DMSAccessor::CarDataAccessor::GetCarLabelListAll, each with its interior;
+//   1. the cars from 500 on;
+//   2. every course layout but the test ones.
+// Each car: setDefaultCarParameter(Car(code), 1000 + n), "clearEntity rygt<n % 2>", then
+// "loadLodCarWithInterior _default<1000 + n> rygt<n % 2>". That reads the race files and the
+// interior, as a race builds the player's car, and a player sees the interior of any car he drives.
+// Each layout: "clearEntity rygtc<i % 2>", then "loadCourse <nickname> rygtc<i % 2>".
+// The scene runs queued commands one at a time while its loader is busy, so when a load starts, the
+// previous car or course is whole and still in memory. The load hooks have the capture scan then
+// (ShaderCapture::ScanNowAndWait). Two entities: on 2026-11-21, eight stopped after about eight cars,
+// where a scene's car slots likely ran out.
+// A slice is chosen by marker files in /APP_DATA, written when it is queued. The scene's queue drops
+// what goes past about 1,024 commands, and a slice of n cars queues 2 n + 4. The script also writes
+// how many loads it queued (kPrepareCountFile), so the host can tell a slice that ran whole from one
+// cut short by a car change, a stalled load or a closed game; the host then drops its marker, and
+// the slice runs again. Layouts whose nickname begins with "test" are skipped: on 11-21, test1_L01
+// never finished loading.
+// Measured on an RTX 4070 PC only: 323 cars with their interior in 5.5 min, 125 layouts in 11 min.
+constexpr s32 kPrepareFirstSlot = 1000; // the menus use slots 0..3
+constexpr s32 kPrepareSlice = 500;
+constexpr s32 kPrepareEntities = 2;
+constexpr const char* kPrepareMarkers[] = {"/APP_DATA/rygt_prepare_0.done", "/APP_DATA/rygt_prepare_1.done",
+                                           "/APP_DATA/rygt_prepare_2.done"};
+constexpr const char* kPrepareCountFile = "/APP_DATA/rygt_prepare.count";
+
+void PrepareEntity(AdhocCode& code, u32 loads) { // " rygt" + n % 2, left on the stack for a push
+    code.Text(" rygt");
+    code.Eval({"rygt_tour_n"}, loads);
+    code.Int(kPrepareEntities);
+    code.Binary("__mod__");
+}
+
+void PrepareCommand(AdhocCode& code, u32 sf, std::string_view text) {
+    code.Eval({"sf"}, sf);
+    code.Get("execCommand");
+    code.Text(text);
+    code.Call(1);
+    code.Op(54);
+}
+
+// pdistd::WriteFile(kPrepareCountFile, "" + <local>): how many loads the slice queued.
+void PrepareCount(AdhocCode& code, u32 write, std::string_view name, u32 local) {
+    code.Eval({"pdistd", "WriteFile", "pdistd::WriteFile"}, write);
+    code.Text(kPrepareCountFile);
+    code.Eval({name}, local);
+    code.Op(30); // STRING_PUSH 1: the number as text
+    code.U32(1);
+    code.Call(2);
+    code.Op(54);
+}
+
+// Cars [from, from + 500). Locals: the iterator, the label index, the loads queued, the car parameter.
+// Statics: GetCarLabelListAll, Car(UInt), GetCarCodeByLabel; `write` is the tour's pdistd::WriteFile.
+void MakePrepareCars(AdhocCode& code, const ArcadeSite& site, u32 from, u32 write) {
+    const u32 sf = site.local;
+    const u32 it = site.locals;
+    const u32 index = site.locals + 1; // labels
+    const u32 loads = site.locals + 2; // loads queued
+    const u32 cp = site.locals + 3;
+    const u32 s = site.statics;
+    PrepareCommand(code, sf, "setScreenColorScaleTarget 1 0.5");
+    code.Eval({"DMSAccessor", "CarDataAccessor", "GetCarLabelListAll",
+               "DMSAccessor::CarDataAccessor::GetCarLabelListAll"},
+              s);
+    code.Call(0);
+    code.Get("iterator");
+    code.Store("rygt_tour_in", it);
+    code.Int(0);
+    code.Store("rygt_tour_i", index);
+    code.Int(0);
+    code.Store("rygt_tour_n", loads);
+    const u32 loop = code.Here();
+    code.Eval({"rygt_tour_in"}, it);
+    code.Get("fetch_next");
+    std::vector<size_t> done{code.Jump(15)};
+    // i < from + slice; the labels before from are passed
+    code.Eval({"rygt_tour_i"}, index);
+    code.Eval({"rygt_tour_from"}, from);
+    code.Int(kPrepareSlice);
+    code.Binary("__add__");
+    code.Binary("__lt__");
+    done.push_back(code.Jump(15));
+    code.Eval({"rygt_tour_i"}, index);
+    code.Eval({"rygt_tour_from"}, from);
+    code.Binary("__lt__");
+    const size_t load = code.Jump(15);
+    const size_t skip = code.Jump(13);
+    code.Land(load, code.Here());
+    // cp = GTCarParameter::Car(GetCarCodeByLabel(label))
+    code.Eval({"GTCarParameter", "Car(UInt)", "GTCarParameter::Car(UInt)"}, s + 1);
+    code.Eval({"DMSAccessor", "CarDataAccessor", "GetCarCodeByLabel",
+               "DMSAccessor::CarDataAccessor::GetCarCodeByLabel"},
+              s + 2);
+    code.Eval({"rygt_tour_in"}, it);
+    code.Op(8);
+    code.Call(1);
+    code.Call(1);
+    code.Store("rygt_tour_cp", cp);
+    // sf.setDefaultCarParameter(cp, 1000 + n)
+    code.Eval({"sf"}, sf);
+    code.Get("setDefaultCarParameter");
+    code.Eval({"rygt_tour_cp"}, cp);
+    code.Int(kPrepareFirstSlot);
+    code.Eval({"rygt_tour_n"}, loads);
+    code.Binary("__add__");
+    code.Call(2);
+    code.Op(54);
+    // sf.execCommand("clearEntity rygt" + n % 2)
+    code.Eval({"sf"}, sf);
+    code.Get("execCommand");
+    code.Text("clearEntity");
+    PrepareEntity(code, loads);
+    code.Op(30);
+    code.U32(3);
+    code.Call(1);
+    code.Op(54);
+    // sf.execCommand("loadLodCarWithInterior _default" + (1000 + n) + " rygt" + n % 2)
+    code.Eval({"sf"}, sf);
+    code.Get("execCommand");
+    code.Text("loadLodCarWithInterior _default");
+    code.Int(kPrepareFirstSlot);
+    code.Eval({"rygt_tour_n"}, loads);
+    code.Binary("__add__");
+    PrepareEntity(code, loads);
+    code.Op(30);
+    code.U32(4);
+    code.Call(1);
+    code.Op(54);
+    code.Eval({"rygt_tour_n"}, loads);
+    code.Int(1);
+    code.Binary("__add__");
+    code.Store("rygt_tour_n", loads);
+    code.Land(skip, code.Here());
+    code.Eval({"rygt_tour_i"}, index);
+    code.Int(1);
+    code.Binary("__add__");
+    code.Store("rygt_tour_i", index);
+    code.Land(code.Jump(13), loop);
+    for (const size_t jump : done) {
+        code.Land(jump, code.Here());
+    }
+    for (int k = 0; k < kPrepareEntities; ++k) {
+        PrepareCommand(code, sf, fmt::format("clearEntity rygt{}", k));
+    }
+    PrepareCount(code, write, "rygt_tour_n", loads);
+}
+
+// Every layout but the test ones. Locals: the iterator, the nickname, the loads queued, the layout
+// index. Statics: GetCourseLayoutIDListAll, GetCourseLayoutNickName, pdistd::WriteFile.
+void MakePrepareCourses(AdhocCode& code, const ArcadeSite& site) {
+    const u32 sf = site.local;
+    const u32 it = site.locals;
+    const u32 nick = site.locals + 1;
+    const u32 queued = site.locals + 2;
+    const u32 index = site.locals + 3;
+    const u32 s = site.statics;
+    PrepareCommand(code, sf, "setScreenColorScaleTarget 1 0.5");
+    code.Int(0);
+    code.Store("rygt_queued", queued);
+    code.Int(0);
+    code.Store("rygt_ci", index);
+    code.Eval({"DMSAccessor", "CourseDataAccessor", "GetCourseLayoutIDListAll",
+               "DMSAccessor::CourseDataAccessor::GetCourseLayoutIDListAll"},
+              s);
+    code.Call(0);
+    code.Get("iterator");
+    code.Store("rygt_in", it);
+    const u32 loop = code.Here();
+    code.Eval({"rygt_in"}, it);
+    code.Get("fetch_next");
+    const size_t done = code.Jump(15);
+    code.Eval({"DMSAccessor", "CourseDataAccessor", "GetCourseLayoutNickName",
+               "DMSAccessor::CourseDataAccessor::GetCourseLayoutNickName"},
+              s + 1);
+    code.Eval({"rygt_in"}, it);
+    code.Op(8);
+    code.Call(1);
+    code.Store("rygt_nick", nick);
+    // if (nick.beginWith("test")) skip it
+    code.Eval({"rygt_nick"}, nick);
+    code.Get("beginWith");
+    code.Text("test");
+    code.Call(1);
+    const size_t load = code.Jump(15);
+    const size_t skip = code.Jump(13);
+    code.Land(load, code.Here());
+    // sf.execCommand("clearEntity rygtc" + i % 2); sf.execCommand("loadCourse " + nick + " rygtc" + i % 2)
+    code.Eval({"sf"}, sf);
+    code.Get("execCommand");
+    code.Text("clearEntity rygtc");
+    code.Eval({"rygt_ci"}, index);
+    code.Int(2);
+    code.Binary("__mod__");
+    code.Op(30);
+    code.U32(2);
+    code.Call(1);
+    code.Op(54);
+    code.Eval({"sf"}, sf);
+    code.Get("execCommand");
+    code.Text("loadCourse ");
+    code.Eval({"rygt_nick"}, nick);
+    code.Text(" rygtc");
+    code.Eval({"rygt_ci"}, index);
+    code.Int(2);
+    code.Binary("__mod__");
+    code.Op(30);
+    code.U32(4);
+    code.Call(1);
+    code.Op(54);
+    code.Eval({"rygt_queued"}, queued);
+    code.Int(1);
+    code.Binary("__add__");
+    code.Store("rygt_queued", queued);
+    code.Land(skip, code.Here());
+    code.Eval({"rygt_ci"}, index);
+    code.Int(1);
+    code.Binary("__add__");
+    code.Store("rygt_ci", index);
+    code.Land(code.Jump(13), loop);
+    code.Land(done, code.Here());
+    PrepareCount(code, s + 2, "rygt_queued", queued);
+}
+
+// The slice chooser: if (!pdistd::Exist(marker k)) { pdistd::WriteFile(marker k, "1"); slice k }.
+// Locals: the cars' 4, the slice's first label, the courses' 4. Statics: the cars' 3, Exist,
+// WriteFile, the courses' 3.
+void MakePrepareTour(AdhocCode& code, const ArcadeSite& site) {
+    constexpr u32 car_statics = 3;
+    const u32 exist = site.statics + car_statics;
+    const u32 write = exist + 1;
+    const u32 from = site.locals + 4;
+    std::vector<size_t> to_cars, to_end;
+    size_t to_courses = 0;
+    for (size_t k = 0; k < std::size(kPrepareMarkers); ++k) {
+        code.Eval({"pdistd", "Exist", "pdistd::Exist"}, exist);
+        code.Text(kPrepareMarkers[k]);
+        code.Call(1);
+        const size_t next = code.Jump(14); // JUMP_IF_TRUE: this slice is taken, try the next one
+        code.Eval({"pdistd", "WriteFile", "pdistd::WriteFile"}, write);
+        code.Text(kPrepareMarkers[k]);
+        code.Text("1");
+        code.Call(2);
+        code.Op(54);
+        if (k + 1 < std::size(kPrepareMarkers)) {
+            code.Int(kPrepareSlice * s32(k));
+            code.Store("rygt_tour_from", from);
+            to_cars.push_back(code.Jump(13));
+        } else {
+            to_courses = code.Jump(13);
+        }
+        code.Land(next, code.Here());
+    }
+    to_end.push_back(code.Jump(13)); // every slice taken: nothing more
+    for (const size_t jump : to_cars) {
+        code.Land(jump, code.Here());
+    }
+    MakePrepareCars(code, site, from, write);
+    to_end.push_back(code.Jump(13));
+    code.Land(to_courses, code.Here());
+    ArcadeSite courses = site;
+    courses.locals = site.locals + 5;
+    courses.statics = site.statics + car_statics + 2;
+    MakePrepareCourses(code, courses);
+    for (const size_t jump : to_end) {
+        code.Land(jump, code.Here());
+    }
+}
+
+// ExecChangeCarCommand(changeCarCommand): sf = Widget(); ...; sf.execCommand(changeCarCommand);
+// <here> sf.execCommand("sendSignal 0 CHANGE_CAR_COMPLATED"). Locals self, changeCarCommand,
+// sf_306_19, sf; one static (System::OptionalCast).
+const ArcadeSite kPrepareTourSites[] = {
+    {"gt7/menu/common_events/SceneFaceEvent.swift", "ExecChangeCarCommand", 33, 4, 1, 26, MakePrepareTour,
+     3, 0, 8, 9, 3 + 2 + 3},
+};
+
 // Copies a script file, changing the symbol indices and jumps that the added code moves.
 class ArcadeScriptPatch {
 public:
-    explicit ArcadeScriptPatch(const std::vector<u8>& in) : in_{in} {}
+    ArcadeScriptPatch(const std::vector<u8>& in, std::span<const ArcadeSite> sites)
+        : in_{in}, sites_{sites} {}
 
     // False if the file isn't the one with Arcade or anything differs.
     bool Run(std::vector<u8>& out) {
@@ -1272,7 +1562,8 @@ public:
             map_.clear();
             mapped_ = 0;
             root_ = RootSource();
-            write_ = root_ == kArcadeControl || root_ == kArcadeTop;
+            write_ = std::any_of(sites_.begin(), sites_.end(),
+                                 [this](const ArcadeSite& s) { return s.root == root_; });
             Frame({}, true);
             if (!ok_ || pos_ + 16 > in_.size()) {
                 return false;
@@ -1283,7 +1574,7 @@ public:
             out_.insert(out_.end(), in_.begin() + pos_, in_.begin() + pos_ + 16);
             pos_ += 16;
         }
-        if (!ok_ || placed_ != std::size(kArcadeSites)) {
+        if (!ok_ || placed_ != sites_.size()) {
             return false;
         }
         out.swap(out_);
@@ -1428,7 +1719,7 @@ private:
         }
         const ArcadeSite* site = nullptr;
         if (write_ && !root) {
-            for (const auto& candidate : kArcadeSites) {
+            for (const auto& candidate : sites_) {
                 if (candidate.root == root_ && candidate.method == method &&
                     candidate.count == count && candidate.locals == locals &&
                     candidate.statics == statics) {
@@ -1442,9 +1733,9 @@ private:
             site->make(code, *site);
             code.Finish();
         }
-        Out32(stack + (site ? 8 : 0));
-        Out32(locals + (site ? 4 : 0));
-        Out32(statics + (site ? 2 : 0));
+        Out32(stack + (site ? site->extra_stack : 0));
+        Out32(locals + (site ? site->extra_locals : 0));
+        Out32(statics + (site ? site->extra_statics : 0));
         Out32(count + code.Count());
         for (u32 i = 0; i < count && ok_; ++i) {
             if (site && i == site->at) {
@@ -1507,6 +1798,7 @@ private:
     }
 
     const std::vector<u8>& in_;
+    std::span<const ArcadeSite> sites_;
     std::vector<u8> out_;
     size_t pos_{};
     bool ok_{true};
@@ -1527,12 +1819,17 @@ struct ScriptCopy {
     bool loaded;
 };
 bool g_arcade_memory = false;
+bool g_prepare_tour = false; // FEAT-SGT-127: on once its load hooks are in (InstallPrepareTour)
 std::vector<ScriptCopy> g_script_copies;
+
+bool AnyScriptPatch() {
+    return g_arcade_memory || g_prepare_tour;
+}
 
 void PS4_SYSV_ABI MakeScriptStreamHook(void** out, void* in, void* iv) {
     g_make_script_stream(out, in, iv);
     std::scoped_lock lock{g_script_dump_mutex};
-    if (g_arcade_memory) {
+    if (AnyScriptPatch()) {
         const auto copy = std::find_if(g_script_copies.begin(), g_script_copies.end(),
                                        [out](const auto& c) { return c.stream == *out; });
         if (copy != g_script_copies.end()) {
@@ -1574,14 +1871,31 @@ u64 ReadScriptCopy(ScriptCopy& copy, u8* to, u64 size) {
                 break;
             }
         }
-        ArcadeScriptPatch patch{data};
-        std::vector<u8> changed;
-        if (patch.Run(changed)) {
-            std::fprintf(stderr, "[patch] FIX-GT7-060 Arcade remembers its choices (%zu bytes added)\n",
-                         changed.size() - data.size());
-            data.swap(changed);
-        } else if (patch.Placed() != 0) {
-            std::fprintf(stderr, "[patch] FIX-GT7-060: Arcade's scripts differ, not applied\n");
+        if (g_arcade_memory) {
+            ArcadeScriptPatch patch{data, kArcadeSites};
+            std::vector<u8> changed;
+            if (patch.Run(changed)) {
+                std::fprintf(stderr,
+                             "[patch] FIX-GT7-060 Arcade remembers its choices (%zu bytes added)\n",
+                             changed.size() - data.size());
+                data.swap(changed);
+            } else if (patch.Placed() != 0) {
+                std::fprintf(stderr, "[patch] FIX-GT7-060: Arcade's scripts differ, not applied\n");
+            }
+        }
+        if (g_prepare_tour) {
+            ArcadeScriptPatch patch{data, kPrepareTourSites};
+            std::vector<u8> changed;
+            if (patch.Run(changed)) {
+                std::fprintf(stderr,
+                             "[patch] FEAT-SGT-127 preparation tour added to the menus' car change "
+                             "(%zu bytes added): change car in a menu to run its next part\n",
+                             changed.size() - data.size());
+                data.swap(changed);
+            } else if (patch.Placed() != 0) {
+                std::fprintf(stderr, "[patch] FEAT-SGT-127: the menus' car change differs, no "
+                                     "preparation tour\n");
+            }
         }
         copy.data.swap(data);
     }
@@ -1596,7 +1910,7 @@ u64 ReadScriptCopy(ScriptCopy& copy, u8* to, u64 size) {
 u64 PS4_SYSV_ABI ScriptStreamReadHook(void* stream, u8* to, u64 size) {
     u64 read = 0;
     bool from_copy = false;
-    if (g_arcade_memory) {
+    if (AnyScriptPatch()) {
         std::scoped_lock lock{g_script_dump_mutex};
         const auto copy = std::find_if(g_script_copies.begin(), g_script_copies.end(),
                                        [stream](const auto& c) { return c.stream == stream; });
@@ -1635,13 +1949,17 @@ void InstallGt7ScriptDump(u8* base) {
         return;
     }
     g_arcade_memory = !(memory && memory[0] == '0');
-    if (!dump && !g_arcade_memory) {
+    // FEAT-SGT-127: wanted with the preparation's capture; InstallPrepareTour keeps it only if its
+    // load hooks go in.
+    g_prepare_tour = Vulkan::ShaderCapture::Enabled();
+    if (!dump && !AnyScriptPatch()) {
         return;
     }
     u8* stubs = AllocNear(base);
     if (!stubs) {
         std::fprintf(stderr, "[patch] DIAG-GT7-043: no memory near the game's code for the hooks\n");
         g_arcade_memory = false;
+        g_prepare_tour = false;
         return;
     }
     if (dump) {
@@ -1675,6 +1993,225 @@ void InstallGt7ScriptDump(u8* base) {
     VirtualProtect(read, kMoved, old_protect, &ignored);
     FlushInstructionCache(GetCurrentProcess(), read, kMoved);
     std::fprintf(stderr, "[patch] DIAG-GT7-043 script reads applied\n");
+}
+
+// FEAT-SGT-127: the host's side of the preparation tour. Each tour load goes through a hook on the
+// scene command's tail jump to the car command (eboot 1.71: loadLodCar 0x21c1457,
+// loadLodCarWithInterior 0x21c146a, loadInteriorWithLodCar 0x21c147d, to 0x208d0d0) or on
+// loadCourse's jump to its handler (0x21bd872 to 0x21bd880). Before the load, the capture scans,
+// and the load waits for that scan: the previous car or course is then whole and in memory.
+// A slice opens at a load that comes after a newer marker than the last slice's, so the menus' own
+// loads never open one. While it is open, nothing new is translated (ShaderCapture::
+// HoldTranslations). It ends when no load has started for its quiet time (PrepareTour::
+// QuietSeconds). It ran whole if every load the script queued started; then two beeps say so. A
+// slice cut short (a car change queued another, a load stalled, the game closed: the file
+// rygt_prepare.running is left) has its marker dropped, and it runs again at a later car change.
+constexpr u64 kGt7LoadLodCarJump = 0x21c1457;
+constexpr u64 kGt7LoadLodCarWithInteriorJump = 0x21c146a;
+constexpr u64 kGt7LoadInteriorWithLodCarJump = 0x21c147d;
+constexpr u64 kGt7CarCommand = 0x208d0d0; // void (scene, args, model type, interior, x)
+constexpr u64 kGt7LoadCourseJump = 0x21bd872;
+constexpr u64 kGt7LoadCourseHandler = 0x21bd880; // void (scene, args, layout)
+using CarCommandFn = void(PS4_SYSV_ABI*)(void*, void*, u32, u8, u8);
+using CourseCommandFn = void(PS4_SYSV_ABI*)(void*, void*, s32);
+CarCommandFn g_car_command = nullptr;
+CourseCommandFn g_course_command = nullptr;
+
+struct PrepareMarker {
+    std::filesystem::path path;
+    std::filesystem::file_time_type written{};
+    size_t slice = 0;
+};
+
+struct PrepareState {
+    std::mutex mutex;
+    PrepareTour::Slice slice;
+    std::optional<PrepareMarker> marker;                   // the open slice's
+    std::filesystem::file_time_type last_marker_written{}; // the latest slice's, open or closed
+    const std::chrono::steady_clock::time_point epoch = std::chrono::steady_clock::now();
+};
+PrepareState g_prepare;
+
+double PrepareNow() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_prepare.epoch).count();
+}
+
+// The game's /APP_DATA: under the savedata of this game, or beside GT7.exe (gts_photo_export.cpp).
+std::vector<std::filesystem::path> PrepareFolders() {
+    wchar_t exe[MAX_PATH];
+    const DWORD length = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) {
+        return {};
+    }
+    const auto root = std::filesystem::path{exe}.parent_path();
+    const std::string serial{Common::CurrentGameSerial()};
+    return {root / L"user" / L"savedata" / serial / L"download0" / L"APP_DATA", root / L"download0" / L"APP_DATA"};
+}
+
+std::filesystem::path PrepareFile(const std::filesystem::path& folder, const char* game_path) {
+    return folder / std::filesystem::path{game_path}.filename();
+}
+
+std::optional<PrepareMarker> NewestPrepareMarker() {
+    std::optional<PrepareMarker> newest;
+    for (const auto& folder : PrepareFolders()) {
+        for (size_t k = 0; k < std::size(kPrepareMarkers); ++k) {
+            const auto path = PrepareFile(folder, kPrepareMarkers[k]);
+            std::error_code ec;
+            const auto written = std::filesystem::last_write_time(path, ec);
+            if (!ec && (!newest || written > newest->written)) {
+                newest = PrepareMarker{path, written, k};
+            }
+        }
+    }
+    return newest;
+}
+
+std::optional<u32> ReadPrepareCount(const std::filesystem::path& folder) {
+    std::FILE* f = _wfopen(PrepareFile(folder, kPrepareCountFile).c_str(), L"rb");
+    if (!f) {
+        return std::nullopt;
+    }
+    unsigned count = 0;
+    const bool read = std::fscanf(f, "%u", &count) == 1;
+    std::fclose(f);
+    return read ? std::optional<u32>{count} : std::nullopt;
+}
+
+const char* PrepareSliceName(size_t k) {
+    return k + 1 < std::size(kPrepareMarkers) ? "cars" : "courses";
+}
+
+// Under g_prepare.mutex. `cut`: another slice was queued meanwhile, this one can't have run whole.
+void EndPrepareSlice(bool cut) {
+    auto& state = g_prepare;
+    const PrepareMarker marker = *state.marker;
+    const auto folder = marker.path.parent_path();
+    const auto queued = cut ? std::nullopt : ReadPrepareCount(folder);
+    std::error_code ec;
+    std::filesystem::remove(folder / L"rygt_prepare.running", ec);
+    if (PrepareTour::RanWhole(state.slice.loads, queued)) {
+        const bool last = marker.slice + 1 == std::size(kPrepareMarkers);
+        std::fprintf(stderr, "[prepare] FEAT-SGT-127: part %zu of %zu (%s) done, %u loads%s\n",
+                     marker.slice + 1, std::size(kPrepareMarkers), PrepareSliceName(marker.slice),
+                     state.slice.loads,
+                     last ? ": the preparation is over, close the game" : ": change car for the next part");
+        MessageBeep(MB_ICONEXCLAMATION);
+        Sleep(500);
+        MessageBeep(MB_ICONEXCLAMATION);
+    } else {
+        std::filesystem::remove(marker.path, ec);
+        std::fprintf(stderr, "[prepare] FEAT-SGT-127: part %zu (%s) stopped after %u loads of %s%s: it runs "
+                     "again at a car change\n",
+                     marker.slice + 1, PrepareSliceName(marker.slice), state.slice.loads,
+                     queued ? std::to_string(*queued).c_str() : "?", cut ? " (another part was queued)" : "");
+    }
+    state.slice.open = false;
+    state.marker.reset();
+    Vulkan::ShaderCapture::HoldTranslations(false);
+}
+
+void PrepareLoad() {
+    if (!g_prepare_tour) {
+        return;
+    }
+    bool scan = false;
+    {
+        std::scoped_lock lock{g_prepare.mutex};
+        auto& state = g_prepare;
+        const auto newest = NewestPrepareMarker();
+        if (state.slice.open && newest && newest->written != state.marker->written) {
+            EndPrepareSlice(true);
+        }
+        if (!state.slice.open && (!newest || newest->written <= state.last_marker_written)) {
+            return; // a menu's own load, or a load after the slice ended
+        }
+        if (PrepareTour::NoteLoad(state.slice, PrepareNow())) {
+            state.marker = newest;
+            state.last_marker_written = newest->written;
+            if (std::FILE* f = _wfopen((newest->path.parent_path() / L"rygt_prepare.running").c_str(), L"wb")) {
+                std::fclose(f);
+            }
+            Vulkan::ShaderCapture::HoldTranslations(true);
+            std::fprintf(stderr, "[prepare] FEAT-SGT-127: part %zu of %zu (%s) started\n", newest->slice + 1,
+                         std::size(kPrepareMarkers), PrepareSliceName(newest->slice));
+        } else {
+            scan = true;
+            if (state.slice.loads % 50 == 0) {
+                std::fprintf(stderr, "[prepare] FEAT-SGT-127: %u loads\n", state.slice.loads);
+            }
+        }
+    }
+    if (scan) {
+        Vulkan::ShaderCapture::ScanNowAndWait(); // the slice's previous car or course, whole and in memory
+    }
+}
+
+void PS4_SYSV_ABI PrepareCarCommand(void* scene, void* args, u32 type, u8 interior, u8 x) {
+    PrepareLoad();
+    g_car_command(scene, args, type, interior, x);
+}
+
+void PS4_SYSV_ABI PrepareCourseCommand(void* scene, void* args, s32 layout) {
+    PrepareLoad();
+    g_course_command(scene, args, layout);
+}
+
+void PrepareWatch() {
+    Common::SetCurrentThreadName("shadGT:PrepareTour");
+    for (;;) {
+        Sleep(1000);
+        std::scoped_lock lock{g_prepare.mutex};
+        if (PrepareTour::WentQuiet(g_prepare.slice, PrepareNow())) {
+            EndPrepareSlice(false);
+        }
+    }
+}
+
+// After InstallGt7ScriptDump, before the game reads its scripts: the tour stays on only if every
+// load hook went in, or it would run with no scan and no hold.
+void InstallPrepareTour(u8* base) {
+    if (!g_prepare_tour) {
+        return;
+    }
+    g_prepare_tour = false;
+    u8* stub = AllocNear(base);
+    if (!stub) {
+        std::fprintf(stderr, "[patch] FEAT-SGT-127: no memory near the game's code, no preparation tour\n");
+        return;
+    }
+    g_car_command = reinterpret_cast<CarCommandFn>(base + kGt7CarCommand + kTextRvaShift);
+    g_course_command = reinterpret_cast<CourseCommandFn>(base + kGt7LoadCourseHandler + kTextRvaShift);
+    const void* car = reinterpret_cast<void*>(&PrepareCarCommand);
+    const void* course = reinterpret_cast<void*>(&PrepareCourseCommand);
+    // One 16-byte trampoline each, in the same page.
+    const bool hooked =
+        RedirectCall(base, stub, kGt7LoadLodCarJump, kGt7CarCommand, const_cast<void*>(car),
+                     "FEAT-SGT-127 loadLodCar") &&
+        RedirectCall(base, stub + 16, kGt7LoadLodCarWithInteriorJump, kGt7CarCommand, const_cast<void*>(car),
+                     "FEAT-SGT-127 loadLodCarWithInterior") &&
+        RedirectCall(base, stub + 32, kGt7LoadInteriorWithLodCarJump, kGt7CarCommand, const_cast<void*>(car),
+                     "FEAT-SGT-127 loadInteriorWithLodCar") &&
+        RedirectCall(base, stub + 48, kGt7LoadCourseJump, kGt7LoadCourseHandler, const_cast<void*>(course),
+                     "FEAT-SGT-127 loadCourse");
+    if (!hooked) {
+        std::fprintf(stderr, "[patch] FEAT-SGT-127: the scene's load commands differ, no preparation tour\n");
+        return;
+    }
+    // A slice the last game left open (closed or crashed in it) runs again.
+    for (const auto& folder : PrepareFolders()) {
+        std::error_code ec;
+        if (std::filesystem::exists(folder / L"rygt_prepare.running", ec)) {
+            std::filesystem::remove(folder / L"rygt_prepare.running", ec);
+            if (const auto newest = NewestPrepareMarker()) {
+                std::filesystem::remove(newest->path, ec);
+                std::fprintf(stderr, "[patch] FEAT-SGT-127: part %zu (%s) did not finish last time, it runs "
+                             "again\n", newest->slice + 1, PrepareSliceName(newest->slice));
+            }
+        }
+    }
+    g_prepare_tour = true;
+    std::thread(PrepareWatch).detach();
 }
 
 // GAME-002: GT7 can raise the race flag (RytyGtsInRace, FIX-110) as GT Sport does, so that both
@@ -4327,6 +4864,7 @@ void RytyApplyGamePatches() {
     InstallLewisChallenge(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallScriptPatches(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallGt7ScriptDump(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // DIAG-GT7-043
+    InstallPrepareTour(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));   // FEAT-SGT-127
     InstallGt7RaceSignal(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // GAME-002
     InstallGtsRaceStartSignal(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // GAME-006
     InstallGt7CpuOcclusion(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // GAME-003

@@ -30,6 +30,13 @@ void Start(const std::filesystem::path& programs_dir, const std::filesystem::pat
 /// once (false) when the capture is off. Never scans during a race.
 bool ScanNowAndWait();
 
+/// FEAT-SGT-127: set while a slice of the preparation tour runs. Nothing new is translated then, and
+/// a draw that would need it is skipped: the tour stores no permutation and builds no menu pipeline,
+/// so its frames stay short and the SRT walker storage is not filled by hundreds of cars. Never
+/// holds during a race, nor without SHADGT_PREPARE_SHADERS.
+void HoldTranslations(bool on);
+bool HoldsTranslations();
+
 /// A program's code starts 256-byte aligned with s_mov_b32 vcc_hi (0xBEEB03FF), whose operand puts its
 /// footer at start + (operand + 1) * 8 bytes (AmdGpu::SearchBinaryInfo). `block` holds the words from
 /// `low` (256-byte aligned) to at least 8 bytes past the last 256-byte boundary at or below `footer`.

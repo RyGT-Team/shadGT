@@ -9365,6 +9365,7 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
     // FIX-SGT-094: first, before translate_jobs gets an entry for this program (the queue cap
     // below walks the whole map).
     if (!WalkerTranslationAllowed(params.hash, hw_stage)) return false;
+    if (ShaderCapture::HoldsTranslations()) return false; // FEAT-SGT-127: a preparation tour runs
     auto& jobs = translate_jobs[params.hash];
     const auto now = std::chrono::steady_clock::now();
     std::erase_if(jobs, [&](const auto& job) {
@@ -10597,6 +10598,11 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         // queued for it, so it sets no deferred_miss: with one, the key builder looked each such
         // draw up again up to 8 times, with a read-ahead (094b's race at the wall: 13.5 fps).
         if (!WalkerTranslationAllowed(params.hash, hw_stage)) {
+            return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
+        }
+        // FEAT-SGT-127: while a preparation tour runs, nothing new is translated, so nothing is
+        // stored and no menu pipeline is built for what it loads; the draw is skipped.
+        if (ShaderCapture::HoldsTranslations()) {
             return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
         }
         const bool unlocked = t_required_lookup_lock && UnlockedShadersEnabled() && !read_ahead &&

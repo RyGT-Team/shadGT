@@ -38,6 +38,9 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 bool WriteStoredGraphicsPipeline(const std::filesystem::path& file, const GraphicsPipelineKey& key,
                                  GraphicsPipeline::SerializationSupport& sdata);
 bool PeekShaderMeta(std::vector<u8>&& blob, u64& pgm_hash, size_t& perm_idx);
+/// FIX-SGT-119: a stored permutation's specialization as LoadShaderMeta reads it, without its
+/// shader info (nothing registered: any thread). `spec.info` is left as the caller set it.
+bool PeekShaderSpec(std::vector<u8>&& blob, Shader::StageSpecialization& spec, size_t& perm_idx);
 /// PERF-038: a stored graphics pipeline of the current key version (others are skipped).
 bool LoadStoredGraphicsPipeline(std::vector<u8>&& blob, GraphicsPipelineKey& key,
                                 GraphicsPipeline::SerializationSupport& sdata);

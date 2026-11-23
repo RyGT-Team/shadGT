@@ -2545,6 +2545,11 @@ bool RytyHudSpread() {
 RytySceneExtent RytySceneSize() {
     static const RytySceneExtent size = [] {
         RytySceneExtent result{};
+        // FEAT-GT7-194: GT7 keeps its 1080p targets and scales its own scene viewports
+        // (InstallGt7SceneScale), so no target here is the scene's size.
+        if (Common::IsGt7()) {
+            return result;
+        }
         const char* viewport = std::getenv("SHADGT_EXPERIMENTAL_SCENE_VIEWPORT");
         if (viewport && std::strcmp(viewport, "1") == 0) {
             const char* w = std::getenv("SHADGT_SCENE_WIDTH");
@@ -3316,7 +3321,84 @@ void InstallSceneHistoryOrigins(u8* base) {
     if (!Apply(base, {y_rva, {original_y.begin(),original_y.end()}, y, "scene history Y origin"}))
         Apply(base, {x_rva, x, {original_x.begin(),original_x.end()}, "restore history X origin"});
 }
+// FEAT-GT7-194: GT7's scene render scale. GT7 has its own: a render settings object made once
+// (exe 0x27a2990, kept at 0x6415300) whose float at +0x28 (1.0, never changed by the game) the
+// scene passes read (exe 0x1eef329, 0x20aad4f, 0x371a6e9) and hand to the scene viewport setup
+// (0x27128c0, GT Sport's 0x18d2cb0 with more arguments) as its X and Y scale. The scene is then
+// drawn into that part of the 1080p targets and the game's own passes (TAA, history, the
+// composition) read it from there, so the targets keep their size and nothing else is patched.
+// One scale for both axes: SHADGT_SCENE_HEIGHT / 1080 (the width must be 16:9 of it).
+namespace Gt7SceneScale {
+constexpr u64 kSettingsMake = 0x27a2990; // exe RVA
+constexpr u64 kSettingsSlot = 0x6415300; // exe RVA of the pointer the maker stores
+constexpr u8 kMakePrologue[]{0x55, 0x48, 0x89, 0xe5, 0x53, 0x50}; // push rbp; mov rbp,rsp; push rbx; push rax
+constexpr u8 kMakeStore[]{0x48, 0x89, 0x1d, 0x37, 0x29, 0xc7, 0x03}; // 0x27a29c2: mov [rip+..], rbx
+constexpr u8 kScaleRead[]{0xc5, 0xfa, 0x10, 0x40, 0x28};                // vmovss xmm0, [rax+0x28]
+using MakeFn = void(PS4_SYSV_ABI*)();
+MakeFn g_make{};
+u8* g_base{};
+float g_scale = 1.0f;
+
+void PS4_SYSV_ABI Make() {
+    g_make();
+    u64 settings{};
+    if (Core::RytyMemory::GuardedCopy(&settings, g_base + kSettingsSlot, sizeof(settings)) &&
+        settings) {
+        float original{};
+        auto* field = reinterpret_cast<float*>(settings + 0x28);
+        if (Core::RytyMemory::GuardedCopy(&original, field, sizeof(original)) && original == 1.0f) {
+            *field = g_scale;
+            std::fprintf(stderr, "[patch] FEAT-GT7-194 scene render scale %.4f set\n", g_scale);
+            return;
+        }
+        std::fprintf(stderr, "[patch] FEAT-GT7-194 scene scale field is %f, not 1; left as it is\n",
+                     original);
+    }
+}
+
+void Install(u8* base) {
+    const char* enabled = std::getenv("SHADGT_EXPERIMENTAL_SCENE_VIEWPORT");
+    if (!enabled || std::strcmp(enabled, "1") != 0) {
+        return;
+    }
+    const char* w = std::getenv("SHADGT_SCENE_WIDTH");
+    const char* h = std::getenv("SHADGT_SCENE_HEIGHT");
+    const u32 width = w ? u32(std::strtoul(w, nullptr, 10)) : 960u;
+    const u32 height = h ? u32(std::strtoul(h, nullptr, 10)) : 540u;
+    if (height < 180 || height >= 1080 || width < 320 || width >= 1920 ||
+        std::abs(s64(width) * 9 - s64(height) * 16) > 16 * 9) {
+        std::fprintf(stderr, "[patch] FEAT-GT7-194: scene %ux%u is not a 16:9 size from 320x180 to "
+                             "below 1920x1080; GT7 renders its scene at 1920x1080\n", width, height);
+        return;
+    }
+    const auto matches = [&](u64 rva, std::span<const u8> expected) {
+        return std::memcmp(base + rva, expected.data(), expected.size()) == 0;
+    };
+    if (!matches(kSettingsMake, kMakePrologue) || !matches(0x27a29c2, kMakeStore) ||
+        !matches(0x1eef329, kScaleRead) || !matches(0x20aad4f, kScaleRead) ||
+        !matches(0x371a6e9, kScaleRead)) {
+        std::fprintf(stderr, "[patch] FEAT-GT7-194: render settings code differs (another GT7 "
+                             "version); scene render scale not applied\n");
+        return;
+    }
+    g_base = base;
+    g_scale = float(height) / 1080.0f;
+    Native::NearCode code{base};
+    g_make = reinterpret_cast<MakeFn>(Native::HookEntry(
+        code, base, kSettingsMake - Native::kEbootToExe, kMakePrologue,
+        reinterpret_cast<void*>(&Make), "FEAT-GT7-194 render settings"));
+    if (g_make) {
+        std::fprintf(stderr, "[patch] FEAT-GT7-194 GT7 scene %ux%u (scale %.4f), output and UI "
+                             "1920x1080\n", u32(std::lround(1920 * g_scale)), height, g_scale);
+    }
+}
+} // namespace Gt7SceneScale
+
 void InstallExperimentalSceneViewport(u8* base) {
+    if (Common::IsGt7()) {
+        Gt7SceneScale::Install(base); // FEAT-GT7-194; GT Sport's sites below are not GT7's
+        return;
+    }
     const char* enabled = std::getenv("SHADGT_EXPERIMENTAL_SCENE_VIEWPORT");
     if ((!enabled || std::strcmp(enabled, "1") != 0) && !Vulkan::RytyWideScene()) return;
     if (Vulkan::RytySceneSize().width == 0) return;

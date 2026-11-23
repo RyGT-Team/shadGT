@@ -3109,8 +3109,15 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                        (instance.IsAmdShaderExplicitVertexParameterSupported() &&
                         instance.IsAmdLegacyShaderCompiler());
             }(),
-        .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
-                              instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
+        // TEST-SGT-092 (local test build only): SHADGT_LDS_BARRIERS=1 adds the shared memory
+        // barriers of 64-thread compute workgroups on any GPU, 0 on none; unset: as before.
+        .needs_lds_barriers = [&] {
+            if (const char* env = std::getenv("SHADGT_LDS_BARRIERS"); env && *env) {
+                return env[0] == '1';
+            }
+            return instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
+                   instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp;
+        }(),
         .intel_arc_workarounds = instance.IsIntel(),
         .needs_buffer_offsets = instance.StorageMinAlignment() > 4,
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,

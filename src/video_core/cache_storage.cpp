@@ -173,7 +173,7 @@ void DataBase::Open() {
                 std::string parts;
                 for (const char* name :
                      {"SHADGT_AMD_NAN_RULES", "SHADGT_QUAD_CONTROL", "SHADGT_VERTEX_ORDER",
-                      "SHADGT_FP32_IMAGE_ATOMICS", "SHADGT_MANUAL_INTERP"}) {
+                      "SHADGT_FP32_IMAGE_ATOMICS", "SHADGT_MANUAL_INTERP", "SHADGT_LDS_BARRIERS"}) {
                     if (const char* env = std::getenv(name); env && *env) {
                         parts += fmt::format(", {}={}", name, env[0]);
                     }

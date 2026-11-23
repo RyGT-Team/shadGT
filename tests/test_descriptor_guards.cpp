@@ -31,6 +31,23 @@ constexpr u32 FlagAt = 40;
 constexpr u32 SecondFlagAt = 41;
 constexpr u32 DescriptorWords = 12; // a T# and an S#
 
+// A T# of a 64x64 2D image whose address, format and type the shader holds as immediates (words
+// 0, 1 and 3) and whose size it loads from the table (word 2), as the review of PR 106 built it.
+constexpr u64 MixedAddress = 0x12345600;
+std::array<u32, 8> MixedTsharp() {
+    auto image = AmdGpu::Image::Null(false);
+    image.base_address = MixedAddress >> 8;
+    image.width = 63;
+    image.height = 63;
+    std::array<u32, 8> words{};
+    static_assert(sizeof(image) == sizeof(words));
+    std::memcpy(words.data(), &image, sizeof(words));
+    return words;
+}
+bool MixedImmediate(u32 word) {
+    return word == 0 || word == 1 || word == 3;
+}
+
 struct Shape {
     bool equal = false;           ///< the branch compares with IEqual instead of INotEqual
     bool negated = false;         ///< through a LogicalNot
@@ -49,6 +66,7 @@ struct Shape {
     bool loaded_before_branch = false;   ///< the words are in registers before the branch decides
     bool no_registers = false;           ///< reads that no register write goes with
     bool register_read_in_loop = false;  ///< the loop's head computes with a word of the round before
+    bool mixed_tsharp = false; ///< the T# is MixedTsharp: immediates and loaded words
 };
 
 class DescriptorGuards : public testing::Test {
@@ -60,6 +78,29 @@ protected:
     std::array<u32, 64> table{};
     std::array<Shader::Gcn::Block, 5> cfg{};
     std::vector<IR::Inst*> descriptor;
+    Shader::Optimization::ResourceDiscoveryList resources;
+
+    /// Guest addresses the GPU wrote for the draw, as the renderer's probe answers
+    /// (Rasterizer::FlatSourcesMayChange), and how often it was asked.
+    struct GpuWrites {
+        std::vector<u64> addresses;
+        u32 asked = 0;
+    } gpu;
+    static bool GpuMayHaveWritten(const void* context, std::span<const u64> sources) {
+        auto& writes = *static_cast<GpuWrites*>(const_cast<void*>(context));
+        ++writes.asked;
+        for (size_t i = Shader::NUM_USER_DATA_REGS; i < sources.size(); ++i) {
+            if (std::ranges::find(writes.addresses, sources[i]) != writes.addresses.end()) {
+                return true;
+            }
+        }
+        return false;
+    }
+    Shader::FlatSourcesProbe probe{&GpuMayHaveWritten, &gpu};
+
+    void TearDown() override {
+        Shader::g_flat_sources_probe.store(nullptr);
+    }
 
     IR::Block* NewBlock() {
         auto* block = pools.block_pool.Create(pools.inst_pool);
@@ -92,9 +133,12 @@ protected:
                 descriptor.push_back(word[i].Inst());
             }
         }
-        const auto handle =
-            ir.ImageHandle(ir.CompositeConstruct(word[0], word[1], word[2], word[3]),
-                           ir.CompositeConstruct(word[4], word[5], word[6], word[7]));
+        const auto tsharp_word = [&](u32 i) -> IR::U32 {
+            return shape.mixed_tsharp && MixedImmediate(i) ? ir.Imm32(MixedTsharp()[i]) : word[i];
+        };
+        const auto handle = ir.ImageHandle(
+            ir.CompositeConstruct(tsharp_word(0), tsharp_word(1), tsharp_word(2), tsharp_word(3)),
+            ir.CompositeConstruct(word[4], word[5], word[6], word[7]));
         const auto at = ir.CompositeConstruct(ir.Imm32(0.0f), ir.Imm32(0.0f), ir.Imm32(0.0f),
                                               ir.Imm32(0.0f));
         if (shape.storage) {
@@ -110,12 +154,22 @@ protected:
         }
     }
 
-    /// entry -> (word decides) body -> merge, as the shape says; then the pass.
-    void Build(const Shape& shape, const std::vector<u32>* replayed = nullptr) {
+    /// entry -> (word decides) body -> merge, as the shape says; then the pass. `replayed`: a shader
+    /// record's words (PB-1); `logged`: the walker's output as a read log holds it (PERF-GT7-117).
+    void Build(const Shape& shape, const std::vector<u32>* replayed = nullptr,
+               Common::GuestReadLog* logged = nullptr) {
         const auto address = reinterpret_cast<u64>(table.data());
         std::memcpy(user_data.data(), &address, sizeof(address));
         for (u32 i = 0; i < DescriptorWords; ++i) {
             table[i] = 0x3f800000U + i; // what an unused slot is left holding: floats
+        }
+        if (shape.mixed_tsharp) {
+            const auto mixed = MixedTsharp();
+            for (u32 i = 0; i < 8; ++i) {
+                if (!MixedImmediate(i)) {
+                    table[TsharpAt + i] = mixed[i];
+                }
+            }
         }
         info.user_data = user_data;
         info.sw_stage =
@@ -185,18 +239,52 @@ protected:
 
         program.post_order_blocks = IR::PostOrder(first);
         Shader::Optimization::SsaRewritePass(program);
-        auto resources = Shader::Optimization::ResourceDiscoverPass(program, Shader::Profile{});
+        resources = Shader::Optimization::ResourceDiscoverPass(program, Shader::Profile{});
         Shader::ReplayInputs replay{};
         replay.flat = replayed;
         Shader::t_replay = replayed ? &replay : nullptr;
+        Common::t_guest_read_log = logged;
         Shader::Optimization::FlattenExtendedUserdataPass(program, resources);
+        Common::t_guest_read_log = nullptr;
         Shader::t_replay = nullptr;
         ASSERT_EQ(descriptor.size(), DescriptorWords);
+    }
+
+    /// A read log in replay whose one read is the walker's output: `words`, every one `value`.
+    static Common::GuestReadLog LoggedFlat(u32 words, u32 value) {
+        Common::GuestReadLog log;
+        const std::vector<u32> flat(words, value);
+        log.Append(Common::FlatBufReadTag, flat.data(), flat.size() * sizeof(u32));
+        log.replay = true;
+        return log;
     }
 
     void Walk(u32 flag) {
         table[FlagAt] = flag;
         info.RefreshFlatBuf();
+        // The words the walker and its caller talk through are zero again.
+        EXPECT_EQ(info.flattened_ud_src[Shader::SrtWalkerNoGuards], 0U);
+        EXPECT_EQ(info.flattened_ud_src[Shader::SrtWalkerGuardEmptied], 0U);
+    }
+
+    /// The sampled T# as the draw binds it: what ImageResource::GetSharp reads from the walked
+    /// buffer, with the fetch the resource patching pass makes (ConstructSharpFetch).
+    AmdGpu::Image BoundTsharp() const {
+        const auto found = std::ranges::find_if(resources, [](const auto& resource) {
+            return resource.user && resource.user->GetOpcode() == IR::Opcode::ImageSampleRaw;
+        });
+        EXPECT_NE(found, resources.end());
+        Shader::ImageResource image{};
+        const auto& sharp = found->sharps[0];
+        for (u32 i = 0; i < sharp.num_dwords; ++i) {
+            if (sharp.dwords[i].IsImmediate()) {
+                image.sharp_fetch.immediates[i] = sharp.dwords[i].U32();
+            } else {
+                image.sharp_fetch.offsets[i] = sharp.dwords[i].Inst()->Flags<u16>();
+                image.sharp_fetch.load_mask |= u8(1U << i);
+            }
+        }
+        return image.GetSharp(info);
     }
 
     void ExpectEmpty() {
@@ -308,11 +396,27 @@ TEST_F(DescriptorGuards, LoopUnderTheBranch) {
     ExpectCopied();
 }
 
-TEST_F(DescriptorGuards, ReplayIsEmptiedToo) {
-    // A replay fills the buffer without the walker, here from a record older than the guards.
-    // The flag's place isn't known before the pass, so every word is junk, the flag's too.
+TEST_F(DescriptorGuards, ARecordsReplayIsTranslatedFromItsWords) {
+    // PB-1 rebuilds a record's missing SPIR-V from its words and stores it under that record,
+    // whose walker and specialization were made from them. Here a record older than the guards,
+    // with the branch off (every word is junk, the flag's too). Emptied, the code was made for
+    // the null 2D image while the record kept the image its junk T# decoded to (a cube).
     const std::vector<u32> recorded(96, 0x3f800000U);
     Build({.equal = true, .constant = 0xdeadbeefU}, &recorded);
+    for (IR::Inst* word : descriptor) {
+        EXPECT_EQ(info.flattened_ud_buf[word->Flags<u16>()], 0x3f800000U);
+    }
+}
+
+TEST_F(DescriptorGuards, AReadLogsReplayIsEmptiedAsTheWalkerWould) {
+    // The manifest pre-translation replays a record's read log, maybe made before the guards
+    // (every word junk, the flag's too), and stores the translation as a new permutation with this
+    // walker: its draws empty these words, so must its translation.
+    // 16 user data words, the flag and the 12 descriptor words: the walker's output.
+    auto log = LoggedFlat(Shader::NUM_USER_DATA_REGS + 1 + DescriptorWords, 0x3f800000U);
+    Build({.equal = true, .constant = 0xdeadbeefU}, nullptr, &log);
+    ASSERT_EQ(log.misses, 0U) << "the walker's output is not the size the log holds";
+    ASSERT_EQ(log.next, 1U);
     ExpectEmpty();
 }
 
@@ -322,6 +426,52 @@ TEST_F(DescriptorGuards, ReplayWithTheBranchOnIsLeftAlone) {
     for (IR::Inst* word : descriptor) {
         EXPECT_EQ(info.flattened_ud_buf[word->Flags<u16>()], 0x3f800000U);
     }
+}
+
+TEST_F(DescriptorGuards, AMixedTsharpIsKeptWhole) {
+    // Its loaded words emptied, the T# kept its immediate address, format and type: a valid
+    // 1x1 image at the address of the 64x64 one.
+    Build({.mixed_tsharp = true});
+    Walk(1);
+    const auto on = BoundTsharp();
+    ASSERT_TRUE(on.Valid());
+    EXPECT_EQ(on.Address(), MixedAddress);
+    EXPECT_EQ(on.width + 1, 64U);
+    EXPECT_EQ(on.height + 1, 64U);
+    Walk(0);
+    const auto off = BoundTsharp();
+    EXPECT_FALSE(off.Valid() && off.Address() == MixedAddress &&
+                 std::memcmp(&off, &on, sizeof(on)) != 0)
+        << "a " << off.width + 1 << "x" << off.height + 1 << " image at the same address";
+    EXPECT_EQ(std::memcmp(&off, &on, sizeof(on)), 0);
+    // The S#, which the shader loads whole, is still emptied.
+    for (u32 i = 8; i < DescriptorWords; ++i) {
+        EXPECT_EQ(info.flattened_ud_buf[descriptor[i]->Flags<u16>()], 0U) << i;
+    }
+}
+
+TEST_F(DescriptorGuards, AFlagTheGpuMayWriteKeepsTheDescriptors) {
+    // The flag's memory was written by GPU work before the draw: its binding copies the word
+    // again (RefreshGpuWrittenConstants) and the shader may take the branch. Emptied, it would
+    // sample nothing where the game's texture is.
+    Build({});
+    gpu.addresses = {reinterpret_cast<u64>(table.data() + FlagAt)};
+    Shader::g_flat_sources_probe.store(&probe);
+    Walk(0);
+    ExpectCopied();
+    EXPECT_EQ(gpu.asked, 1U);
+}
+
+TEST_F(DescriptorGuards, TheGpuIsAskedOnlyWhenAGuardEmpties) {
+    Build({});
+    gpu.addresses = {reinterpret_cast<u64>(table.data() + 60)}; // not read by the shader
+    Shader::g_flat_sources_probe.store(&probe);
+    Walk(1);
+    ExpectCopied();
+    EXPECT_EQ(gpu.asked, 0U);
+    Walk(0);
+    ExpectEmpty();
+    EXPECT_EQ(gpu.asked, 1U);
 }
 
 TEST_F(DescriptorGuards, SampledPastTheBranchIsNeverEmptied) {

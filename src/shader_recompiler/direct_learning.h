@@ -104,10 +104,27 @@ inline size_t Load(const std::filesystem::path& path) {
     return state.start.size();
 }
 
+/// FIX-SGT-119: set while this thread translates as a store made before the learning did (every
+/// direct path kept). Only for one translation, through IgnoreLearned.
+inline thread_local bool t_ignore_learned = false;
+
+/// FIX-SGT-119: this thread's translations ignore the learned file while it lives.
+struct IgnoreLearned {
+    bool previous = t_ignore_learned;
+    IgnoreLearned() {
+        t_ignore_learned = true;
+    }
+    ~IgnoreLearned() {
+        t_ignore_learned = previous;
+    }
+    IgnoreLearned(const IgnoreLearned&) = delete;
+    IgnoreLearned& operator=(const IgnoreLearned&) = delete;
+};
+
 /// Whether slot `slot` of shader `hash` is translated without the direct-memory path.
 inline bool NoDirect(u64 hash, u32 slot) {
     auto& state = GetState();
-    if (!Enabled() || !state.loaded || slot >= MaxSlots) {
+    if (!Enabled() || !state.loaded || slot >= MaxSlots || t_ignore_learned) {
         return false;
     }
     const auto it = state.start.find(hash); // never written after Load

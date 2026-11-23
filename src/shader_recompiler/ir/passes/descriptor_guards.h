@@ -37,7 +37,10 @@ inline bool BranchOffDescriptorsEnabled() {
 }
 
 /// Descriptor words that nothing reads unless a branch on a word of the same flattened buffer is
-/// taken. That word is the one the shader itself branches on, from the copy it is given.
+/// taken. That word is the one the shader itself branches on, from the walker's copy; when the
+/// binding may copy it again from what the GPU wrote, the walk keeps the descriptors
+/// (Info::RefreshFlatBuf). The generated walker empties them, and so does the translation of a
+/// read log's replay (FlattenExtendedUserdataPass), never a shader record's.
 struct DescriptorGuard {
     u16 word{};
     u32 value{};
@@ -48,7 +51,7 @@ struct DescriptorGuard {
         return word < flat.size() && (flat[word] == value) != taken_if_equal;
     }
 
-    /// What the generated walker does, for a flattened buffer a replay filled without it.
+    /// What the generated walker does, for a flattened buffer filled without it.
     void Apply(std::span<u32> flat, std::span<u64> sources) const {
         if (!Off(flat)) {
             return;
@@ -290,12 +293,16 @@ inline std::vector<DescriptorGuard> FindDescriptorGuards(const IR::Program& prog
                     continue;
                 }
                 for (const auto& sharp : resource.sharps) {
-                    // All of a descriptor's words or none: half a descriptor is another one.
+                    // All of a descriptor's words or none: half a descriptor is another one. A
+                    // word the shader holds itself (an immediate) can't be emptied, so neither are
+                    // the others: a T# whose address and format are immediates and whose size is
+                    // loaded would be a valid 1x1 image at the same address.
                     std::vector<u16> words;
                     bool whole = true;
                     for (u32 i = 0; i < sharp.num_dwords && whole; ++i) {
                         if (sharp.dwords[i].IsImmediate()) {
-                            continue;
+                            whole = false;
+                            break;
                         }
                         const u16 word = FlatWord(sharp.dwords[i].TryInst());
                         whole = word != 0 && unread_if_off(word);

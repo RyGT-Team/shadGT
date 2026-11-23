@@ -456,6 +456,13 @@ private:
     /// the uploaded flat buffer, so the shader sees them in GPU execution order.
     void RefreshGpuWrittenConstants(const Shader::Info& stage, const VideoCore::Buffer& flat_buffer,
                                     u64 flat_offset);
+    /// FIX-SGT-115: calls run(begin, end, address) for each run of flattened words that
+    /// RefreshGpuWrittenConstants copies again, until run returns true; true then.
+    template <typename Run>
+    bool ForEachGpuWrittenRun(std::span<const u64> sources, Run&& run);
+    /// FIX-SGT-115 (Shader::g_flat_sources_probe): whether RefreshGpuWrittenConstants would
+    /// replace any of the words read from these sources.
+    static bool FlatSourcesMayChange(const void* rasterizer, std::span<const u64> sources);
     void RebindTextures(bool is_compute, u32 num_color_targets);
     void FinalizeTextureLayouts(RenderState* render_state = nullptr);
     bool BindResources(const Pipeline* pipeline);
@@ -710,6 +717,7 @@ private:
     } deferred_fence_stats;
     std::unordered_map<VAddr, u32> deferred_fence_addresses;
     std::unordered_map<VAddr, std::vector<u8>> pending_fence_bytes;
+    Shader::FlatSourcesProbe flat_sources_probe{&FlatSourcesMayChange, this}; // FIX-SGT-115
     u64 gpu_constant_refresh_count{};
     u64 next_gpu_constant_refresh_report{1000};
 #ifdef RYTY_GPU

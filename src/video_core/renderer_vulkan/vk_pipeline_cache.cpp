@@ -12,6 +12,7 @@
 #include "video_core/renderer_vulkan/compute_ahead.h"
 #include "video_core/renderer_vulkan/stale_pipeline_builds.h"
 #include "video_core/renderer_vulkan/stored_no_pixel.h"
+#include "video_core/renderer_vulkan/stored_pipeline_slack.h"
 #include "video_core/renderer_vulkan/skipped_picture_read.h"
 #include "video_core/renderer_vulkan/read_ahead_budget.h"
 #include "video_core/renderer_vulkan/speculative_key.h"
@@ -7525,6 +7526,8 @@ void PipelineCache::ImportForeignPipelines(std::stop_token stop) {
 // them (ImportForeignPipelines) once its pre-translation has made the records' translations.
 // Pipelines with helper shaders made for the host are left out. Written after the splash
 // precompile, at low priority, when the store's pipeline count or the records changed.
+// FIX-SGT-135: the key file's bytes that nothing reads (free table slots, padding) are zeroed:
+// they were this PC's memory. A file that can't be told apart that way is left out.
 //
 // File: "RYGTRCP1", u32 switches length, the store's switches, u32 count, then per recipe
 // MaxShaderStages (u64 program, u64 SPIR-V hash) pairs (0 for none), u32 length, key file bytes.
@@ -7625,7 +7628,9 @@ void PipelineCache::ExportPipelineRecipes(std::stop_token stop) {
     const auto target =
         g_manifest_dir / fmt::format("pipelines-{:04x}-{:04x}.rcp", g_manifest_vendor, g_manifest_device);
     const fs::path marker = local / "recipe-export.txt";
-    const std::string mark = fmt::format("{} {} {}", keys.size(), records.size(), record_of_perm.size());
+    // FIX-SGT-135: a recipe file exported before the zeroing has another mark: written again once.
+    const std::string mark = fmt::format("{} {} {} FIX-SGT-135", keys.size(), records.size(),
+                                         record_of_perm.size());
     if (const auto old = read_bytes(marker);
         std::string{old.begin(), old.end()} == mark && fs::exists(target, ec)) {
         return;
@@ -7645,15 +7650,19 @@ void PipelineCache::ExportPipelineRecipes(std::stop_token stop) {
     out.insert(out.end(), switches.begin(), switches.end());
     const size_t count_at = out.size();
     put(u32{0});
-    u32 written = 0, helpers = 0, unnamed = 0;
+    u32 written = 0, helpers = 0, unnamed = 0, uncleared = 0;
     for (const auto& [file, time] : keys) {
         if (stop.stop_requested()) return;
-        const auto blob = read_bytes(file);
+        auto blob = read_bytes(file);
         GraphicsPipelineKey key{};
         GraphicsPipeline::SerializationSupport sdata{};
         if (!LoadStoredGraphicsPipeline(std::vector<u8>{blob}, key, sdata)) continue;
         if (!sdata.tcs.empty() || !sdata.tes.empty() || !sdata.fragment.empty()) {
             ++helpers;
+            continue;
+        }
+        if (!ClearStoredPipelineSlack<GraphicsPipelineKey>(blob, sdata)) { // FIX-SGT-135
+            ++uncleared;
             continue;
         }
         std::array<std::pair<u64, u64>, MaxShaderStages> stage_names{};
@@ -7711,10 +7720,11 @@ void PipelineCache::ExportPipelineRecipes(std::stop_token stop) {
         std::fclose(f);
     }
     LOG_WARNING(Render_Vulkan, "FEAT-GTS-471: {} pipeline recipes written to {} ({} KB) in {:.1f} s; "
-                "{} with host helper shaders, {} with a shader no record names",
+                "{} with host helper shaders, {} with a shader no record names, {} whose unread bytes "
+                "could not be told apart (FIX-SGT-135)",
                 written, target.filename().string(), out.size() / 1024,
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count(),
-                helpers, unnamed);
+                helpers, unnamed, uncleared);
 }
 
 void PipelineCache::PrewarmRead(std::stop_token stop) {

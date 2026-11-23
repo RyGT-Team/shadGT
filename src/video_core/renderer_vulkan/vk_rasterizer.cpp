@@ -127,6 +127,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     }
     memory->SetRasterizer(this);
     scheduler.StartPerfMonitor();
+    // FIX-SGT-115: SRT walks keep a guarded descriptor when its branch's word may be replaced at
+    // the binding (RefreshGpuWrittenConstants).
+    Shader::g_flat_sources_probe.store(&flat_sources_probe, std::memory_order_release);
 
     // FIX-188: on Intel Arc (#65) the native work is spliced and barriers flushed when the
     // session ends, before the submit callback (the scheduler ends it first there).
@@ -159,7 +162,24 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
 #endif
 }
 
-Rasterizer::~Rasterizer() = default;
+Rasterizer::~Rasterizer() {
+    const Shader::FlatSourcesProbe* ours = &flat_sources_probe;
+    Shader::g_flat_sources_probe.compare_exchange_strong(ours, nullptr);
+}
+
+namespace {
+/// FIX-SGT-115: set while the command thread selects a pipeline ahead. The recorder binds such a
+/// selection's flattened buffers without their sources (PERF-061, InstallDrawStages), so no word
+/// the walks read is copied again (FlatSourcesMayChange).
+thread_local bool t_selecting_ahead = false;
+
+struct SelectingAhead {
+    const bool before = std::exchange(t_selecting_ahead, true);
+    ~SelectingAhead() {
+        t_selecting_ahead = before;
+    }
+};
+} // namespace
 
 namespace {
 /// What FilterDraw does with a draw instead of drawing it, decided from the registers alone
@@ -302,6 +322,7 @@ Rasterizer::SelectedPipelinePtr Rasterizer::SelectPipelineAhead(
         return nullptr;
     }
     Common::PhaseTimer timer{Common::Phase::SelectAhead};
+    const SelectingAhead selecting_ahead; // FIX-SGT-115
     auto snapshot = selected_recycler.Take(); // PERF-056, PERF-GT7-125
     if (!snapshot) {
         snapshot = std::make_unique<SelectedPipeline>();
@@ -430,6 +451,7 @@ Rasterizer::SelectedPipelinePtr Rasterizer::SelectComputePipelineAhead() {
         return nullptr;
     }
     Common::PhaseTimer timer{Common::Phase::SelectAhead};
+    const SelectingAhead selecting_ahead; // FIX-SGT-115
     auto snapshot = selected_recycler.Take(); // PERF-056, PERF-GT7-125
     if (!snapshot) {
         snapshot = std::make_unique<SelectedPipeline>();
@@ -5463,14 +5485,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     }
 }
 
-void Rasterizer::RefreshGpuWrittenConstants(const Shader::Info& stage,
-                                            const VideoCore::Buffer& flat_buffer, u64 flat_offset) {
-    // The SRT walker copied these dwords from guest memory while recording. A GPU write to that
-    // memory is not visible there (and may not have executed yet), so replace the stale values
-    // with a copy that runs after earlier GPU work, as hardware scalar loads would.
+template <typename Run>
+bool Rasterizer::ForEachGpuWrittenRun(std::span<const u64> sources, Run&& run) {
     constexpr u64 TrackedAddressLimit = 1ULL << VideoCore::MemoryTracker::MAX_CPU_PAGE_BITS;
-    const auto& sources = stage.flattened_ud_src;
-    u32 refreshed{};
     for (u32 begin = Shader::NUM_USER_DATA_REGS; begin < sources.size();) {
         const VAddr address = sources[begin];
         u32 end = begin + 1;
@@ -5480,18 +5497,49 @@ void Rasterizer::RefreshGpuWrittenConstants(const Shader::Info& stage,
         }
         const u64 size = u64(end - begin) * sizeof(u32);
         if (address != 0 && address + size <= TrackedAddressLimit &&
-            buffer_cache.IsRegionGpuModified(address, size)) {
-            const auto [buffer, buffer_offset] = buffer_cache.ObtainBuffer(address, size, false);
-            const vk::BufferCopy copy = {
-                .srcOffset = buffer_offset,
-                .dstOffset = flat_offset + u64(begin) * sizeof(u32),
-                .size = size,
-            };
-            runtime.CopyBuffer(buffer, &flat_buffer, std::span{&copy, 1});
-            refreshed += end - begin;
+            buffer_cache.IsRegionGpuModified(address, size) && run(begin, end, address)) {
+            return true;
         }
         begin = end;
     }
+    return false;
+}
+
+bool Rasterizer::FlatSourcesMayChange(const void* rasterizer, std::span<const u64> sources) {
+    auto& self = *static_cast<Rasterizer*>(const_cast<void*>(rasterizer));
+#ifdef RYTY_GPU
+    // The native renderer binds the walked copy as it is (NativeRenderer::BindBuffers): no word
+    // is copied again. GT7 always runs on it (FIX-231).
+    if (self.native) {
+        return false;
+    }
+#endif
+    // Nor is one of a selection made ahead, bound without its sources.
+    if (t_selecting_ahead) {
+        return false;
+    }
+    // Otherwise the same test as the copies below: a word they leave alone is the one read.
+    return self.ForEachGpuWrittenRun(sources, [](u32, u32, VAddr) { return true; });
+}
+
+void Rasterizer::RefreshGpuWrittenConstants(const Shader::Info& stage,
+                                            const VideoCore::Buffer& flat_buffer, u64 flat_offset) {
+    // The SRT walker copied these dwords from guest memory while recording. A GPU write to that
+    // memory is not visible there (and may not have executed yet), so replace the stale values
+    // with a copy that runs after earlier GPU work, as hardware scalar loads would.
+    u32 refreshed{};
+    ForEachGpuWrittenRun(stage.flattened_ud_src, [&](u32 begin, u32 end, VAddr address) {
+        const u64 size = u64(end - begin) * sizeof(u32);
+        const auto [buffer, buffer_offset] = buffer_cache.ObtainBuffer(address, size, false);
+        const vk::BufferCopy copy = {
+            .srcOffset = buffer_offset,
+            .dstOffset = flat_offset + u64(begin) * sizeof(u32),
+            .size = size,
+        };
+        runtime.CopyBuffer(buffer, &flat_buffer, std::span{&copy, 1});
+        refreshed += end - begin;
+        return false;
+    });
     if (refreshed == 0) {
         return;
     }

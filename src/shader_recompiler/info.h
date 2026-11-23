@@ -42,6 +42,17 @@ struct ReplayInputs {
     const void* tess_constants{};           // TessellationDataConstantBuffer
 };
 inline thread_local const ReplayInputs* t_replay = nullptr;
+
+/// FIX-SGT-115: the renderer's answer to whether a word of a flattened buffer may be replaced at
+/// its binding by what the GPU wrote where the walker read it (RefreshGpuWrittenConstants). A
+/// descriptor guard then compared a word that may not be the one the shader reads, and the walk
+/// is made again with the descriptors copied. Unset (tests, translation without the game): what
+/// the walker read is what the shader reads.
+struct FlatSourcesProbe {
+    bool (*may_change)(const void* context, std::span<const u64> sources){};
+    const void* context{};
+};
+inline std::atomic<const FlatSourcesProbe*> g_flat_sources_probe{};
 // Set only while a queued translation owns its auxiliary fetch programs.
 inline thread_local const std::vector<Common::FetchCodeSnapshot>* t_fetch_code_snapshots = nullptr;
 
@@ -269,6 +280,20 @@ struct Info : InfoPersistent {
             const auto walker_lease = srt_walker_owner;
             srt_info.walker_func(user_data.data(), flattened_ud_buf.data(),
                                  flattened_ud_src.data());
+            // FIX-SGT-115: a guard emptied descriptors on a word read from memory the GPU may
+            // still write for this draw: the shader may take the branch after all, so they are
+            // copied as before guards.
+            if (flattened_ud_src[SrtWalkerGuardEmptied] != 0) [[unlikely]] {
+                flattened_ud_src[SrtWalkerGuardEmptied] = 0;
+                const auto* probe = g_flat_sources_probe.load(std::memory_order_acquire);
+                if (probe && probe->may_change(probe->context, flattened_ud_src)) {
+                    flattened_ud_src.assign(flattened_ud_src.size(), 0);
+                    flattened_ud_src[SrtWalkerNoGuards] = 1;
+                    srt_info.walker_func(user_data.data(), flattened_ud_buf.data(),
+                                         flattened_ud_src.data());
+                    flattened_ud_src[SrtWalkerNoGuards] = 0;
+                }
+            }
         }
         if (log) {
             log->Append(Common::FlatBufReadTag, flattened_ud_buf.data(),

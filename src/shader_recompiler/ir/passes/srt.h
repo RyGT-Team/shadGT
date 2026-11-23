@@ -19,6 +19,11 @@ namespace Shader {
 // written by the GPU can be refreshed on the GPU timeline.
 using PFN_SrtWalker = void PS4_SYSV_ABI (*)(const u32* /*user_data*/, u32* /*flat_dst*/,
                                             u64* /*flat_src*/);
+/// FIX-SGT-115: two places of flat_src that no walker fills (a user data register's word has no
+/// source), zero before and after Info::RefreshFlatBuf. In the first the caller asks the walker
+/// to empty no descriptors; in the second a walker that emptied some says so.
+constexpr u32 SrtWalkerNoGuards = 0;
+constexpr u32 SrtWalkerGuardEmptied = 1;
 struct WalkerCode {
     PFN_SrtWalker function{};
     std::shared_ptr<void> owner;

@@ -3,6 +3,8 @@
 
 #include <array>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <string>
 #include <fmt/format.h>
 
@@ -101,6 +103,48 @@ void ReleaseHold() {
     if (Enabled()) {
         Counter().Resume(FencedRDTSC());
     }
+}
+
+namespace {
+struct StartGate {
+    std::mutex mutex;
+    std::condition_variable opened;
+    bool closed = false;
+};
+StartGate& Gate() {
+    static StartGate gate;
+    return gate;
+}
+} // namespace
+
+void CloseStartGate() {
+    std::scoped_lock lock{Gate().mutex};
+    Gate().closed = true;
+}
+
+void OpenStartGate() {
+    {
+        std::scoped_lock lock{Gate().mutex};
+        if (!Gate().closed) {
+            return;
+        }
+        Gate().closed = false;
+    }
+    Gate().opened.notify_all();
+}
+
+bool WaitStartGate(std::chrono::seconds limit) {
+    std::unique_lock lock{Gate().mutex};
+    if (!Gate().closed) {
+        return false;
+    }
+    if (!Gate().opened.wait_for(lock, limit, [] { return !Gate().closed; })) {
+        // Never left closed for good: the precompile's own limit is the same (900 s).
+        Gate().closed = false;
+        LOG_ERROR(Common, "FIX-SGT-134: the start gate stayed closed {} s; the game goes on",
+                  limit.count());
+    }
+    return true;
 }
 
 CompilePause::CompilePause(HoldSite site_) : active{is_gpu_command_thread && Enabled()}, site{site_} {

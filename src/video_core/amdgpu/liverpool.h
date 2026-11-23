@@ -159,7 +159,13 @@ public:
     }
 
     void BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
-        rasterizer = rasterizer_;
+        {
+            std::scoped_lock lk{submit_mutex};
+            rasterizer = rasterizer_;
+        }
+        // FIX-SGT-134: the command thread, started before the rasterizer, may already wait for
+        // work; the splash precompile runs in its idle loop and the gated game submits nothing.
+        submit_cv.notify_all();
     }
 
     /// PERF-050: a CPU fault's flush from a game thread; returns once it ran. With the draw pipe

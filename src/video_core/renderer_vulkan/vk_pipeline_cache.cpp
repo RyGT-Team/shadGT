@@ -10,6 +10,7 @@
 #include "video_core/renderer_vulkan/draw_preparation_options.h"
 #include "video_core/renderer_vulkan/compile_cpu_batch.h"
 #include "video_core/renderer_vulkan/stale_pipeline_builds.h"
+#include "video_core/renderer_vulkan/stored_no_pixel.h"
 #include "video_core/renderer_vulkan/skipped_picture_read.h"
 #include "video_core/renderer_vulkan/read_ahead_budget.h"
 #include "video_core/renderer_vulkan/speculative_key.h"
@@ -7559,9 +7560,18 @@ void PipelineCache::PrewarmRead(std::stop_token stop) {
             std::vector<u8> blob;
             store.Load(Storage::BlobType::PipelineKey, name, blob);
             valid = LoadStoredGraphicsPipeline(std::move(blob), record->key, record->sdata);
-            // Only pipelines whose every stage input is stored (see InstallPrewarmRecord).
+            // Only pipelines whose every stage input is stored (see InstallPrewarmRecord), so
+            // without a pixel shader only those that read nothing of that stage (FIX-SGT-116).
             valid = valid && record->key.stage_hashes[u32(SwStage::Vertex)] != 0 &&
-                    record->key.stage_hashes[u32(SwStage::Fragment)] != 0;
+                    (record->key.stage_hashes[u32(SwStage::Fragment)] != 0 ||
+                     (PrecompileWithoutPixelShaderEnabled() &&
+                      StoredBuildIgnoresPixelInfo(
+                          record->sdata,
+                          record->key.prim_type == AmdGpu::PrimitiveType::RectList ||
+                              record->key.prim_type == AmdGpu::PrimitiveType::QuadList,
+                          record->key.stage_hashes[u32(SwStage::TessellationControl)] != 0 ||
+                              record->key.stage_hashes[u32(SwStage::TessellationEval)] != 0,
+                          instance.IsShaderObjectEnabled() && record->key.num_samples > 1)));
             for (u32 stage = 0; valid && stage < MaxShaderStages; ++stage) {
                 const u64 perm_hash = record->key.stage_hashes[stage];
                 if (perm_hash == 0) {
@@ -7894,6 +7904,23 @@ bool PipelineCache::InstallPrewarmRecord(PrewarmRecord& record) {
     S().infos.fill(nullptr);
     S().modules.fill(nullptr);
     S().fetch_shader = nullptr;
+    if (record.pgm[u32(SwStage::Fragment)] == 0) {
+        // FIX-SGT-116: a draw's build of it may have had the clip distance emulation's discard
+        // shader, which isn't stored. It only discards anything when the vertex stage outputs clip
+        // distances: told from the vertex permutation's stored runtime info, before any stage's
+        // module is made below (a refused record made none).
+        const u32 vs = u32(SwStage::Vertex);
+        const auto vertex = program_cache.find(record.pgm[vs]);
+        if (vertex == program_cache.end() || record.perm[vs] >= vertex->second->modules.size() ||
+            VertexStageMayClip(vertex->second->modules[record.perm[vs]].spec.runtime_info,
+                               profile.needs_clip_distance_emulation)) {
+            return false;
+        }
+        // Not what the last draw left. The reader took this record because its build can't depend
+        // on it (StoredBuildIgnoresPixelInfo, and VertexStageMayClip above); the caller restores
+        // the draws' own.
+        S().runtime_infos[u32(SwStage::Fragment)].Initialize(HwStage::Fragment, SwStage::Fragment);
+    }
     for (u32 stage = 0; stage < MaxShaderStages; ++stage) {
         if (record.pgm[stage] == 0) {
             continue;

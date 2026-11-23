@@ -4566,6 +4566,26 @@ void NativeRenderer::PassBarrier(std::source_location where) {
     NATIVE_DIAGNOSTIC(++stats.pass_barriers);
 }
 
+static VAddr InplaceFrom();
+
+// FIX-GTS-528: in GT Sport, a small picture in the memory the CPU reads (0xf0'0000'0000 and up,
+// the game's own heap) goes back in this submission, before the fence the CPU waits for, and not
+// at the frame's end. When GT Sport makes its first car thumbnails (a new save), it draws a 32x32
+// float picture into a heap buffer, waits for the GPU, reads it and frees the buffer within the
+// frame; written back at the frame's end, the picture landed in the freed block, over the heap's
+// free-list links, and the next allocation crashed (GTSport.exe+0x1c3a01d, RyGT #53 and #87; 4 of
+// 5 fresh starts). GT7 keeps PERF-GT7-044 as it is. SHADGT_GTS_CPU_WRITEBACK_NOW=0: as before.
+static bool GtsCpuWritebackNow(const Native::ImageEntry* entry) {
+    static const bool on = [] {
+        if (Common::IsGt7()) {
+            return false;
+        }
+        const char* env = std::getenv("SHADGT_GTS_CPU_WRITEBACK_NOW");
+        return !(env && env[0] == '0');
+    }();
+    return on && entry->info.guest_address >= InplaceFrom();
+}
+
 // PERF-GT7-044: NAT-112 writes a small picture back to guest memory once a frame, when the frame
 // ends, for the CPU to read (GT Sport's auto exposure), and not after every draw into it. GT7 draws
 // ~100 such pictures a frame: on its pre-race screens ~210 write-backs a frame, nearly all tiled (a
@@ -4576,7 +4596,7 @@ void NativeRenderer::QueueWriteback(const Native::ImageEntry* entry) {
         const char* env = std::getenv("SHADGT_NATIVE_WRITEBACK_EACH");
         return env && env[0] == '1';
     }();
-    if (each || entry->info.guest_size > 64_KB) {
+    if (each || entry->info.guest_size > 64_KB || GtsCpuWritebackNow(entry)) {
         if (std::ranges::find(writebacks, entry) == writebacks.end()) {
             writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
         }

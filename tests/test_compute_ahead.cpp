@@ -144,6 +144,69 @@ TEST(ComputeAhead, EachRecipeIsBuiltOnceWhileHeld) {
     EXPECT_EQ(counts.built, 2U);
     EXPECT_EQ(counts.failed, 1U);
     EXPECT_EQ(counts.left, 0U);
+    // Built and refused by the driver alike: their records may be mapped.
+    EXPECT_EQ(counts.attempted.size(), 3U);
+}
+
+TEST(ComputeAhead, ARefusalAtTheGateOnceReleasedIsLeft) {
+    // WarmFromWords says no when the game was released while the build waited at the gate: that
+    // build never reached the driver, so its record must be built at the next start.
+    ComputeAheadQueue queue;
+    u64 hash = 0;
+    queue.Add(Recipe(1), [] { return true; }, &hash);
+    std::atomic<u64> done{0};
+    bool held = true;
+    const auto counts = queue.Run([&] { return held; },
+                                  [&](const std::vector<u32>&) {
+                                      held = false;
+                                      return false;
+                                  },
+                                  done);
+    EXPECT_EQ(counts.left, 1U);
+    EXPECT_EQ(counts.failed, 0U);
+    EXPECT_FALSE(counts.attempted.contains(hash));
+}
+
+TEST(ComputeAhead, AddGivesTheRecipesHashForACopyToo) {
+    ComputeAheadQueue queue;
+    u64 first = 0, copy = 0, released = 0;
+    EXPECT_TRUE(queue.Add(Recipe(3), [] { return true; }, &first));
+    EXPECT_FALSE(queue.Add(Recipe(3), [] { return true; }, &copy));
+    EXPECT_FALSE(queue.Add(Recipe(3), [] { return false; }, &released));
+    EXPECT_NE(first, 0U);
+    EXPECT_EQ(copy, first);
+    EXPECT_EQ(released, 0U) << "the game plays: no recipe, the record stays unmapped";
+}
+
+// recipe-perms.txt: a compute record is mapped only once its recipe was built or refused, so a
+// start stopped or released before then replays it next time (FIX-SGT-119 skips mapped records).
+TEST(ComputeAhead, ComputeRecordsAreMappedOnceBuilt) {
+    using Line = Vulkan::ComputeAheadRecords::Line;
+    Vulkan::ComputeAheadRecords records;
+    records.Note(0x11, 0xa1, 101); // built below
+    records.Note(0x22, 0xa2, 202); // left: the game was released
+    records.Note(0x33, 0xa3, std::nullopt); // not kept: the game played
+    std::vector<Line> lines{{0x11, 0xa1, 0}, {0x44, 0xa4, 3}, {0x22, 0xa2, 1}, {0x33, 0xa3, 2}};
+    auto compute = records.TakeLines(lines);
+    ASSERT_EQ(lines.size(), 1U) << "a graphics record is mapped at once";
+    EXPECT_EQ(lines[0][0], 0x44U);
+    ASSERT_EQ(compute.size(), 3U);
+    EXPECT_EQ(records.DropUnbuilt(compute, {101}), 2U);
+    ASSERT_EQ(compute.size(), 1U);
+    EXPECT_EQ(compute[0][0], 0x11U);
+}
+
+TEST(ComputeAhead, NoBuildsLeaveEveryComputeRecordUnmapped) {
+    // The game was released, or the start stopped, before the compute builds.
+    using Line = Vulkan::ComputeAheadRecords::Line;
+    Vulkan::ComputeAheadRecords records;
+    records.Note(0x11, 0xa1, 101);
+    records.Note(0x22, 0xa2, 202);
+    std::vector<Line> lines{{0x11, 0xa1, 0}, {0x22, 0xa2, 1}};
+    auto compute = records.TakeLines(lines);
+    EXPECT_EQ(records.DropUnbuilt(compute, {}), 2U);
+    EXPECT_TRUE(compute.empty());
+    EXPECT_TRUE(lines.empty());
 }
 
 } // namespace

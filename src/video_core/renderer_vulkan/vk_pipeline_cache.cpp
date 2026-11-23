@@ -2223,16 +2223,18 @@ static bool ComputeAheadWanted() {
 }
 
 // The splash's step of its own (GetComputeAheadProgress), built once the translations are made.
-static void PrecompileCompute(const Instance& instance, const Shader::Profile& profile,
-                              vk::PipelineCache cache, ComputeAheadQueue& queue, u32 offered,
-                              std::stop_token stop) {
+// Returns the recipes built or refused by the driver (ComputeAheadRecords maps their records).
+static std::unordered_set<u64> PrecompileCompute(const Instance& instance,
+                                                 const Shader::Profile& profile,
+                                                 vk::PipelineCache cache, ComputeAheadQueue& queue,
+                                                 u32 offered, std::stop_token stop) {
     const auto started = std::chrono::steady_clock::now();
     const size_t distinct = queue.Size();
     g_compute_ahead_done = 0;
     g_compute_ahead_total = distinct;
     g_compute_ahead_active = true;
     SCOPE_EXIT { g_compute_ahead_active = false; };
-    const auto counts = queue.Run(
+    auto counts = queue.Run(
         [&] { return !stop.stop_requested() && ComputeAheadWanted(); },
         [&](const std::vector<u32>& words) {
             try {
@@ -2250,6 +2252,7 @@ static void PrecompileCompute(const Instance& instance, const Shader::Profile& p
                 "refused, {} left once the game was released, in {:.1f} s",
                 offered, distinct, counts.built, counts.failed, counts.left,
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+    return std::move(counts.attempted);
 }
 
 // FIX-SGT-097: whether the store has a program. An end or a failed write between a permutation's
@@ -2355,6 +2358,7 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
     // FEAT-SGT-118: only for a start the splash holds for, and only as long as it holds.
     const bool compute_ahead = PrecompileComputeOn() && PrecompileHoldsGame();
     ComputeAheadQueue compute_queue;
+    ComputeAheadRecords compute_records; // mapped once built (recipe-perms.txt, below)
     std::atomic<u32> compute_offered{0};
     std::unordered_map<u64, Stored> programs;
     // FEAT-GTS-469: while the splash precompile holds the game for it, every logical processor
@@ -2504,17 +2508,25 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
                     matched_by_direct = same_stored.has_value();
                 }
             }
-            if (compute_ahead && r.hw_stage == u32(Shader::HwStage::Compute) &&
-                ComputeAheadWanted()) {
+            if (compute_ahead && r.hw_stage == u32(Shader::HwStage::Compute)) {
                 // FEAT-SGT-118: before the duplicate check: equal code is kept once anyway. When
                 // the stored permutation matched only with every direct path (FIX-SGT-119), that
                 // is the code a draw will take, so the one built.
-                ++compute_offered;
-                compute_queue.Add(matched_by_direct
-                                      ? ComputePipeline::AheadRecipe(instance, profile,
-                                                                     *direct_info, direct_spv)
-                                      : ComputePipeline::AheadRecipe(instance, profile, *info, spv),
-                                  ComputeAheadWanted);
+                std::optional<u64> recipe;
+                if (ComputeAheadWanted()) {
+                    ++compute_offered;
+                    u64 hash = 0;
+                    if (compute_queue.Add(
+                            matched_by_direct
+                                ? ComputePipeline::AheadRecipe(instance, profile, *direct_info,
+                                                               direct_spv)
+                                : ComputePipeline::AheadRecipe(instance, profile, *info, spv),
+                            ComputeAheadWanted, &hash) ||
+                        hash != 0) {
+                        recipe = hash;
+                    }
+                }
+                compute_records.Note(r.hash, r.spv_xxh, recipe);
             }
             std::unique_lock lk{mutex};
             auto& program = programs[r.hash];
@@ -2596,18 +2608,24 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
             return unwritten.contains(HashCombine(line[0], line[2]));
         });
     }
-    if (!recipe_perms.empty()) {
-        // FEAT-GTS-470: appended; a later start finds these programs stored and skips them.
+    // FEAT-GTS-470: appended; a later start finds these programs stored and skips them.
+    const auto map_records = [](const std::vector<ComputeAheadRecords::Line>& lines) {
+        if (lines.empty()) {
+            return;
+        }
         const auto path = Storage::DataBase::Instance().StorePath() / "recipe-perms.txt";
         if (std::FILE* f = std::fopen(path.string().c_str(), "ab")) {
-            for (const auto& [pgm, spv_xxh, perm] : recipe_perms) {
+            for (const auto& [pgm, spv_xxh, perm] : lines) {
                 std::fprintf(f, "%016llx %016llx %llu\n", static_cast<unsigned long long>(pgm),
                              static_cast<unsigned long long>(spv_xxh),
                              static_cast<unsigned long long>(perm));
             }
             std::fclose(f);
         }
-    }
+    };
+    // FEAT-SGT-118: the compute records' lines wait for their builds (ComputeAheadRecords).
+    auto compute_lines = compute_records.TakeLines(recipe_perms);
+    map_records(recipe_perms);
     LOG_WARNING(Render_Vulkan,
                 "PERF-GT7-117: {} records in {:.1f} s on {} threads: {} translations stored, {} "
                 "for programs already stored or in use, {} duplicates, {} with reads not replayed "
@@ -2620,13 +2638,21 @@ void PipelineCache::PretranslateManifest(std::stop_token stop) {
                 no_code.load(), failed.load(), in_use.load(), foreign.load(), matched.load(),
                 matched_direct.load());
     // FEAT-SGT-118: the game still held, or nothing more (the queue goes with this function).
+    std::unordered_set<u64> compute_built;
     if (compute_ahead && compute_queue.Size() != 0 && !stop.stop_requested() &&
         ComputeAheadWanted()) {
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Normal);
         Common::AllowAllCores();
-        PrecompileCompute(instance, profile, *pipeline_cache, compute_queue,
-                          compute_offered.load(), stop);
+        compute_built = PrecompileCompute(instance, profile, *pipeline_cache, compute_queue,
+                                          compute_offered.load(), stop);
     }
+    if (const size_t left = compute_records.DropUnbuilt(compute_lines, compute_built)) {
+        LOG_WARNING(Render_Vulkan,
+                    "FEAT-SGT-118: {} compute records left unmapped: the next start replays them "
+                    "and builds them ahead",
+                    left);
+    }
+    map_records(compute_lines);
 }
 
 // PERF-GT7-108: builds one recipe's shader objects and writes them to the SO-009 cache file the

@@ -6,10 +6,15 @@
 // FEAT-SGT-118: the compute recipes the splash builds ahead, and the gate a build waits at. Both
 // stop at the game's release: a driver compile in play costs frames. Without Vulkan, for its tests.
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <map>
 #include <mutex>
+#include <optional>
 #include <stop_token>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -45,17 +50,22 @@ public:
         u32 built{};
         u32 failed{};
         u32 left{}; ///< not built: the game was released
+        std::unordered_set<u64> attempted; ///< the recipes built or refused by the driver
     };
 
-    /// From the pre-translation's workers. False when not kept: a copy, or the game plays.
+    /// From the pre-translation's workers. False when not kept: a copy, or the game plays. `hash`,
+    /// when the game is held: the recipe's, whether kept now or already.
     template <typename Held>
-    bool Add(std::vector<u32>&& words, Held&& held) {
+    bool Add(std::vector<u32>&& words, Held&& held, u64* hash = nullptr) {
         if (!held()) {
             return false;
         }
-        const u64 hash = XXH3_64bits(words.data(), words.size() * sizeof(u32));
+        const u64 key = XXH3_64bits(words.data(), words.size() * sizeof(u32));
+        if (hash) {
+            *hash = key;
+        }
         std::scoped_lock lk{mutex};
-        return recipes.try_emplace(hash, std::move(words)).second;
+        return recipes.try_emplace(key, std::move(words)).second;
     }
 
     size_t Size() const {
@@ -78,8 +88,12 @@ public:
                 ++counts.left;
             } else if (build(std::as_const(words))) {
                 ++counts.built;
+                counts.attempted.insert(hash);
+            } else if (!held()) {
+                ++counts.left; // refused at the gate: the game was released while it waited
             } else {
                 ++counts.failed;
+                counts.attempted.insert(hash);
             }
             std::vector<u32>{}.swap(words); // built or not, no longer needed
             ++done;
@@ -90,6 +104,49 @@ public:
 private:
     mutable std::mutex mutex;
     std::unordered_map<u64, std::vector<u32>> recipes;
+};
+
+/// The pre-translation maps each record to its permutation in recipe-perms.txt, and a later start
+/// skips the records it maps (FIX-SGT-119). A compute record is mapped only once its recipe was
+/// built or refused here: a start that ended, or let the game go, before then leaves it unmapped,
+/// so the next start replays it and builds it ahead. The other records are mapped at once, as
+/// before: a start stopped during these builds keeps them.
+class ComputeAheadRecords {
+public:
+    using Line = std::array<u64, 3>; ///< program, the record's SPIR-V hash, permutation
+
+    /// A compute record and its recipe; none when it wasn't kept (the game played).
+    void Note(u64 program, u64 record_spirv, std::optional<u64> recipe) {
+        std::scoped_lock lk{mutex};
+        records[{program, record_spirv}] = recipe;
+    }
+
+    /// Moves the noted records' lines out of `lines`, to be kept for after the builds.
+    std::vector<Line> TakeLines(std::vector<Line>& lines) const {
+        std::scoped_lock lk{mutex};
+        std::vector<Line> taken;
+        std::erase_if(lines, [&](const Line& line) {
+            if (!records.contains({line[0], line[1]})) {
+                return false;
+            }
+            taken.push_back(line);
+            return true;
+        });
+        return taken;
+    }
+
+    /// Removes from `lines` those whose recipe `attempted` doesn't hold; how many.
+    size_t DropUnbuilt(std::vector<Line>& lines, const std::unordered_set<u64>& attempted) const {
+        std::scoped_lock lk{mutex};
+        return std::erase_if(lines, [&](const Line& line) {
+            const auto it = records.find({line[0], line[1]});
+            return it != records.end() && (!it->second || !attempted.contains(*it->second));
+        });
+    }
+
+private:
+    mutable std::mutex mutex;
+    std::map<std::pair<u64, u64>, std::optional<u64>> records;
 };
 
 } // namespace Vulkan

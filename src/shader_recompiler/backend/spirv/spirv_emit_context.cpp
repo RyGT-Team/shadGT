@@ -622,10 +622,12 @@ void EmitContext::DefineInputs() {
                 last_location = std::max<u32>(
                     last_location, input.param_index + (has_clip_distance_inputs ? 1 : 0));
             }
-            if (per_vertex && last_location < OrderCheckRefLocation) {
-                order_ref_in = Name(DefineInput(F32[4], OrderCheckRefLocation), "order_ref_in");
+            // PERF-SGT-126: right after the exports when the pipeline cache put them there.
+            const u32 ref_location = runtime_info.hw.fs.OrderLocation();
+            if (per_vertex && last_location < ref_location) {
+                order_ref_in = Name(DefineInput(F32[4], ref_location), "order_ref_in");
                 order_vertex_in =
-                    Name(DefineInput(F32[4], OrderCheckVertexLocation), "order_vertex_in");
+                    Name(DefineInput(F32[4], ref_location + 1), "order_vertex_in");
                 Decorate(order_vertex_in, spv::Decoration::ExplicitInterpAMD);
                 if (!ValidId(bary_coord_smooth)) {
                     bary_coord_smooth = DefineVariable(F32[2], spv::BuiltIn::BaryCoordSmoothAMD,
@@ -781,11 +783,17 @@ void EmitContext::DefineVertexBlock() {
     }
     // AMD-307: the stage that feeds the rasterizer also writes the position to two locations the
     // pixel shader reads interpolated and per vertex (see DefineAmdPerVertexAttribs).
+    // PERF-SGT-126: a plain vertex shader puts them right after its exports.
+    const u32 order_ref_location =
+        hw_stage == HwStage::Vertex && sw_stage == SwStage::Vertex &&
+                runtime_info.hw.vs.order_location != 0
+            ? runtime_info.hw.vs.order_location
+            : OrderCheckRefLocation;
     if (profile.vertex_order_check &&
         (hw_stage == HwStage::Vertex || sw_stage == SwStage::Geometry) &&
-        LastParamOutputLocation() < OrderCheckRefLocation) {
-        order_ref_out = Name(DefineOutput(F32[4], OrderCheckRefLocation), "order_ref_out");
-        order_vertex_out = Name(DefineOutput(F32[4], OrderCheckVertexLocation), "order_vertex_out");
+        LastParamOutputLocation() < order_ref_location) {
+        order_ref_out = Name(DefineOutput(F32[4], order_ref_location), "order_ref_out");
+        order_vertex_out = Name(DefineOutput(F32[4], order_ref_location + 1), "order_vertex_out");
     }
     const bool needs_clip_distance_emulation = sw_stage == SwStage::Vertex &&
                                                hw_stage == HwStage::Vertex &&

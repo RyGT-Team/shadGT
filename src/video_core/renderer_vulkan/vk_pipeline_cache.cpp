@@ -1266,11 +1266,14 @@ private:
     // (PERF-GT7-034's step back) and were never measured narrowed.
     // PERF-GTS-489: 2 at once is the default for both games; it is what took the compile stutter
     // out of play. SHADGT_COMPILE_PLAY_WIDTH=<n> narrows to n; 0: never.
+    // FIX-SGT-125: not with "Pause the game" (compile mode 0). The game waits for the builds
+    // there, so no submit of its competes with them, and 2 at once only made each pause longer
+    // (an RDNA2 iGPU sat 10 s of every 10 in build waits). An explicit width still applies.
     static bool NarrowInPlay() {
         static const bool on = [] {
             const char* env = std::getenv("SHADGT_COMPILE_PLAY_WIDTH");
             if (env && *env) return std::strtoul(env, nullptr, 10) != 0;
-            return true;
+            return CompileMode() != 0;
         }();
         return on;
     }

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <cstring>
 #include <system_error>
 
 #include "common/aes.h"
@@ -110,14 +109,7 @@ bool TRP::Extract(const std::filesystem::path& trophyPath, std::string npCommId,
                 break;
             }
 
-            const std::string_view name(entry.entry_name,
-                                        strnlen(entry.entry_name, sizeof(entry.entry_name)));
-            if (name.empty() || name.find_first_of("/\\:") != std::string_view::npos ||
-                name.find("..") != std::string_view::npos) {
-                LOG_WARNING(Common_Filesystem, "Skipping TRP entry {} with an unsafe name", i);
-                trpFileIndex++;
-                continue;
-            }
+            std::string_view name(entry.entry_name);
 
             if (entry.flag == ENTRY_FLAG_PNG) {
                 if (!ProcessPngEntry(file, entry, outputPath, name)) {

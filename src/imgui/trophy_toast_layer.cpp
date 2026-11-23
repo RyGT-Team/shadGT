@@ -162,7 +162,7 @@ void TrophyToastUI::LoadAssets() {
         }
         return {};
     };
-    const auto font_path = pick({"font.ttf", "font.otf", "fonts/SSTRg.ttf"});
+    const auto font_path = pick({"font.ttf", "font.otf"});
     if (!font_path.empty()) {
         ImFontConfig cfg{};
         cfg.OversampleH = 2;
@@ -180,8 +180,8 @@ void TrophyToastUI::LoadAssets() {
             ++cups;
         }
     }
-    wav_trophy_ = pick({"trophy.wav", "ps5_trophy.wav"});
-    wav_platinum_ = pick({"platinum.wav", "ps5_platinum.wav"});
+    wav_trophy_ = pick({"trophy.wav"});
+    wav_platinum_ = pick({"platinum.wav"});
     LOG_INFO(Lib_NpTrophy,
              "FEAT-GT7-186 trophy toast: {}; font {}, {} cup images, sounds {}/{}, {} custom "
              "file(s) from {}{}",

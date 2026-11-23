@@ -701,7 +701,6 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|RYGT_TROPHY_TOAST|flag|Trophies|on|0 = off|Shows the PS5-style trophy pop-up (top right, with the grade's sound) when a trophy unlocks; 0 hides it (unlocks are still logged and saved).",
     "RYGTSW1|RYGT_TROPHY_TOAST_TEST|string|Trophies|off|1 = a Gold demo; B, S, G or P = a demo of that grade|Shows one demo trophy pop-up 5 s after the game starts, to check its look and sound without unlocking anything.",
     "RYGTSW1|RYGT_TROPHY_PROGRESS_SD|flag|Trophies|on|0 = old place|Keeps trophy progress next to the saves in user\\savedata\\<serial>\\_sd\\trophies_progress (copied once from the old _sd\\trophies_progress or user\\home\\<1000+slot>\\trophy, which stay as a backup); 0 uses the old user\\home place.",
-    "RYGTSW1|RYGT_TROPHY_KEY_FILE|string|Trophies|set by the launcher|path of a file with the 32 hex digit trophy key|The launcher passes the user's trophy key in a temporary file so the game's trophy files can be extracted (FEAT-GT7-185). The key is never logged.",
 };
 
 RYGT_SWITCH_EXPORT const std::size_t RyGT_SwitchDescriptionCount = std::size(RyGT_SwitchDescriptions);

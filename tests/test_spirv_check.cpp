@@ -62,9 +62,9 @@ TEST(SpirvCheck, IgnoresOtherAtomicsAndSelects) {
               FloatAtomicEmulation::None);
 }
 
-TEST(SpirvCheck, IgnoresImageAtomics) {
-    // FIX-GT7-013: an image's float atomic max keeps both atomics and the OpSelect (FIX-226 left
-    // image atomics as they were): translating it again would make the same module.
+TEST(SpirvCheck, FindsBothImageAtomicsBeforeSgt136) {
+    // FIX-SGT-136: an image's float atomic max made before the fix: both atomics on a texel
+    // pointer and the OpSelect. It counts now, so a stored module of it is translated again.
     const auto module = Module({
         {OpImageTexelPointer, 3, 9, 40, 41, 42},
         {OpAtomicUMin, 1, 20, 9, 10, 11, 12},
@@ -73,7 +73,20 @@ TEST(SpirvCheck, IgnoresImageAtomics) {
         {OpBitcast, 2, 23, 22},
         {OpSelect, 2, 24, 13, 21, 23},
     });
-    EXPECT_EQ(FindFloatAtomicEmulation(module), FloatAtomicEmulation::None);
+    EXPECT_EQ(FindFloatAtomicEmulation(module), FloatAtomicEmulation::BothAtomics);
+}
+
+TEST(SpirvCheck, FindsOneImageAtomicOfSgt136) {
+    // FIX-SGT-136: an image's float atomic min: UMax and SMin on a texel pointer in two
+    // branches, an OpPhi of both, bitcast to a float.
+    const auto module = Module({
+        {OpImageTexelPointer, 3, 9, 40, 41, 42},
+        {OpAtomicUMax, 1, 20, 9, 10, 11, 12},
+        {OpAtomicSMin, 1, 22, 9, 10, 11, 12},
+        {OpPhi, 1, 24, 20, 30, 22, 31},
+        {OpBitcast, 2, 25, 24},
+    });
+    EXPECT_EQ(FindFloatAtomicEmulation(module), FloatAtomicEmulation::OneAtomic);
 }
 
 TEST(SpirvCheck, IgnoresIntegerSelectsAndPhis) {

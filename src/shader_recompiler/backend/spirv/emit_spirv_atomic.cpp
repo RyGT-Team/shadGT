@@ -468,9 +468,45 @@ Id EmitImageAtomicUMax32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords
     return ImageAtomicU32(ctx, inst, handle, coords, value, &Sirit::Module::OpAtomicUMax);
 }
 
+// FIX-SGT-136: FIX-226's exact emulation for images too. Without native image float min/max
+// (RDNA3 has no such image instruction at all, and AMD-308 turns it off with AMD's older shader
+// compiler on RDNA2), both integer atomics ran, so for a value of +0 or more the image kept the
+// last value written, not the min or max: whichever thread came last. GT7's volumetric clouds
+// build an image this way, and on big RX 7000 cards the order changes every frame, so the clouds
+// and the mountains they shade flickered (RyGT #92). SHADGT_FLOAT_ATOMIC_EXACT=0: as before.
+static Id FloatImageMinMaxByIntegerAtomics(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords,
+                                           Id value, bool is_max) {
+    const Id u32_value = ctx.OpBitcast(ctx.U32[1], value);
+    const Id negative = ctx.OpINotEqual(
+        ctx.U1[1],
+        ctx.OpBitFieldUExtract(ctx.U32[1], u32_value, ctx.ConstU32(31u), ctx.ConstU32(1u)),
+        ctx.u32_zero_value);
+    const Id negative_label = ctx.OpLabel();
+    const Id positive_label = ctx.OpLabel();
+    const Id merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(negative, negative_label, positive_label);
+    ctx.AddLabel(negative_label);
+    const Id negative_old =
+        is_max ? EmitImageAtomicUMin32(ctx, inst, handle, coords, u32_value)
+               : EmitImageAtomicUMax32(ctx, inst, handle, coords, u32_value);
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(positive_label);
+    const Id positive_old =
+        is_max ? EmitImageAtomicSMax32(ctx, inst, handle, coords, u32_value)
+               : EmitImageAtomicSMin32(ctx, inst, handle, coords, u32_value);
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
+    const Id old = ctx.OpPhi(ctx.U32[1], negative_old, negative_label, positive_old, positive_label);
+    return ctx.OpBitcast(ctx.F32[1], old);
+}
+
 Id EmitImageAtomicFMax32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id value) {
     if (ctx.profile.supports_image_fp32_atomic_min_max) {
         return ImageAtomicF32(ctx, inst, handle, coords, value, &Sirit::Module::OpAtomicFMax);
+    }
+    if (FloatAtomicExact()) {
+        return FloatImageMinMaxByIntegerAtomics(ctx, inst, handle, coords, value, true);
     }
 
     const auto u32_value = ctx.OpBitcast(ctx.U32[1], value);
@@ -491,6 +527,9 @@ Id EmitImageAtomicFMax32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords
 Id EmitImageAtomicFMin32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id value) {
     if (ctx.profile.supports_image_fp32_atomic_min_max) {
         return ImageAtomicF32(ctx, inst, handle, coords, value, &Sirit::Module::OpAtomicFMin);
+    }
+    if (FloatAtomicExact()) {
+        return FloatImageMinMaxByIntegerAtomics(ctx, inst, handle, coords, value, false);
     }
 
     const auto u32_value = ctx.OpBitcast(ctx.U32[1], value);

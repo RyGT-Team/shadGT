@@ -11,7 +11,8 @@
 namespace Shader::Backend::SPIRV {
 
 /// FIX-226: float atomic min/max without VK_EXT_shader_atomic_float2 run only the integer atomic
-/// the value's sign picks (SHADGT_FLOAT_ATOMIC_EXACT=0: both, as before).
+/// the value's sign picks, on buffers and (FIX-SGT-136) images (SHADGT_FLOAT_ATOMIC_EXACT=0: both,
+/// as before).
 bool FloatAtomicExact();
 
 /// PERF-GTS-473: reads of a direct-eligible buffer share one direct/SSBO branch per run of reads

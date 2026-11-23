@@ -39,15 +39,15 @@ inline bool IsCompleteSpirv(std::span<const u32> words) {
 /// (without VK_EXT_shader_atomic_float2): both atomics, each result bitcast to a float, then an
 /// OpSelect by the value's sign (before FIX-226, or SHADGT_FLOAT_ATOMIC_EXACT=0), or only the one
 /// the sign picks, the two results merged by an OpPhi that is bitcast to a float (FIX-226). The
-/// pairs are UMin + SMax (max) and UMax + SMin (min). FIX-GT7-013: image atomics (on an
-/// OpImageTexelPointer) are not counted: FIX-226 left their emulation as it was, so a module of
-/// them would be translated again into the same form every session. Nor are atomics whose
-/// results are selected or merged as integers. Words of a whole module (IsCompleteSpirv).
+/// pairs are UMin + SMax (max) and UMax + SMin (min). FIX-SGT-136: image atomics (on an
+/// OpImageTexelPointer) count too, now that images are emulated the same way; FIX-GT7-013 left
+/// them out while their emulation stayed both atomics. Atomics whose results are selected or
+/// merged as integers are not counted. Words of a whole module (IsCompleteSpirv).
 enum class FloatAtomicEmulation { None, BothAtomics, OneAtomic };
 
 inline FloatAtomicEmulation FindFloatAtomicEmulation(std::span<const u32> words) {
     constexpr u32 HeaderWords = 5;
-    constexpr u32 OpImageTexelPointer = 60, OpBitcast = 124, OpSelect = 169, OpPhi = 245;
+    constexpr u32 OpBitcast = 124, OpSelect = 169, OpPhi = 245;
     constexpr u32 OpAtomicSMin = 236, OpAtomicUMin = 237, OpAtomicSMax = 238, OpAtomicUMax = 239;
     const auto each = [&](auto&& visit) {
         for (size_t at = HeaderWords; at < words.size();) {
@@ -59,15 +59,10 @@ inline FloatAtomicEmulation FindFloatAtomicEmulation(std::span<const u32> words)
             at += count;
         }
     };
-    // Image texel pointers first (an atomic's pointer is defined before it).
-    std::unordered_map<u32, u32> texel_pointers;
-    std::unordered_map<u32, u32> atomics; // result id: opcode, buffer atomics only
+    std::unordered_map<u32, u32> atomics; // result id: opcode, buffer and image atomics
     std::unordered_map<u32, u32> bitcasts; // result id: source id
     each([&](u32 op, std::span<const u32> operands) {
-        if (op == OpImageTexelPointer && operands.size() >= 2) {
-            texel_pointers.emplace(operands[1], 0u);
-        } else if (op >= OpAtomicSMin && op <= OpAtomicUMax && operands.size() >= 3 &&
-                   !texel_pointers.contains(operands[2])) {
+        if (op >= OpAtomicSMin && op <= OpAtomicUMax && operands.size() >= 3) {
             atomics.emplace(operands[1], op);
         } else if (op == OpBitcast && operands.size() >= 3) {
             bitcasts.emplace(operands[1], operands[2]);

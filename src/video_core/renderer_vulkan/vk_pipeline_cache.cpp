@@ -1527,6 +1527,25 @@ bool PipelineCache::ReadsVertexValues(const AmdGpu::ShaderProgram& program) {
     return found;
 }
 
+// PERF-SGT-126: AMD-307's two position copies go right after the vertex stage's exports instead
+// of at locations 30/31. At 30/31, AMD's older shader compiler compiled each new pixel shader a
+// second time when its pipeline was linked from libraries (GT7, Radeon iGPU, cold: link 553 ms
+// a pipeline, 0 ms with the copies here; 1172 -> 447 ms of compiling a pipeline). Only for a
+// plain vertex shader feeding the pixel shader (no geometry or tessellation stage), where the
+// pixel shader's input locations are the export indices (no clip distance emulation on AMD).
+// Both shaders take the location from the same register. SHADGT_ORDER_COMPACT=0 keeps 30/31.
+static u8 CompactOrderLocation(const AmdGpu::Regs& regs) {
+    static const bool compact = [] {
+        const char* env = std::getenv("SHADGT_ORDER_COMPACT");
+        return !(env && env[0] == '0');
+    }();
+    if (!compact || regs.stage_enable.IsStageEnabled(static_cast<u32>(HwStage::Geometry)) ||
+        regs.stage_enable.IsStageEnabled(static_cast<u32>(HwStage::Local))) {
+        return 0;
+    }
+    return static_cast<u8>(regs.vs_output_config.NumExports());
+}
+
 const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStage l_stage) {
     auto& info = S().runtime_infos[u32(l_stage)];
     const auto& regs = Regs();
@@ -1605,6 +1624,10 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.hw.vs.clip_disable = regs.IsClipDisabled();
         info.hw.vs.depth_min_offset = DepthMinOffset( // FIX-SGT-124
             regs, instance.GetDriverID() == vk::DriverId::eAmdProprietary);
+        info.hw.vs.order_location = profile.vertex_order_check && !IsTessEmulatedDraw() &&
+                                            regs.vs_output_config.NumExports() + 2 <= 30
+                                        ? CompactOrderLocation(regs)
+                                        : u8{0};
         break;
     }
     case HwStage::Fragment: {
@@ -1833,6 +1856,11 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.hw.fs.vertex_order_check =
             profile.vertex_order_check && !IsTessEmulatedDraw() &&
             regs.vs_output_config.NumExports() + 2 <= 30; // OrderCheckRefLocation
+        if (info.hw.fs.vertex_order_check) {
+            if (const u8 location = CompactOrderLocation(regs); location != 0) {
+                info.hw.fs.vertex_order_check = static_cast<u8>(location + 2); // PERF-SGT-126
+            }
+        }
         break;
     }
     case HwStage::Compute: {

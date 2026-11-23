@@ -98,6 +98,9 @@ struct HwVertexRuntimeInfo {
     std::array<OutputMap, 3> outputs;
     bool emulate_depth_negative_one_to_one{};
     bool clip_disable{};
+    // PERF-SGT-126: AMD-307's two position copies go to this location and the next, right after
+    // the exports, instead of 30/31 (0 keeps 30/31). In former padding: the size is unchanged.
+    u8 order_location{};
     u32 user_clip_plane_mask{};
     /// FIX-SGT-124: the vertex shader adds this times w to its depth (z += k * w), for a viewport
     /// whose depth range starts at 0 in place of a small non-zero minimum (AMD). In the union's
@@ -314,7 +317,12 @@ struct HwFragmentRuntimeInfo {
     bool single_sample_barycentric{false};
     // AMD-307: the pipeline's vertex exports leave locations 30/31 free for the vertex order
     // check (set only where the device profile enables the check; formerly padding).
-    bool vertex_order_check{false};
+    // PERF-SGT-126: 0 off, 1 on at locations 30/31, 2 + L on at L/L+1 (the copies right after the
+    // exports). The same byte as before, so the struct keeps its stored size.
+    u8 vertex_order_check{0};
+    u32 OrderLocation() const noexcept {
+        return vertex_order_check >= 2 ? vertex_order_check - 2u : 30u;
+    }
 
     bool operator==(const HwFragmentRuntimeInfo& other) const noexcept {
         return std::ranges::equal(color_buffers, other.color_buffers) &&

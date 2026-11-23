@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <optional>
+#include <string_view>
 
 // FEAT-SGT-127: when one slice of the preparation tour is over, and whether it ran whole. The menu
 // script queues a slice's loads at once; the scene then runs them one after the other, and the load
@@ -55,6 +56,58 @@ inline bool WentQuiet(const Slice& slice, double now) {
 /// it. Unknown (nothing read) or nothing queued is not whole.
 inline bool RanWhole(std::uint32_t loads, std::optional<std::uint32_t> queued) {
     return queued.has_value() && *queued > 0 && loads >= *queued;
+}
+
+/// FEAT-SGT-129: what the tour loads besides the cars and courses. SHADGT_PREPARE_LEAVE_OUT lists, with
+/// commas, what it leaves out: drivers, crowds, wheels (the spare rims), reward (the reward screen).
+struct Choices {
+    bool drivers = true;
+    bool crowds = true;
+    bool wheels = true;
+    bool reward = true;
+    unsigned unknown = 0; // words that name none of them
+};
+
+inline Choices ParseLeaveOut(std::string_view text) {
+    Choices choices;
+    while (!text.empty()) {
+        const size_t comma = text.find(',');
+        std::string_view word = text.substr(0, comma);
+        text = comma == std::string_view::npos ? std::string_view{} : text.substr(comma + 1);
+        while (!word.empty() && (word.front() == ' ' || word.front() == '\t')) {
+            word.remove_prefix(1);
+        }
+        while (!word.empty() && (word.back() == ' ' || word.back() == '\t')) {
+            word.remove_suffix(1);
+        }
+        if (word.empty()) {
+            continue;
+        }
+        if (word == "drivers") {
+            choices.drivers = false;
+        } else if (word == "crowds") {
+            choices.crowds = false;
+        } else if (word == "wheels") {
+            choices.wheels = false;
+        } else if (word == "reward") {
+            choices.reward = false;
+        } else {
+            ++choices.unknown;
+        }
+    }
+    return choices;
+}
+
+/// FEAT-SGT-129: how a part ends. One that ran whole is done. One cut short by the next part's car
+/// change runs again. One that stopped short by itself (a load that never finished, or never started)
+/// runs again once; stopped short a second time, it is left as it is, so the parts after it still run.
+enum class End { Done, Again, GiveUp };
+
+inline End HowItEnds(bool whole, bool cut, bool stopped_before) {
+    if (whole) {
+        return End::Done;
+    }
+    return cut || !stopped_before ? End::Again : End::GiveUp;
 }
 
 } // namespace PrepareTour

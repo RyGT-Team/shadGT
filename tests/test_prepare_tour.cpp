@@ -8,6 +8,7 @@
 
 namespace {
 
+using PrepareTour::End;
 using PrepareTour::Slice;
 
 TEST(PrepareTour, FirstLoadOpensTheSliceAndWaitsThirtySeconds) {
@@ -70,6 +71,43 @@ TEST(PrepareTour, WholeOnlyWhenEveryQueuedLoadStarted) {
     EXPECT_FALSE(PrepareTour::RanWhole(499, 500u));
     EXPECT_FALSE(PrepareTour::RanWhole(10, std::nullopt));
     EXPECT_FALSE(PrepareTour::RanWhole(0, 0u));
+}
+
+TEST(PrepareTourChoices, NothingLeftOutByDefault) {
+    const auto choices = PrepareTour::ParseLeaveOut("");
+    EXPECT_TRUE(choices.drivers && choices.crowds && choices.wheels && choices.reward);
+    EXPECT_EQ(choices.unknown, 0u);
+}
+
+TEST(PrepareTourChoices, ReadsTheListWithSpaces) {
+    const auto choices = PrepareTour::ParseLeaveOut(" crowds, reward ,,");
+    EXPECT_TRUE(choices.drivers);
+    EXPECT_FALSE(choices.crowds);
+    EXPECT_TRUE(choices.wheels);
+    EXPECT_FALSE(choices.reward);
+    EXPECT_EQ(choices.unknown, 0u);
+}
+
+TEST(PrepareTourChoices, CountsUnknownWords) {
+    const auto choices = PrepareTour::ParseLeaveOut("drivers,tyres,Wheels");
+    EXPECT_FALSE(choices.drivers);
+    EXPECT_TRUE(choices.wheels); // the words are lower case
+    EXPECT_EQ(choices.unknown, 2u);
+}
+
+TEST(PrepareTourEnd, WholeIsDone) {
+    EXPECT_EQ(PrepareTour::HowItEnds(true, false, false), End::Done);
+    EXPECT_EQ(PrepareTour::HowItEnds(true, false, true), End::Done);
+}
+
+TEST(PrepareTourEnd, ACarChangeAlwaysRunsItAgain) {
+    EXPECT_EQ(PrepareTour::HowItEnds(false, true, false), End::Again);
+    EXPECT_EQ(PrepareTour::HowItEnds(false, true, true), End::Again);
+}
+
+TEST(PrepareTourEnd, StoppedShortTwiceIsLeft) {
+    EXPECT_EQ(PrepareTour::HowItEnds(false, false, false), End::Again);
+    EXPECT_EQ(PrepareTour::HowItEnds(false, false, true), End::GiveUp);
 }
 
 } // namespace

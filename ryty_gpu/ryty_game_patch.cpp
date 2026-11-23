@@ -1265,39 +1265,107 @@ const ArcadeSite kArcadeSites[] = {
 };
 
 // FEAT-SGT-127: the preparation tour (SHADGT_PREPARE_SHADERS=1, GT7 1.71). A car change in a menu runs
-// the next slice. Every menu that shows a car (the dealership, Arcade, the garage) goes through the
+// the next part. Every menu that shows a car (the dealership, Arcade, the garage) goes through the
 // common SceneFaceEventProtocol.ExecChangeCarCommand. After the menu's own car command and before
-// its completion signal, the slice's loads are queued:
-//   0. cars [0, 500) of DMSAccessor::CarDataAccessor::GetCarLabelListAll, each with its interior;
-//   1. the cars from 500 on;
-//   2. every course layout but the test ones.
-// Each car: setDefaultCarParameter(Car(code), 1000 + n), "clearEntity rygt<n % 2>", then
-// "loadLodCarWithInterior _default<1000 + n> rygt<n % 2>". That reads the race files and the
-// interior, as a race builds the player's car, and a player sees the interior of any car he drives.
-// Each layout: "clearEntity rygtc<i % 2>", then "loadCourse <nickname> rygtc<i % 2>".
+// its completion signal, the part's loads are queued (PrepareParts):
+//   cars [0, 300), then [300, 600), of DMSAccessor::CarDataAccessor::GetCarLabelListAll (587 in
+//     1.71), each with its interior and (FEAT-SGT-129) a driver;
+//   FEAT-SGT-129: on one car, the player's kinds of driver and the spare rims;
+//   every course layout but the test ones, (FEAT-SGT-129) with its crowd;
+//   FEAT-SGT-129: then, once, the reward screen, last since it replaces the scene.
+// Each car: setDefaultCarParameter(Car(code), 1000 + n), "clearEntity rygt<n % 2>",
+// "loadLodCarWithInterior _default<1000 + n> rygt<n % 2>", then "loadDefaultDriver 2000 false
+// rygt<n % 2> false". That reads the race files and the interior, as a race builds the player's car,
+// and a player sees the interior of any car he drives. Driver 2000 has head and body codes 4, as
+// every driver of a race but the player's (journal 35l: character/f004, o004); mode false loads
+// these race models, true also the high definition the race gives the player's (DIAG-SGT-128).
+// Each layout: "clearEntity rygtc<n % 2>", then "loadCourseWithCrowd <nickname> rygtc<n % 2> 0 0",
+// which opens the crowd files the race reads (DIAG-SGT-128), or "loadCourse" without the crowds.
+// The extras, on the first car GT Auto has rims for (of the first 60 labels), each after a new load
+// of that car: "loadDefaultDriver 2000 true", "loadSpecifiedDriver initialdriver" false and true (a
+// race loads the player's driver in high definition: f005, o007, hm005, hs007), then
+// "setCarWheelVariation <id> rygt<n % 2>" for each rim of GTGameSystem::GTAuto::MGTAutoBehavior().
+// GetWheelItemList(&list, cp, UInt(NO_CODE32)), as the wheel shop's inventory asks it: 161 rims,
+// once each though the list has one per colour; they opened 159 /carparts/race/ files.
+// The reward screen: car and driver in slot 0, then the command file the scene alias names and its
+// DEFAULT commands, as GT7RewardRootEvent.setSceneFace does.
+// SHADGT_PREPARE_LEAVE_OUT leaves out drivers, crowds, wheels or reward (PrepareTour::Choices).
 // The scene runs queued commands one at a time while its loader is busy, so when a load starts, the
 // previous car or course is whole and still in memory. The load hooks have the capture scan then
 // (ShaderCapture::ScanNowAndWait). Two entities: on 2026-11-21, eight stopped after about eight cars,
-// where a scene's car slots likely ran out.
-// A slice is chosen by marker files in /APP_DATA, written when it is queued. The scene's queue drops
-// what goes past about 1,024 commands, and a slice of n cars queues 2 n + 4. The script also writes
-// how many loads it queued (kPrepareCountFile), so the host can tell a slice that ran whole from one
-// cut short by a car change, a stalled load or a closed game; the host then drops its marker, and
-// the slice runs again. Layouts whose nickname begins with "test" are skipped: on 11-21, test1_L01
-// never finished loading.
-// Measured on an RTX 4070 PC only: 323 cars with their interior in 5.5 min, 125 layouts in 11 min.
+// where a scene's car slots likely ran out. A part leaves its last load in memory, for the capture's
+// own scans while the part goes quiet; each part first clears every tour entity.
+// A part is chosen by marker files in /APP_DATA, written when it is queued. The scene's queue drops
+// what goes past about 1,024 commands: a car part queues 3 n + 5, the extras 3 n + 5, the courses
+// 2 n + 5. The script also writes how many loads it queued (kPrepareCountFile), so the host can tell a
+// part that ran whole from one cut short by a car change, a stalled load or a closed game; the host
+// then drops its marker, and the part runs again at a later car change. Layouts whose nickname begins
+// with "test" are skipped: on 11-21, test1_L01 never finished loading.
+// Measured on an RTX 4070 PC only: 323 cars with their interior in 5.5 min, 125 layouts in 11 min
+// (without drivers or crowds), 161 rims in under 3 min (DIAG-SGT-128).
 constexpr s32 kPrepareFirstSlot = 1000; // the menus use slots 0..3
-constexpr s32 kPrepareSlice = 500;
+constexpr s32 kPrepareDriverSlot = 2000;
+constexpr s32 kPrepareExtrasSlot = 2998;
+constexpr s32 kPrepareSlice = 300;
 constexpr s32 kPrepareEntities = 2;
-constexpr const char* kPrepareMarkers[] = {"/APP_DATA/rygt_prepare_0.done", "/APP_DATA/rygt_prepare_1.done",
-                                           "/APP_DATA/rygt_prepare_2.done"};
+constexpr s32 kPrepareWheelsMax = 300;
+constexpr s32 kPrepareWheelSearch = 60;
 constexpr const char* kPrepareCountFile = "/APP_DATA/rygt_prepare.count";
+constexpr const char* kPrepareRewardMarker = "/APP_DATA/rygt_prepare_reward.done";
+constexpr const char* kPrepareDrivers[] = {"loadDefaultDriver 2000 true", "loadSpecifiedDriver initialdriver false",
+                                           "loadSpecifiedDriver initialdriver true"};
+static_assert(kPrepareDriverSlot == 2000 && kPrepareExtrasSlot == 2998, "the commands' text names them");
 
-void PrepareEntity(AdhocCode& code, u32 loads) { // " rygt" + n % 2, left on the stack for a push
-    code.Text(" rygt");
-    code.Eval({"rygt_tour_n"}, loads);
-    code.Int(kPrepareEntities);
-    code.Binary("__mod__");
+PrepareTour::Choices g_prepare_choices; // FEAT-SGT-129: read with the tour's switch (InstallGt7ScriptDump)
+
+enum class PreparePart : u8 { Cars, Extras, Courses };
+
+struct PreparePartInfo {
+    PreparePart kind;
+    s32 from; // a car part's first label
+    const char* marker;
+    const char* name;
+};
+
+// The parts, in their order. The extras come before the courses: a layout that never loads can't
+// hold them back.
+std::vector<PreparePartInfo> PrepareParts() {
+    std::vector<PreparePartInfo> parts{
+        {PreparePart::Cars, 0, "/APP_DATA/rygt_prepare_cars0.done", "cars"},
+        {PreparePart::Cars, kPrepareSlice, "/APP_DATA/rygt_prepare_cars1.done", "cars"}};
+    if (g_prepare_choices.drivers || g_prepare_choices.wheels) {
+        parts.push_back({PreparePart::Extras, 0, "/APP_DATA/rygt_prepare_extras.done", "drivers and spare rims"});
+    }
+    parts.push_back({PreparePart::Courses, 0, "/APP_DATA/rygt_prepare_courses.done", "courses"});
+    return parts;
+}
+
+// The tour's slots past ExecChangeCarCommand's own (kPrepareTourSites): one name per local.
+struct PrepareFrame {
+    u32 sf;
+    u32 it, index, loads, cp, from, dp, wl, wit, item, prev, search, nick, rw, cit;            // locals
+    u32 labels, car, code, exist, write, layouts, nickname, driver, gt_auto, uint, none, alias; // statics
+};
+constexpr u32 kPrepareLocals = 14;
+constexpr u32 kPrepareStatics = 12;
+
+PrepareFrame MakePrepareFrame(const ArcadeSite& site) {
+    PrepareFrame f{};
+    f.sf = site.local;
+    const std::array locals{&f.it,   &f.index, &f.loads, &f.cp,     &f.from, &f.dp, &f.wl,
+                            &f.wit,  &f.item,  &f.prev,  &f.search, &f.nick, &f.rw, &f.cit};
+    const std::array statics{&f.labels,  &f.car,     &f.code, &f.exist, &f.write, &f.layouts,
+                             &f.nickname, &f.driver, &f.gt_auto, &f.uint, &f.none, &f.alias};
+    static_assert(locals.size() == kPrepareLocals && statics.size() == kPrepareStatics);
+    u32 next = site.locals;
+    for (u32* slot : locals) {
+        *slot = next++;
+    }
+    next = site.statics;
+    for (u32* slot : statics) {
+        *slot = next++;
+    }
+    return f;
 }
 
 void PrepareCommand(AdhocCode& code, u32 sf, std::string_view text) {
@@ -1308,229 +1376,436 @@ void PrepareCommand(AdhocCode& code, u32 sf, std::string_view text) {
     code.Op(54);
 }
 
-// pdistd::WriteFile(kPrepareCountFile, "" + <local>): how many loads the slice queued.
-void PrepareCount(AdhocCode& code, u32 write, std::string_view name, u32 local) {
-    code.Eval({"pdistd", "WriteFile", "pdistd::WriteFile"}, write);
+// sf.execCommand(<what the caller pushes between Begin and End, `values` of them, as one text>)
+void PrepareExecBegin(AdhocCode& code, const PrepareFrame& f) {
+    code.Eval({"sf"}, f.sf);
+    code.Get("execCommand");
+}
+
+void PrepareExecEnd(AdhocCode& code, u32 values) {
+    code.Op(30); // STRING_PUSH
+    code.U32(values);
+    code.Call(1);
+    code.Op(54);
+}
+
+// Pushes `entity` (" rygt" or " rygtc") and n % 2: two values for a STRING_PUSH.
+void PrepareEntity(AdhocCode& code, const PrepareFrame& f, std::string_view entity) {
+    code.Text(entity);
+    code.Eval({"rygt_tour_n"}, f.loads);
+    code.Int(kPrepareEntities);
+    code.Binary("__mod__");
+}
+
+// sf.execCommand(before + entity + n % 2 + after)
+void PrepareEntityCommand(AdhocCode& code, const PrepareFrame& f, std::string_view before, std::string_view entity,
+                          std::string_view after = {}) {
+    PrepareExecBegin(code, f);
+    code.Text(before);
+    PrepareEntity(code, f, entity);
+    if (!after.empty()) {
+        code.Text(after);
+    }
+    PrepareExecEnd(code, after.empty() ? 3 : 4);
+}
+
+void PrepareAddOne(AdhocCode& code, std::string_view name, u32 slot) {
+    code.Eval({name}, slot);
+    code.Int(1);
+    code.Binary("__add__");
+    code.Store(name, slot);
+}
+
+// pdistd::WriteFile(kPrepareCountFile, "" + n): how many loads the part queued.
+void PrepareCount(AdhocCode& code, const PrepareFrame& f) {
+    code.Eval({"pdistd", "WriteFile", "pdistd::WriteFile"}, f.write);
     code.Text(kPrepareCountFile);
-    code.Eval({name}, local);
+    code.Eval({"rygt_tour_n"}, f.loads);
     code.Op(30); // STRING_PUSH 1: the number as text
     code.U32(1);
     code.Call(2);
     code.Op(54);
 }
 
-// Cars [from, from + 500). Locals: the iterator, the label index, the loads queued, the car parameter.
-// Statics: GetCarLabelListAll, Car(UInt), GetCarCodeByLabel; `write` is the tour's pdistd::WriteFile.
-void MakePrepareCars(AdhocCode& code, const ArcadeSite& site, u32 from, u32 write) {
-    const u32 sf = site.local;
-    const u32 it = site.locals;
-    const u32 index = site.locals + 1; // labels
-    const u32 loads = site.locals + 2; // loads queued
-    const u32 cp = site.locals + 3;
-    const u32 s = site.statics;
-    PrepareCommand(code, sf, "setScreenColorScaleTarget 1 0.5");
+// Dims the screen, clears every tour entity (the last part left its last load), and n = 0.
+void PrepareStart(AdhocCode& code, const PrepareFrame& f) {
+    PrepareCommand(code, f.sf, "setScreenColorScaleTarget 1 0.5");
+    for (const char* entity : {"rygt0", "rygt1", "rygtc0", "rygtc1"}) {
+        PrepareCommand(code, f.sf, fmt::format("clearEntity {}", entity));
+    }
+    code.Int(0);
+    code.Store("rygt_tour_n", f.loads);
+}
+
+// it = GetCarLabelListAll().iterator
+void PrepareLabels(AdhocCode& code, const PrepareFrame& f) {
     code.Eval({"DMSAccessor", "CarDataAccessor", "GetCarLabelListAll",
                "DMSAccessor::CarDataAccessor::GetCarLabelListAll"},
-              s);
+              f.labels);
     code.Call(0);
     code.Get("iterator");
-    code.Store("rygt_tour_in", it);
+    code.Store("rygt_tour_in", f.it);
+}
+
+// cp = GTCarParameter::Car(GetCarCodeByLabel(it's label)), the iterator having fetched one
+void PrepareCarOfLabel(AdhocCode& code, const PrepareFrame& f) {
+    code.Eval({"GTCarParameter", "Car(UInt)", "GTCarParameter::Car(UInt)"}, f.car);
+    code.Eval({"DMSAccessor", "CarDataAccessor", "GetCarCodeByLabel",
+               "DMSAccessor::CarDataAccessor::GetCarCodeByLabel"},
+              f.code);
+    code.Eval({"rygt_tour_in"}, f.it);
+    code.Op(8);
+    code.Call(1);
+    code.Call(1);
+    code.Store("rygt_tour_cp", f.cp);
+}
+
+// sf.setDefaultCarParameter(cp, slot [+ n])
+void PrepareSetCar(AdhocCode& code, const PrepareFrame& f, s32 slot, bool plus_n) {
+    code.Eval({"sf"}, f.sf);
+    code.Get("setDefaultCarParameter");
+    code.Eval({"rygt_tour_cp"}, f.cp);
+    code.Int(slot);
+    if (plus_n) {
+        code.Eval({"rygt_tour_n"}, f.loads);
+        code.Binary("__add__");
+    }
+    code.Call(2);
+    code.Op(54);
+}
+
+// dp = GTPilot::CarDriverParameter() with head and body codes 4; sf.setDefaultCarDriverParameter(dp, slot)
+void PrepareDriver(AdhocCode& code, const PrepareFrame& f, s32 slot) {
+    code.Eval({"GTPilot", "CarDriverParameter", "GTPilot::CarDriverParameter"}, f.driver);
+    code.Call(0);
+    code.Store("rygt_tour_dp", f.dp);
+    for (const char* set : {"setHeadCode(Int)", "setBodyCode(Int)"}) {
+        code.Eval({"rygt_tour_dp"}, f.dp);
+        code.Get(set);
+        code.Int(4);
+        code.Call(1);
+        code.Op(54);
+    }
+    code.Eval({"sf"}, f.sf);
+    code.Get("setDefaultCarDriverParameter");
+    code.Eval({"rygt_tour_dp"}, f.dp);
+    code.Int(slot);
+    code.Call(2);
+    code.Op(54);
+}
+
+// "clearEntity rygt<n % 2>", then "loadLodCarWithInterior _default<slot [+ n]> rygt<n % 2>"
+void PrepareLoadCar(AdhocCode& code, const PrepareFrame& f, s32 slot, bool plus_n) {
+    PrepareEntityCommand(code, f, "clearEntity", " rygt");
+    PrepareExecBegin(code, f);
+    code.Text("loadLodCarWithInterior _default");
+    code.Int(slot);
+    if (plus_n) {
+        code.Eval({"rygt_tour_n"}, f.loads);
+        code.Binary("__add__");
+    }
+    PrepareEntity(code, f, " rygt");
+    PrepareExecEnd(code, 4);
+}
+
+// Cars [from, from + 300), `from` being set by the part chooser.
+void MakePrepareCars(AdhocCode& code, const PrepareFrame& f) {
+    PrepareStart(code, f);
+    if (g_prepare_choices.drivers) {
+        PrepareDriver(code, f, kPrepareDriverSlot);
+    }
+    PrepareLabels(code, f);
     code.Int(0);
-    code.Store("rygt_tour_i", index);
-    code.Int(0);
-    code.Store("rygt_tour_n", loads);
+    code.Store("rygt_tour_i", f.index);
     const u32 loop = code.Here();
-    code.Eval({"rygt_tour_in"}, it);
+    code.Eval({"rygt_tour_in"}, f.it);
     code.Get("fetch_next");
     std::vector<size_t> done{code.Jump(15)};
     // i < from + slice; the labels before from are passed
-    code.Eval({"rygt_tour_i"}, index);
-    code.Eval({"rygt_tour_from"}, from);
+    code.Eval({"rygt_tour_i"}, f.index);
+    code.Eval({"rygt_tour_from"}, f.from);
     code.Int(kPrepareSlice);
     code.Binary("__add__");
     code.Binary("__lt__");
     done.push_back(code.Jump(15));
-    code.Eval({"rygt_tour_i"}, index);
-    code.Eval({"rygt_tour_from"}, from);
+    code.Eval({"rygt_tour_i"}, f.index);
+    code.Eval({"rygt_tour_from"}, f.from);
     code.Binary("__lt__");
     const size_t load = code.Jump(15);
     const size_t skip = code.Jump(13);
     code.Land(load, code.Here());
-    // cp = GTCarParameter::Car(GetCarCodeByLabel(label))
-    code.Eval({"GTCarParameter", "Car(UInt)", "GTCarParameter::Car(UInt)"}, s + 1);
-    code.Eval({"DMSAccessor", "CarDataAccessor", "GetCarCodeByLabel",
-               "DMSAccessor::CarDataAccessor::GetCarCodeByLabel"},
-              s + 2);
-    code.Eval({"rygt_tour_in"}, it);
-    code.Op(8);
-    code.Call(1);
-    code.Call(1);
-    code.Store("rygt_tour_cp", cp);
-    // sf.setDefaultCarParameter(cp, 1000 + n)
-    code.Eval({"sf"}, sf);
-    code.Get("setDefaultCarParameter");
-    code.Eval({"rygt_tour_cp"}, cp);
-    code.Int(kPrepareFirstSlot);
-    code.Eval({"rygt_tour_n"}, loads);
-    code.Binary("__add__");
-    code.Call(2);
-    code.Op(54);
-    // sf.execCommand("clearEntity rygt" + n % 2)
-    code.Eval({"sf"}, sf);
-    code.Get("execCommand");
-    code.Text("clearEntity");
-    PrepareEntity(code, loads);
-    code.Op(30);
-    code.U32(3);
-    code.Call(1);
-    code.Op(54);
-    // sf.execCommand("loadLodCarWithInterior _default" + (1000 + n) + " rygt" + n % 2)
-    code.Eval({"sf"}, sf);
-    code.Get("execCommand");
-    code.Text("loadLodCarWithInterior _default");
-    code.Int(kPrepareFirstSlot);
-    code.Eval({"rygt_tour_n"}, loads);
-    code.Binary("__add__");
-    PrepareEntity(code, loads);
-    code.Op(30);
-    code.U32(4);
-    code.Call(1);
-    code.Op(54);
-    code.Eval({"rygt_tour_n"}, loads);
-    code.Int(1);
-    code.Binary("__add__");
-    code.Store("rygt_tour_n", loads);
+    PrepareCarOfLabel(code, f);
+    PrepareSetCar(code, f, kPrepareFirstSlot, true);
+    PrepareLoadCar(code, f, kPrepareFirstSlot, true);
+    if (g_prepare_choices.drivers) {
+        PrepareEntityCommand(code, f, "loadDefaultDriver 2000 false", " rygt", " false");
+    }
+    PrepareAddOne(code, "rygt_tour_n", f.loads);
     code.Land(skip, code.Here());
-    code.Eval({"rygt_tour_i"}, index);
-    code.Int(1);
-    code.Binary("__add__");
-    code.Store("rygt_tour_i", index);
+    PrepareAddOne(code, "rygt_tour_i", f.index);
     code.Land(code.Jump(13), loop);
     for (const size_t jump : done) {
         code.Land(jump, code.Here());
     }
-    for (int k = 0; k < kPrepareEntities; ++k) {
-        PrepareCommand(code, sf, fmt::format("clearEntity rygt{}", k));
-    }
-    PrepareCount(code, write, "rygt_tour_n", loads);
+    PrepareCount(code, f);
 }
 
-// Every layout but the test ones. Locals: the iterator, the nickname, the loads queued, the layout
-// index. Statics: GetCourseLayoutIDListAll, GetCourseLayoutNickName, pdistd::WriteFile.
-void MakePrepareCourses(AdhocCode& code, const ArcadeSite& site) {
-    const u32 sf = site.local;
-    const u32 it = site.locals;
-    const u32 nick = site.locals + 1;
-    const u32 queued = site.locals + 2;
-    const u32 index = site.locals + 3;
-    const u32 s = site.statics;
-    PrepareCommand(code, sf, "setScreenColorScaleTarget 1 0.5");
-    code.Int(0);
-    code.Store("rygt_queued", queued);
-    code.Int(0);
-    code.Store("rygt_ci", index);
+// wl = MGTAutoBehavior().GetWheelItemList(&wl, cp, UInt(NO_CODE32)), the list filled through the reference
+void PrepareWheelList(AdhocCode& code, const PrepareFrame& f) {
+    code.Eval({"GTGameSystem", "GTAuto", "MGTAutoBehavior", "GTGameSystem::GTAuto::MGTAutoBehavior"}, f.gt_auto);
+    code.Call(0);
+    code.Get("GetWheelItemList");
+    code.Var(36, {"rygt_tour_wl"}, f.wl); // VAR_PUSH
+    code.Eval({"rygt_tour_cp"}, f.cp);
+    code.Eval({"UInt", "UInt"}, f.uint);
+    code.Eval({"GTDataModelingSystem", "NoCode32", "NO_CODE32", "GTDataModelingSystem::NoCode32::NO_CODE32"}, f.none);
+    code.Call(1);
+    code.Call(3);
+    code.Op(54);
+}
+
+// On one car: the player's kinds of driver, then each spare rim, the car loaded again for each.
+void MakePrepareExtras(AdhocCode& code, const PrepareFrame& f) {
+    PrepareStart(code, f);
+    PrepareLabels(code, f);
+    code.Eval({"rygt_tour_in"}, f.it);
+    code.Get("fetch_next");
+    const size_t empty = code.Jump(15);
+    PrepareCarOfLabel(code, f);
+    if (g_prepare_choices.wheels) {
+        // the first car the wheel shop has rims for, of the first labels (a race car may have none)
+        code.Int(0);
+        code.Store("rygt_tour_search", f.search);
+        const u32 search = code.Here();
+        PrepareWheelList(code, f);
+        code.Eval({"rygt_tour_wl"}, f.wl);
+        code.Get("size");
+        code.Int(0);
+        code.Binary("__gt__");
+        const size_t none = code.Jump(15);
+        const size_t found = code.Jump(13);
+        code.Land(none, code.Here());
+        code.Eval({"rygt_tour_search"}, f.search);
+        code.Int(kPrepareWheelSearch);
+        code.Binary("__lt__");
+        std::vector<size_t> give_up{code.Jump(15)};
+        code.Eval({"rygt_tour_in"}, f.it);
+        code.Get("fetch_next");
+        give_up.push_back(code.Jump(15));
+        PrepareCarOfLabel(code, f);
+        PrepareAddOne(code, "rygt_tour_search", f.search);
+        code.Land(code.Jump(13), search);
+        for (const size_t jump : give_up) {
+            code.Land(jump, code.Here());
+        }
+        code.Land(found, code.Here());
+    }
+    PrepareSetCar(code, f, kPrepareExtrasSlot, false);
+    if (g_prepare_choices.drivers) {
+        PrepareDriver(code, f, kPrepareDriverSlot);
+        for (const char* driver : kPrepareDrivers) {
+            PrepareLoadCar(code, f, kPrepareExtrasSlot, false);
+            PrepareEntityCommand(code, f, driver, " rygt", " false");
+            PrepareAddOne(code, "rygt_tour_n", f.loads);
+        }
+    }
+    if (g_prepare_choices.wheels) {
+        const s32 most = (g_prepare_choices.drivers ? s32(std::size(kPrepareDrivers)) : 0) + kPrepareWheelsMax;
+        code.Int(0);
+        code.Store("rygt_tour_prev", f.prev);
+        code.Eval({"rygt_tour_wl"}, f.wl);
+        code.Get("iterator");
+        code.Store("rygt_tour_wit", f.wit);
+        const u32 loop = code.Here();
+        code.Eval({"rygt_tour_wit"}, f.wit);
+        code.Get("fetch_next");
+        std::vector<size_t> done{code.Jump(15)};
+        code.Eval({"rygt_tour_n"}, f.loads);
+        code.Int(most);
+        code.Binary("__lt__");
+        done.push_back(code.Jump(15));
+        code.Eval({"rygt_tour_wit"}, f.wit);
+        code.Op(8);
+        code.Store("rygt_tour_item", f.item);
+        // the list has each rim once per colour, one after the other: a rim is mounted once
+        code.Eval({"rygt_tour_item"}, f.item);
+        code.Get("ID_");
+        code.Eval({"rygt_tour_prev"}, f.prev);
+        code.Binary("__eq__");
+        const size_t same = code.Jump(14); // JUMP_IF_TRUE
+        code.Eval({"rygt_tour_item"}, f.item);
+        code.Get("ID_");
+        code.Store("rygt_tour_prev", f.prev);
+        PrepareLoadCar(code, f, kPrepareExtrasSlot, false);
+        // "setCarWheelVariation " + item.ID_ + " rygt" + n % 2, as SceneFaceEvent.SetCarWheel does
+        PrepareExecBegin(code, f);
+        code.Text("setCarWheelVariation ");
+        code.Eval({"rygt_tour_item"}, f.item);
+        code.Get("ID_");
+        PrepareEntity(code, f, " rygt");
+        PrepareExecEnd(code, 4);
+        PrepareAddOne(code, "rygt_tour_n", f.loads);
+        code.Land(same, code.Here());
+        code.Land(code.Jump(13), loop);
+        for (const size_t jump : done) {
+            code.Land(jump, code.Here());
+        }
+    }
+    code.Land(empty, code.Here());
+    PrepareCount(code, f);
+}
+
+// Every layout but the test ones, each with its crowd.
+void MakePrepareCourses(AdhocCode& code, const PrepareFrame& f) {
+    PrepareStart(code, f);
     code.Eval({"DMSAccessor", "CourseDataAccessor", "GetCourseLayoutIDListAll",
                "DMSAccessor::CourseDataAccessor::GetCourseLayoutIDListAll"},
-              s);
+              f.layouts);
     code.Call(0);
     code.Get("iterator");
-    code.Store("rygt_in", it);
+    code.Store("rygt_tour_in", f.it);
     const u32 loop = code.Here();
-    code.Eval({"rygt_in"}, it);
+    code.Eval({"rygt_tour_in"}, f.it);
     code.Get("fetch_next");
     const size_t done = code.Jump(15);
     code.Eval({"DMSAccessor", "CourseDataAccessor", "GetCourseLayoutNickName",
                "DMSAccessor::CourseDataAccessor::GetCourseLayoutNickName"},
-              s + 1);
-    code.Eval({"rygt_in"}, it);
+              f.nickname);
+    code.Eval({"rygt_tour_in"}, f.it);
     code.Op(8);
     code.Call(1);
-    code.Store("rygt_nick", nick);
+    code.Store("rygt_tour_nick", f.nick);
     // if (nick.beginWith("test")) skip it
-    code.Eval({"rygt_nick"}, nick);
+    code.Eval({"rygt_tour_nick"}, f.nick);
     code.Get("beginWith");
     code.Text("test");
     code.Call(1);
     const size_t load = code.Jump(15);
     const size_t skip = code.Jump(13);
     code.Land(load, code.Here());
-    // sf.execCommand("clearEntity rygtc" + i % 2); sf.execCommand("loadCourse " + nick + " rygtc" + i % 2)
-    code.Eval({"sf"}, sf);
-    code.Get("execCommand");
-    code.Text("clearEntity rygtc");
-    code.Eval({"rygt_ci"}, index);
-    code.Int(2);
-    code.Binary("__mod__");
-    code.Op(30);
-    code.U32(2);
-    code.Call(1);
-    code.Op(54);
-    code.Eval({"sf"}, sf);
-    code.Get("execCommand");
-    code.Text("loadCourse ");
-    code.Eval({"rygt_nick"}, nick);
-    code.Text(" rygtc");
-    code.Eval({"rygt_ci"}, index);
-    code.Int(2);
-    code.Binary("__mod__");
-    code.Op(30);
-    code.U32(4);
-    code.Call(1);
-    code.Op(54);
-    code.Eval({"rygt_queued"}, queued);
-    code.Int(1);
-    code.Binary("__add__");
-    code.Store("rygt_queued", queued);
+    PrepareEntityCommand(code, f, "clearEntity", " rygtc");
+    // "loadCourseWithCrowd " + nick + " rygtc" + n % 2 + " 0 0", or "loadCourse " + nick + " rygtc" + n % 2
+    PrepareExecBegin(code, f);
+    code.Text(g_prepare_choices.crowds ? "loadCourseWithCrowd " : "loadCourse ");
+    code.Eval({"rygt_tour_nick"}, f.nick);
+    PrepareEntity(code, f, " rygtc");
+    if (g_prepare_choices.crowds) {
+        code.Text(" 0 0");
+    }
+    PrepareExecEnd(code, g_prepare_choices.crowds ? 5 : 4);
+    PrepareAddOne(code, "rygt_tour_n", f.loads);
     code.Land(skip, code.Here());
-    code.Eval({"rygt_ci"}, index);
-    code.Int(1);
-    code.Binary("__add__");
-    code.Store("rygt_ci", index);
     code.Land(code.Jump(13), loop);
     code.Land(done, code.Here());
-    PrepareCount(code, s + 2, "rygt_queued", queued);
+    PrepareCount(code, f);
 }
 
-// The slice chooser: if (!pdistd::Exist(marker k)) { pdistd::WriteFile(marker k, "1"); slice k }.
-// Locals: the cars' 4, the slice's first label, the courses' 4. Statics: the cars' 3, Exist,
-// WriteFile, the courses' 3.
+// As GT7RewardRootEvent.setSceneFace: car 0 and driver 0, then the command file the scene alias
+// names, and the commands of its DEFAULT list (reward/control.swift GetDefaultCommand). The tour's
+// entities go first: the courses' part left two layouts with their crowd. From a menu, this scene
+// lacks what a race's reward screen also shows: the player's car with its livery, his driver in
+// high definition, and its two characters (ma07s, mf05s).
+void MakePrepareReward(AdhocCode& code, const PrepareFrame& f) {
+    for (const char* entity : {"rygt0", "rygt1", "rygtc0", "rygtc1"}) {
+        PrepareCommand(code, f.sf, fmt::format("clearEntity {}", entity));
+    }
+    PrepareLabels(code, f);
+    code.Eval({"rygt_tour_in"}, f.it);
+    code.Get("fetch_next");
+    const size_t empty = code.Jump(15);
+    PrepareCarOfLabel(code, f);
+    PrepareSetCar(code, f, 0, false);
+    PrepareDriver(code, f, 0);
+    PrepareCommand(code, f.sf, "setCommandFileCompleteSignal 0 RYGTRW");
+    // rw = CommonControls::SceneAliasControl().GetCommandFilePath("Reward_Sequence"): [path, command sets]
+    code.Eval({"CommonControls", "SceneAliasControl", "CommonControls::SceneAliasControl"}, f.alias);
+    code.Call(0);
+    code.Get("GetCommandFilePath");
+    code.Text("Reward_Sequence");
+    code.Call(1);
+    code.Store("rygt_tour_rw", f.rw);
+    // sf.loadCommandFile(rw[0])
+    code.Eval({"sf"}, f.sf);
+    code.Get("loadCommandFile");
+    code.Element(0, "rygt_tour_rw", f.rw);
+    code.Call(1);
+    code.Op(54);
+    // for (c in rw[1]["DEFAULT"]) sf.execCommand(c)
+    code.Element(1, "rygt_tour_rw", f.rw);
+    code.Text("DEFAULT");
+    code.Op(62); // ELEMENT_EVAL
+    code.Get("iterator");
+    code.Store("rygt_tour_cit", f.cit);
+    const u32 loop = code.Here();
+    code.Eval({"rygt_tour_cit"}, f.cit);
+    code.Get("fetch_next");
+    const size_t done = code.Jump(15);
+    code.Eval({"sf"}, f.sf);
+    code.Get("execCommand");
+    code.Eval({"rygt_tour_cit"}, f.cit);
+    code.Op(8);
+    code.Call(1);
+    code.Op(54);
+    code.Land(code.Jump(13), loop);
+    code.Land(done, code.Here());
+    code.Land(empty, code.Here());
+}
+
+// The part chooser: the first part whose marker is missing, `if (!pdistd::Exist(marker)) {
+// pdistd::WriteFile(marker, "1"); part }`; once they are all there, the reward screen the same way.
 void MakePrepareTour(AdhocCode& code, const ArcadeSite& site) {
-    constexpr u32 car_statics = 3;
-    const u32 exist = site.statics + car_statics;
-    const u32 write = exist + 1;
-    const u32 from = site.locals + 4;
-    std::vector<size_t> to_cars, to_end;
-    size_t to_courses = 0;
-    for (size_t k = 0; k < std::size(kPrepareMarkers); ++k) {
-        code.Eval({"pdistd", "Exist", "pdistd::Exist"}, exist);
-        code.Text(kPrepareMarkers[k]);
+    const PrepareFrame f = MakePrepareFrame(site);
+    const auto parts = PrepareParts();
+    std::vector<size_t> to_cars, to_extras, to_courses, to_reward, to_end;
+    const auto take = [&](const char* marker) {
+        code.Eval({"pdistd", "Exist", "pdistd::Exist"}, f.exist);
+        code.Text(marker);
         code.Call(1);
-        const size_t next = code.Jump(14); // JUMP_IF_TRUE: this slice is taken, try the next one
-        code.Eval({"pdistd", "WriteFile", "pdistd::WriteFile"}, write);
-        code.Text(kPrepareMarkers[k]);
+        const size_t next = code.Jump(14); // JUMP_IF_TRUE: taken, try the next one
+        code.Eval({"pdistd", "WriteFile", "pdistd::WriteFile"}, f.write);
+        code.Text(marker);
         code.Text("1");
         code.Call(2);
         code.Op(54);
-        if (k + 1 < std::size(kPrepareMarkers)) {
-            code.Int(kPrepareSlice * s32(k));
-            code.Store("rygt_tour_from", from);
+        return next;
+    };
+    for (const auto& part : parts) {
+        const size_t next = take(part.marker);
+        switch (part.kind) {
+        case PreparePart::Cars:
+            code.Int(part.from);
+            code.Store("rygt_tour_from", f.from);
             to_cars.push_back(code.Jump(13));
-        } else {
-            to_courses = code.Jump(13);
+            break;
+        case PreparePart::Extras:
+            to_extras.push_back(code.Jump(13));
+            break;
+        case PreparePart::Courses:
+            to_courses.push_back(code.Jump(13));
+            break;
         }
         code.Land(next, code.Here());
     }
-    to_end.push_back(code.Jump(13)); // every slice taken: nothing more
-    for (const size_t jump : to_cars) {
-        code.Land(jump, code.Here());
+    if (g_prepare_choices.reward) {
+        const size_t next = take(kPrepareRewardMarker);
+        to_reward.push_back(code.Jump(13));
+        code.Land(next, code.Here());
     }
-    MakePrepareCars(code, site, from, write);
-    to_end.push_back(code.Jump(13));
-    code.Land(to_courses, code.Here());
-    ArcadeSite courses = site;
-    courses.locals = site.locals + 5;
-    courses.statics = site.statics + car_statics + 2;
-    MakePrepareCourses(code, courses);
+    to_end.push_back(code.Jump(13)); // all taken: nothing more
+    const auto body = [&](const std::vector<size_t>& to, void (*make)(AdhocCode&, const PrepareFrame&)) {
+        if (to.empty()) {
+            return;
+        }
+        for (const size_t jump : to) {
+            code.Land(jump, code.Here());
+        }
+        make(code, f);
+        to_end.push_back(code.Jump(13));
+    };
+    body(to_cars, MakePrepareCars);
+    body(to_extras, MakePrepareExtras);
+    body(to_courses, MakePrepareCourses);
+    body(to_reward, MakePrepareReward);
     for (const size_t jump : to_end) {
         code.Land(jump, code.Here());
     }
@@ -1541,7 +1816,7 @@ void MakePrepareTour(AdhocCode& code, const ArcadeSite& site) {
 // sf_306_19, sf; one static (System::OptionalCast).
 const ArcadeSite kPrepareTourSites[] = {
     {"gt7/menu/common_events/SceneFaceEvent.swift", "ExecChangeCarCommand", 33, 4, 1, 26, MakePrepareTour,
-     3, 0, 8, 9, 3 + 2 + 3},
+     3, 0, 12, kPrepareLocals, kPrepareStatics},
 };
 
 // Copies a script file, changing the symbol indices and jumps that the added code moves.
@@ -1889,8 +2164,11 @@ u64 ReadScriptCopy(ScriptCopy& copy, u8* to, u64 size) {
             if (patch.Run(changed)) {
                 std::fprintf(stderr,
                              "[patch] FEAT-SGT-127 preparation tour added to the menus' car change "
-                             "(%zu bytes added): change car in a menu to run its next part\n",
-                             changed.size() - data.size());
+                             "(%zu bytes added, %zu parts, FEAT-SGT-129: drivers %s, crowds %s, spare rims %s, "
+                             "reward screen %s): change car in a menu to run its next part\n",
+                             changed.size() - data.size(), PrepareParts().size(),
+                             g_prepare_choices.drivers ? "on" : "off", g_prepare_choices.crowds ? "on" : "off",
+                             g_prepare_choices.wheels ? "on" : "off", g_prepare_choices.reward ? "on" : "off");
                 data.swap(changed);
             } else if (patch.Placed() != 0) {
                 std::fprintf(stderr, "[patch] FEAT-SGT-127: the menus' car change differs, no "
@@ -1952,6 +2230,15 @@ void InstallGt7ScriptDump(u8* base) {
     // FEAT-SGT-127: wanted with the preparation's capture; InstallPrepareTour keeps it only if its
     // load hooks go in.
     g_prepare_tour = Vulkan::ShaderCapture::Enabled();
+    if (g_prepare_tour) { // FEAT-SGT-129
+        const char* leave = std::getenv("SHADGT_PREPARE_LEAVE_OUT");
+        g_prepare_choices = PrepareTour::ParseLeaveOut(leave ? leave : "");
+        if (g_prepare_choices.unknown != 0) {
+            std::fprintf(stderr, "[patch] FEAT-SGT-129: SHADGT_PREPARE_LEAVE_OUT has %u word(s) it doesn't know; "
+                         "it knows drivers, crowds, wheels, reward\n",
+                         g_prepare_choices.unknown);
+        }
+    }
     if (!dump && !AnyScriptPatch()) {
         return;
     }
@@ -1997,21 +2284,29 @@ void InstallGt7ScriptDump(u8* base) {
 
 // FEAT-SGT-127: the host's side of the preparation tour. Each tour load goes through a hook on the
 // scene command's tail jump to the car command (eboot 1.71: loadLodCar 0x21c1457,
-// loadLodCarWithInterior 0x21c146a, loadInteriorWithLodCar 0x21c147d, to 0x208d0d0) or on
-// loadCourse's jump to its handler (0x21bd872 to 0x21bd880). Before the load, the capture scans,
-// and the load waits for that scan: the previous car or course is then whole and in memory.
-// A slice opens at a load that comes after a newer marker than the last slice's, so the menus' own
+// loadLodCarWithInterior 0x21c146a, loadInteriorWithLodCar 0x21c147d, to 0x208d0d0) or on a course
+// command's jump to their handler (loadCourse 0x21bd872 and, FEAT-SGT-129, loadCourseWithCrowd
+// 0x21be3c5, to 0x21bd880, whose third argument says with or without the crowd). Before the load,
+// the capture scans, and the load waits for that scan: the previous car or course is then whole and
+// in memory.
+// A part opens at a load that comes after a newer marker than the last part's, so the menus' own
 // loads never open one. While it is open, nothing new is translated (ShaderCapture::
 // HoldTranslations). It ends when no load has started for its quiet time (PrepareTour::
 // QuietSeconds). It ran whole if every load the script queued started; then two beeps say so. A
-// slice cut short (a car change queued another, a load stalled, the game closed: the file
+// part cut short (a car change queued another, a load stalled, the game closed: the file
 // rygt_prepare.running is left) has its marker dropped, and it runs again at a later car change.
+// FEAT-SGT-129: a part that stopped short by itself twice is left as it is (PrepareTour::HowItEnds;
+// the file <marker>.stopped remembers the first time), so a load that never finishes can't hold back
+// the parts after it. The reward screen loads nothing the hooks see: a minute after its marker is
+// written, two beeps say the preparation is over.
 constexpr u64 kGt7LoadLodCarJump = 0x21c1457;
 constexpr u64 kGt7LoadLodCarWithInteriorJump = 0x21c146a;
 constexpr u64 kGt7LoadInteriorWithLodCarJump = 0x21c147d;
 constexpr u64 kGt7CarCommand = 0x208d0d0; // void (scene, args, model type, interior, x)
 constexpr u64 kGt7LoadCourseJump = 0x21bd872;
-constexpr u64 kGt7LoadCourseHandler = 0x21bd880; // void (scene, args, layout)
+constexpr u64 kGt7LoadCourseWithCrowdJump = 0x21be3c5;
+constexpr u64 kGt7LoadCourseHandler = 0x21bd880; // void (scene, args, crowd)
+constexpr double kPrepareRewardSeconds = 60.0;
 using CarCommandFn = void(PS4_SYSV_ABI*)(void*, void*, u32, u8, u8);
 using CourseCommandFn = void(PS4_SYSV_ABI*)(void*, void*, s32);
 CarCommandFn g_car_command = nullptr;
@@ -2020,14 +2315,16 @@ CourseCommandFn g_course_command = nullptr;
 struct PrepareMarker {
     std::filesystem::path path;
     std::filesystem::file_time_type written{};
-    size_t slice = 0;
+    size_t part = 0; // in PrepareParts()
 };
 
 struct PrepareState {
     std::mutex mutex;
     PrepareTour::Slice slice;
-    std::optional<PrepareMarker> marker;                   // the open slice's
-    std::filesystem::file_time_type last_marker_written{}; // the latest slice's, open or closed
+    std::optional<PrepareMarker> marker;                   // the open part's
+    std::filesystem::file_time_type last_marker_written{}; // the latest part's, open or closed
+    std::optional<std::filesystem::file_time_type> reward_done; // the reward marker beeped for, or found at start
+    std::optional<double> reward_since;                         // when a newer reward marker was first seen
     const std::chrono::steady_clock::time_point epoch = std::chrono::steady_clock::now();
 };
 PrepareState g_prepare;
@@ -2054,14 +2351,27 @@ std::filesystem::path PrepareFile(const std::filesystem::path& folder, const cha
 
 std::optional<PrepareMarker> NewestPrepareMarker() {
     std::optional<PrepareMarker> newest;
+    const auto parts = PrepareParts();
     for (const auto& folder : PrepareFolders()) {
-        for (size_t k = 0; k < std::size(kPrepareMarkers); ++k) {
-            const auto path = PrepareFile(folder, kPrepareMarkers[k]);
+        for (size_t k = 0; k < parts.size(); ++k) {
+            const auto path = PrepareFile(folder, parts[k].marker);
             std::error_code ec;
             const auto written = std::filesystem::last_write_time(path, ec);
             if (!ec && (!newest || written > newest->written)) {
                 newest = PrepareMarker{path, written, k};
             }
+        }
+    }
+    return newest;
+}
+
+std::optional<std::filesystem::file_time_type> RewardMarkerWritten() {
+    std::optional<std::filesystem::file_time_type> newest;
+    for (const auto& folder : PrepareFolders()) {
+        std::error_code ec;
+        const auto written = std::filesystem::last_write_time(PrepareFile(folder, kPrepareRewardMarker), ec);
+        if (!ec && (!newest || written > *newest)) {
+            newest = written;
         }
     }
     return newest;
@@ -2078,33 +2388,52 @@ std::optional<u32> ReadPrepareCount(const std::filesystem::path& folder) {
     return read ? std::optional<u32>{count} : std::nullopt;
 }
 
-const char* PrepareSliceName(size_t k) {
-    return k + 1 < std::size(kPrepareMarkers) ? "cars" : "courses";
+void PrepareBeeps() {
+    MessageBeep(MB_ICONEXCLAMATION);
+    Sleep(500);
+    MessageBeep(MB_ICONEXCLAMATION);
 }
 
-// Under g_prepare.mutex. `cut`: another slice was queued meanwhile, this one can't have run whole.
+// Under g_prepare.mutex. `cut`: another part was queued meanwhile, this one can't have run whole.
 void EndPrepareSlice(bool cut) {
     auto& state = g_prepare;
     const PrepareMarker marker = *state.marker;
+    const auto parts = PrepareParts();
+    const char* name = parts[marker.part].name;
     const auto folder = marker.path.parent_path();
     const auto queued = cut ? std::nullopt : ReadPrepareCount(folder);
+    const std::string of = queued ? std::to_string(*queued) : "?";
+    auto stopped = marker.path;
+    stopped.replace_extension(L".stopped");
     std::error_code ec;
     std::filesystem::remove(folder / L"rygt_prepare.running", ec);
-    if (PrepareTour::RanWhole(state.slice.loads, queued)) {
-        const bool last = marker.slice + 1 == std::size(kPrepareMarkers);
-        std::fprintf(stderr, "[prepare] FEAT-SGT-127: part %zu of %zu (%s) done, %u loads%s\n",
-                     marker.slice + 1, std::size(kPrepareMarkers), PrepareSliceName(marker.slice),
-                     state.slice.loads,
-                     last ? ": the preparation is over, close the game" : ": change car for the next part");
-        MessageBeep(MB_ICONEXCLAMATION);
-        Sleep(500);
-        MessageBeep(MB_ICONEXCLAMATION);
-    } else {
+    const bool whole = PrepareTour::RanWhole(state.slice.loads, queued);
+    const auto end = PrepareTour::HowItEnds(whole, cut, std::filesystem::exists(stopped, ec));
+    if (end == PrepareTour::End::Again) {
         std::filesystem::remove(marker.path, ec);
+        if (!cut) {
+            if (std::FILE* f = _wfopen(stopped.c_str(), L"wb")) {
+                std::fclose(f);
+            }
+        }
         std::fprintf(stderr, "[prepare] FEAT-SGT-127: part %zu (%s) stopped after %u loads of %s%s: it runs "
                      "again at a car change\n",
-                     marker.slice + 1, PrepareSliceName(marker.slice), state.slice.loads,
-                     queued ? std::to_string(*queued).c_str() : "?", cut ? " (another part was queued)" : "");
+                     marker.part + 1, name, state.slice.loads, of.c_str(), cut ? " (another part was queued)" : "");
+    } else {
+        std::filesystem::remove(stopped, ec);
+        const bool last = marker.part + 1 == parts.size();
+        const char* next = !last                    ? ": change car for the next part"
+                           : g_prepare_choices.reward ? ": change car once more, for the reward screen"
+                                                      : ": the preparation is over, close the game";
+        if (end == PrepareTour::End::Done) {
+            std::fprintf(stderr, "[prepare] FEAT-SGT-127: part %zu of %zu (%s) done, %u loads%s\n", marker.part + 1,
+                         parts.size(), name, state.slice.loads, next);
+        } else {
+            std::fprintf(stderr, "[prepare] FEAT-SGT-129: part %zu of %zu (%s) stopped short again, after %u loads "
+                         "of %s: left as it is%s\n",
+                         marker.part + 1, parts.size(), name, state.slice.loads, of.c_str(), next);
+        }
+        PrepareBeeps();
     }
     state.slice.open = false;
     state.marker.reset();
@@ -2124,7 +2453,7 @@ void PrepareLoad() {
             EndPrepareSlice(true);
         }
         if (!state.slice.open && (!newest || newest->written <= state.last_marker_written)) {
-            return; // a menu's own load, or a load after the slice ended
+            return; // a menu's own load, or a load after the part ended
         }
         if (PrepareTour::NoteLoad(state.slice, PrepareNow())) {
             state.marker = newest;
@@ -2133,8 +2462,8 @@ void PrepareLoad() {
                 std::fclose(f);
             }
             Vulkan::ShaderCapture::HoldTranslations(true);
-            std::fprintf(stderr, "[prepare] FEAT-SGT-127: part %zu of %zu (%s) started\n", newest->slice + 1,
-                         std::size(kPrepareMarkers), PrepareSliceName(newest->slice));
+            std::fprintf(stderr, "[prepare] FEAT-SGT-127: part %zu of %zu (%s) started\n", newest->part + 1,
+                         PrepareParts().size(), PrepareParts()[newest->part].name);
         } else {
             scan = true;
             if (state.slice.loads % 50 == 0) {
@@ -2143,7 +2472,7 @@ void PrepareLoad() {
         }
     }
     if (scan) {
-        Vulkan::ShaderCapture::ScanNowAndWait(); // the slice's previous car or course, whole and in memory
+        Vulkan::ShaderCapture::ScanNowAndWait(); // the part's previous car or course, whole and in memory
     }
 }
 
@@ -2152,9 +2481,30 @@ void PS4_SYSV_ABI PrepareCarCommand(void* scene, void* args, u32 type, u8 interi
     g_car_command(scene, args, type, interior, x);
 }
 
-void PS4_SYSV_ABI PrepareCourseCommand(void* scene, void* args, s32 layout) {
+void PS4_SYSV_ABI PrepareCourseCommand(void* scene, void* args, s32 crowd) {
     PrepareLoad();
-    g_course_command(scene, args, layout);
+    g_course_command(scene, args, crowd);
+}
+
+// Under g_prepare.mutex, every second: two beeps a minute after a new reward marker.
+void WatchPrepareReward() {
+    auto& state = g_prepare;
+    const auto written = RewardMarkerWritten();
+    if (!written || written == state.reward_done) {
+        state.reward_since.reset();
+        return;
+    }
+    const double now = PrepareNow();
+    if (!state.reward_since) {
+        state.reward_since = now;
+        std::fprintf(stderr, "[prepare] FEAT-SGT-129: the reward screen, the preparation's last step\n");
+    } else if (now - *state.reward_since >= kPrepareRewardSeconds) {
+        state.reward_done = written;
+        state.reward_since.reset();
+        std::fprintf(stderr, "[prepare] FEAT-SGT-129: the reward screen had a minute: the preparation is "
+                             "over, close the game\n");
+        PrepareBeeps();
+    }
 }
 
 void PrepareWatch() {
@@ -2165,11 +2515,15 @@ void PrepareWatch() {
         if (PrepareTour::WentQuiet(g_prepare.slice, PrepareNow())) {
             EndPrepareSlice(false);
         }
+        if (g_prepare_choices.reward) {
+            WatchPrepareReward();
+        }
     }
 }
 
 // After InstallGt7ScriptDump, before the game reads its scripts: the tour stays on only if every
-// load hook went in, or it would run with no scan and no hold.
+// load hook went in, or it would run with no scan and no hold. Without the crowd's hook, the courses
+// load without their crowd.
 void InstallPrepareTour(u8* base) {
     if (!g_prepare_tour) {
         return;
@@ -2198,7 +2552,13 @@ void InstallPrepareTour(u8* base) {
         std::fprintf(stderr, "[patch] FEAT-SGT-127: the scene's load commands differ, no preparation tour\n");
         return;
     }
-    // A slice the last game left open (closed or crashed in it) runs again.
+    if (g_prepare_choices.crowds &&
+        !RedirectCall(base, stub + 64, kGt7LoadCourseWithCrowdJump, kGt7LoadCourseHandler, const_cast<void*>(course),
+                      "FEAT-SGT-129 loadCourseWithCrowd")) {
+        g_prepare_choices.crowds = false;
+        std::fprintf(stderr, "[patch] FEAT-SGT-129: the courses load without their crowd\n");
+    }
+    // A part the last game left open (closed or crashed in it) runs again.
     for (const auto& folder : PrepareFolders()) {
         std::error_code ec;
         if (std::filesystem::exists(folder / L"rygt_prepare.running", ec)) {
@@ -2206,10 +2566,11 @@ void InstallPrepareTour(u8* base) {
             if (const auto newest = NewestPrepareMarker()) {
                 std::filesystem::remove(newest->path, ec);
                 std::fprintf(stderr, "[patch] FEAT-SGT-127: part %zu (%s) did not finish last time, it runs "
-                             "again\n", newest->slice + 1, PrepareSliceName(newest->slice));
+                             "again\n", newest->part + 1, PrepareParts()[newest->part].name);
             }
         }
     }
+    g_prepare.reward_done = RewardMarkerWritten(); // a reward screen of an earlier game: no beeps
     g_prepare_tour = true;
     std::thread(PrepareWatch).detach();
 }

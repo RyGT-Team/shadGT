@@ -61,6 +61,19 @@ public:
     static u64 RecipePolicy(const Instance& instance, const Shader::Profile& profile);
     static bool WarmFromRecipe(const Instance& instance, const Shader::Profile& profile, vk::PipelineCache cache,
                                const std::filesystem::path& file, std::stop_token stop);
+    /// The same, from a recipe's words. FEAT-SGT-118: with `wanted`, only while it says so, asked
+    /// as `stop` is (at the gate and once through it).
+    static bool WarmFromWords(const Instance& instance, const Shader::Profile& profile, vk::PipelineCache cache,
+                              std::span<const u32> words, std::stop_token stop,
+                              bool (*wanted)() = nullptr);
+    /// FEAT-SGT-118: the set's bindings of a compute shader; the constructor's rule.
+    static u32 StageBindings(const Shader::Info& info,
+                             std::vector<vk::DescriptorSetLayoutBinding>& bindings);
+    /// FEAT-SGT-118: a translation's recipe words, before any dispatch. A mip fallback indexed at
+    /// runtime takes its count from the T# in `info` (the recorded one, for a replayed translation):
+    /// another count at the dispatch only means that this build served nothing.
+    static std::vector<u32> AheadRecipe(const Instance& instance, const Shader::Profile& profile,
+                                        const Shader::Info& info, std::span<const u32> spirv);
 
     void SetStageInfo(const Shader::Info& info) {
         SetCanonicalStage(u32(Shader::SwStage::Compute), &info);

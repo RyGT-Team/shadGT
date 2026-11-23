@@ -11,6 +11,7 @@
 #include "common/scope_exit.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/lane_read_policy.h"
+#include "video_core/renderer_vulkan/compute_ahead.h"
 #include "video_core/renderer_vulkan/compute_warm_recipe.h"
 #include "video_core/renderer_vulkan/compiler_worker_budget.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
@@ -57,36 +58,8 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         .pName = "main",
     };
 
-    u32 binding{};
-    boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
-    for (const auto& buffer : info->buffers) {
-        const auto sharp = buffer.GetSharp(*info);
-        bindings.push_back({
-            .binding = binding++,
-            .descriptorType = vk::DescriptorType::eStorageBuffer,
-            .descriptorCount = 1,
-            .stageFlags = vk::ShaderStageFlagBits::eCompute,
-        });
-    }
-    for (const auto& image : info->images) {
-        const u32 num_bindings = image.NumBindings(*info);
-        bindings.push_back({
-            .binding = binding,
-            .descriptorType = image.is_written ? vk::DescriptorType::eStorageImage
-                                               : vk::DescriptorType::eSampledImage,
-            .descriptorCount = num_bindings,
-            .stageFlags = vk::ShaderStageFlagBits::eCompute,
-        });
-        binding += num_bindings;
-    }
-    for (const auto& sampler : info->samplers) {
-        bindings.push_back({
-            .binding = binding++,
-            .descriptorType = vk::DescriptorType::eSampler,
-            .descriptorCount = 1,
-            .stageFlags = vk::ShaderStageFlagBits::eCompute,
-        });
-    }
+    std::vector<vk::DescriptorSetLayoutBinding> bindings;
+    const u32 binding = StageBindings(*info, bindings);
 
     const vk::PushConstantRange push_constants = {
         .stageFlags = vk::ShaderStageFlagBits::eCompute,
@@ -145,9 +118,53 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
 
 ComputePipeline::~ComputePipeline() = default;
 
+u32 ComputePipeline::StageBindings(const Shader::Info& info,
+                                   std::vector<vk::DescriptorSetLayoutBinding>& bindings) {
+    u32 binding{};
+    const auto add = [&](vk::DescriptorType type, u32 count) {
+        bindings.push_back({
+            .binding = binding,
+            .descriptorType = type,
+            .descriptorCount = count,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        });
+        binding += count;
+    };
+    for (size_t i = 0; i < info.buffers.size(); ++i) {
+        add(vk::DescriptorType::eStorageBuffer, 1);
+    }
+    for (const auto& image : info.images) {
+        add(image.is_written ? vk::DescriptorType::eStorageImage : vk::DescriptorType::eSampledImage,
+            image.NumBindings(info));
+    }
+    for (size_t i = 0; i < info.samplers.size(); ++i) {
+        add(vk::DescriptorType::eSampler, 1);
+    }
+    return binding;
+}
+
 namespace {
 constexpr u32 RecipeMagic = 0x43574752; // "RGWC"
 constexpr u32 RecipeVersion = 2;
+std::vector<u32> MakeRecipeWords(u64 signature, bool push, bool subgroup_control, u32 subgroup,
+                                 std::span<const vk::DescriptorSetLayoutBinding> bindings,
+                                 std::span<const u32> spirv) {
+    std::vector<u32> words{RecipeMagic,
+                           RecipeVersion,
+                           u32(signature), u32(signature >> 32),
+                           u32(push),
+                           u32(subgroup_control),
+                           subgroup,
+                           u32(bindings.size())};
+    for (const auto& b : bindings) {
+        words.push_back(b.binding);
+        words.push_back(u32(b.descriptorType));
+        words.push_back(b.descriptorCount);
+    }
+    words.push_back(u32(spirv.size()));
+    words.insert(words.end(), spirv.begin(), spirv.end());
+    return words;
+}
 u64 RecipeSignature(const Instance& instance, const Shader::Profile& p) {
     u64 hash = 1469598103934665603ull;
     const auto add = [&](u64 v) { for (u32 i=0;i<8;++i) { hash ^= (v >> (i*8)) & 255; hash *= 1099511628211ull; } };
@@ -192,21 +209,9 @@ u64 ComputePipeline::RecipePolicy(const Instance& instance, const Shader::Profil
 
 bool ComputePipeline::SaveRecipe(const std::filesystem::path& file,
                                  std::span<const u32> spirv) const {
-    const u64 signature = RecipeSignature(instance, profile);
-    std::vector<u32> words{RecipeMagic,
-                           RecipeVersion,
-                           u32(signature), u32(signature >> 32),
-                           u32(recipe_push),
-                           u32(recipe_subgroup_control),
-                           recipe_subgroup,
-                           u32(recipe_bindings.size())};
-    for (const auto& b : recipe_bindings) {
-        words.push_back(b.binding);
-        words.push_back(u32(b.descriptorType));
-        words.push_back(b.descriptorCount);
-    }
-    words.push_back(u32(spirv.size()));
-    words.insert(words.end(), spirv.begin(), spirv.end());
+    const auto words =
+        MakeRecipeWords(RecipeSignature(instance, profile), recipe_push, recipe_subgroup_control,
+                        recipe_subgroup, recipe_bindings, spirv);
     {
         // FIX-GT7-150: a recipe that already says this is left as it is (false: nothing kept).
         // One that says something else is removed first: the write below never replaces a file
@@ -252,6 +257,22 @@ bool ComputePipeline::WarmFromRecipe(const Instance& instance, const Shader::Pro
             return false;
         }
     }
+    return WarmFromWords(instance, profile, cache, words, stop);
+}
+
+std::vector<u32> ComputePipeline::AheadRecipe(const Instance& instance,
+                                              const Shader::Profile& profile,
+                                              const Shader::Info& info,
+                                              std::span<const u32> spirv) {
+    std::vector<vk::DescriptorSetLayoutBinding> bindings;
+    const u32 total = StageBindings(info, bindings);
+    return MakeRecipeWords(RecipeSignature(instance, profile), total < instance.MaxPushDescriptors(),
+                           UseSubgroupControl(instance), RequiredSubgroup(instance), bindings, spirv);
+}
+
+bool ComputePipeline::WarmFromWords(const Instance& instance, const Shader::Profile& profile,
+                                    vk::PipelineCache cache, std::span<const u32> words,
+                                    std::stop_token stop, bool (*wanted)()) {
     if (!ValidateComputeWarmRecipe(words, RecipeSignature(instance, profile),
         instance.MaxPushDescriptors(), profile.supported_spirv,
         instance.IsIntel() && instance.IsSubgroupSizeControlSupported() && instance.SubgroupSize() == 32,
@@ -331,6 +352,10 @@ bool ComputePipeline::WarmFromRecipe(const Instance& instance, const Shader::Pro
             },
         .layout = *layout,
     };
+    // FEAT-SGT-118: `wanted` (the splash's hold, for a build ahead of the game) is asked as `stop`
+    // is, while waiting at the gate and once through it: a build that waited across the game's
+    // release never reaches the driver.
+    const auto still_wanted = [wanted] { return !wanted || wanted(); };
     const bool gate = Common::PerfFeatureEnabled(79);
     if (gate) {
         // FIX-SGT-114: a free gate is taken at once; a full one is retried every 2 ms. No
@@ -338,13 +363,14 @@ bool ComputePipeline::WarmFromRecipe(const Instance& instance, const Shader::Pro
         // __std_atomic_wait_get_deadline and _get_remaining_timeout, which Wine and Proton only
         // stub, so the first compute warm-up (shadGT:WarmCompute) aborted the game under Proton
         // without the native VC++ runtime (RyGT issue 77). Sleep is a plain kernel32 call there.
-        while (!HeavyPipelineGate().try_acquire()) {
-            if (stop.stop_requested()) return false;
-            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        if (!TakeHeavyGate(HeavyPipelineGate(), stop, still_wanted,
+                           [] { std::this_thread::sleep_for(std::chrono::milliseconds{2}); })) {
+            return false;
         }
+    } else if (stop.stop_requested() || !still_wanted()) {
+        return false;
     }
     SCOPE_EXIT { if (gate) HeavyPipelineGate().release(); };
-    if (stop.stop_requested()) return false;
     auto [pipeline_result, pipeline] = device.createComputePipelineUnique(cache, pipeline_ci);
     return pipeline_result == vk::Result::eSuccess;
 }

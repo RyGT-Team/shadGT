@@ -36,6 +36,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
+#include "video_core/renderer_vulkan/depth_min_offset.h"
 #include "video_core/renderer_vulkan/vk_ui_hires.h"
 #include "video_core/renderer_vulkan/depth_attachment.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -6875,6 +6876,9 @@ void Rasterizer::UpdateViewportScissorState() const {
     }
 
     const auto& vp_ctl = regs.viewport_control;
+    // FIX-SGT-124: the vertex shaders add the range's minimum (depth_min_offset.h).
+    const bool depth_min_offset =
+        DepthMinOffset(regs, instance.GetDriverID() == vk::DriverId::eAmdProprietary) != 0.f;
     for (u32 i = 0; i < AmdGpu::NUM_VIEWPORTS; i++) {
         const auto& vp = regs.viewports[i];
         const auto& vp_d = regs.viewport_depths[i];
@@ -6897,6 +6901,11 @@ void Rasterizer::UpdateViewportScissorState() const {
         } else {
             viewport.minDepth = zoffset;
             viewport.maxDepth = zoffset + zscale;
+        }
+
+        if (depth_min_offset) {
+            viewport.maxDepth -= viewport.minDepth;
+            viewport.minDepth = 0.f;
         }
 
         if (!instance.IsDepthRangeUnrestrictedSupported()) {

@@ -257,6 +257,18 @@ void ConvertDepthMode(EmitContext& ctx) {
     ctx.OpStore(ctx.output_position, vector);
 }
 
+// FIX-SGT-124: the depth range's minimum, added here (z += k * w) for a viewport that starts at 0.
+void AddDepthMinOffset(EmitContext& ctx) {
+    const Id type{ctx.F32[1]};
+    const Id position{ctx.OpLoad(ctx.F32[4], ctx.output_position)};
+    const Id z{ctx.OpCompositeExtract(type, position, 2u)};
+    const Id w{ctx.OpCompositeExtract(type, position, 3u)};
+    const Id k{ctx.Constant(type, ctx.runtime_info.hw.vs.depth_min_offset)};
+    const Id depth{ctx.OpFAdd(type, z, ctx.OpFMul(type, k, w))};
+    const Id vector{ctx.OpCompositeInsert(ctx.F32[4], depth, position, 2u)};
+    ctx.OpStore(ctx.output_position, vector);
+}
+
 void ConvertPositionToClipSpace(EmitContext& ctx) {
     ASSERT_MSG(!ctx.info.stores.GetAny(IR::Attribute::ViewportIndex),
                "Multi-viewport with shader clip space conversion not yet implemented.");
@@ -390,6 +402,9 @@ void EmitEpilogue(EmitContext& ctx) {
     if (ctx.hw_stage == HwStage::Vertex &&
         ctx.runtime_info.hw.vs.emulate_depth_negative_one_to_one) {
         ConvertDepthMode(ctx);
+    }
+    if (ctx.hw_stage == HwStage::Vertex && ctx.runtime_info.hw.vs.depth_min_offset != 0.f) {
+        AddDepthMinOffset(ctx);
     }
     if (ctx.hw_stage == HwStage::Vertex && ctx.runtime_info.hw.vs.clip_disable) {
         ConvertPositionToClipSpace(ctx);

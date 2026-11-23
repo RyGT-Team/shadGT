@@ -1,3 +1,4 @@
+#include "video_core/renderer_vulkan/depth_min_offset.h"
 #include "video_core/renderer_vulkan/shared_pipeline_policy.h"
 #include "common/geometry_trace.h"
 #include "video_core/renderer_vulkan/oneshot_shader.h"
@@ -1602,6 +1603,8 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
             !instance.UsesDepthClipControl() && // FIX-GTS-443
             regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
         info.hw.vs.clip_disable = regs.IsClipDisabled();
+        info.hw.vs.depth_min_offset = DepthMinOffset( // FIX-SGT-124
+            regs, instance.GetDriverID() == vk::DriverId::eAmdProprietary);
         break;
     }
     case HwStage::Fragment: {

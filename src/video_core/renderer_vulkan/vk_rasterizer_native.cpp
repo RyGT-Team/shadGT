@@ -2180,7 +2180,10 @@ static bool InSmallUnimportedMapping(const VideoCore::DirectMemory& direct, VAdd
     return mapping_end > address && mapping_end - mapping <= copy_below;
 }
 
+static void DecideGtsCpuWritebackNow();
+
 NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
+    DecideGtsCpuWritebackNow(); // FIX-GTS-529: before the game sets up its save memory
     SnapshotLease::BackingProtocol::Initialize(r.instance.GetVendorID());
     sampler_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
     if(PreparedSampledProofRequested())try {prepared_proof_contexts.Register(this);} catch(...) {}
@@ -4590,23 +4593,33 @@ static bool GtsFreshGame() {
     return true;
 }
 
+// FIX-GTS-529: decided when the native renderer starts, before the game runs. FIX-GTS-528 decided
+// at the first small picture, but GT Sport sets up its save memory (and so creates memory.dat) at
+// boot, before its first auto exposure picture, so a fresh game always looked like one with save
+// data and the fix never came on (2 of 4 fresh starts still crashed).
+static std::atomic<bool> gts_cpu_writeback_now{false};
+
+static void DecideGtsCpuWritebackNow() {
+    if (Common::IsGt7()) {
+        return;
+    }
+    bool on = false;
+    const char* env = std::getenv("SHADGT_GTS_CPU_WRITEBACK_NOW");
+    if (env && (env[0] == '0' || env[0] == '1')) {
+        on = env[0] == '1';
+    } else {
+        on = GtsFreshGame();
+    }
+    gts_cpu_writeback_now.store(on, std::memory_order_relaxed);
+    if (on) {
+        LOG_INFO(Render_Vulkan, "FIX-GTS-528: no GT Sport save data yet, small pictures in "
+                                "CPU-read memory go back before the fence this session");
+    }
+}
+
 static bool GtsCpuWritebackNow(const Native::ImageEntry* entry) {
-    static const bool on = [] {
-        if (Common::IsGt7()) {
-            return false;
-        }
-        const char* env = std::getenv("SHADGT_GTS_CPU_WRITEBACK_NOW");
-        if (env && (env[0] == '0' || env[0] == '1')) {
-            return env[0] == '1';
-        }
-        const bool fresh = GtsFreshGame();
-        if (fresh) {
-            LOG_INFO(Render_Vulkan, "FIX-GTS-528: no GT Sport save data yet, small pictures in "
-                                    "CPU-read memory go back before the fence this session");
-        }
-        return fresh;
-    }();
-    return on && entry->info.guest_address >= InplaceFrom();
+    return gts_cpu_writeback_now.load(std::memory_order_relaxed) &&
+           entry->info.guest_address >= InplaceFrom();
 }
 
 // PERF-GT7-044: NAT-112 writes a small picture back to guest memory once a frame, when the frame

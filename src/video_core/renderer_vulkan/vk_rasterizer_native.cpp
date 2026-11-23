@@ -4568,20 +4568,43 @@ void NativeRenderer::PassBarrier(std::source_location where) {
 
 static VAddr InplaceFrom();
 
-// FIX-GTS-528: in GT Sport, a small picture in the memory the CPU reads (0xf0'0000'0000 and up,
-// the game's own heap) goes back in this submission, before the fence the CPU waits for, and not
-// at the frame's end. When GT Sport makes its first car thumbnails (a new save), it draws a 32x32
-// float picture into a heap buffer, waits for the GPU, reads it and frees the buffer within the
-// frame; written back at the frame's end, the picture landed in the freed block, over the heap's
-// free-list links, and the next allocation crashed (GTSport.exe+0x1c3a01d, RyGT #53 and #87; 4 of
-// 5 fresh starts). GT7 keeps PERF-GT7-044 as it is. SHADGT_GTS_CPU_WRITEBACK_NOW=0: as before.
+// FIX-GTS-528: in a fresh GT Sport game (no save data yet), a small picture in the memory the CPU
+// reads (0xf0'0000'0000 and up, the game's own heap) goes back in this submission, before the
+// fence the CPU waits for, and not at the frame's end. On a fresh game GT Sport makes its first car
+// thumbnails after the intro: it draws a 32x32 float picture into a heap buffer, waits for the GPU,
+// reads it and frees the buffer within the frame; written back at the frame's end, the picture
+// landed in the freed block, over the heap's free-list links, and the next allocation crashed
+// (GTSport.exe+0x1c3a01d, RyGT #53 and #87; 4 of 5 fresh starts). A game with save data
+// (user\savedata\CUSA03220\_sd\sce_sdmemory\<user>\memory.dat) and GT7 keep PERF-GT7-044 as it
+// is. SHADGT_GTS_CPU_WRITEBACK_NOW=0: as before; 1: in every GT Sport session.
+static bool GtsFreshGame() {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path memory = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "savedata" /
+                            std::string(Common::GtSportSerial) / "_sd" / "sce_sdmemory";
+    for (fs::directory_iterator it{memory, ec}, end; !ec && it != end; it.increment(ec)) {
+        if (fs::exists(it->path() / "memory.dat", ec)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool GtsCpuWritebackNow(const Native::ImageEntry* entry) {
     static const bool on = [] {
         if (Common::IsGt7()) {
             return false;
         }
         const char* env = std::getenv("SHADGT_GTS_CPU_WRITEBACK_NOW");
-        return !(env && env[0] == '0');
+        if (env && (env[0] == '0' || env[0] == '1')) {
+            return env[0] == '1';
+        }
+        const bool fresh = GtsFreshGame();
+        if (fresh) {
+            LOG_INFO(Render_Vulkan, "FIX-GTS-528: no GT Sport save data yet, small pictures in "
+                                    "CPU-read memory go back before the fence this session");
+        }
+        return fresh;
     }();
     return on && entry->info.guest_address >= InplaceFrom();
 }

@@ -90,6 +90,13 @@ target_include_directories(shadps4_readable_binding_test PRIVATE ${CMAKE_SOURCE_
 target_compile_features(shadps4_readable_binding_test PRIVATE cxx_std_23)
 target_link_libraries(shadps4_readable_binding_test PRIVATE GTest::gtest_main)
 gtest_discover_tests(shadps4_readable_binding_test)
+add_executable(shadgt_stored_no_pixel_test test_stored_no_pixel.cpp)
+target_include_directories(shadgt_stored_no_pixel_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadgt_stored_no_pixel_test PRIVATE cxx_std_23)
+target_link_libraries(shadgt_stored_no_pixel_test PRIVATE
+    GTest::gtest_main fmt::fmt Boost::headers Vulkan::Headers magic_enum::magic_enum)
+gtest_discover_tests(shadgt_stored_no_pixel_test)
+
 add_executable(shadps4_cube_store_policy_test test_cube_store_policy.cpp)
 target_include_directories(shadps4_cube_store_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(shadps4_cube_store_policy_test PRIVATE cxx_std_23)
@@ -762,6 +769,7 @@ set(GCN_TEST_SOURCES
     test_color_export.cpp
     test_tess_lds_shader.cpp
     test_srt_walker_registry.cpp
+    test_descriptor_guards.cpp
     test_number_conversion.cpp
 )
 

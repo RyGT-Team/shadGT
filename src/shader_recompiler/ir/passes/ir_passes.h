@@ -24,7 +24,9 @@ void LowerHardwareIntrinsics(IR::Program& program);
 void LowerPhisToRegsPass(IR::Program& program);
 void DeadCodeEliminationPass(IR::Program& program);
 void ConstantPropagationPass(IR::BlockList& program);
-void FlattenExtendedUserdataPass(IR::Program& program);
+/// `resources`: what discovery found, for descriptors read only in a branch (FIX-SGT-115).
+void FlattenExtendedUserdataPass(IR::Program& program,
+                                 const ResourceDiscoveryList& resources = {});
 void ReadLaneEliminationPass(IR::Program& program);
 ResourceDiscoveryList ResourceDiscoverPass(IR::Program& program, const Profile& profile);
 void LowerDynamicReadConstPass(IR::Program& program, ResourceDiscoveryList& resources);

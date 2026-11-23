@@ -26,6 +26,7 @@
 #endif
 #include "shader_recompiler/ir/ir_emitter.h"
 #include "shader_recompiler/ir/opcodes.h"
+#include "shader_recompiler/ir/passes/descriptor_guards.h"
 #include "shader_recompiler/ir/passes/srt.h"
 #include "shader_recompiler/ir/passes/srt_walker_storage.h"
 #include "shader_recompiler/ir/program.h"
@@ -834,7 +835,29 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
     PopPtr(c);
 }
 
-static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
+// FIX-SGT-115: after every load, the descriptors of a branch that is off are emptied. Only the flattened copy
+// is read here, never guest memory (the walker's fault handler knows nothing but the loads).
+static void EmitDescriptorGuards(Xbyak::CodeGenerator& c,
+                                 std::span<const DescriptorGuard> guards) {
+    for (const auto& guard : guards) {
+        Xbyak::Label taken;
+        c.cmp(dword[rsi + (u32(guard.word) << 2)], guard.value);
+        if (guard.taken_if_equal) {
+            c.je(taken, Xbyak::CodeGenerator::T_NEAR);
+        } else {
+            c.jne(taken, Xbyak::CodeGenerator::T_NEAR);
+        }
+        for (const u16 at : guard.descriptor_words) {
+            c.mov(dword[rsi + (u32(at) << 2)], 0);
+            c.mov(qword[r11 + (u32(at) << 3)], 0); // not read: no source, as an unread slot
+        }
+        c.L(taken);
+    }
+}
+
+// `find_guards` runs once every read has its flattened word.
+template <typename FindGuards>
+static void GenerateSrtProgram(Info& info, PassInfo& pass_info, FindGuards&& find_guards) {
     if (pass_info.srt_roots.empty()) {
         return;
     }
@@ -893,6 +916,7 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
         }
     }
 
+    EmitDescriptorGuards(c, find_guards());
     c.ret();
     c.ready();
 #ifndef NDEBUG
@@ -987,7 +1011,7 @@ void SimplifyReadConstAddressAdd(IR::Inst& inst) {
 
 } // Anonymous namespace
 
-void FlattenExtendedUserdataPass(IR::Program& program) {
+void FlattenExtendedUserdataPass(IR::Program& program, const ResourceDiscoveryList& resources) {
     auto& post_order = program.post_order_blocks;
     PassInfo pass_info;
 
@@ -1090,8 +1114,22 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
         }
     }
 
+    std::vector<DescriptorGuard> guards; // FIX-SGT-115
+    const auto find_guards = [&]() -> std::span<const DescriptorGuard> {
+        if (!BranchOffDescriptorsEnabled() || resources.empty()) {
+            return {};
+        }
+        // A duplicate takes its original's word below; the search needs it now.
+        for (IR::Inst* readconst : all_readconsts) {
+            SetFlatbufOffset(readconst,
+                             GetFlatbufOffset(pass_info.DeduplicateInstruction(readconst)));
+        }
+        guards = FindDescriptorGuards(program, resources,
+                                      {all_readconsts.data(), all_readconsts.size()});
+        return guards;
+    };
     try {
-        GenerateSrtProgram(program.info, pass_info);
+        GenerateSrtProgram(program.info, pass_info, find_guards);
     } catch (const Xbyak::Error&) {
         throw Common::RecoverableFailure{"SRT walker code generation failed"};
     }
@@ -1104,6 +1142,19 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
     }
 
     program.info.RefreshFlatBuf();
+    // FIX-SGT-115: a replay (the read log, PB-1) fills the buffer without the walker, maybe from
+    // a record older than the guards.
+    for (const auto& guard : guards) {
+        guard.Apply(program.info.flattened_ud_buf, program.info.flattened_ud_src);
+        static std::atomic<u32> logged{};
+        if (const u32 n = ++logged; n <= 40 || n % 500 == 0) {
+            LOG_INFO(Render_Recompiler,
+                     "FIX-SGT-115: program {:#x}: {} descriptor words are empty while word {} {} "
+                     "{:#x}, the branch that reads them being off ({} so far)",
+                     program.info.pgm_hash, guard.descriptor_words.size(), guard.word,
+                     guard.taken_if_equal ? "is not" : "is", guard.value, n);
+        }
+    }
 }
 
 } // namespace Shader::Optimization
@@ -1124,7 +1175,7 @@ bool SrtWalkerStorageAtWall() {
 
 namespace Optimization {
 
-void FlattenExtendedUserdataPass(IR::Program& program) {
+void FlattenExtendedUserdataPass(IR::Program& program, const ResourceDiscoveryList& resources) {
     UNREACHABLE_MSG("FlattenExtendedUserdataPass unimplemented for target architecture.");
 }
 

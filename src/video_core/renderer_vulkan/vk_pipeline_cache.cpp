@@ -1,3 +1,4 @@
+#include "video_core/renderer_vulkan/depth_min_offset.h"
 #include "video_core/renderer_vulkan/shared_pipeline_policy.h"
 #include "common/geometry_trace.h"
 #include "video_core/renderer_vulkan/oneshot_shader.h"
@@ -10,6 +11,7 @@
 #include "video_core/renderer_vulkan/compile_cpu_batch.h"
 #include "video_core/renderer_vulkan/compute_ahead.h"
 #include "video_core/renderer_vulkan/stale_pipeline_builds.h"
+#include "video_core/renderer_vulkan/stored_no_pixel.h"
 #include "video_core/renderer_vulkan/skipped_picture_read.h"
 #include "video_core/renderer_vulkan/read_ahead_budget.h"
 #include "video_core/renderer_vulkan/speculative_key.h"
@@ -1278,11 +1280,14 @@ private:
     // (PERF-GT7-034's step back) and were never measured narrowed.
     // PERF-GTS-489: 2 at once is the default for both games; it is what took the compile stutter
     // out of play. SHADGT_COMPILE_PLAY_WIDTH=<n> narrows to n; 0: never.
+    // FIX-SGT-125: not with "Pause the game" (compile mode 0). The game waits for the builds
+    // there, so no submit of its competes with them, and 2 at once only made each pause longer
+    // (an RDNA2 iGPU sat 10 s of every 10 in build waits). An explicit width still applies.
     static bool NarrowInPlay() {
         static const bool on = [] {
             const char* env = std::getenv("SHADGT_COMPILE_PLAY_WIDTH");
             if (env && *env) return std::strtoul(env, nullptr, 10) != 0;
-            return true;
+            return CompileMode() != 0;
         }();
         return on;
     }
@@ -1539,6 +1544,25 @@ bool PipelineCache::ReadsVertexValues(const AmdGpu::ShaderProgram& program) {
     return found;
 }
 
+// PERF-SGT-126: AMD-307's two position copies go right after the vertex stage's exports instead
+// of at locations 30/31. At 30/31, AMD's older shader compiler compiled each new pixel shader a
+// second time when its pipeline was linked from libraries (GT7, Radeon iGPU, cold: link 553 ms
+// a pipeline, 0 ms with the copies here; 1172 -> 447 ms of compiling a pipeline). Only for a
+// plain vertex shader feeding the pixel shader (no geometry or tessellation stage), where the
+// pixel shader's input locations are the export indices (no clip distance emulation on AMD).
+// Both shaders take the location from the same register. SHADGT_ORDER_COMPACT=0 keeps 30/31.
+static u8 CompactOrderLocation(const AmdGpu::Regs& regs) {
+    static const bool compact = [] {
+        const char* env = std::getenv("SHADGT_ORDER_COMPACT");
+        return !(env && env[0] == '0');
+    }();
+    if (!compact || regs.stage_enable.IsStageEnabled(static_cast<u32>(HwStage::Geometry)) ||
+        regs.stage_enable.IsStageEnabled(static_cast<u32>(HwStage::Local))) {
+        return 0;
+    }
+    return static_cast<u8>(regs.vs_output_config.NumExports());
+}
+
 const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStage l_stage) {
     auto& info = S().runtime_infos[u32(l_stage)];
     const auto& regs = Regs();
@@ -1615,6 +1639,12 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
             !instance.UsesDepthClipControl() && // FIX-GTS-443
             regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
         info.hw.vs.clip_disable = regs.IsClipDisabled();
+        info.hw.vs.depth_min_offset = DepthMinOffset( // FIX-SGT-124
+            regs, instance.GetDriverID() == vk::DriverId::eAmdProprietary);
+        info.hw.vs.order_location = profile.vertex_order_check && !IsTessEmulatedDraw() &&
+                                            regs.vs_output_config.NumExports() + 2 <= 30
+                                        ? CompactOrderLocation(regs)
+                                        : u8{0};
         break;
     }
     case HwStage::Fragment: {
@@ -1843,6 +1873,11 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.hw.fs.vertex_order_check =
             profile.vertex_order_check && !IsTessEmulatedDraw() &&
             regs.vs_output_config.NumExports() + 2 <= 30; // OrderCheckRefLocation
+        if (info.hw.fs.vertex_order_check) {
+            if (const u8 location = CompactOrderLocation(regs); location != 0) {
+                info.hw.fs.vertex_order_check = static_cast<u8>(location + 2); // PERF-SGT-126
+            }
+        }
         break;
     }
     case HwStage::Compute: {
@@ -7606,9 +7641,18 @@ void PipelineCache::PrewarmRead(std::stop_token stop) {
             std::vector<u8> blob;
             store.Load(Storage::BlobType::PipelineKey, name, blob);
             valid = LoadStoredGraphicsPipeline(std::move(blob), record->key, record->sdata);
-            // Only pipelines whose every stage input is stored (see InstallPrewarmRecord).
+            // Only pipelines whose every stage input is stored (see InstallPrewarmRecord), so
+            // without a pixel shader only those that read nothing of that stage (FIX-SGT-116).
             valid = valid && record->key.stage_hashes[u32(SwStage::Vertex)] != 0 &&
-                    record->key.stage_hashes[u32(SwStage::Fragment)] != 0;
+                    (record->key.stage_hashes[u32(SwStage::Fragment)] != 0 ||
+                     (PrecompileWithoutPixelShaderEnabled() &&
+                      StoredBuildIgnoresPixelInfo(
+                          record->sdata,
+                          record->key.prim_type == AmdGpu::PrimitiveType::RectList ||
+                              record->key.prim_type == AmdGpu::PrimitiveType::QuadList,
+                          record->key.stage_hashes[u32(SwStage::TessellationControl)] != 0 ||
+                              record->key.stage_hashes[u32(SwStage::TessellationEval)] != 0,
+                          instance.IsShaderObjectEnabled() && record->key.num_samples > 1)));
             for (u32 stage = 0; valid && stage < MaxShaderStages; ++stage) {
                 const u64 perm_hash = record->key.stage_hashes[stage];
                 if (perm_hash == 0) {
@@ -7941,6 +7985,23 @@ bool PipelineCache::InstallPrewarmRecord(PrewarmRecord& record) {
     S().infos.fill(nullptr);
     S().modules.fill(nullptr);
     S().fetch_shader = nullptr;
+    if (record.pgm[u32(SwStage::Fragment)] == 0) {
+        // FIX-SGT-116: a draw's build of it may have had the clip distance emulation's discard
+        // shader, which isn't stored. It only discards anything when the vertex stage outputs clip
+        // distances: told from the vertex permutation's stored runtime info, before any stage's
+        // module is made below (a refused record made none).
+        const u32 vs = u32(SwStage::Vertex);
+        const auto vertex = program_cache.find(record.pgm[vs]);
+        if (vertex == program_cache.end() || record.perm[vs] >= vertex->second->modules.size() ||
+            VertexStageMayClip(vertex->second->modules[record.perm[vs]].spec.runtime_info,
+                               profile.needs_clip_distance_emulation)) {
+            return false;
+        }
+        // Not what the last draw left. The reader took this record because its build can't depend
+        // on it (StoredBuildIgnoresPixelInfo, and VertexStageMayClip above); the caller restores
+        // the draws' own.
+        S().runtime_infos[u32(SwStage::Fragment)].Initialize(HwStage::Fragment, SwStage::Fragment);
+    }
     for (u32 stage = 0; stage < MaxShaderStages; ++stage) {
         if (record.pgm[stage] == 0) {
             continue;

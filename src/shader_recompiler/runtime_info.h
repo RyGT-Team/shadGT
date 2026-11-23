@@ -99,6 +99,10 @@ struct HwVertexRuntimeInfo {
     bool emulate_depth_negative_one_to_one{};
     bool clip_disable{};
     u32 user_clip_plane_mask{};
+    /// FIX-SGT-124: the vertex shader adds this times w to its depth (z += k * w), for a viewport
+    /// whose depth range starts at 0 in place of a small non-zero minimum (AMD). In the union's
+    /// unused bytes: stored translations read 0, no offset, and the RuntimeInfo size is unchanged.
+    float depth_min_offset{};
 
     bool operator==(const HwVertexRuntimeInfo& other) const noexcept = default;
 };

@@ -836,9 +836,18 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
 }
 
 // FIX-SGT-115: after every load, the descriptors of a branch that is off are emptied. Only the flattened copy
-// is read here, never guest memory (the walker's fault handler knows nothing but the loads).
+// is read here, never guest memory (the walker's fault handler knows nothing but the loads). Unless
+// the caller asks for none (flat_src[SrtWalkerNoGuards]), and a guard that empties says so
+// (flat_src[SrtWalkerGuardEmptied]): Info::RefreshFlatBuf then decides whether the word it compared
+// is the one the shader will read.
 static void EmitDescriptorGuards(Xbyak::CodeGenerator& c,
                                  std::span<const DescriptorGuard> guards) {
+    if (guards.empty()) {
+        return;
+    }
+    Xbyak::Label none;
+    c.cmp(qword[r11 + (SrtWalkerNoGuards << 3)], 0);
+    c.jne(none, Xbyak::CodeGenerator::T_NEAR);
     for (const auto& guard : guards) {
         Xbyak::Label taken;
         c.cmp(dword[rsi + (u32(guard.word) << 2)], guard.value);
@@ -851,8 +860,10 @@ static void EmitDescriptorGuards(Xbyak::CodeGenerator& c,
             c.mov(dword[rsi + (u32(at) << 2)], 0);
             c.mov(qword[r11 + (u32(at) << 3)], 0); // not read: no source, as an unread slot
         }
+        c.mov(qword[r11 + (SrtWalkerGuardEmptied << 3)], 1);
         c.L(taken);
     }
+    c.L(none);
 }
 
 // `find_guards` runs once every read has its flattened word.
@@ -1141,11 +1152,19 @@ void FlattenExtendedUserdataPass(IR::Program& program, const ResourceDiscoveryLi
         SetFlatbufOffset(readconst, GetFlatbufOffset(original));
     }
 
+    // FIX-SGT-115: a replay fills the buffer without the walker, maybe from a record older than the
+    // guards. A read log's (the manifest pre-translation, PERF-GT7-117) becomes a new permutation
+    // with this walker: its words are emptied as the walker would empty them. A shader record's
+    // (PB-1, t_replay) is not: its SPIR-V goes under that record, whose walker and specialization
+    // were made from its words as they are.
     program.info.RefreshFlatBuf();
-    // FIX-SGT-115: a replay (the read log, PB-1) fills the buffer without the walker, maybe from
-    // a record older than the guards.
+    if (const auto* log = Common::t_guest_read_log; log && log->replay && !t_replay) {
+        for (const auto& guard : guards) {
+            guard.Apply(program.info.flattened_ud_buf, program.info.flattened_ud_src);
+        }
+    }
+#ifdef SHADGT_DIAGNOSTICS
     for (const auto& guard : guards) {
-        guard.Apply(program.info.flattened_ud_buf, program.info.flattened_ud_src);
         static std::atomic<u32> logged{};
         if (const u32 n = ++logged; n <= 40 || n % 500 == 0) {
             LOG_INFO(Render_Recompiler,
@@ -1155,6 +1174,7 @@ void FlattenExtendedUserdataPass(IR::Program& program, const ResourceDiscoveryLi
                      guard.taken_if_equal ? "is not" : "is", guard.value, n);
         }
     }
+#endif
 }
 
 } // namespace Shader::Optimization

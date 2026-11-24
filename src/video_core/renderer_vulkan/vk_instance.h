@@ -843,4 +843,12 @@ private:
 enum class StoreGpuFamily { Other, AmdRdna3, AmdRdna4, AmdLegacy };
 StoreGpuFamily GetStoreGpuFamily();
 
+/// FIX-SGT-139: shared memory barriers in 64-thread compute shaders are on by default for Radeon
+/// RX 7000 and RX 9000 cards on AMD's driver (RyGT #92: sky and background flicker in GT7 without
+/// them on an RX 9050). Their translations get a store of their own (cache_storage.cpp).
+inline bool AmdLdsBarriersByDefault() {
+    const StoreGpuFamily family = GetStoreGpuFamily();
+    return family == StoreGpuFamily::AmdRdna3 || family == StoreGpuFamily::AmdRdna4;
+}
+
 } // namespace Vulkan

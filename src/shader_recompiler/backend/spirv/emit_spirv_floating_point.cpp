@@ -11,6 +11,21 @@ Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
     return op;
 }
 
+// DIAG-SGT-144: in the traced hull, float results go to the read trace too (vertex field
+// 0x20000 + kind, attribute field = the op's emission order in this module).
+void EmitTcsReadTrace(EmitContext& ctx, Id vertex_index, Id attr_index, Id comp_index,
+                      Id from_scratch, Id valid, Id value, Id dword);
+static Id TraceFp(EmitContext& ctx, Id result, u32 kind) {
+    if (ctx.sw_stage != Shader::SwStage::TessellationControl ||
+        !ctx.profile.TesDump(ctx.info.pgm_hash) || !Sirit::ValidId(ctx.lds_vertex_base)) {
+        return result;
+    }
+    const Id no = ctx.ConstantFalse(ctx.U1[1]);
+    EmitTcsReadTrace(ctx, ctx.ConstU32(0x20000u + kind), ctx.ConstU32(ctx.trace_site++),
+                     ctx.u32_zero_value, no, no, result, ctx.u32_zero_value);
+    return result;
+}
+
 Id EmitFPAbs32(EmitContext& ctx, Id value) {
     return ctx.OpFAbs(ctx.F32[1], value);
 }
@@ -20,7 +35,7 @@ Id EmitFPAbs64(EmitContext& ctx, Id value) {
 }
 
 Id EmitFPAdd32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-    return Decorate(ctx, inst, ctx.OpFAdd(ctx.F32[1], a, b));
+    return TraceFp(ctx, Decorate(ctx, inst, ctx.OpFAdd(ctx.F32[1], a, b)), 1);
 }
 
 Id EmitFPAdd64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
@@ -28,11 +43,11 @@ Id EmitFPAdd64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
 }
 
 Id EmitFPSub32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-    return Decorate(ctx, inst, ctx.OpFSub(ctx.F32[1], a, b));
+    return TraceFp(ctx, Decorate(ctx, inst, ctx.OpFSub(ctx.F32[1], a, b)), 2);
 }
 
 Id EmitFPFma32(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
-    return Decorate(ctx, inst, ctx.OpFma(ctx.F32[1], a, b, c));
+    return TraceFp(ctx, Decorate(ctx, inst, ctx.OpFma(ctx.F32[1], a, b, c)), 3);
 }
 
 Id EmitFPFma64(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
@@ -43,7 +58,7 @@ Id EmitFPFma64(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
 // FMax leave that undefined, and with SignedZeroInfNanPreserve drivers keep the NaN, so use the
 // NaN-suppressing NMin/NMax. Results are identical for non-NaN inputs.
 Id EmitFPMax32(EmitContext& ctx, Id a, Id b) {
-    return ctx.OpNMax(ctx.F32[1], a, b);
+    return TraceFp(ctx, ctx.OpNMax(ctx.F32[1], a, b), 6);
 }
 
 Id EmitFPMax64(EmitContext& ctx, Id a, Id b) {
@@ -51,7 +66,7 @@ Id EmitFPMax64(EmitContext& ctx, Id a, Id b) {
 }
 
 Id EmitFPMin32(EmitContext& ctx, Id a, Id b) {
-    return ctx.OpNMin(ctx.F32[1], a, b);
+    return TraceFp(ctx, ctx.OpNMin(ctx.F32[1], a, b), 7);
 }
 
 Id EmitFPMin64(EmitContext& ctx, Id a, Id b) {
@@ -106,7 +121,7 @@ Id EmitFPMedTri32(EmitContext& ctx, Id a, Id b, Id c) {
 }
 
 Id EmitFPMul32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-    return Decorate(ctx, inst, ctx.OpFMul(ctx.F32[1], a, b));
+    return TraceFp(ctx, Decorate(ctx, inst, ctx.OpFMul(ctx.F32[1], a, b)), 4);
 }
 
 Id EmitFPMul64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
@@ -114,7 +129,7 @@ Id EmitFPMul64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
 }
 
 Id EmitFPDiv32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-    return Decorate(ctx, inst, ctx.OpFDiv(ctx.F32[1], a, b));
+    return TraceFp(ctx, Decorate(ctx, inst, ctx.OpFDiv(ctx.F32[1], a, b)), 5);
 }
 
 Id EmitFPDiv64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {

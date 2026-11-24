@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <vector>
 #include <fmt/format.h>
+#include "common/alignment.h"
+#include "common/diagnostics.h"
 #include "common/logging/log.h"
 #include "common/recoverable.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
@@ -374,7 +376,266 @@ static bool DiagConstantOutput(u64 hash) {
     return std::ranges::find(hashes, hash) != hashes.end();
 }
 
+// FIX-SGT-143 (RyGT #86): keep the padding attributes of the hull/domain interface in use, or
+// the driver drops them when it links the stages and the layout stays as it was: the hull writes
+// 0 to them, the domain shader adds control point 0's first one (that 0) to its position's x.
+static void KeepTessAttrPad(EmitContext& ctx) {
+    const u32 pad = ctx.profile.tess_attr_pad;
+    if (pad == 0) {
+        return;
+    }
+    if (ctx.sw_stage == SwStage::TessellationControl && Sirit::ValidId(ctx.output_attr_array)) {
+        const u32 used = Common::AlignUp(ctx.runtime_info.sw.tcs.hs_output_cp_stride, 16) >> 4;
+        const u32 declared = std::min<u32>(used + pad, 32);
+        const Id invocation = ctx.OpLoad(ctx.U32[1], ctx.invocation_id);
+        const Id output_vec4 = ctx.TypePointer(spv::StorageClass::Output, ctx.F32[4]);
+        for (u32 attr = used; used != 0 && attr < declared; ++attr) {
+            ctx.OpStore(ctx.OpAccessChain(output_vec4, ctx.output_attr_array, invocation,
+                                          ctx.ConstU32(attr)),
+                        ctx.ConstantNull(ctx.F32[4]));
+        }
+        return;
+    }
+    if (ctx.sw_stage == SwStage::TessellationEval && Sirit::ValidId(ctx.input_attr_array) &&
+        Sirit::ValidId(ctx.output_position)) {
+        const u32 used = Common::AlignUp(ctx.runtime_info.sw.tes.hs_output_cp_stride, 16) >> 4;
+        if (used == 0 || used >= 32) {
+            return;
+        }
+        const Id input_f32 = ctx.TypePointer(spv::StorageClass::Input, ctx.F32[1]);
+        const Id zero =
+            ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(input_f32, ctx.input_attr_array,
+                                                     ctx.u32_zero_value, ctx.ConstU32(used),
+                                                     ctx.u32_zero_value));
+        const Id x = ctx.OpAccessChain(ctx.output_f32, ctx.output_position, ctx.u32_zero_value);
+        ctx.OpStore(x, ctx.OpFAdd(ctx.F32[1], ctx.OpLoad(ctx.F32[1], x), zero));
+    }
+}
+
+// DIAG-SGT-144 (RyGT #86, SHADGT_DIAG_TES_DUMP=<hex hash>): while the dump buffer's header word 0
+// is set, every output vertex of this domain shader appends a vertex record (position, TessCoord,
+// PrimitiveID) and the vertex at TessCoord (0, 0) also appends a patch record (PrimitiveID and
+// the 16 attributes of control points 0-3). Layout: TesDumpLayout in profile users.
+static void EmitTesDump(EmitContext& ctx) {
+    constexpr u64 VertexBase = 256;
+    constexpr u32 VertexWords = 8;
+    constexpr u32 VertexCapacity = 512 * 1024;
+    constexpr u64 PatchBase = VertexBase + u64(VertexCapacity) * VertexWords * 4;
+    constexpr u32 PatchAttrs = 16;
+    constexpr u32 PatchWords = 4 + 4 * PatchAttrs * 4;
+    constexpr u32 PatchCapacity = 16 * 1024;
+    const u64 base = ctx.profile.tes_dump_address;
+    const auto u32_ptr = [&](Id address) {
+        return ctx.OpConvertUToPtr(ctx.physical_pointer_type_u32, address);
+    };
+    const auto at = [&](u64 offset) { return ctx.Constant(ctx.U64, base + offset); };
+    const Id device = ctx.ConstU32(u32(spv::Scope::Device));
+    const Id relaxed = ctx.u32_zero_value;
+    const auto store = [&](Id record, u32 word, Id value_u32) {
+        const Id address = ctx.OpIAdd(ctx.U64, record, ctx.Constant(ctx.U64, u64(word) * 4));
+        ctx.OpStore(u32_ptr(address), value_u32, spv::MemoryAccessMask::Aligned, 4u);
+    };
+    const auto record_at = [&](u64 region, Id index, u32 words) {
+        return ctx.OpIAdd(ctx.U64, at(region),
+                          ctx.OpIMul(ctx.U64, ctx.OpUConvert(ctx.U64, index),
+                                     ctx.Constant(ctx.U64, u64(words) * 4)));
+    };
+    const auto bits = [&](Id f32) { return ctx.OpBitcast(ctx.U32[1], f32); };
+    // SHADGT_DIAG_TES_DUMP_LITE=1: no vertex records, patch records with attrs 10-15 only, and a
+    // plain load of the switch word (NVIDIA's compiler died on the full dump).
+    static const bool lite = [] {
+        const char* env = Common::DiagEnv("SHADGT_DIAG_TES_DUMP_LITE");
+        return env && env[0] == '1';
+    }();
+
+    const Id enabled =
+        lite ? ctx.OpLoad(ctx.U32[1], u32_ptr(at(0)),
+                          spv::MemoryAccessMask::Aligned | spv::MemoryAccessMask::Volatile, 4u)
+             : ctx.OpAtomicLoad(ctx.U32[1], u32_ptr(at(0)), device, relaxed);
+    // Conditions are made before OpSelectionMerge: it must come right before the branch.
+    const Id on = ctx.OpINotEqual(ctx.U1[1], enabled, ctx.u32_zero_value);
+    const Id on_label = ctx.OpLabel();
+    const Id end_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(end_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(on, on_label, end_label);
+    ctx.AddLabel(on_label);
+
+    const Id position = ctx.OpLoad(ctx.F32[4], ctx.output_position);
+    const Id tess_coord = ctx.OpLoad(ctx.F32[3], ctx.tess_coord);
+    const Id primitive = ctx.OpLoad(ctx.U32[1], ctx.primitive_id);
+
+    // Vertex record.
+    if (!lite) {
+        const Id vertex =
+            ctx.OpAtomicIAdd(ctx.U32[1], u32_ptr(at(4)), device, relaxed, ctx.u32_one_value);
+        const Id vertex_fits = ctx.OpULessThan(ctx.U1[1], vertex, ctx.ConstU32(VertexCapacity));
+        const Id vertex_label = ctx.OpLabel();
+        const Id vertex_end = ctx.OpLabel();
+        ctx.OpSelectionMerge(vertex_end, spv::SelectionControlMask::MaskNone);
+        ctx.OpBranchConditional(vertex_fits, vertex_label, vertex_end);
+        ctx.AddLabel(vertex_label);
+        {
+            const Id record = record_at(VertexBase, vertex, VertexWords);
+            for (u32 c = 0; c < 4; ++c) {
+                store(record, c, bits(ctx.OpCompositeExtract(ctx.F32[1], position, c)));
+            }
+            for (u32 c = 0; c < 3; ++c) {
+                store(record, 4 + c, bits(ctx.OpCompositeExtract(ctx.F32[1], tess_coord, c)));
+            }
+            store(record, 7, primitive);
+        }
+        ctx.OpBranch(vertex_end);
+        ctx.AddLabel(vertex_end);
+    }
+
+    // Patch record, once per patch (the vertex at TessCoord (0, 0)).
+    if (Sirit::ValidId(ctx.input_attr_array)) {
+        const Id corner = ctx.OpLogicalAnd(
+            ctx.U1[1],
+            ctx.OpFOrdEqual(ctx.U1[1], ctx.OpCompositeExtract(ctx.F32[1], tess_coord, 0),
+                            ctx.ConstF32(0.0f)),
+            ctx.OpFOrdEqual(ctx.U1[1], ctx.OpCompositeExtract(ctx.F32[1], tess_coord, 1),
+                            ctx.ConstF32(0.0f)));
+        const Id corner_label = ctx.OpLabel();
+        const Id corner_end = ctx.OpLabel();
+        ctx.OpSelectionMerge(corner_end, spv::SelectionControlMask::MaskNone);
+        ctx.OpBranchConditional(corner, corner_label, corner_end);
+        ctx.AddLabel(corner_label);
+        const Id patch =
+            ctx.OpAtomicIAdd(ctx.U32[1], u32_ptr(at(8)), device, relaxed, ctx.u32_one_value);
+        const Id patch_fits = ctx.OpULessThan(ctx.U1[1], patch, ctx.ConstU32(PatchCapacity));
+        const Id patch_label = ctx.OpLabel();
+        const Id patch_end = ctx.OpLabel();
+        ctx.OpSelectionMerge(patch_end, spv::SelectionControlMask::MaskNone);
+        ctx.OpBranchConditional(patch_fits, patch_label, patch_end);
+        ctx.AddLabel(patch_label);
+        {
+            const Id record = record_at(PatchBase, patch, PatchWords);
+            store(record, 0, primitive);
+            const u32 attrs = std::min<u32>(
+                PatchAttrs,
+                (Common::AlignUp(ctx.runtime_info.sw.tes.hs_output_cp_stride, 16) >> 4));
+            store(record, 1, ctx.ConstU32(attrs));
+            const Id input_vec4 = ctx.TypePointer(spv::StorageClass::Input, ctx.F32[4]);
+            for (u32 cp = 0; cp < 4; ++cp) {
+                for (u32 attr = lite ? std::min(10u, attrs) : 0u; attr < attrs; ++attr) {
+                    const Id value = ctx.OpLoad(
+                        ctx.F32[4], ctx.OpAccessChain(input_vec4, ctx.input_attr_array,
+                                                      ctx.ConstU32(cp), ctx.ConstU32(attr)));
+                    for (u32 c = 0; c < 4; ++c) {
+                        store(record, 4 + (cp * PatchAttrs + attr) * 4 + c,
+                              bits(ctx.OpCompositeExtract(ctx.F32[1], value, c)));
+                    }
+                }
+            }
+        }
+        ctx.OpBranch(patch_end);
+        ctx.AddLabel(patch_end);
+        ctx.OpBranch(corner_end);
+        ctx.AddLabel(corner_end);
+    }
+    ctx.OpBranch(end_label);
+    ctx.AddLabel(end_label);
+}
+
+// DIAG-SGT-144 (RyGT #86, SHADGT_DIAG_VS_NULL=<hex>[,...]): the stage that writes the position of
+// these programs writes (0, 0, 0, 0), so their draws vanish: which draw makes an artefact.
+static bool DiagNullPosition(u64 hash) {
+    static const std::vector<u64> hashes = [] {
+        std::vector<u64> list;
+        const char* env = Common::DiagEnv("SHADGT_DIAG_VS_NULL");
+        for (const char* at = env ? env : ""; *at;) {
+            char* end = nullptr;
+            const u64 value = std::strtoull(at, &end, 16);
+            if (end == at)
+                break;
+            list.push_back(value);
+            at = *end == ',' ? end + 1 : end;
+        }
+        return list;
+    }();
+    return std::ranges::find(hashes, hash) != hashes.end();
+}
+
+// DIAG-SGT-144 (RyGT #86, SHADGT_DIAG_TES_DUMP=<hull hash>): while the dump buffer's word 0 is set,
+// each hull invocation writes its own output control point into a fixed slot: slot = (PrimitiveID %
+// 4096) * 4 + InvocationID % 4 at 256 + slot * 272 bytes; words: PrimitiveID, InvocationID,
+// 0xD00D, attribute count, then 16 attributes x xyzw. No atomics, a plain load of the switch:
+// the same raw-pointer use the hull's LDS emulation already makes on NVIDIA.
+static void EmitHsDump(EmitContext& ctx) {
+    if (!Sirit::ValidId(ctx.output_attr_array)) {
+        return;
+    }
+    const u64 base = ctx.profile.tes_dump_address;
+    const auto u32_ptr = [&](Id address) {
+        return ctx.OpConvertUToPtr(ctx.physical_pointer_type_u32, address);
+    };
+    // NVIDIA's compiler threw on raw pointers made from a constant address: add a zero it
+    // cannot prove (PrimitiveID >> 31), as the LDS emulation takes its base from push data.
+    // AMD then read from the address's low 32 bits only (device lost at 0x0ec00000 for
+    // 0x30ec00000), so the non-constant form is used on NVIDIA only (the GPU that clips by
+    // emulated clip distances); the plain constant worked on AMD.
+    const Id primitive = ctx.OpLoad(ctx.U32[1], ctx.primitive_id);
+    const Id base_id =
+        ctx.profile.needs_clip_distance_emulation
+            ? ctx.OpIAdd(ctx.U64, ctx.Constant(ctx.U64, base),
+                         ctx.OpUConvert(ctx.U64, ctx.OpShiftRightLogical(ctx.U32[1], primitive,
+                                                                         ctx.ConstU32(31u))))
+            : ctx.Constant(ctx.U64, base);
+    const Id enabled =
+        ctx.OpLoad(ctx.U32[1], u32_ptr(base_id),
+                   spv::MemoryAccessMask::Aligned | spv::MemoryAccessMask::Volatile, 4u);
+    const Id on = ctx.OpINotEqual(ctx.U1[1], enabled, ctx.u32_zero_value);
+    const Id on_label = ctx.OpLabel();
+    const Id end_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(end_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(on, on_label, end_label);
+    ctx.AddLabel(on_label);
+    const Id invocation = ctx.OpLoad(ctx.U32[1], ctx.invocation_id);
+    const Id slot = ctx.OpIAdd(
+        ctx.U32[1],
+        ctx.OpIMul(ctx.U32[1], ctx.OpBitwiseAnd(ctx.U32[1], primitive, ctx.ConstU32(4095u)),
+                   ctx.ConstU32(4u)),
+        ctx.OpBitwiseAnd(ctx.U32[1], invocation, ctx.ConstU32(3u)));
+    const Id record = ctx.OpIAdd(
+        ctx.U64, ctx.OpIAdd(ctx.U64, base_id, ctx.Constant(ctx.U64, u64(256))),
+        ctx.OpIMul(ctx.U64, ctx.OpUConvert(ctx.U64, slot), ctx.Constant(ctx.U64, u64(272))));
+    const auto store = [&](u32 word, Id value_u32) {
+        const Id address = ctx.OpIAdd(ctx.U64, record, ctx.Constant(ctx.U64, u64(word) * 4));
+        ctx.OpStore(u32_ptr(address), value_u32, spv::MemoryAccessMask::Aligned, 4u);
+    };
+    const u32 attrs =
+        std::min<u32>(16, Common::AlignUp(ctx.runtime_info.sw.tcs.hs_output_cp_stride, 16) >> 4);
+    store(0, primitive);
+    store(1, invocation);
+    store(2, ctx.ConstU32(0xD00Du));
+    store(3, ctx.ConstU32(attrs));
+    const Id output_vec4 = ctx.TypePointer(spv::StorageClass::Output, ctx.F32[4]);
+    for (u32 attr = 0; attr < attrs; ++attr) {
+        const Id value =
+            ctx.OpLoad(ctx.F32[4], ctx.OpAccessChain(output_vec4, ctx.output_attr_array, invocation,
+                                                     ctx.ConstU32(attr)));
+        for (u32 c = 0; c < 4; ++c) {
+            store(4 + attr * 4 + c,
+                  ctx.OpBitcast(ctx.U32[1], ctx.OpCompositeExtract(ctx.F32[1], value, c)));
+        }
+    }
+    ctx.OpBranch(end_label);
+    ctx.AddLabel(end_label);
+}
+
 void EmitEpilogue(EmitContext& ctx) {
+    KeepTessAttrPad(ctx); // FIX-SGT-143
+    if (ctx.sw_stage == SwStage::TessellationEval && ctx.profile.TesDump(ctx.info.pgm_hash)) {
+        EmitTesDump(ctx); // DIAG-SGT-144
+    }
+    if (ctx.sw_stage == SwStage::TessellationControl && ctx.profile.TesDump(ctx.info.pgm_hash)) {
+        EmitHsDump(ctx); // DIAG-SGT-144
+    }
+    if (ctx.hw_stage == HwStage::Vertex && Sirit::ValidId(ctx.output_position) &&
+        DiagNullPosition(ctx.info.pgm_hash)) {
+        ctx.OpStore(ctx.output_position, ctx.ConstantNull(ctx.F32[4])); // DIAG-SGT-144
+    }
     if (ctx.hw_stage == HwStage::Fragment && DiagConstantOutput(ctx.info.pgm_hash)) {
         const std::array<float, 4> magenta{1.0f, 0.0f, 1.0f, 1.0f};
         for (const auto& output : ctx.frag_outputs) {

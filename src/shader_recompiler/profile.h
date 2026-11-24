@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "common/diagnostics.h"
 #include "common/types.h"
 
 namespace Shader {
@@ -79,6 +80,18 @@ struct Profile {
     /// DIAG-GTS-459 (SHADGT_DIAG_LDS_READS=1): GPU address of 64 slots of two u32 counters a hull
     /// shader's emulated LDS reads add to (reads, reads outside the patch); 0: off.
     u64 lds_read_counters{};
+    /// FIX-SGT-143 (RyGT #86): extra per-vertex attributes hull and domain shaders declare and
+    /// keep in use (Vulkan::TessAttrPad(); AMD 1).
+    u32 tess_attr_pad{};
+    /// DIAG-SGT-144 (RyGT #86, SHADGT_DIAG_TES_DUMP=<hex hash>): GPU address of a host-visible dump
+    /// buffer the domain shader `tes_dump_hash` appends its output vertices and patches to.
+    u64 tes_dump_address{};
+    u64 tes_dump_hash{};
+
+    bool TesDump(u64 pgm_hash) const {
+        // Diagnostics builds only: a constant false in Release drops every dump and trace.
+        return Common::DiagnosticsBuilt && tes_dump_address != 0 && pgm_hash == tes_dump_hash;
+    }
 
     bool operator==(const Profile&) const = default;
 };

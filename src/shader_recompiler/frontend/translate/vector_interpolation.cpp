@@ -50,13 +50,42 @@ void Translator::EmitVectorInterpolation(const GcnInst& inst) {
     }
 }
 
+// PERF-SGT-151: on AMD's explicit vertex path (AMD-315, RX 6000 and older) a V_INTERP_MOV makes
+// its whole attribute per-vertex, so P1/P2 reads of that attribute must be done by hand. Other
+// attributes keep the hardware's interpolation: doing them all by hand cost 8% of a GT7 frame on
+// a Radeon 610M (27 vertex reads in one pixel shader). The KHR barycentric path (NVIDIA, the
+// single-sample barycentric fix) keeps every attribute by hand. SHADGT_MANUAL_INTERP_ALL=1: every
+// attribute by hand on AMD too, as before (part of the shader store key).
+void Translator::NoteInterpMovs(std::span<const GcnInst> program) {
+    interp_mov_attrs = 0;
+    for (const GcnInst& inst : program) {
+        if (inst.opcode == Opcode::V_INTERP_MOV_F32 && inst.control.vintrp.attr < 64) {
+            interp_mov_attrs |= u64{1} << inst.control.vintrp.attr;
+        }
+    }
+}
+
+bool Translator::ManualInterpolation(u32 attr_index) const {
+    if (!profile.needs_manual_interpolation) {
+        return false;
+    }
+    static const bool all = [] {
+        const char* env = std::getenv("SHADGT_MANUAL_INTERP_ALL");
+        return env && env[0] == '1';
+    }();
+    if (all || !profile.supports_amd_shader_explicit_vertex_parameter) {
+        return true;
+    }
+    return attr_index < 64 && (interp_mov_attrs >> attr_index & 1) != 0;
+}
+
 // VINTRP
 
 void Translator::V_INTERP_P1_F32(const GcnInst& inst) {
-    if (!profile.needs_manual_interpolation) {
+    const u32 attr_index = inst.control.vintrp.attr;
+    if (!ManualInterpolation(attr_index)) {
         return;
     }
-    const u32 attr_index = inst.control.vintrp.attr;
     const auto& attr = runtime_info.hw.fs.inputs[attr_index];
     if (attr.IsDefault()) {
         return;
@@ -81,7 +110,7 @@ void Translator::V_INTERP_P2_F32(const GcnInst& inst) {
         return;
     }
     ASSERT(!attr.is_flat);
-    if (!profile.needs_manual_interpolation) {
+    if (!ManualInterpolation(attr_index)) {
         interp = GetInterpolation(vgpr_to_interp[inst.src[0].code]);
         SetDst(inst.dst[0], ir.GetAttribute(attrib, inst.control.vintrp.chan));
         return;

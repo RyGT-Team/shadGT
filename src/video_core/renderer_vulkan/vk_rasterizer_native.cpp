@@ -8592,6 +8592,45 @@ static u64 PerFrameReadCut(VAddr base, u64 size, bool written) {
     return end - base;
 }
 
+/// FIX-GT7-196 (RyGT #99, SHADGT_LISTED_READ_CUT=0: as before): a read over one of the other listed
+/// in-place ranges (GT7's culling block at 0x1020000000) that reaches more than 64 MB past that
+/// range's end is cut there. It is FIX-GT7-195's read outside the per-frame memory: an unbounded
+/// buffer from 0x1015603260, sized to the end of the mapping, grew from 690 MB to 2.6 GB over a
+/// session of License Test retries as the game mapped more after it. Each growth retired its span
+/// view and imported a bigger one (150-180 ms each), and past 1 GiB (FIX-SGT-041) no span view could
+/// hold it and it fell back to a region: freezes, then 0 FPS until a restart. The 64 MB keeps
+/// FIX-SGT-014's rain read (77-85 MB from 0x101d8d9490, ending about 34 MB past the block) whole.
+/// Writes keep their size.
+static u64 ListedReadCut(VAddr base, u64 size, bool written) {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_LISTED_READ_CUT");
+        return !(env && env[0] == '0');
+    }();
+    if (!on || written || size == 0) {
+        return size;
+    }
+    const VAddr per_frame = PerFrameListed().first;
+    const VAddr per_frame_end = PerFrameEnd();
+    for (const auto& [range_begin, range_end] : InplaceRanges()) {
+        if (per_frame != 0 && range_begin >= per_frame && range_end <= per_frame_end) {
+            continue; // FIX-GT7-195's
+        }
+        const VAddr limit = range_end + 64_MB;
+        if (base >= range_end || base + size <= limit) {
+            continue;
+        }
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-GT7-196: read {:#x}+{:#x} cut 64 MB past the listed range "
+                        "{:#x}-{:#x}",
+                        base, size, range_begin, range_end);
+        }
+        return limit - base;
+    }
+    return size;
+}
+
 void NativeRenderer::NotePerFrameRange(VAddr address, u64 size) {
     // The unbounded reads end where the per-frame memory does: one that starts in it and ends past
     // its end shows how far it goes now.
@@ -12127,6 +12166,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                 [&](u64 a, u64 n) { return readable_direct->EnsureImported(a, n); },
                 [&](u64 a, u64 n) { return Native::ReadablePrefix(reinterpret_cast<const void*>(a), n); });
             if (bindable) size = PerFrameReadCut(base, size, desc.is_written); // FIX-GT7-195
+            if (bindable) size = ListedReadCut(base, size, desc.is_written); // FIX-GT7-196
             if (bindable && size != 0) {
 #if !defined(NDEBUG)
                 // FIX-174 (diagnosis, SHADGT_NATIVE_WATCH_BUFFER=<hex address>+<hex size>): the
@@ -21231,6 +21271,7 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                 [&](u64 a, u64 n) { return readable_direct->EnsureImported(a, n); },
                 [&](u64 a, u64 n) { return Native::ReadablePrefix(reinterpret_cast<const void*>(a), n); });
             if (bindable) size = PerFrameReadCut(base, size, desc.is_written); // FIX-GT7-195
+            if (bindable) size = ListedReadCut(base, size, desc.is_written); // FIX-GT7-196
             // A region can appear after a worker's overlap check. Recheck any
             // truncated/empty range on the serialized recorder rather than
             // publishing an untracked truncated descriptor.

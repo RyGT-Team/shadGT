@@ -88,6 +88,11 @@ void VideoOutDriver::Close(s32 handle) {
     main_port.prev_index = -1;
 
     // Clear port information
+#ifdef RYTY_GPU
+    for (std::size_t i = 0; i < main_port.buffer_slots.size(); ++i) {
+        Vulkan::SetDisplaySlot(i, 0, {});
+    }
+#endif
     std::memset(main_port.buffer_labels.data(), 0, sizeof(main_port.buffer_labels));
     std::memset(main_port.groups.data(), 0, sizeof(main_port.groups));
     std::memset(&main_port.vblank_status, 0, sizeof(main_port.vblank_status));
@@ -189,6 +194,9 @@ int VideoOutDriver::RegisterBuffers(VideoOutPort* port, s32 startIndex, void* co
         port->buffer_labels[startIndex + i] = 0;
         port->SignalVoLabel();
 
+#ifdef RYTY_GPU
+        Vulkan::SetDisplaySlot(startIndex + i, address, group.attrib);
+#endif
         presenter->RegisterVideoOutSurface(group, address);
         LOG_INFO(Lib_VideoOut, "buffers[{}] = {:#x}", i + startIndex, address);
     }
@@ -205,10 +213,14 @@ int VideoOutDriver::UnregisterBuffers(VideoOutPort* port, s32 attributeIndex) {
     auto& group = port->groups[attributeIndex];
     group.is_occupied = false;
 
-    for (auto& buffer : port->buffer_slots) {
+    for (std::size_t i = 0; i < port->buffer_slots.size(); ++i) {
+        auto& buffer = port->buffer_slots[i];
         if (buffer.group_index != attributeIndex) {
             continue;
         }
+#ifdef RYTY_GPU
+        Vulkan::SetDisplaySlot(i, 0, {});
+#endif
         buffer.group_index = -1;
     }
 
@@ -250,6 +262,14 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
 
     std::unique_lock lock{port->port_mutex};
     std::memcpy(&port->groups[attributeIndex].attrib, attribute, sizeof(BufferAttribute));
+#ifdef RYTY_GPU
+    for (std::size_t i = 0; i < port->buffer_slots.size(); ++i) {
+        const auto& buffer = port->buffer_slots[i];
+        if (buffer.group_index == attributeIndex) {
+            Vulkan::SetDisplaySlot(i, buffer.address_left, *attribute);
+        }
+    }
+#endif
     return 0;
 }
 

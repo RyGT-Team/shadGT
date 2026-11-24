@@ -21,6 +21,7 @@
 #include "ryty_gpu/native/buffer_sizes.h"
 #include "ryty_gpu/native/descriptor_dead_handles.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/videoout/buffer.h"
 #include "ryty_gpu/native/parallel_rotate_segment.h"
 #include "ryty_gpu/native/natural_scope_boundary.h"
 #include "ryty_gpu/native/attachment_alias.h"
@@ -2693,34 +2694,35 @@ static bool FaultAheadEnabled() {
     return enabled;
 }
 
-// GT7-UW: the display buffers' addresses (the presenter notes them as the game registers them).
+// VideoOut may register multiple views of the same address, each with its own pitch.
 namespace {
-std::array<std::atomic<VAddr>, 16> g_display_addresses{};
-/// DLSS-GT7-001: the size each was registered with (width << 32 | height; 0 unknown).
-std::array<std::atomic<u64>, 16> g_display_sizes{};
+struct DisplaySlot {
+    std::atomic<VAddr> address{};
+    vk::Extent2D extent{};
+    u32 pitch{};
+};
+std::array<DisplaySlot, Libraries::VideoOut::MaxDisplayBuffers> g_display_slots{};
+std::atomic<std::size_t> g_display_slot_count{};
+std::mutex g_display_slots_mutex;
 } // namespace
 
-void NoteDisplayAddress(VAddr address, u32 width, u32 height) {
-    for (std::size_t i = 0; i < g_display_addresses.size(); ++i) {
-        auto& slot = g_display_addresses[i];
-        VAddr expected = 0;
-        if (slot.load(std::memory_order_relaxed) == address ||
-            slot.compare_exchange_strong(expected, address)) {
-            if (width != 0 && height != 0) {
-                g_display_sizes[i].store((u64{width} << 32) | height, std::memory_order_relaxed);
-            }
-            return;
-        }
+void SetDisplaySlot(std::size_t index, VAddr address, const Libraries::VideoOut::BufferAttribute& view) {
+    std::scoped_lock lock{g_display_slots_mutex};
+    auto& slot = g_display_slots[index];
+    slot.extent = vk::Extent2D{view.width, view.height};
+    slot.pitch = view.pitch_in_pixel;
+    slot.address.store(address, std::memory_order_relaxed);
+    auto count = std::max(index + 1, g_display_slot_count.load(std::memory_order_relaxed));
+    while (count && !g_display_slots[count - 1].address.load(std::memory_order_relaxed)) {
+        --count;
     }
+    g_display_slot_count.store(count, std::memory_order_release);
 }
 
 static bool IsDisplayAddress(VAddr address) {
-    for (const auto& slot : g_display_addresses) {
-        const VAddr value = slot.load(std::memory_order_relaxed);
-        if (value == 0) {
-            return false;
-        }
-        if (value == address) {
+    const auto count = g_display_slot_count.load(std::memory_order_acquire);
+    for (std::size_t i = 0; address && i < count; ++i) {
+        if (g_display_slots[i].address.load(std::memory_order_relaxed) == address) {
             return true;
         }
     }
@@ -2745,22 +2747,25 @@ static bool Gt7TemporalActive() {
 // before a menu's interface) are made that size, so they match what FindDisplay shows. Elsewhere
 // the picture's own size.
 static vk::Extent2D ShownPart(const Native::ImageEntry& picture) {
-    vk::Extent2D size{picture.info.size.width, picture.info.size.height};
-    for (std::size_t i = 0; i < g_display_addresses.size(); ++i) {
-        const VAddr value = g_display_addresses[i].load(std::memory_order_relaxed);
-        if (value == 0) {
-            break;
+    const vk::Extent2D size{picture.info.size.width, picture.info.size.height};
+    std::scoped_lock lock{g_display_slots_mutex};
+    int best_rank = -1;
+    auto shown = size;
+    for (const auto& slot : g_display_slots) {
+        if (slot.address.load(std::memory_order_relaxed) != picture.info.guest_address ||
+            !slot.extent.width || !slot.extent.height) {
+            continue;
         }
-        if (value == picture.info.guest_address) {
-            const u64 shown = g_display_sizes[i].load(std::memory_order_relaxed);
-            if (shown != 0) {
-                size.width = std::min(size.width, static_cast<u32>(shown >> 32));
-                size.height = std::min(size.height, static_cast<u32>(shown & 0xffffffffu));
-            }
-            break;
+        // Prefer the matching row layout. At equal pitch prefer an exact size, then
+        // the first slot (the primary view when a padded Pro target needs cropping).
+        const int rank = 2 * (slot.pitch == picture.info.pitch) + (slot.extent == size);
+        if (rank > best_rank) {
+            best_rank = rank;
+            shown.width = std::min(size.width, slot.extent.width);
+            shown.height = std::min(size.height, slot.extent.height);
         }
     }
-    return size;
+    return shown;
 }
 
 bool NativeRenderer::HudSplitOn() {

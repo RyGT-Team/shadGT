@@ -184,6 +184,12 @@ void DataBase::Open() {
                     !(env && *env) && Vulkan::AmdLdsBarriersByDefault()) {
                     parts += ", lds barriers";
                 }
+                // FIX-SGT-145: RX 7000/9000 stores made before were translated without the
+                // hand-made interpolation that is now on by default there.
+                if (const char* env = std::getenv("SHADGT_MANUAL_INTERP");
+                    !(env && *env) && Vulkan::AmdManualInterpByDefault()) {
+                    parts += ", manual interp";
+                }
                 // DIAG-230 (port): without SHADGT_MANUAL_INTERP, the diagnosis switch changes
                 // NVIDIA's translations (vk_pipeline_cache.cpp); they are kept apart.
                 if (const char* manual = std::getenv("SHADGT_MANUAL_INTERP");

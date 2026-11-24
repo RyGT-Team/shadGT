@@ -25,6 +25,13 @@
 #include <cstring>
 #include <vk_mem_alloc.h>
 
+#ifdef RYTY_GPU
+namespace Vulkan {
+float RytyDisplayAspect(); // GTS-009 (ryty_game_patch.cpp)
+bool RytyWideScene();      // WIDE-001
+} // namespace Vulkan
+#endif
+
 namespace Vulkan::HostPasses {
 
 namespace {
@@ -388,8 +395,19 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
 
     // WIDE-009: a 16:9 picture (the boot screens, shown before the high-resolution UI takes
     // over) on a wide window goes between black bars instead of being stretched over it.
+    // FIX-SGT-142 (RyGT #110): not when the picture is meant to be stretched (GTS-009, a screen
+    // shape set without WIDE-001's wide scene). GT7's Ultrawide widens its camera and lays its
+    // menus out for the window's shape on a 16:9 picture; WIDE-009 put that picture between
+    // black bars, so 21:9 came out squeezed into the middle, whatever the setting.
+    static const bool stretch = [] {
+#ifdef RYTY_GPU
+        return RytyDisplayAspect() > 0.0f && !RytyWideScene();
+#else
+        return false;
+#endif
+    }();
     vk::Rect2D area{{0, 0}, {frame.width, frame.height}};
-    if (input_size.width != 0 && input_size.height != 0 && frame.height != 0) {
+    if (!stretch && input_size.width != 0 && input_size.height != 0 && frame.height != 0) {
         const double input_aspect = double(input_size.width) / input_size.height;
         const double frame_aspect = double(frame.width) / frame.height;
         if (input_aspect < frame_aspect * 0.8) {

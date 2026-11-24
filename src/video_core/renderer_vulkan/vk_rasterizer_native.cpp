@@ -24358,7 +24358,9 @@ void NativeRenderer::EvictImages() {
     // This pass keeps none of them, so the next attempt finds the room.
     const bool pressure = Native::Rhi::g_device_memory_pressure.exchange(false,
                                                                          std::memory_order_relaxed);
-    if (pressure) {
+    // FIX-SGT-140: rate-limited; under lasting pressure this came every frame.
+    static std::atomic<u32> pressure_logged{};
+    if (pressure && OutOfMemoryLogDue(pressure_logged)) {
         LOG_WARNING(Render_Vulkan, "VRAM-PRESSURE-001: device memory ran out; idle textures are "
                                    "released instead of kept");
     }
@@ -24550,7 +24552,8 @@ void NativeRenderer::EvictImages() {
             return kept_textures.contains(&entry) || keep(entry) || keep_new_texture(entry);
         },
         pressure ? ~u32{0} : 16);
-    if (pressure) {
+    static std::atomic<u32> evict_logged{};
+    if (pressure && evicted != 0 && OutOfMemoryLogDue(evict_logged)) {
         LOG_WARNING(Render_Vulkan, "FIX-SGT-140: {} idle pictures released under memory pressure",
                     evicted);
     }

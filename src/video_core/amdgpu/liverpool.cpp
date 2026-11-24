@@ -1587,9 +1587,11 @@ void Liverpool::Process(std::stop_token stoken) {
             const auto has_work = [this] { return num_commands || num_tasks || submit_done; };
             // PERF-098: while the splash screen shows, or stored pipelines remain, the idle
             // command thread queues stored pipeline builds every few milliseconds.
+            // FIX-SGT-134: and while the precompile holds the game, which waits at its start
+            // gate until IdlePrewarm releases the hold (also with the splash screen off).
             while (!has_work() && !stoken.stop_requested() && rasterizer &&
                    (Libraries::SystemService::IsSplashVisible() ||
-                    Vulkan::GetPrecompileProgress().active)) {
+                    Vulkan::GetPrecompileProgress().active || Vulkan::PrecompileHoldsGame())) {
                 if (submit_cv.wait_for(lk, stoken, std::chrono::milliseconds{5}, has_work)) {
                     break;
                 }
@@ -1598,7 +1600,11 @@ void Liverpool::Process(std::stop_token stoken) {
                     Libraries::SystemService::IsSplashVisible());
                 lk.lock();
             }
-            Common::CondvarWait(submit_cv, lk, stoken, has_work);
+            // FIX-SGT-134: the game, at its start gate, submits nothing while the precompile holds
+            // it, so the precompile's idle work wakes this wait too (BindRasterizer notifies it).
+            Common::CondvarWait(submit_cv, lk, stoken, [&] {
+                return has_work() || (rasterizer && Vulkan::PrecompileHoldsGame());
+            });
         }
         if (stoken.stop_requested()) {
             break;

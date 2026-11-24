@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <limits>
 #include "common/assert.h"
@@ -276,6 +277,14 @@ bool Swapchain::Present(u64 anti_lag_frame) {
     return !needs_recreation;
 }
 
+// FIX-SGT-134: whether the output can be HDR10 (the display offers it and the launcher's HDR box
+// is ticked), for the splash precompile's start gate, decided before the presenter is published.
+static std::atomic<bool> g_swapchain_hdr10{};
+
+bool SwapchainOffersHdr10() {
+    return g_swapchain_hdr10.load(std::memory_order_relaxed);
+}
+
 void Swapchain::FindPresentFormat() {
     const auto [formats_result, formats] =
         instance.GetPhysicalDevice().getSurfaceFormatsKHR(surface);
@@ -291,6 +300,7 @@ void Swapchain::FindPresentFormat() {
         }) != formats.end();
     // Also make sure that user allowed us to use HDR
     supports_hdr &= EmulatorSettings.IsHdrAllowed();
+    g_swapchain_hdr10.store(supports_hdr, std::memory_order_relaxed); // FIX-SGT-134
 
     // If there is a single undefined surface format, the device doesn't care, so we'll just use
     // RGBA sRGB.

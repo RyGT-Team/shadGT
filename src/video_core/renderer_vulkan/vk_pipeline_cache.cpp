@@ -1008,9 +1008,51 @@ bool PrecompileHoldsGame() {
 // FEAT-GTS-470: when the hold was taken, for the splash's length in the log.
 static std::atomic<s64> g_precompile_hold_since_ms{};
 
+// FIX-SGT-134: the game waits at the renderer's start gate (Common::GuestClock), before its first
+// call into the renderer returns, until the splash precompile is done; its clock is not held, so
+// none of its threads works through the hold in no time. Holding only the clock (PERF-102), the
+// game ran its start under a 12-15 s splash in no time and GT Sport, past its HDR switch, drew
+// its SDR shader variants into the HDR10 display buffers (cyan sky, burnt whites).
+// The gate makes the start ~5 s longer (the game's own start no longer runs under the hold), so
+// by default it is only where the held clock did harm: GT Sport with an HDR10 output (the
+// launcher's HDR box and a display in HDR). GT Sport in SDR draws its SDR variants anyway, and
+// GT7's HDR was right under the old hold (played 23-11, RTX 4070 only): both keep the old hold.
+// SHADGT_PRECOMPILE_START_GATE=1: the gate for every start; 0: never.
+bool SwapchainOffersHdr10(); // vk_swapchain.cpp, made before the pipeline cache
+
+static bool PrecompileStartGateOn() {
+    static const bool on = [] {
+        if (const char* env = std::getenv("SHADGT_PRECOMPILE_START_GATE"); env && *env) {
+            return env[0] != '0';
+        }
+        return !Common::IsGt7() && SwapchainOffersHdr10();
+    }();
+    return on;
+}
+
+// FIX-SGT-134: whether the hold paused the game's clock (PERF-102 without the start gate).
+static std::atomic<bool> g_precompile_hold_clock{};
+
+// PERF-102: the game waits on the splash screen until the precompile is done (FIX-SGT-134: at the
+// start gate, its clock running; else with its clock held).
+static void TakePrecompileHold(bool hold_clock) {
+    if (!g_precompile_hold.exchange(true)) {
+        g_precompile_hold_since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (hold_clock) {
+            g_precompile_hold_clock = true;
+            Common::GuestClock::TakeHold();
+        }
+        LOG_WARNING(Render_Vulkan, "PERF-102: the game waits on the splash screen for the precompile");
+    }
+}
+
 static void ReleasePrecompileHold() {
+    SCOPE_EXIT { Common::GuestClock::OpenStartGate(); }; // FIX-SGT-134
     if (g_precompile_hold.exchange(false)) {
-        Common::GuestClock::ReleaseHold();
+        if (g_precompile_hold_clock.exchange(false)) {
+            Common::GuestClock::ReleaseHold();
+        }
         const s64 since = g_precompile_hold_since_ms.load();
         const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -3325,6 +3367,22 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                                                "vertex input; not available here");
                 } else {
                     prewarm_enabled = true;
+#ifdef RYTY_GPU
+                    // FIX-SGT-134: made while the game's first call into the renderer waits for
+                    // its initialization; that call returns once the hold is released.
+                    if (PrecompileStartGateOn()) {
+                        TakePrecompileHold(false);
+                        Common::GuestClock::CloseStartGate();
+                        LOG_WARNING(Render_Vulkan, "FIX-SGT-134: the game waits at the start gate "
+                                                   "until the splash precompile is done, its clock "
+                                                   "running (SHADGT_PRECOMPILE_START_GATE=0: it runs "
+                                                   "under the hold, as before)");
+                    } else {
+                        LOG_WARNING(Render_Vulkan, "FIX-SGT-134: no start gate ({}): the game runs "
+                                                   "under the splash hold, its clock held",
+                                    Common::IsGt7() ? "GT7" : "GT Sport without an HDR10 output");
+                    }
+#endif
 #ifndef NDEBUG
                     prewarm_stats.since = std::chrono::steady_clock::now();
 #endif
@@ -7734,13 +7792,11 @@ void PipelineCache::PrewarmRead(std::stop_token stop) {
     Common::SetCurrentThreadName("shadGT:PrewarmRead");
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
 #ifdef RYTY_GPU
-    // PERF-102: the game waits on the splash screen until the precompile is done.
-    if (!g_precompile_hold.exchange(true)) {
-        g_precompile_hold_since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-        Common::GuestClock::TakeHold();
-        LOG_WARNING(Render_Vulkan, "PERF-102: the game waits on the splash screen for the precompile");
-    }
+    TakePrecompileHold(true); // PERF-102 (with FIX-SGT-134, already taken by the constructor)
+    // FIX-SGT-134: stopped before it is done (the renderer closes), the game is let go.
+    SCOPE_EXIT {
+        if (stop.stop_requested()) ReleasePrecompileHold();
+    };
 #endif
     auto& store = Storage::DataBase::Instance();
     RebuildFromPrograms(); // PB-1

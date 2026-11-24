@@ -456,11 +456,19 @@ bool Instance::CreateDevice() {
     // libraries stay off them (BIN-003).
     // PERF-GTS-486: on by default on RDNA2 (measured on a Radeon 610M), together with whole
     // prewarm below; SHADGT_AMD_WHOLE_BINARIES=0 turns both defaults off.
+    // PERF-SGT-147: and on RX 7000/9000 (RyGT #104: AMD's own cache, AppData\Local\AMD\VkCache,
+    // was often wiped at shutdown on an RX 9050, and every start then compiled every pipeline
+    // again, once for 40+ minutes; the .vkpipelinecache file helps little there, since the driver
+    // leaves whole pipelines out of it, and costs its whole size in RAM). Libraries stay off the
+    // binaries (BIN-003, an RX 7600).
+    const bool amd_whole_binaries_default =
+        IsAmdRdna2() || GetStoreGpuFamily() == StoreGpuFamily::AmdRdna3 ||
+        GetStoreGpuFamily() == StoreGpuFamily::AmdRdna4;
     const char* amd_whole_binaries_env = std::getenv("SHADGT_AMD_WHOLE_BINARIES");
     const bool amd_whole_binaries_set = amd_whole_binaries_env && *amd_whole_binaries_env;
     whole_pipeline_binaries_only =
         properties.vendorID == 0x1002 &&
-        (amd_whole_binaries_set ? amd_whole_binaries_env[0] == '1' : IsAmdRdna2());
+        (amd_whole_binaries_set ? amd_whole_binaries_env[0] == '1' : amd_whole_binaries_default);
     const bool request_pipeline_binaries = (properties.vendorID != 0x1002 &&
         pipeline_binary_env && pipeline_binary_env[0] == '1' && pipeline_binary_env[1] == '\0') ||
         whole_pipeline_binaries_only;
@@ -489,16 +497,19 @@ bool Instance::CreateDevice() {
         LOG_WARNING(Render_Vulkan, "PERF-GTS-482: whole pipelines are stored as pipeline binaries "
                                    "(libraries are not)");
     }
-    // PERF-GTS-486: whole prewarm is the RDNA2 default only when those binaries are in use;
-    // without them the driver would compile every whole pipeline again on each launch.
+    // PERF-GTS-486: whole prewarm is the default (RDNA2; PERF-SGT-147: RX 7000/9000 too) only
+    // when those binaries are in use; without them the driver would compile every whole
+    // pipeline again on each launch.
     {
         const char* whole_prewarm_env = std::getenv("SHADGT_PREWARM_WHOLE_PIPELINES");
         whole_prewarm = whole_prewarm_env && *whole_prewarm_env
                             ? whole_prewarm_env[0] == '1'
-                            : whole_pipeline_binaries_only &&
-                                  IsAmdRdna2();
-        LOG_INFO(Render_Vulkan, "PERF-GTS-486: RDNA2 {}, whole prewarm {}, whole binaries {}",
-                 IsAmdRdna2(), whole_prewarm, whole_pipeline_binaries_only);
+                            : whole_pipeline_binaries_only && amd_whole_binaries_default;
+        LOG_INFO(Render_Vulkan,
+                 "PERF-GTS-486: RDNA2 {}, RX 7000/9000 {} (PERF-SGT-147), whole prewarm {}, "
+                 "whole binaries {}",
+                 IsAmdRdna2(), amd_whole_binaries_default && !IsAmdRdna2(), whole_prewarm,
+                 whole_pipeline_binaries_only);
     }
     attachment_feedback_loop =
         feature_chain.get<vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT>().attachmentFeedbackLoopLayout &&

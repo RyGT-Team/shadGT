@@ -3191,6 +3191,13 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     LOG_INFO(Render_Vulkan, "FIX-SGT-139: shared memory barriers in 64-thread compute: {}",
              profile.needs_lds_barriers);
     profile.lds_read_counters = DiagLdsReadCountersAddress(instance); // DIAG-GTS-459
+    profile.tess_attr_pad = TessAttrPad();                            // FIX-SGT-143
+    if (profile.tess_attr_pad != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "FIX-SGT-143: hull and domain shaders declare {} more control-point "
+                 "attribute(s) (SHADGT_TESS_ATTR_PAD)",
+                 profile.tess_attr_pad);
+    }
 #ifdef RYTY_GPU
     // FIX-GTS-364 (FIX-GT7-151): an RX 480 drew GT7 right only with the legacy 2D-array cube
     // sampling path, so GCN Radeons take it by default. SHADGT_NATIVE_CUBE=0 picks the legacy

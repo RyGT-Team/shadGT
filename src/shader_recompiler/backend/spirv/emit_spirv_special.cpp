@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <vector>
 #include <fmt/format.h>
+#include "common/alignment.h"
 #include "common/logging/log.h"
 #include "common/recoverable.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
@@ -374,7 +375,44 @@ static bool DiagConstantOutput(u64 hash) {
     return std::ranges::find(hashes, hash) != hashes.end();
 }
 
+// FIX-SGT-143 (RyGT #86): keep the padding attributes of the hull/domain interface in use, or
+// the driver drops them when it links the stages and the layout stays as it was: the hull writes
+// 0 to them, the domain shader adds control point 0's first one (that 0) to its position's x.
+static void KeepTessAttrPad(EmitContext& ctx) {
+    const u32 pad = ctx.profile.tess_attr_pad;
+    if (pad == 0) {
+        return;
+    }
+    if (ctx.sw_stage == SwStage::TessellationControl && Sirit::ValidId(ctx.output_attr_array)) {
+        const u32 used = Common::AlignUp(ctx.runtime_info.sw.tcs.hs_output_cp_stride, 16) >> 4;
+        const u32 declared = std::min<u32>(used + pad, 32);
+        const Id invocation = ctx.OpLoad(ctx.U32[1], ctx.invocation_id);
+        const Id output_vec4 = ctx.TypePointer(spv::StorageClass::Output, ctx.F32[4]);
+        for (u32 attr = used; used != 0 && attr < declared; ++attr) {
+            ctx.OpStore(ctx.OpAccessChain(output_vec4, ctx.output_attr_array, invocation,
+                                          ctx.ConstU32(attr)),
+                        ctx.ConstantNull(ctx.F32[4]));
+        }
+        return;
+    }
+    if (ctx.sw_stage == SwStage::TessellationEval && Sirit::ValidId(ctx.input_attr_array) &&
+        Sirit::ValidId(ctx.output_position)) {
+        const u32 used = Common::AlignUp(ctx.runtime_info.sw.tes.hs_output_cp_stride, 16) >> 4;
+        if (used == 0 || used >= 32) {
+            return;
+        }
+        const Id input_f32 = ctx.TypePointer(spv::StorageClass::Input, ctx.F32[1]);
+        const Id zero =
+            ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(input_f32, ctx.input_attr_array,
+                                                     ctx.u32_zero_value, ctx.ConstU32(used),
+                                                     ctx.u32_zero_value));
+        const Id x = ctx.OpAccessChain(ctx.output_f32, ctx.output_position, ctx.u32_zero_value);
+        ctx.OpStore(x, ctx.OpFAdd(ctx.F32[1], ctx.OpLoad(ctx.F32[1], x), zero));
+    }
+}
+
 void EmitEpilogue(EmitContext& ctx) {
+    KeepTessAttrPad(ctx); // FIX-SGT-143
     if (ctx.hw_stage == HwStage::Fragment && DiagConstantOutput(ctx.info.pgm_hash)) {
         const std::array<float, 4> magenta{1.0f, 0.0f, 1.0f, 1.0f};
         for (const auto& output : ctx.frag_outputs) {

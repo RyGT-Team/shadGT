@@ -184,6 +184,11 @@ void DataBase::Open() {
                     !(env && *env) && Vulkan::AmdLdsBarriersByDefault()) {
                     parts += ", lds barriers";
                 }
+                // FIX-SGT-143: hull/domain translations with padding attributes (AMD by default)
+                // are kept apart from those made without.
+                if (const u32 pad = Vulkan::TessAttrPad(); pad != 0) {
+                    parts += fmt::format(", tess attr pad {}", pad);
+                }
                 // DIAG-230 (port): without SHADGT_MANUAL_INTERP, the diagnosis switch changes
                 // NVIDIA's translations (vk_pipeline_cache.cpp); they are kept apart.
                 if (const char* manual = std::getenv("SHADGT_MANUAL_INTERP");

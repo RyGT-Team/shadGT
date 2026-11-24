@@ -20,6 +20,12 @@
 #include <string_view>
 
 namespace Shader::Backend::SPIRV {
+
+/// FIX-SGT-143 (RyGT #86): the per-vertex attribute count hull and domain shaders declare: the
+/// used ones plus `pad` kept in use (EmitEpilogue), at most 32 (a vec4 location each).
+static u32 TessAttrsWithPad(u32 used, u32 pad) {
+    return used == 0 ? 0 : std::min<u32>(used + pad, 32);
+}
 namespace {
 
 std::string_view StageName(HwStage stage) {
@@ -717,7 +723,10 @@ void EmitContext::DefineInputs() {
         if (runtime_info.sw.tes.hs_output_cp_stride > 64u * 1024u) {
             throw Common::RecoverableFailure{"Tessellation interface stride exceeds 64 KiB LDS"};
         }
-        const u32 num_attrs = Common::AlignUp(runtime_info.sw.tes.hs_output_cp_stride, 16) >> 4;
+        // FIX-SGT-143: both stages declare profile.tess_attr_pad more attributes (AMD).
+        const u32 num_attrs =
+            TessAttrsWithPad(Common::AlignUp(runtime_info.sw.tes.hs_output_cp_stride, 16) >> 4,
+                             profile.tess_attr_pad);
         if (num_attrs > 0) {
             const Id per_vertex_type{TypeArray(F32[4], ConstU32(num_attrs))};
             // The input vertex count isn't statically known, so make length 32 (what
@@ -890,7 +899,10 @@ void EmitContext::DefineOutputs() {
         if (runtime_info.sw.tcs.hs_output_cp_stride > 64u * 1024u) {
             throw Common::RecoverableFailure{"Tessellation interface stride exceeds 64 KiB LDS"};
         }
-        const u32 num_attrs = Common::AlignUp(runtime_info.sw.tcs.hs_output_cp_stride, 16) >> 4;
+        // FIX-SGT-143: both stages declare profile.tess_attr_pad more attributes (AMD).
+        const u32 num_attrs =
+            TessAttrsWithPad(Common::AlignUp(runtime_info.sw.tcs.hs_output_cp_stride, 16) >> 4,
+                             profile.tess_attr_pad);
         if (num_attrs > 0) {
             const Id per_vertex_type{TypeArray(F32[4], ConstU32(num_attrs))};
             // The input vertex count isn't statically known, so make length 32 (what

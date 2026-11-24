@@ -331,6 +331,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_PROTO_INPLACE_MAX|hex|Memory & VRAM|unlimited|hex guest address; only with SHADGT_PROTO_INPLACE=1|With SHADGT_PROTO_INPLACE, only guest views below this hex address are imported.",
     "RYGTSW1|SHADGT_STREAM_HOST|flag|Memory & VRAM|on|0 = off; -DisablePerf 111 keeps video memory|Puts the stream ring (small per-draw buffer copies) in system memory instead of video memory (PERF-094). 0 keeps it in VRAM.",
     // Tessellation
+    "RYGTSW1|SHADGT_TESS_ATTR_PAD|int|Tessellation|1 on AMD, 0 elsewhere|0 = off; n = extra attributes|Hull and domain shaders declare this many extra control-point attributes, fixing GT7's exploded headlight lenses on AMD (RyGT #86). Changes translations.",
     "RYGTSW1|SHADGT_DIAG_HS_SAMPLERS|flag|Tessellation|off|set = on. Diagnostics builds only (Common::DiagEnv).|Diagnosis: logs up to 40 hull shader sampler states (DIAG-235).",
     "RYGTSW1|SHADGT_DIAG_HS_SAMPLE_SCALE|float|Tessellation|0 (off)|scale factor. Diagnostic builds only.|Hull shader texture samples are multiplied by this value (DIAG-236). Changes rendering; for diagnosis only.",
     "RYGTSW1|SHADGT_DIAG_HS_SAMPLE_ZERO|flag|Tessellation|off|any value = on (presence). Diagnostic builds only.|Hull shader texture samples read 0 (DIAG-232). Changes rendering; for diagnosis only.",

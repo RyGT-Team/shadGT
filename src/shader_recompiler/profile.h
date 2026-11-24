@@ -79,6 +79,9 @@ struct Profile {
     /// DIAG-GTS-459 (SHADGT_DIAG_LDS_READS=1): GPU address of 64 slots of two u32 counters a hull
     /// shader's emulated LDS reads add to (reads, reads outside the patch); 0: off.
     u64 lds_read_counters{};
+    /// FIX-SGT-143 (RyGT #86): extra per-vertex attributes hull and domain shaders declare and
+    /// keep in use (Vulkan::TessAttrPad(); AMD 1).
+    u32 tess_attr_pad{};
 
     bool operator==(const Profile&) const = default;
 };

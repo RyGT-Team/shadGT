@@ -3109,8 +3109,19 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                        (instance.IsAmdShaderExplicitVertexParameterSupported() &&
                         instance.IsAmdLegacyShaderCompiler());
             }(),
-        .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
-                              instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
+        // FIX-SGT-139: GCN code leaves out the shared memory barriers of a 64-thread workgroup,
+        // one wave there. RX 7000/9000 on AMD's driver (LLPC) need them too, though their compute
+        // runs 64 wide (RyGT #92: GT7 sky flicker on an RX 9050, gone with them).
+        // SHADGT_LDS_BARRIERS=1: on for any GPU, other value: off; part of the store key.
+        .needs_lds_barriers =
+            [&] {
+                if (const char* env = std::getenv("SHADGT_LDS_BARRIERS"); env && *env) {
+                    return env[0] == '1';
+                }
+                return instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
+                       instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp ||
+                       AmdLdsBarriersByDefault();
+            }(),
         .intel_arc_workarounds = instance.IsIntel(),
         .needs_buffer_offsets = instance.StorageMinAlignment() > 4,
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
@@ -3135,6 +3146,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                  "translated without the direct-memory path (SHADGT_LEARNED_DIRECT=0: off)",
                  shaders, path.string());
     }
+    LOG_INFO(Render_Vulkan, "FIX-SGT-139: shared memory barriers in 64-thread compute: {}",
+             profile.needs_lds_barriers);
     profile.lds_read_counters = DiagLdsReadCountersAddress(instance); // DIAG-GTS-459
 #ifdef RYTY_GPU
     // FIX-GTS-364 (FIX-GT7-151): an RX 480 drew GT7 right only with the legacy 2D-array cube

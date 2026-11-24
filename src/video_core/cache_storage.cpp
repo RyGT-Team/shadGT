@@ -173,10 +173,16 @@ void DataBase::Open() {
                 std::string parts;
                 for (const char* name :
                      {"SHADGT_AMD_NAN_RULES", "SHADGT_QUAD_CONTROL", "SHADGT_VERTEX_ORDER",
-                      "SHADGT_FP32_IMAGE_ATOMICS", "SHADGT_MANUAL_INTERP"}) {
+                      "SHADGT_FP32_IMAGE_ATOMICS", "SHADGT_MANUAL_INTERP", "SHADGT_LDS_BARRIERS"}) {
                     if (const char* env = std::getenv(name); env && *env) {
                         parts += fmt::format(", {}={}", name, env[0]);
                     }
+                }
+                // FIX-SGT-139: RX 7000/9000 stores made before were translated without the
+                // shared memory barriers that are now on by default there.
+                if (const char* env = std::getenv("SHADGT_LDS_BARRIERS");
+                    !(env && *env) && Vulkan::AmdLdsBarriersByDefault()) {
+                    parts += ", lds barriers";
                 }
                 // DIAG-230 (port): without SHADGT_MANUAL_INTERP, the diagnosis switch changes
                 // NVIDIA's translations (vk_pipeline_cache.cpp); they are kept apart.

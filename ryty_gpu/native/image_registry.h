@@ -468,6 +468,10 @@ public:
     /// guest memory the CPU reads after the GPU wrote it.
     bool RecordDownload(Rhi::CommandList& list, ImageEntry& entry, const Rhi::Buffer& out,
                         u64 out_offset = 0, DownloadBatch* batch = nullptr);
+    /// FIX-SGT-140: makes the buffers RecordDownload would make for the picture (its tiling
+    /// parameters, and unbatched its scratch), before anything is recorded. false: device
+    /// memory ran out, and the write-back can be left out with nothing half recorded.
+    bool PrepareDownload(ImageEntry& entry, bool batched);
     // FIX-SGT-072 (review): what RecordPartialVolumeFill needs, checked and made before anything
     // is recorded. Ineligible does not change for the image; OutOfMemory may pass later.
     enum class PartialFill : u8 { Ready, Ineligible, OutOfMemory };

@@ -970,6 +970,36 @@ void VulkanDevice::ReadGpuTimings() {
 }
 
 #endif
+
+// FIX-SGT-140 (RyGT #103): which heap ran out. The failure lines named no heap: a 4 GB video
+// memory setting did not stop it, and upload memory prefers video memory the CPU can write,
+// which without Resizable BAR is a heap of about 256 MB of its own. Each heap's size, flags and
+// what this allocator holds in it (VMA's count; its budget is an estimate without
+// VK_EXT_memory_budget), the first 8 failures.
+static void LogHeapsOnFailure(VmaAllocator allocator, const char* what, u64 size, const char* unit) {
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) >= 8) return;
+    const VkPhysicalDeviceMemoryProperties* props = nullptr;
+    vmaGetMemoryProperties(allocator, &props);
+    if (!props) return;
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+    vmaGetHeapBudgets(allocator, budgets.data());
+    std::string heaps;
+    for (u32 i = 0; i < props->memoryHeapCount; ++i) {
+        bool host_visible = false;
+        for (u32 t = 0; t < props->memoryTypeCount; ++t) {
+            host_visible |= props->memoryTypes[t].heapIndex == i &&
+                            (props->memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+        }
+        heaps += fmt::format("{}heap {}: {} MB{}{}, {} MB in use, budget {} MB", i ? "; " : "", i,
+                             props->memoryHeaps[i].size >> 20,
+                             (props->memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ? " video" : " system",
+                             host_visible ? " CPU-visible" : "", budgets[i].usage >> 20,
+                             budgets[i].budget >> 20);
+    }
+    LOG_WARNING(Render_Vulkan, "FIX-SGT-140: {} of {} {} failed; {}", what, size, unit, heaps);
+}
+
 std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
 #ifndef NDEBUG
     const auto allocation_start = std::chrono::steady_clock::now();
@@ -1089,6 +1119,10 @@ std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
     if (result.result != VK_SUCCESS) {
       LOG_ERROR(Render_Vulkan, "Native buffer allocation failed: {} bytes, {}",
                 desc.size, vk::to_string(vk::Result{result.result}));
+      LogHeapsOnFailure(allocator, desc.memory == MemoryKind::Upload ? "upload buffer"
+                                   : desc.memory == MemoryKind::Readback ? "readback buffer"
+                                                                         : "video memory buffer",
+                        desc.size, "bytes");
       return nullptr;
     }
 #ifndef NDEBUG
@@ -1426,6 +1460,7 @@ std::unique_ptr<Image> VulkanDevice::CreateImageFrom(const VkImageCreateInfo& im
       LOG_ERROR(Render_Vulkan, "Native image allocation failed: {}x{}, {}",
                 desc.width, desc.height,
                 vk::to_string(vk::Result{result.result}));
+      LogHeapsOnFailure(allocator, "image", u64(desc.width) * desc.height, "pixels");
       return nullptr;
     }
 #ifndef NDEBUG

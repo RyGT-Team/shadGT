@@ -9,6 +9,7 @@
 // experiments (RVA in GTSport.exe: eboot.bin address + 0x10000).
 
 #include "common/game_title.h"
+#include "ryty_gpu/ryty_pro_mode.h"
 #include <cstdio>
 #include <array>
 #include <algorithm>
@@ -3410,6 +3411,30 @@ void InstallExperimentalSceneViewport(u8* base) {
         reinterpret_cast<void*>(&MatchExperimentalSceneViewport), "experimental scene viewport scale"));
 }
 
+// GTS 1.69 registers a 1080p display on a Pro 1080p TV, but normally allocates a UHD flip
+// buffer. The True wide viewport uses the 1080p display extent to identify its scene draws.
+// Select the visible dimensions for the flip buffer too. The game selects its Pro effects
+// separately, before this pair of conditional moves.
+static void SetWidePro1080Flip(u8* base) {
+    const char* setting = std::getenv("RYGT_GTS_WIDE_PRO_FLIP");
+    if (Ryty::GetProMode() != Ryty::ProMode::Neo1080 || (setting && setting[0] == '0')) {
+        return;
+    }
+    const std::vector<u8> original{
+        0xb8, 0x00, 0x0f, 0x00, 0x00,       // mov eax, 3840
+        0x41, 0xbf, 0x80, 0x07, 0x00, 0x00, // mov r15d, 1920
+        0x41, 0xbc, 0x38, 0x04, 0x00, 0x00, // mov r12d, 1080
+        0x44, 0x0f, 0x44, 0xf8,             // cmovz r15d, eax
+        0xb8, 0x70, 0x08, 0x00, 0x00,       // mov eax, 2160
+        0x44, 0x0f, 0x44, 0xe0,             // cmovz r12d, eax
+    };
+    auto replacement = original;
+    constexpr u32 width = 1920, height = 1080;
+    std::memcpy(replacement.data() + 1, &width, sizeof(width));
+    std::memcpy(replacement.data() + 22, &height, sizeof(height));
+    Apply(base, Patch{0x1c6dee0, original, replacement, "True wide Pro TV 1080p flip 1920x1080"});
+}
+
 // WIDE-001: the scene allocated at the screen's shape. The same three sites the launcher's scene
 // render scale patches (RenderResolution.cs), from the game's bytes or from the launcher's.
 static void InstallWideSceneAllocation(u8* base) {
@@ -3462,6 +3487,7 @@ static void InstallWideSceneAllocation(u8* base) {
     }
     if (w->original != w->replacement) Apply(base, *w);
     if (h->original != h->replacement) Apply(base, *h);
+    SetWidePro1080Flip(base);
 }
 
 static void ApplyEnvironmentPatches(u8* base) {

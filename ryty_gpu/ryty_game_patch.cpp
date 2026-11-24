@@ -1708,6 +1708,7 @@ constexpr u8 kGt7OrgRaceStart[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x5
                                    0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x18};
 using OrgRaceFn = void(PS4_SYSV_ABI*)(void*);
 OrgRaceFn g_gt7_org_race = nullptr;
+std::atomic<bool> g_gt7_race_hook_installed{false};
 std::atomic<u64> g_gt7_org_race_ms{0};
 
 // GAME-006: the race runs, from its start countdown (3-2-1, or a rolling start's start) to its
@@ -1924,6 +1925,7 @@ void InstallGt7RaceSignal(u8* base) {
     DWORD ignored = 0;
     VirtualProtect(entry, kMoved, old_protect, &ignored);
     FlushInstructionCache(GetCurrentProcess(), entry, kMoved);
+    g_gt7_race_hook_installed.store(true, std::memory_order_relaxed);
     // The flag falls when the module stops running.
     std::thread([] {
         for (;;) {
@@ -4434,6 +4436,9 @@ bool RytyRaceRunning() {
 }
 bool RytyRaceStartSignal() {
     return RaceStartSignalOn() && g_race_signal.load(std::memory_order_relaxed);
+}
+bool RytyGt7RaceHookInstalled() {
+    return g_gt7_race_hook_installed.load(std::memory_order_relaxed);
 }
 // FIX-110: true while a race project runs (see NoteProjectScript).
 bool RytyGtsInRace() {

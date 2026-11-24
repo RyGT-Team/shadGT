@@ -175,6 +175,7 @@ public:
         vk::ImageView hud_white{};
         /// GT7-UW: the frame's HUD is a race's (its moved pieces apply; not to menus).
         bool hud_race = false;
+        bool center_menu = false;
         /// DLSS-GT7-001: the frame's depth, motion vectors and jitter, when the game's temporal
         /// anti-aliasing pass was seen in it (RYGT_DLSS_TEMPORAL=1).
         std::optional<RytyUpscale::TemporalInputs> temporal;
@@ -1988,6 +1989,7 @@ private:
     const RecordContext& Ctx() const {
         return main_record_context;
     }
+    bool center_wide_menu = false;
     u64 frame = 0;
     u64 timing_tick = 0; ///< OPT-001
     u64 ui_draws = 0;

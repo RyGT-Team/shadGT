@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <optional>
 #include <span>
 
 #include "common/types.h"
@@ -66,7 +67,8 @@ public:
                 Frame& output, Settings settings, vk::ImageView ui_layer = {},
                 bool dlss_scaled = false, float side_x0 = 0.0f, float side_x1 = 1.0f,
                 vk::ImageView hud_black = {}, vk::ImageView hud_white = {},
-                std::span<const HudWidget> hud_widgets = {});
+                std::span<const HudWidget> hud_widgets = {},
+                std::optional<vk::Rect2D> content_rect = {});
 
 private:
     struct OutputPipeline {

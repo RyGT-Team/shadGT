@@ -585,6 +585,7 @@ static std::unique_ptr<Native::Rhi::Buffer> scene_indirect_buffer;
 static std::vector<SceneIndirectArgs> scene_indirect_args;
 
 bool RytyGtsInRace();
+bool RytyGt7RaceHookInstalled();
 bool RytyRaceRunning(); // GAME-006, ryty_game_patch.cpp
 static bool PrepareScope(); // PERF-GTS-450: races, or menus with SHADGT_NATIVE_PREPARE_MENUS=1
 bool RytyGtsRaceSession(); // WIDE-015
@@ -2885,7 +2886,7 @@ void NativeRenderer::SpliceStream(Stream& s, u64 tick) {
 // came out wrong (seen by the user on 2026-11-11).
 bool NativeRenderer::HudSplitNow() const {
     // DLSS-GT7-001: not in a menu frame whose interface goes through DLSS (NoteTemporalDraw).
-    return HudSplitOn() && (RytyDisplayAspect() > 0.0f ||
+    return !center_wide_menu && HudSplitOn() && (RytyDisplayAspect() > 0.0f ||
                             (temporal.frame == frame && temporal.through_frame != frame));
 }
 
@@ -25082,6 +25083,14 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         }
     }
     frame_writebacks.clear();
+    // Use one routing decision for all draws and the presentation of the same frame.
+    const bool finished_wide_menu = center_wide_menu;
+    static const bool fit_gt7_menus = [] {
+        const char* setting = std::getenv("RYGT_ULTRAWIDE_MENUS");
+        return Common::IsGt7() && RytyDisplayAspect() > 16.0f / 9.0f + 0.01f &&
+               !(setting && setting[0] == '0');
+    }();
+    center_wide_menu = fit_gt7_menus && RytyGt7RaceHookInstalled() && !RytyGtsInRace();
     ++frame;
     BufferOrderFrame(); // PERF-SGT-120
     TrimIdleChunks();
@@ -25271,6 +25280,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     Splice();
     Display display{vk::Image{Handle<VkImage_T>(source->image->NativeHandle())}, view,
                     source->info.size.width, source->info.size.height};
+    display.center_menu = finished_wide_menu;
     r.scheduler.EndRendering(); // WIDE-042: TakeFrame may blit
 #ifndef NDEBUG
     display.capture_format = static_cast<vk::Format>(source->image->Desc().format);

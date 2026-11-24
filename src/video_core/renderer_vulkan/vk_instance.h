@@ -5,6 +5,7 @@
 
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <mutex>
 #include <span>
 #include <unordered_map>
@@ -846,6 +847,22 @@ StoreGpuFamily GetStoreGpuFamily();
 /// FIX-SGT-139: shared memory barriers in 64-thread compute shaders are on by default for Radeon
 /// RX 7000 and RX 9000 cards on AMD's driver (RyGT #92: sky and background flicker in GT7 without
 /// them on an RX 9050). Their translations get a store of their own (cache_storage.cpp).
+/// FIX-SGT-143 (RyGT #86): extra per-vertex attributes hull and domain shaders declare between
+/// them. On AMD's driver a hull shader with 16 attributes per control point (GT7's lamp lenses)
+/// had the end of the last patch of each 16-patch group overwritten: six tessellation-factor-like
+/// values 60 bytes before the group's end, so cp3 of every 16th patch threw a corner across the
+/// ground. One more attribute, kept in use, moves the layout and the lenses draw right.
+/// SHADGT_TESS_ATTR_PAD=<n> overrides (0 = off); AMD families default to 1.
+inline u32 TessAttrPad() {
+    static const u32 pad = [] {
+        if (const char* env = std::getenv("SHADGT_TESS_ATTR_PAD"); env && *env) {
+            return u32(std::strtoul(env, nullptr, 10));
+        }
+        return GetStoreGpuFamily() != StoreGpuFamily::Other ? 1u : 0u;
+    }();
+    return pad;
+}
+
 inline bool AmdLdsBarriersByDefault() {
     const StoreGpuFamily family = GetStoreGpuFamily();
     return family == StoreGpuFamily::AmdRdna3 || family == StoreGpuFamily::AmdRdna4;

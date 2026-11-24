@@ -14424,9 +14424,77 @@ void NativeRenderer::CheckVertexReach(const GraphicsPipeline& pipeline, const Am
     // vertex it can read (its indices read from guest memory, or its vertex count) against each
     // vertex V#'s end and the mirror bound there: draws reading past a mirror's end got zeros
     // (the tunnel explosions went away with mirrors 256 KB longer).
+    // DIAG-SGT-144 (RyGT #86, debug builds): SHADGT_DIAG_VERTEX_INPUTS=<hex vs hash> logs that
+    // draw's vertex attributes and bindings (format, offset, stride, guest base) 8 times.
+    static const u64 inputs_hash = [] {
+        const char* env = Common::DiagEnv("SHADGT_DIAG_VERTEX_INPUTS");
+        return env && *env ? u64(std::strtoull(env, nullptr, 16)) : 0ull;
+    }();
+    static std::atomic<u32> inputs_logged{};
+    if (inputs_hash != 0 && pipeline.GetStage(Shader::SwStage::Vertex).pgm_hash == inputs_hash &&
+        inputs_logged.fetch_add(1) < 8) {
+        VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+        VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+        VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
+        VertexInputs<AmdGpu::Buffer> guest_buffers;
+        pipeline.GetVertexInputs(attributes, bindings, divisors, guest_buffers,
+                                 regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
+        // Restart indices in the index list, and whether restart is on (patch lists: AMD lacks
+        // primitiveTopologyPatchListRestart, so the renderer turns restart off for them).
+        if (is_indexed) {
+            const bool is16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
+            const u32 index_size = is16 ? 2 : 4;
+            const VAddr address =
+                regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size;
+            const u64 bytes = std::min<u64>(u64(regs.num_indices) * index_size, 1_MB);
+            std::vector<u8> indices(bytes);
+            u64 restarts = 0, first_restart = ~0ull, max_index = 0;
+            const u32 restart_index =
+                is16 ? (regs.primitive_restart_index & 0xffff) : regs.primitive_restart_index;
+            if (bytes && Core::RytyMemory::GuardedCopy(
+                             indices.data(), reinterpret_cast<const void*>(address), bytes)) {
+                for (u64 i = 0; i < bytes / index_size; ++i) {
+                    const u32 v = is16 ? u32(reinterpret_cast<const u16*>(indices.data())[i])
+                                       : reinterpret_cast<const u32*>(indices.data())[i];
+                    if (v == restart_index) {
+                        ++restarts;
+                        first_restart = std::min(first_restart, i);
+                    } else {
+                        max_index = std::max<u64>(max_index, v);
+                    }
+                }
+            }
+            LOG_WARNING(
+                Render_Vulkan,
+                "DIAG-SGT-144: indices (vs {:#x}): primitive type {} restart enabled {} index "
+                "{:#x} 16-bit {} count {}: {} restart indices (first at {}), max other {}; "
+                "patch list restart supported {}",
+                inputs_hash, u32(regs.primitive_type), regs.enable_primitive_restart & 1,
+                restart_index, is16, regs.num_indices, restarts,
+                first_restart == ~0ull ? -1ll : static_cast<long long>(first_restart), max_index,
+                r.instance.IsPatchListRestartSupported());
+        }
+        for (const auto& a : attributes) {
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-SGT-144: vertex input (vs {:#x}): location {} binding {} format {} "
+                        "offset {}",
+                        inputs_hash, a.location, a.binding, vk::to_string(a.format), a.offset);
+        }
+        for (u32 i = 0; i < guest_buffers.size(); ++i) {
+            const auto& g = guest_buffers[i];
+            LOG_WARNING(
+                Render_Vulkan,
+                "DIAG-SGT-144: vertex binding {}: stride {} rate {} guest base {:#x} (mod 4 = {}) "
+                "V# stride {} records {} size {} indices {} indexed {}",
+                bindings[i].binding, bindings[i].stride,
+                bindings[i].inputRate == vk::VertexInputRate::eInstance ? "instance" : "vertex",
+                g.base_address, g.base_address % 4, g.GetStride(), g.num_records, g.GetSize(),
+                regs.num_indices, is_indexed);
+        }
+    }
     static const u32 every = [] {
         const char* env = std::getenv("SHADGT_NATIVE_VERTEX_REACH_CHECK");
-        return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 0u;
+        return env && *env ? u32(std::strtoull(env, nullptr, 10)) : 0u;
     }();
     if (every == 0 || ++reach_check_counter % every != 0) {
         return;

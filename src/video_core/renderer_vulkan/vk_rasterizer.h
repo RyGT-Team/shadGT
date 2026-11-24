@@ -527,11 +527,12 @@ private:
         BufferPlan* buffer_plan{};             ///< PERF-067
     };
     RecorderStages main_recorder_stages;
+    RecorderStages b_recorder_stages; ///< FEAT-SGT-079: recorder B's thread's
     RecorderStages& Rec() {
-        return main_recorder_stages;
+        return OnRecorderBThread() ? b_recorder_stages : main_recorder_stages;
     }
     const RecorderStages& Rec() const {
-        return main_recorder_stages;
+        return OnRecorderBThread() ? b_recorder_stages : main_recorder_stages;
     }
     // FIX-077 (under the lookup lock): the identity each cache info was last seeded with.
     tsl::robin_map<const Shader::Info*, u64, Common::PointerHash> seeded_infos; ///< PERF-SGT-026
@@ -548,7 +549,7 @@ private:
     std::atomic<u32> shared_lookup_turn{};  ///< PERF-415
     std::atomic<u32> shared_lookup_draws{}; ///< PERF-415: not yet counted by the cache
     Common::Recycler<SelectedPipelinePtr, 4096> selected_recycler;
-    const Common::ReadCapture* read_capture{}; // PERF-063
+    static inline thread_local const Common::ReadCapture* read_capture{}; // PERF-063 (FEAT-SGT-079: per recorder thread)
     const char* capture_failure{};
     std::vector<std::pair<VAddr, u64>> capture_writes; // PERF-070
     std::atomic<u64> guards_dropped{};
@@ -680,7 +681,23 @@ private:
     void prepareNativeHud(RenderState& state);
 #endif
     bool TemporalOwnsDisplay();
-    DrawContext* ctx = &main_ctx;
+    /// FEAT-SGT-079 step 25: recorder B's draw context; `ctx` is the calling thread's.
+    DrawContext b_ctx;
+    struct CtxSelect {
+        Rasterizer* r;
+        DrawContext* get() const {
+            return ::Vulkan::OnRecorderBThread() ? &r->b_ctx : &r->main_ctx;
+        }
+        DrawContext* operator->() const {
+            return get();
+        }
+        DrawContext& operator*() const {
+            return *get();
+        }
+        operator DrawContext*() const {
+            return get();
+        }
+    } ctx{this};
     /// DIAG-041: buffers and images of the current draw that were bound empty.
     /// DIAG-044: records the current draw or dispatch in the dependency history.
     void RecordDiagHistory(const Pipeline* pipeline, bool compute, u32 count);

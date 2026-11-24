@@ -198,6 +198,39 @@ bool RaceCarStopped();  // the car stands still (WIDE-005)
 }
 
 namespace Vulkan {
+// FEAT-SGT-079: a diagnostics-only text (null in other builds, so no text reaches them).
+template <std::size_t N>
+static constexpr const char* DiagText(const char (&text)[N]) {
+    if constexpr (Common::DiagnosticsBuilt) {
+        return text;
+    } else {
+        return nullptr;
+    }
+}
+} // namespace Vulkan
+
+namespace Vulkan {
+
+namespace {
+// PERF-SGT-062 (diagnostics builds): a region (0) or mirror (1) made, a mirror dropped (2).
+void NoteCommitMade(int what);
+void NoteCommitUploads(bool uploads); // PERF-SGT-062: work that recorded picture uploads
+// DIAG-SGT-075 (diagnostics builds, SHADGT_DIAG_PASS_AUDIT=1): ordered work, by kind (AuditKind).
+void AuditCount(int kind);
+// DIAG-SGT-075: a guest range the work binds (a buffer, or a picture's memory).
+void AuditBoundRange(VAddr address, u64 size, bool picture);
+enum AuditKind : int {
+    AuditListStart,   // Begin() started a list
+    AuditSplice,      // a list was spliced (run and submitted)
+    AuditWriteback,   // FlushWritebacks with writebacks to record
+    AuditGpuWrites,   // WritebacksBefore for work writing guest memory through buffers
+    AuditImageWork,   // PrepareImages recorded uploads or image inits
+    AuditContentBind, // a PERF-SGT-062 content op (page, rewrite, twin, source copy) while binding
+    AuditContentElse, // the same outside binding (target setup, NoteWrites, ...)
+    AuditBarrier,     // GlobalBarrier (for information: barriers are decided at commit)
+    AuditKinds
+};
+} // namespace
 
 struct NativeRenderer::PendingLinearDownload {
     std::vector<VideoCore::DirectMemory::LeasedPart> imports;
@@ -2593,8 +2626,8 @@ static std::atomic<u64> g_lds_owned_epoch{1};
 static void NoteOwnedMapChange() { g_lds_owned_epoch.fetch_add(1, std::memory_order_acq_rel); }
 
 NativeRenderer::~NativeRenderer() {
-    if (binder) { // FEAT-SGT-022: every job made before anything its jobs use goes
-        binder->Drain();
+    for (auto& binder : binders) { // FEAT-SGT-022: every job made before anything its jobs use goes
+        if (binder) binder->Drain();
     }
     g_lds_owned_epoch.fetch_add(1, std::memory_order_acq_rel); // PERF-GT7-133
     auto expected_observer = one_off_observer;
@@ -2609,7 +2642,8 @@ NativeRenderer::~NativeRenderer() {
         r.scheduler.Finish();
         r.scheduler.SyncCommandThread();
     }
-    if (binder) { // FEAT-SGT-022: its placeholders replayed, nothing points at it any more
+    for (auto& binder : binders) { // FEAT-SGT-022: its placeholders replayed, nothing points at it any more
+        if (!binder) continue;
         binder->WaitReplayed();
         binder.reset();
     }
@@ -2650,7 +2684,7 @@ NativeRenderer::~NativeRenderer() {
         r.scheduler.SyncCommandThread();
     }
     ClearTemporalPictures();
-    retired_pipeline_owners.ClearAfterGpuIdle();
+    { std::scoped_lock owners_lock{retired_owners_mutex}; retired_pipeline_owners.ClearAfterGpuIdle(); }
     Ctx().stream.writeback_plan_leases.clear();
     retired_writeback_plans.ClearAfterGpuIdle();
     if (auto* direct = r.buffer_cache.GetDirectMemory()) {
@@ -2957,6 +2991,20 @@ static bool CubeCompatible(const Instance& instance, u32 width, u32 height, u32 
 }
 
 static bool ListedInPlace(VAddr address, u64 size);
+
+bool NativeRenderer::WantedPicturesOn() { // PERF-SGT-093 (2: in arm 1 of the 2 s A/B)
+    static const int mode = [] {
+        const char* env = std::getenv("SHADGT_PREPARE_WANTED_PICTURES");
+        // Off while recorder B overlaps the recorder: it drew glitches there (a texture's first
+        // upload then goes to whichever recorder reaches it first), even made only while B held
+        // nothing. The user's runs: overlap with it on, glitches; off, like B off.
+        const char* overlap = std::getenv("SHADGT_RECORDER_B_OVERLAP");
+        if (overlap && (overlap[0] == '1' || overlap[0] == '2')) return 0;
+        if (!env || !*env) return 1; // on by default (two A/B drives: +3.1-3.2% EOPs, trail -0.5 ms)
+        return env[0] == '1' || env[0] == '2' ? env[0] - '0' : 0;
+    }();
+    return mode == 1 || (mode == 2 && SubmitAbArm().load(std::memory_order_relaxed) == 1);
+}
 
 // PERF-SGT-021 (SHADGT_RECYCLE_FRAME_TEXTURES=0: as before): GT7 writes a few small lookup
 // textures (30x17x16 and 4x4x48 R32G32Uint, a 512x256 R32Sfloat with mips) at a new address
@@ -3473,6 +3521,7 @@ void NativeRenderer::RecycleSamplers() {
     // SamplersAPass at most: the first pass of a session finds everything the table took to fill,
     // and this runs under the lock every sampler lookup takes. What is left keeps its old epoch
     // and goes with the next passes.
+    const BPinWrite pin{*this}; // FEAT-SGT-079 step 22: the erases and samplers_dropped together
     std::vector<const SamplerEntry*> gone;
     gone.reserve(SamplersAPass);
     for (auto it = samplers.begin(); it != samplers.end() && gone.size() < SamplersAPass;) {
@@ -3810,7 +3859,44 @@ CmdBuf NativeRenderer::StreamCmdOf(Native::Rhi::CommandList& list) const {
     return CmdBuf{vk::CommandBuffer{Handle<VkCommandBuffer_T>(list.NativeHandle())}};
 }
 
+static bool RecorderBRawLists(); // FEAT-SGT-079 step 7
+
+// FEAT-SGT-079 step 9 (SHADGT_RECORDER_B_RING=1; 2: in arm 1 of the 2 s A/B): recorder B's
+// context records its lists through a command ring of its own (and their deferred-list pool is
+// that ring's). At each of its splices the main ring replays B's ring up to there in place
+// (Scheduler::RecordChunk, on the command thread), then runs the list. B's lists keep the
+// command thread and the binder, unlike step 7's raw lists.
+static bool RecorderBOwnRing() {
+    static const int mode = [] {
+        const char* env = std::getenv("SHADGT_RECORDER_B_RING");
+        return env && (env[0] == '1' || env[0] == '2') ? env[0] - '0' : 0;
+    }();
+    return mode == 1 || (mode == 2 && SubmitAbArm().load(std::memory_order_relaxed) == 1);
+}
+
 void NativeRenderer::AcquireList(Stream& s) {
+    SHADGT_B_TOUCH("AcquireList"); // DIAG-SGT-089
+    if (&s == &b_record_context.stream && RecorderBRawLists()) { // FEAT-SGT-079 step 7
+        // Not ApplyRingPriority: the command thread's priority follows A's lists.
+        s.list = device->AcquireCommandList(Native::Rhi::CommandListLevel::Secondary);
+        s.list->Begin();
+        s.cmd = CmdBuf{vk::CommandBuffer{Handle<VkCommandBuffer_T>(s.list->NativeHandle())}};
+        if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("recorder B raw list", {});
+        return;
+    }
+    if (&s == &b_record_context.stream && RecorderBOwnRing() && RingEnabled() &&
+        r.scheduler.CommandThreadRing() && !Native::GpuCheckpoints::Requested() &&
+        !Scheduler::ThreadRing()) { // FEAT-SGT-079 step 9
+        if (!b_ring) b_ring = r.scheduler.NewWorkerRing();
+        if (auto* list = device->AcquireDeferredCommandList(b_ring.get())) {
+            s.list = list;
+            list->Begin();
+            s.cmd = CmdBuf{b_ring.get(),
+                           reinterpret_cast<const vk::CommandBuffer*>(list->NativeHandleSlot())};
+            if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("recorder B own-ring list", {});
+            return;
+        }
+    }
     const bool enabled = RingEnabled();
     static const bool logged = [enabled] {
         if (enabled && ParallelRecordingRequested())
@@ -3862,6 +3948,7 @@ CmdBuf NativeRenderer::CmdOf(Native::Rhi::CommandList& list) const {
 }
 
 NativeRenderer::Stream& NativeRenderer::Begin() {
+    SHADGT_B_TOUCH("Begin"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::Begin}; // DIAG-SGT-023
     // DLSS-GT7-001: work other than a HUD draw of the open batch runs after the batch.
     if (temporal.hud_batch_open && !temporal.display_draw_now) {
@@ -3871,6 +3958,7 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     if (s.list) {
         return s;
     }
+    if constexpr (Common::DiagnosticsBuilt) AuditCount(AuditListStart); // DIAG-SGT-075
     // Zero permanently disables receipts after incarnation overflow.
     s.upload_incarnation=s.upload_incarnation && s.upload_incarnation!=UINT64_MAX ? s.upload_incarnation+1 : 0;
     UploadMemoFor(this).Clear(); // new list: old upload-buffer bindings cannot be reused
@@ -4165,7 +4253,7 @@ void NativeRenderer::BindGraphics(Stream& s, const GraphicsPipeline& pipeline,
             return value == "keep" ? 0 : value == "change" ? 1 : 2;
         }();
         if (so_bindings == 2 || (so_bindings == 1 && !(known && shaders == pipeline.ShaderObjects()))) {
-            if (binder) {
+            if (AnyBinder()) {
                 s.binding_commands_stale = true; // FEAT-SGT-022: the binder may be using them
             } else {
                 s.binding_commands.Invalidate();
@@ -4187,6 +4275,7 @@ void NativeRenderer::BindGraphics(Stream& s, const GraphicsPipeline& pipeline,
 }
 
 void NativeRenderer::FlushLdsReaders(u32) {
+    SHADGT_B_TOUCH("FlushLdsReaders"); // DIAG-SGT-089
     Stream& s = Ctx().stream;
     if (s.lds_readers.empty()) return;
     auto readers = std::move(s.lds_readers);
@@ -4275,6 +4364,7 @@ void NativeRenderer::FlushLdsReaders(u32) {
 }
 
 void NativeRenderer::EndRendering(u32 reason, [[maybe_unused]] std::source_location where) {
+    SHADGT_B_TOUCH("EndRendering"); // FEAT-SGT-079 step 22
     if (!Ctx().stream.lds_readers.empty()) FlushLdsReaders(reason);
     RecordPartitionClock end_partition{t_record_partition_end};
     auto* sidecar=FindParallelRuntime(this);
@@ -4385,10 +4475,14 @@ bool NativeRenderer::ContinueSmallParallelPass(const RenderState& target,u32 rea
 }
 
 void NativeRenderer::BeginRendering(const RenderState& state) {
+    SHADGT_B_TOUCH("BeginRendering"); // FEAT-SGT-079 step 22
     Stream& s = Ctx().stream;
     if (s.rendering && s.render == state) {
         return;
     }
+    if constexpr (Common::DiagnosticsBuilt) PassDiagBegin(true); // DIAG-SGT-061
+    if constexpr (Common::DiagnosticsBuilt) PassAuditBegin(true); // DIAG-SGT-075
+    BindCommitPassBegin(true); // PERF-SGT-062
     EndRendering();
     // As Scheduler::BeginRendering.
     std::array<vk::RenderingAttachmentInfo, 8> colors;
@@ -4510,7 +4604,9 @@ void DiagNotePassEnd(std::source_location where) {
 #endif
 
 void NativeRenderer::GlobalBarrier([[maybe_unused]] std::source_location where) {
+    SHADGT_B_TOUCH("GlobalBarrier"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::GlobalBarrier}; // DIAG-SGT-023
+    if constexpr (Common::DiagnosticsBuilt) AuditCount(AuditBarrier); // DIAG-SGT-075
 #if !defined(NDEBUG)
     {
         std::scoped_lock lock{g_barrier_stats_mutex};
@@ -4546,6 +4642,7 @@ void NativeRenderer::GlobalBarrier([[maybe_unused]] std::source_location where) 
 }
 
 void NativeRenderer::PassBarrier(std::source_location where) {
+    SHADGT_B_TOUCH("PassBarrier"); // DIAG-SGT-089
     Stream& s = Ctx().stream;
     EndRendering(0, where);
     constexpr auto stages = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
@@ -4680,6 +4777,7 @@ void NativeRenderer::WritebacksBefore(DrawBindings& b) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::WritebacksBefore}; // DIAG-SGT-023
     if (b.failed) return;
     if (b.gpu_writes.empty()) return;
+    if constexpr (Common::DiagnosticsBuilt) AuditCount(AuditGpuWrites); // DIAG-SGT-075
     bool needs_region_writeback = false;
     if (NativeRegionWritebackEnabled()) for (const auto [address, size] : b.gpu_writes) {
         if (!size) continue;
@@ -4837,6 +4935,7 @@ void NativeRenderer::FlushWritebacks() {
     if (writebacks.empty() || !Ctx().stream.list) {
         return;
     }
+    if constexpr (Common::DiagnosticsBuilt) AuditCount(AuditWriteback); // DIAG-SGT-075
     AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::WriteBacks};
 #ifndef NDEBUG // PERF-SGT-025: read only by the debug report
     struct Timed {
@@ -5254,6 +5353,7 @@ void NativeRenderer::FlushWritebacks() {
 }
 
 void NativeRenderer::PrepareImages(std::span<const Native::ImageEntry* const> bound) {
+    SHADGT_B_TOUCH("PrepareImages"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::PrepareImages}; // DIAG-SGT-023
     AmdGpu::RecorderParts::Scope part{AmdGpu::RecorderParts::Part::Uploads}; // DIAG-GT7-005
     Native::SlowCallTrace<6> trace{t_timed, "prepare-images",
@@ -5268,6 +5368,10 @@ void NativeRenderer::PrepareImages(std::span<const Native::ImageEntry* const> bo
     const bool uploads = bound_stale || registry->HasPendingUploads();
     if (!init && !uploads) {
         return;
+    }
+    if constexpr (Common::DiagnosticsBuilt) NoteCommitUploads(uploads); // PERF-SGT-062
+    if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-088: B readies pictures itself
+        if (OnRecorderBThread()) NoteSubmitSite(init ? "B: pending inits" : "B: uploads", {});
     }
     Stream& s = Ctx().stream;
     trace.Next(2);
@@ -5291,6 +5395,7 @@ void NativeRenderer::PrepareImages(std::span<const Native::ImageEntry* const> bo
 }
 
 void NativeRenderer::PrepareImages(const DrawBindings& b) {
+    SHADGT_B_TOUCH("PrepareImages"); // DIAG-SGT-089
     // PERF-109: the pictures the work samples and stores into.
     boost::container::small_vector<const Native::ImageEntry*, 32> bound;
     bound.insert(bound.end(), b.sampled.begin(), b.sampled.end());
@@ -5299,6 +5404,10 @@ void NativeRenderer::PrepareImages(const DrawBindings& b) {
 }
 
 void NativeRenderer::ChunkFlushCheck() {
+    // FEAT-SGT-079 step 10: recorder B's thread never splices or submits; its run is one list,
+    // spliced by the recorder at the run's end. Step 19: nor does the recorder while B holds
+    // handed work (B's list must go in first).
+    if (OnRecorderBThread() || b_outstanding.load(std::memory_order_acquire)) return;
     // Long lists are run and submitted as they grow, so the GPU starts on them (as the old
     // path's SubmitChunkIfNeeded does).
     if (Ctx().stream.commands >= SpliceAfter) {
@@ -5318,7 +5427,16 @@ void NativeRenderer::ChunkFlushCheck() {
         if (*env == '-' || end == env || *end || value > UINT32_MAX) return 32u;
         return std::max<u32>(u32(value), 1u);
     }();
-    if (feed_min == 0 || Ctx().stream.commands < feed_min || (Ctx().stream.commands & 15) != 0) {
+    u32 feed = feed_min;
+    if constexpr (Common::DiagnosticsBuilt) {
+        // DIAG-SGT-076 (SHADGT_DIAG_FEED_GPU_AB=<min commands>, 0 = off; diagnostics builds): the
+        // idle-GPU feed with this minimum in turns every 2 s (arm B), for an A/B in one drive.
+        static const char* ab = Common::DiagEnv("SHADGT_DIAG_FEED_GPU_AB");
+        if (ab && *ab && SubmitAbArm().load(std::memory_order_relaxed)) {
+            feed = u32(std::strtoul(ab, nullptr, 10));
+        }
+    }
+    if (feed == 0 || Ctx().stream.commands < feed || (Ctx().stream.commands & 15) != 0) {
         return;
     }
     // PERF-GTS-397: not while a parallel pass is open. With parallel recording the GPU is
@@ -5774,6 +5892,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
     WatchPages(begin, end - begin);
     DropMirrors(begin, end - begin); // NAT-150: reads there use the region from now on
     NATIVE_DIAGNOSTIC(++stats.regions_made);
+    if constexpr (Common::DiagnosticsBuilt) NoteCommitMade(0); // PERF-SGT-062
 #if !defined(NDEBUG)
     if (end-begin >= 4_MB && !merged.empty()) {
         LOG_INFO(Render_Vulkan,
@@ -5792,6 +5911,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
 }
 
 void NativeRenderer::SortRegionWrites() {
+    SHADGT_B_TOUCH("SortRegionWrites"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::SortRegionWrites}; // DIAG-SGT-023
     if (!has_pending_region_writes.exchange(false, std::memory_order_acq_rel)) {
         return;
@@ -5898,6 +6018,7 @@ void NativeRenderer::SortRegionWrites() {
                 if(mirror_diag)NoteMirrorDiagnostic(MirrorCpuDrop,begin,end,mirror.begin,mirror.end,unmap_generation.load(),blocked_granule,blocked_age);
                 mirror_bytes -= mirror.end - mirror.begin;
                 NATIVE_DIAGNOSTIC(++stats.mirrors_dropped);
+                if constexpr (Common::DiagnosticsBuilt) NoteCommitMade(2); // PERF-SGT-062
                 ++buffer_generation; // OPT-003
                 buffer_log.Note(mirror.begin, mirror.end, true); // OPT-010
                 retired_watch_ranges.emplace_back(mirror.begin, mirror.end);
@@ -6018,6 +6139,7 @@ bool NativeRenderer::IsDynamic(VAddr begin, VAddr end, u64* blocked_granule, u64
 static thread_local u8 g_mirror_miss = 0;
 
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr address, u64 size) {
+    SHADGT_B_TOUCH("MirrorBuffer"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::MirrorBuffer}; // DIAG-SGT-023
     g_mirror_miss = 0;
     static const bool enabled = [] {
@@ -6095,12 +6217,19 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr add
 }
 
 bool NativeRenderer::RefreshMirror(Mirror& mirror) {
+    SHADGT_B_TOUCH("RefreshMirror"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::RefreshMirror}; // DIAG-SGT-023
     { Native::CpuStackRegistry::Lease lease{Native::CpuStacks()};
       if (!lease.Allowed(mirror.begin, mirror.end)) return false; }
     if (mirror.dirty_pages.empty()) {
         return true;
     }
+    // PERF-SGT-062: with a list open (no Begin() that could make or drop mirrors), the pages are
+    // copied at the commit; a failure there binds the work again at once.
+    if (Ctx().stream.list && QueueCommit(CommitKind::RefreshMirror, &mirror)) {
+        return true;
+    }
+    if constexpr (Common::DiagnosticsBuilt) NoteCommitWork(CommitKind::RefreshMirror); // PERF-SGT-062
     const VAddr mirror_begin = mirror.begin, mirror_end = mirror.end;
     Mirror* const original = &mirror;
     auto* direct = r.buffer_cache.GetDirectMemory();
@@ -6341,6 +6470,7 @@ void NativeRenderer::MakePendingMirrors() {
                     !(it->second.begin < end && it->second.end > begin)) {
                     mirror_bytes -= it->second.end - it->second.begin;
                     NATIVE_DIAGNOSTIC(++stats.mirrors_evicted);
+                    if constexpr (Common::DiagnosticsBuilt) NoteCommitMade(2); // PERF-SGT-062
                     ++buffer_generation;
                     buffer_log.Note(it->second.begin, it->second.end, true);
                     retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
@@ -6433,6 +6563,7 @@ void NativeRenderer::MakePendingMirrors() {
         NoteHistory(begin, end - begin, 12, 0); // DIAG-187 (diagnosis)
         mirror_bytes += end - begin;
         NATIVE_DIAGNOSTIC(++stats.mirrors_made);
+        if constexpr (Common::DiagnosticsBuilt) NoteCommitMade(1); // PERF-SGT-062
         NATIVE_DIAGNOSTIC(stats.mirror_made_bytes += end - begin);
         // DIAG-GTS-387: how much of what is copied was in a mirror already.
         NATIVE_DIAGNOSTIC(stats.mirrors_regrown += taken != 0);
@@ -6453,13 +6584,30 @@ void NativeRenderer::MakePendingMirrors() {
     }
 }
 
+// FEAT-SGT-079 step 22: b_pin exclusively, once per thread (the drops nest: OnUnmap ->
+// DropRegionsOver -> DropMirrors).
+static thread_local bool t_b_pin_written = false;
+NativeRenderer::BPinWrite::BPinWrite(NativeRenderer& renderer) {
+    if (t_b_pin_written) return;
+    renderer.b_pin.lock();
+    t_b_pin_written = true;
+    held = &renderer;
+}
+NativeRenderer::BPinWrite::~BPinWrite() {
+    if (!held) return;
+    t_b_pin_written = false;
+    held->b_pin.unlock();
+}
+
 void NativeRenderer::DropMirrors(VAddr address, u64 size, u32 diagnostic_reason) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::DropMirrors}; // DIAG-SGT-023
+    const BPinWrite pin{*this}; // FEAT-SGT-079 step 22
     for (auto it = FirstMirror(address); it != mirrors.end() && it->second.begin < address + size;) {
         if(diagnostic_reason!=~u32{0} && MirrorDiagnosticEnabled())
             NoteMirrorDiagnostic(diagnostic_reason,address,address+size,it->second.begin,it->second.end,unmap_generation.load());
         mirror_bytes -= it->second.end - it->second.begin;
         ++buffer_generation; // OPT-003
+        if constexpr (Common::DiagnosticsBuilt) NoteCommitMade(2); // PERF-SGT-062
         buffer_log.Note(it->second.begin, it->second.end, true); // OPT-010
         retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
         std::unique_lock map_lock{buffer_map_mutex};
@@ -6763,11 +6911,15 @@ void NativeRenderer::RecordRegionWriteback(const std::shared_ptr<WritebackPlan>&
 }
 
 void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
+    SHADGT_B_TOUCH("RefreshRegion"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::RefreshRegion}; // DIAG-SGT-023
     SortRegionWrites();
     auto& dirty = region.dirty_pages;
     if (dirty.empty() || size == 0) {
         return;
+    }
+    if (QueueCommit(CommitKind::RefreshRegion, &region, address, size)) {
+        return; // PERF-SGT-062: copied at the commit (the pages stay dirty until then)
     }
     if (!region.dirty_sorted) {
         std::ranges::sort(dirty);
@@ -6784,6 +6936,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
     if (first == last) {
         return;
     }
+    if constexpr (Common::DiagnosticsBuilt) NoteCommitWork(CommitKind::RefreshRegion); // PERF-SGT-062
     std::vector<VAddr> pages(first, last);
 #if !defined(NDEBUG)
     const auto refresh_start = std::chrono::steady_clock::now();
@@ -8725,6 +8878,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
         return std::nullopt;
     }
     if (write) SnapshotLease::MarkUnsafe(address, size, 16);
+    if constexpr (Common::DiagnosticsBuilt) AuditBoundRange(address, size, false); // DIAG-SGT-075
     PhaseClock guest_clock{stats.guest_buffer_ns}; // NAT-145
     NATIVE_DIAGNOSTIC(++stats.guest_buffer_calls);
     Ctx().last_mirror = nullptr; // OPT-004
@@ -9884,6 +10038,7 @@ bool NativeRenderer::TargetsFromMemo(const AmdGpu::Regs& regs, const GraphicsPip
 
 bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline,
                                     Targets& out) {
+    SHADGT_B_TOUCH("ResolveTargets"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::Targets}; // DIAG-SGT-023
     static const bool reuse = [] {
         const char* env = std::getenv("SHADGT_NATIVE_REUSE");
@@ -10109,8 +10264,305 @@ void NativeRenderer::BindStagesStable(std::span<const Shader::Info* const> stage
     LOG_WARNING(Render_Vulkan, "FIX-GT7-090: region bindings did not stabilize");
 }
 
+// PERF-SGT-062 (SHADGT_BIND_COMMIT, phase 1 of plan-multi-recorder.md): binding, then a commit
+// of what binding asked to change, on the one recorder thread. Binding queues the work that only
+// changes contents (a region's or mirror's dirty pages copied in, a picture's pending rewrite, a
+// depth twin's or a texture's sources copied in) instead of doing it: the handles and views bound
+// do not depend on it, and the flags that ask for it (dirty pages, `rewrite`, `sources_dirty`) stay
+// set until the commit does it. The commit runs right after binding, before anything records the
+// work's commands, in the order binding asked, so the GPU sees what it sees today. Work that makes
+// or drops something (regions, mirrors, pictures, snapshots) is still done where binding asks:
+// it gives the handles binding returns. If any of it happened after the first queued op (a
+// generation moved), the queue is dropped and the work binds again with everything done at once.
+// This is what a second recorder needs: binding that only reads, a commit list in GPU order, and
+// a check of the generations it was bound under.
+namespace {
+struct BindCommitDiag { // PERF-SGT-062 (diagnostics builds): per arm, 0 off and 1 on
+    static constexpr size_t Kinds = 5;
+    std::array<std::array<u64, Kinds>, 2> work{};   // ops that did work (queued or not)
+    std::array<u64, Kinds> queued{}, committed{};
+    u64 commits = 0, rejected = 0, failed = 0, rebinds = 0, binds = 0;
+    std::array<u64, 4> reject_why{}; // buffer, hard, registry, unmap generation
+    std::array<u64, 2> frames{}, frame_ns{}, structural{}, uploads{};
+    std::array<std::array<u64, 4>, 2> made{}; // regions made, mirrors made, mirrors dropped, pictures
+    // Passes: would a recorder that bound the pass ahead (from the generations at the start of
+    // the pass before, or of the run of 4 before) be rejected at its commit?
+    u64 passes = 0, passes_changed = 0, stale_1 = 0, stale_4 = 0;
+    u64 pass_ns = 0, ns_changed = 0, ns_stale_1 = 0, ns_stale_4 = 0;
+    std::array<u64, 3> run4_generations{}, run4_previous{};
+    u64 pass_index = 0, pass_frame = ~u64{0};
+    bool pass_open = false;
+    std::array<u64, 3> pass_start{};
+    u64 pass_item_ns = 0;
+    bool pass_stale_1 = false, pass_stale_4 = false;
+    u64 last_registry = 0, bind_frame = ~u64{0};
+    int arm = 0;
+    std::chrono::steady_clock::time_point frame_at{}, since = std::chrono::steady_clock::now();
+};
+BindCommitDiag& CommitDiag() {
+    static BindCommitDiag d;
+    return d;
+}
+void NoteCommitMade(int what) {
+    auto& d = CommitDiag();
+    ++d.made[d.arm][what];
+}
+void NoteCommitUploads(bool uploads) {
+    auto& d = CommitDiag();
+    d.uploads[d.arm] += uploads ? 1 : 0;
+    AuditCount(AuditImageWork); // DIAG-SGT-075
+}
+constexpr std::array<const char*, 5> CommitKindNames{"region refreshes", "mirror refreshes",
+                                                     "rewrites", "depth-twin copies",
+                                                     "source copies"};
+// Every 5 s: per arm the frame time and the work binding asked for a frame; for the on arm what
+// was queued and committed, the checks that failed, and the passes a recorder binding ahead would
+// have had rejected.
+void ReportBindCommit(BindCommitDiag& d) {
+    std::string arms;
+    for (int a = 0; a < 2; ++a) {
+        if (d.frames[a] == 0) continue;
+        const double f = double(d.frames[a]);
+        std::string work;
+        for (size_t k = 0; k < BindCommitDiag::Kinds; ++k) {
+            work += fmt::format(" {} {:.1f},", CommitKindNames[k], d.work[a][k] / f);
+        }
+        arms += fmt::format(" [{}: {} frames, {:.2f} ms a frame; a frame:{} regions made {:.1f}, "
+                            "mirrors made {:.2f}, mirrors dropped {:.2f}, pictures made or "
+                            "dropped {:.1f}, uploads {:.1f}]",
+                            a ? "on" : "off", d.frames[a], d.frame_ns[a] / f / 1e6, work,
+                            d.made[a][0] / f, d.made[a][1] / f, d.made[a][2] / f, d.made[a][3] / f,
+                            d.uploads[a] / f);
+    }
+    std::string queued;
+    for (size_t k = 0; k < BindCommitDiag::Kinds; ++k) {
+        queued += fmt::format(" {} {}/{},", CommitKindNames[k], d.queued[k], d.committed[k]);
+    }
+    const auto pct = [](u64 a, u64 b) { return b ? 100.0 * double(a) / double(b) : 0.0; };
+    LOG_INFO(Render_Vulkan,
+             "PERF-SGT-062: in 5 s:{}; on: {} binds, {} with a commit list; queued/committed:{} "
+             "check failed {} times (buffer {}, hard {}, registry {}, unmap generation {}), "
+             "mirror copy failed {}, bound again {}; passes {} ({:.2f} ms each): something made or "
+             "dropped while bound {:.1f}% of pass time ({:.1f}% of passes), bound under the pass "
+             "before's generations would fail {:.1f}% ({:.1f}%), under the run of 4 before's "
+             "{:.1f}% ({:.1f}%)",
+             arms, d.binds, d.commits, queued, d.rejected, d.reject_why[0], d.reject_why[1],
+             d.reject_why[2], d.reject_why[3], d.failed, d.rebinds, d.passes,
+             d.passes ? d.pass_ns / 1e6 / double(d.passes) : 0.0, pct(d.ns_changed, d.pass_ns),
+             pct(d.passes_changed, d.passes), pct(d.ns_stale_1, d.pass_ns), pct(d.stale_1, d.passes),
+             pct(d.ns_stale_4, d.pass_ns), pct(d.stale_4, d.passes));
+    for (auto& w : d.work) w = {};
+    d.queued = d.committed = {};
+    d.commits = d.rejected = d.failed = d.rebinds = d.binds = 0;
+    d.reject_why = {};
+    d.frames = d.frame_ns = d.structural = d.uploads = {};
+    for (auto& m : d.made) m = {};
+    d.passes = d.passes_changed = d.stale_1 = d.stale_4 = 0;
+    d.pass_ns = d.ns_changed = d.ns_stale_1 = d.ns_stale_4 = 0;
+}
+} // namespace
+
+// 1 = on; 2 = on and off in turns every 2 s at a frame boundary (an A/B within one drive).
+static int BindCommitMode() {
+    static const int mode = [] {
+        const char* env = std::getenv("SHADGT_BIND_COMMIT");
+        return env && (env[0] == '1' || env[0] == '2') ? env[0] - '0' : 0;
+    }();
+    return mode;
+}
+
+bool NativeRenderer::BindCommitOn() {
+    const int mode = BindCommitMode();
+    if (mode != 2) {
+        return mode == 1;
+    }
+    static u64 seen_frame = ~u64{0};
+    static bool on = false;
+    static auto since = std::chrono::steady_clock::now();
+    if (seen_frame != frame) {
+        seen_frame = frame;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - since >= std::chrono::seconds{2}) {
+            on = !on;
+            since = now;
+        }
+    }
+    return on;
+}
+
+bool NativeRenderer::QueueCommit(CommitKind kind, void* target, VAddr address, u64 size) {
+    auto& c = Ctx().commit;
+    if (!c.queueing) {
+        return false;
+    }
+    if (!c.armed) {
+        c.armed = true;
+        c.buffer_generation = buffer_generation;
+        c.hard_generation = buffer_hard_generation;
+        c.registry_generation = registry->Generation();
+        c.unmap_generation = unmap_generation.load(std::memory_order_relaxed);
+    }
+    c.ops.push_back({kind, target, address, size});
+    if constexpr (Common::DiagnosticsBuilt) ++CommitDiag().queued[size_t(kind)];
+    return true;
+}
+
+void NativeRenderer::NoteCommitWork(CommitKind kind) {
+    if constexpr (Common::DiagnosticsBuilt) {
+        if (OnRecorderBThread()) { // DIAG-SGT-084
+            NoteSubmitSite("B: ordered work", {}); // DIAG-SGT-088
+            b_run_flags |= 1;
+            b_draw_kinds |= 1u << u32(kind);
+        }
+        auto& d = CommitDiag();
+        ++d.work[d.arm][size_t(kind)];
+        AuditCount(Ctx().commit.binding ? AuditContentBind : AuditContentElse); // DIAG-SGT-075
+    }
+}
+
 void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
                                 const AmdGpu::Regs& regs, bool compute, DrawBindings& b) {
+    const bool on = BindCommitOn();
+    if (Common::DiagnosticsBuilt && BindCommitMode() != 0) {
+        auto& d = CommitDiag();
+        // Frame times and per-frame counts by arm: a frame counts for the arm in force when its
+        // first work bound (the alternating mode turns only at frame boundaries).
+        if (d.bind_frame != frame) {
+            d.bind_frame = frame;
+            const auto now = std::chrono::steady_clock::now();
+            if (d.frame_at.time_since_epoch().count() != 0) {
+                ++d.frames[d.arm];
+                d.frame_ns[d.arm] += u64(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(now - d.frame_at).count());
+            }
+            d.frame_at = now;
+            const u64 reg = registry->Generation();
+            if (d.last_registry != 0) d.made[d.arm][3] += reg - d.last_registry;
+            d.last_registry = reg;
+            if (now - d.since >= std::chrono::seconds{5}) {
+                ReportBindCommit(d);
+                d.since = now;
+            }
+            d.arm = on ? 1 : 0;
+        }
+    }
+    struct Binding { // DIAG-SGT-075: content work done while binding (and its commit)
+        RecordContext::BindCommit* c;
+        ~Binding() {
+            if (c) c->binding = false;
+        }
+    } const binding{Common::DiagnosticsBuilt ? &Ctx().commit : nullptr};
+    if constexpr (Common::DiagnosticsBuilt) Ctx().commit.binding = true;
+    if (on) {
+        BindStagesCommitted(stages, regs, compute, b);
+    } else {
+        BindStagesNow(stages, regs, compute, b);
+    }
+    if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-075: the pictures it binds
+        for (const auto* entry : b.sampled) {
+            if (entry) AuditBoundRange(entry->info.guest_address, entry->info.guest_size, true);
+        }
+        for (const auto* entry : b.stored) {
+            if (entry) AuditBoundRange(entry->info.guest_address, entry->info.guest_size, true);
+        }
+    }
+}
+
+void NativeRenderer::BindStagesCommitted(std::span<const Shader::Info* const> stages,
+                                         const AmdGpu::Regs& regs, bool compute,
+                                         DrawBindings& b) {
+    auto& c = Ctx().commit;
+    // An earlier bind left by an exception queued nothing it consumed: its flags are still set.
+    c.ops.clear();
+    c.armed = false;
+    c.queueing = true;
+    struct Stop {
+        RecordContext::BindCommit& c;
+        ~Stop() {
+            c.queueing = false;
+        }
+    } stop{c};
+    BindStagesNow(stages, regs, compute, b);
+    c.queueing = false;
+    if constexpr (Common::DiagnosticsBuilt) ++CommitDiag().binds;
+    if (c.ops.empty()) {
+        return;
+    }
+    // The check: nothing was made or dropped since the first queued op (the pointers queued are
+    // live and the work's order against what was made is today's).
+    const auto changed = [&]() -> int {
+        if (c.buffer_generation != buffer_generation) return 0;
+        if (c.hard_generation != buffer_hard_generation) return 1;
+        if (c.registry_generation != registry->Generation()) return 2;
+        if (c.unmap_generation != unmap_generation.load(std::memory_order_relaxed)) return 3;
+        return -1;
+    };
+    int why = changed();
+    bool ok = why < 0;
+    size_t done = 0;
+    if (ok) {
+        for (const auto& op : c.ops) {
+            // A copy may start a list (Begin makes the pending mirrors): check again before each.
+            if ((why = changed()) >= 0) {
+                ok = false;
+                break;
+            }
+            switch (op.kind) {
+            case CommitKind::RefreshRegion:
+                RefreshRegion(*static_cast<Region*>(op.target), op.address, op.size);
+                break;
+            case CommitKind::RefreshMirror:
+                if (!RefreshMirror(*static_cast<Mirror*>(op.target))) {
+                    ok = false;
+                }
+                break;
+            case CommitKind::ApplyRewrite:
+                ApplyRewrite(*static_cast<Native::ImageEntry*>(op.target));
+                break;
+            case CommitKind::SyncDepthTwin:
+                SyncDepthTwin(*static_cast<Native::ImageEntry*>(op.target));
+                break;
+            case CommitKind::RefreshSources:
+                RefreshSources(*static_cast<Native::ImageEntry*>(op.target));
+                break;
+            default:
+                break;
+            }
+            ++done;
+            if (!ok) {
+                break;
+            }
+        }
+    }
+    if constexpr (Common::DiagnosticsBuilt) {
+        auto& d = CommitDiag();
+        ++d.commits;
+        for (size_t i = 0; i < done; ++i) {
+            ++d.committed[size_t(c.ops[i].kind)];
+        }
+        if (!ok) {
+            if (why >= 0) {
+                ++d.rejected;
+                ++d.reject_why[why];
+            } else {
+                ++d.failed;
+            }
+        }
+    }
+    c.ops.clear();
+    c.armed = false;
+    if (!ok) {
+        // What was not committed is still flagged: binding again does it at once, in today's
+        // order.
+        if constexpr (Common::DiagnosticsBuilt) ++CommitDiag().rebinds;
+        b.Clear();
+        b.push = UserData(regs);
+        BindStagesNow(stages, regs, compute, b);
+    }
+}
+
+void NativeRenderer::BindStagesNow(std::span<const Shader::Info* const> stages,
+                                   const AmdGpu::Regs& regs, bool compute, DrawBindings& b) {
     const u64 nulls_before = stats.null_images; // DIAG-170
     const auto reasons_before = stats.null_reasons;
     size_t total = 0;
@@ -10912,6 +11364,7 @@ void NativeRenderer::CompareRegion(VAddr base, u64 size, u32 stride, vk::Buffer 
 
 void NativeRenderer::CaptureImage(const Native::ImageEntry& entry, u64 at_frame,
                                   const std::string& what) {
+    SHADGT_B_TOUCH("CaptureImage"); // DIAG-SGT-089
     // DIAG-212 (diagnosis): mip 0 layer 0 of a 32-bit picture, copied where the work stands now.
     if (!entry.image || entry.info.num_bits != 32 || captures.size() >= 12) {
         return;
@@ -12948,6 +13401,7 @@ vk::ImageView NativeRenderer::DepthStandIn(bool array, bool may_create) {
 }
 
 void NativeRenderer::EnsureAheadArena() {
+    SHADGT_B_TOUCH("EnsureAheadArena"); // DIAG-SGT-089
     if (ahead_arena.tried) return;
     ahead_arena.tried = true;
     // PERF-GTS-377 (SHADGT_AHEAD_UPLOAD_MB, 0 = off): a race draw's constants (about 550 bytes,
@@ -13118,7 +13572,7 @@ void NativeRenderer::LongSetsUpkeep() {
     const bool some = Native::DeadHandles::Take(dead);
     if (some) g_buffer_size_epoch.fetch_add(1, std::memory_order_release); // PERF-SGT-020
     std::unique_lock<std::mutex> lock{long_sets_mutex, std::defer_lock};
-    if (ParallelRecordingRequested() || binder) lock.lock(); // FEAT-SGT-022: the binder's too
+    if (ParallelRecordingRequested() || AnyBinder()) lock.lock(); // FEAT-SGT-022: the binder's too
     if (some) DropLongSets(dead);
     if (long_sets.entries.Size() > 200000 || long_sets.unused_sets > 20000) FlushLongSets();
 }
@@ -13419,6 +13873,7 @@ static int RecorderBinderWanted() {
 
 NativeRenderer::DrawBindings& NativeRenderer::NextBindings() {
     RecordContext& c = Ctx();
+    auto* const binder = CtxBinder(); // FEAT-SGT-079: this context's
     if (!binder) {
         return c.binding_slots[0];
     }
@@ -13449,9 +13904,12 @@ void NativeRenderer::RunBindJob(void* owner, BindJob& job, CommandRing&) {
 
 void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoint bind_point,
                                   DrawBindings& b) {
+    SHADGT_B_TOUCH("PushBindings"); // DIAG-SGT-089
     LongSetsUpkeep();
     Stream& s = Ctx().stream;
     RecordContext& c = Ctx();
+    const u8 binder_index = ContextIndex();
+    auto& binder = binders[binder_index]; // FEAT-SGT-079: this context's
     if (!binder && RecorderBinderWanted() != 0 && s.cmd.Ring()) {
         binder = std::make_unique<Native::RecorderBinder<BindJob>>(this, &RunBindJob);
         binder_mode = RecorderBinderWanted();
@@ -13482,6 +13940,7 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             c.binding_jobs[&b - c.binding_slots.data()] = seq;
         } else {
             binding_prepared->binder_job = seq;
+            binding_prepared->binder_index = binder_index;
         }
         auto* const owner = binder.get();
         s.cmd.Control([owner, seq](Scheduler& scheduler) {
@@ -13510,7 +13969,7 @@ void NativeRenderer::PushBindingsWith(const Pipeline& pipeline, vk::PipelineBind
     // PERF-GTS-398: with parallel recording the table is the pass workers' too.
     static const bool long_sets_shared = ParallelRecordingRequested();
     // FEAT-SGT-022: and the binder's (locked as it is shared, without changing what is kept).
-    const bool long_sets_locked = long_sets_shared || binder != nullptr;
+    const bool long_sets_locked = long_sets_shared || AnyBinder();
     auto* pending_owner = inputs.on_binder ? nullptr : FindParallelRuntime(this);
     if(!parallel_binding_capture && pending_owner)
         pending_owner->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::Serial);
@@ -14110,6 +14569,7 @@ bool NativeRenderer::MirrorKind(char kind) {
 
 void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
                                           const AmdGpu::Regs& regs, VertexIndexState& v) {
+    SHADGT_B_TOUCH("ResolveVertexBuffers"); // DIAG-SGT-089
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
     VertexInputs<AmdGpu::Buffer> guest_buffers;
     pipeline.GetVertexInputs(v.attributes, v.input_bindings, divisors, guest_buffers,
@@ -14415,6 +14875,7 @@ void NativeRenderer::CheckMirrorBind(Mirror& mirror, VAddr base, u64 size) {
 
 bool NativeRenderer::ResolveIndices(const AmdGpu::Regs& regs, bool is_indexed, u32 index_offset,
                                     bool quad_triangles, VertexIndexState& v) {
+    SHADGT_B_TOUCH("ResolveIndices"); // DIAG-SGT-089
     const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
     const u32 index_size = is_index16 ? sizeof(u16) : sizeof(u32);
     v.index_type = is_index16 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
@@ -14485,6 +14946,7 @@ bool NativeRenderer::ResolveIndices(const AmdGpu::Regs& regs, bool is_indexed, u
 }
 
 void NativeRenderer::RecordVertexIndex(const VertexIndexState& v) {
+    SHADGT_B_TOUCH("RecordVertexIndex"); // DIAG-SGT-089
     Stream& s = Ctx().stream;
     const CmdBuf cmdbuf{s.cmd};
     const bool dynamic_input = r.instance.IsVertexInputDynamicState();
@@ -14792,6 +15254,7 @@ void NativeRenderer::WrittenSubresources(const Native::ImageEntry* entry, u64 at
     if (!entry) {
         return;
     }
+    if constexpr (Common::DiagnosticsBuilt) PassDiagWritten(entry); // DIAG-SGT-061
     auto* written = const_cast<Native::ImageEntry*>(entry);
 #if !defined(NDEBUG)
     const bool watched = Native::WatchedTexture(entry->info.guest_address,
@@ -14919,9 +15382,15 @@ u64 NativeRenderer::WholeVersion(Native::ImageEntry& source) {
 }
 
 void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
+    SHADGT_B_TOUCH("RefreshSources"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::RefreshSources}; // DIAG-SGT-023
     // NAT-111: only when one of its targets was drawn since the last time.
     const bool traced = Rasterizer::Traced(texture.info.guest_address, texture.info.guest_size);
+    // PERF-SGT-062: queued whether or not the flag is set now: a copy queued before it (a rewrite
+    // or a depth twin of one of its sources) may set it. The commit checks and clears it in order.
+    if (QueueCommit(CommitKind::RefreshSources, &texture)) {
+        return;
+    }
     if (!texture.sources_dirty.exchange(false, std::memory_order_relaxed)) {
         if (traced) {
             LOG_WARNING(Render_Vulkan, "DIAG-165: texture {:#x} {}x{} not dirty (frame {})",
@@ -15228,11 +15697,13 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
         ProbeRefresh(texture, what); // DIAG-179 (diagnosis)
     }
     NATIVE_DIAGNOSTIC(stats.source_copies += picks.size());
+    if constexpr (Common::DiagnosticsBuilt) NoteCommitWork(CommitKind::RefreshSources); // PERF-SGT-062
     ++s.commands;
 }
 
 
 void NativeRenderer::SyncDepthTwin(Native::ImageEntry& entry) {
+    SHADGT_B_TOUCH("SyncDepthTwin"); // DIAG-SGT-089
     // FIX-212: on the PS4 a depth buffer and a colour picture of its layout at its address are
     // the same memory. GT7 double-buffers its 5120x5120 static shadow map (D16 at 0x2900000000
     // and 0x2920000000): each frame a compute pass reprojects the last map into the other
@@ -15249,6 +15720,11 @@ void NativeRenderer::SyncDepthTwin(Native::ImageEntry& entry) {
     if (!on || entry.from_cpu || !entry.image || info.num_samples != 1 ||
         info.props.has_stencil ||
         (!info.props.is_depth && !LiverpoolToVK::IsFormatDepthCompatible(info.pixel_format))) {
+        return;
+    }
+    // PERF-SGT-062: queued before the version check: a rewrite queued before it may change
+    // either picture's version. The commit runs the whole check in order.
+    if (QueueCommit(CommitKind::SyncDepthTwin, &entry)) {
         return;
     }
     Native::ImageEntry* twin =
@@ -15269,6 +15745,7 @@ void NativeRenderer::SyncDepthTwin(Native::ImageEntry& entry) {
     if (version == 0 || version <= entry.write_version.load(std::memory_order_relaxed)) {
         return;
     }
+    if constexpr (Common::DiagnosticsBuilt) NoteCommitWork(CommitKind::SyncDepthTwin); // PERF-SGT-062
     const u32 texel = std::max<u32>(info.num_bits / 8, 1);
     const u32 mips = std::max<u32>(info.resources.levels, 1);
     const u32 layers = std::max<u32>(info.resources.layers, 1);
@@ -15579,8 +16056,70 @@ void NativeRenderer::DiagWrites(const Targets* targets, const DrawBindings& b) {
     }
 }
 
+static bool PassGraphOn(); // DIAG-SGT-087, below
+
 void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::NoteWrites}; // DIAG-SGT-023
+    if (PassGraphOn() && !graph.passes.empty()) { // DIAG-SGT-087: reads, then writes
+        const u32 cur = u32(graph.passes.size() - 1);
+        const auto read = [&](const void* e) {
+            if (!e) return;
+            const auto it = graph.last_writer.find(e);
+            if (it == graph.last_writer.end() || it->second == cur) return;
+            auto& w = graph.passes[it->second];
+            if (w.consumer < 0) {
+                w.consumer = s32(cur);
+                w.consumer_start = graph.passes[cur].start;
+            }
+        };
+        for (const auto* e : b.sampled) read(e);
+        for (const auto* e : b.stored) read(e);
+        if (targets) {
+            for (const auto* e : targets->colors) read(e);
+            read(targets->depth);
+            for (const auto* e : targets->colors) {
+                if (e) graph.last_writer[e] = cur;
+            }
+            if (targets->depth) graph.last_writer[targets->depth] = cur;
+        }
+        for (const auto* e : b.stored) {
+            if (e) graph.last_writer[e] = cur;
+        }
+    }
+    if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-086
+        if (OnRecorderBThread()) {
+            if (targets) {
+                for (const auto* color : targets->colors) {
+                    if (color) b_run_written.insert(color);
+                }
+                if (targets->depth) b_run_written.insert(targets->depth);
+            }
+            for (const auto* stored : b.stored) {
+                if (stored) b_run_written.insert(stored);
+            }
+        } else if (!b_prev_written.empty() && a_seg_dep < 0) {
+            bool dep = false;
+            for (const auto* e : b.sampled) dep = dep || b_prev_written.contains(e);
+            for (const auto* e : b.stored) dep = dep || b_prev_written.contains(e);
+            static const bool chunked = [] {
+                const char* env = std::getenv("SHADGT_RECORDER_B_CHUNK");
+                return env && *env && env[0] != '0';
+            }();
+            if (targets && !chunked) {
+                for (const auto* e : targets->colors) dep = dep || (e && b_prev_written.contains(e));
+                dep = dep || (targets->depth && b_prev_written.contains(targets->depth));
+            }
+            if (dep) {
+                a_seg_dep = s32(a_seg_draws);
+                a_seg_dep_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count() -
+                               a_seg_from;
+            } else {
+                ++a_seg_draws;
+            }
+        }
+    }
     DiagWrites(targets, b);               // DIAG-178 (diagnosis)
     NoteProgramTextureWrites(targets, b); // DIAG-185 (diagnosis)
     if (WriteHistoryOn()) {
@@ -15760,6 +16299,7 @@ struct PixelTrace {
 #endif
 
 void NativeRenderer::YieldToMappingChanges() {
+    SHADGT_B_TOUCH("YieldToMappingChanges"); // DIAG-SGT-089
     // PERF-GTS-368: the recorder takes `mutex` for each draw and dispatch and took it straight
     // back after each one, so a game thread unmapping memory (OnUnmap) waited out whole
     // stretches of recording: 250 to 390 ms at the Autopolis start (no CPU time used), and
@@ -15779,10 +16319,523 @@ void NativeRenderer::YieldToMappingChanges() {
     }
 }
 
+// DIAG-SGT-061 (SHADGT_DIAG_PASS_SPLIT=1, diagnostics builds): phase 0 of plan-multi-recorder.md. How
+// much of the recorder's frame lies in passes a second recorder could record? A pass is a render
+// scope (BeginRendering) or a run of dispatches between them. Per pass: draws and dispatches,
+// recorder time, state changes made while it was recorded (PERF-SGT-062: a buffer, hard or picture
+// generation moved: regions, mirrors or pictures made or dropped, memory unmapped; and small
+// rewrites), texture work done at bind time (PERF-SGT-062's counted rewrites, depth-twin and source
+// copies), and sampled pictures another recorder's earlier pass wrote this frame, for passes dealt in
+// runs of N = 1, 4, 8 and 16 (recorder (pass / N) % 2). Every 5 s, shares of the recorder time a
+// frame.
+namespace {
+constexpr std::array<u64, 4> PassRun{1, 4, 8, 16};
+struct PassSplitDiag {
+    bool on = false;
+    u64 frame = ~u64{0};
+    u64 pass = 0;           // pass index in the frame
+    bool pass_is_render = false;
+    bool pass_open = false;
+    u64 pass_ns = 0, pass_items = 0, pass_state_start = 0, pass_tex_start = 0;
+    std::array<u64, 4> pass_cross{};
+    std::unordered_map<const void*, u64> written; // entry -> pass index that wrote it this frame
+    // totals since the last report
+    u64 frames = 0, passes = 0, items = 0, ns = 0, max_pass_ns = 0;
+    u64 ns_state = 0, ns_tex = 0, ns_neither_change = 0;
+    std::array<u64, 4> ns_cross{}, ns_clean{}, ns_b{}, ns_b_clean{};
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+};
+PassSplitDiag& PassDiag() {
+    static PassSplitDiag d = [] {
+        PassSplitDiag x;
+        x.on = Common::DiagEnv("SHADGT_DIAG_PASS_SPLIT") != nullptr;
+        return x;
+    }();
+    return d;
+}
+void PassDiagClose(PassSplitDiag& d, u64 state_now, u64 tex_now) {
+    if (!d.pass_open) return;
+    const bool state = state_now != d.pass_state_start, tex = tex_now != d.pass_tex_start;
+    ++d.passes;
+    d.items += d.pass_items;
+    d.ns += d.pass_ns;
+    d.max_pass_ns = std::max(d.max_pass_ns, d.pass_ns);
+    if (state) d.ns_state += d.pass_ns;
+    if (tex) d.ns_tex += d.pass_ns;
+    if (!state && !tex) d.ns_neither_change += d.pass_ns;
+    for (size_t i = 0; i < PassRun.size(); ++i) {
+        const bool cross = d.pass_cross[i] != 0;
+        const bool clean = !state && !tex && !cross;
+        if (cross) d.ns_cross[i] += d.pass_ns;
+        if (clean) d.ns_clean[i] += d.pass_ns;
+        if ((d.pass / PassRun[i]) % 2 == 1) {
+            d.ns_b[i] += d.pass_ns;
+            if (clean) d.ns_b_clean[i] += d.pass_ns;
+        }
+    }
+    d.pass_open = false;
+}
+void PassDiagStart(PassSplitDiag& d, u64 frame, bool render, u64 state_now, u64 tex_now) {
+    PassDiagClose(d, state_now, tex_now);
+    if (d.frame != frame) {
+        if (d.frame != ~u64{0}) ++d.frames;
+        d.frame = frame;
+        d.pass = 0;
+        d.written.clear();
+    } else {
+        ++d.pass;
+    }
+    d.pass_open = true;
+    d.pass_is_render = render;
+    d.pass_ns = d.pass_items = 0;
+    d.pass_cross = {};
+    d.pass_state_start = state_now;
+    d.pass_tex_start = tex_now;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - d.since < std::chrono::seconds{5} || d.frames == 0 || d.ns == 0) return;
+    const double f = double(d.frames), t = double(d.ns);
+    const auto pct = [&](u64 v) { return 100.0 * double(v) / t; };
+    std::string runs;
+    for (size_t i = 0; i < PassRun.size(); ++i) {
+        runs += fmt::format(" N={}: cross {:.0f}%, clean {:.0f}%, B {:.0f}% (clean {:.0f}%), "
+                            "hand-offs {:.0f};",
+                            PassRun[i], pct(d.ns_cross[i]), pct(d.ns_clean[i]), pct(d.ns_b[i]),
+                            d.ns_b[i] ? 100.0 * d.ns_b_clean[i] / d.ns_b[i] : 0.0,
+                            d.passes / f / PassRun[i]);
+    }
+    LOG_INFO(Render_Vulkan,
+             "DIAG-SGT-061: {:.0f} frames; per frame {:.1f} passes, {:.0f} draws+dispatches, {:.2f} ms "
+             "in passes (largest {:.2f} ms); time in passes with state changes {:.0f}%, with bind-time "
+             "texture work {:.0f}%, with neither {:.0f}%; dealt in runs of N passes:{}",
+             f, d.passes / f, d.items / f, t / f / 1e6, d.max_pass_ns / 1e6, pct(d.ns_state),
+             pct(d.ns_tex), pct(d.ns_neither_change), runs);
+    d.frames = d.passes = d.items = d.ns = d.max_pass_ns = 0;
+    d.ns_state = d.ns_tex = d.ns_neither_change = 0;
+    d.ns_cross = d.ns_clean = d.ns_b = d.ns_b_clean = {};
+    d.since = now;
+}
+u64 PassDiagTextureWork() {
+    u64 sum = 0;
+    for (const auto& arm : CommitDiag().work) {
+        for (size_t k = 2; k < arm.size(); ++k) { // rewrites, depth-twin and source copies
+            sum += arm[k];
+        }
+    }
+    return sum;
+}
+} // namespace
+
+u64 NativeRenderer::PassDiagMutations() const {
+    return u64(buffer_generation) + u64(buffer_hard_generation) + registry->Generation() +
+           stats.small_rewrites;
+}
+
+bool NativeRenderer::PassDiagOn() const {
+    if constexpr (!Common::DiagnosticsBuilt) {
+        return false;
+    } else {
+        return PassDiag().on;
+    }
+}
+void NativeRenderer::PassDiagBegin(bool render) {
+    if (!PassDiagOn()) return;
+    auto& d = PassDiag();
+    // A dispatch run continues while dispatches follow each other outside rendering.
+    if (!render && d.pass_open && !d.pass_is_render && d.frame == frame) return;
+    PassDiagStart(d, frame, render, PassDiagMutations(), PassDiagTextureWork());
+}
+void NativeRenderer::PassDiagItem(u64 ns) {
+    if constexpr (Common::DiagnosticsBuilt) CommitDiag().pass_item_ns += ns; // PERF-SGT-062
+    if constexpr (Common::DiagnosticsBuilt) PassAuditDraw(ns);              // DIAG-SGT-075
+    if (!PassDiagOn()) return;
+    auto& d = PassDiag();
+    if (!d.pass_open) return;
+    d.pass_ns += ns;
+    ++d.pass_items;
+}
+void NativeRenderer::PassDiagSampled(const DrawBindings& b) {
+    if (!PassDiagOn()) return;
+    auto& d = PassDiag();
+    if (!d.pass_open) return;
+    for (const auto* entry : b.sampled) {
+        const auto it = d.written.find(entry);
+        if (it == d.written.end() || it->second == d.pass) continue;
+        for (size_t i = 0; i < PassRun.size(); ++i) {
+            const u64 n = PassRun[i];
+            if (it->second / n != d.pass / n && (it->second / n) % 2 != (d.pass / n) % 2) {
+                ++d.pass_cross[i];
+            }
+        }
+    }
+}
+void NativeRenderer::PassDiagWritten(const void* entry) {
+    if (!PassDiagOn()) return;
+    auto& d = PassDiag();
+    if (d.pass_open) d.written[entry] = d.pass;
+}
+
+// PERF-SGT-062: a pass starts. The generations binding sees from here on are recorded for the pass
+// (a second recorder binding it ahead would commit it only while they hold). Diagnostics builds
+// also close the pass before: whether something was made or dropped while it was bound, and
+// whether it would have failed that check had it been bound one pass, or one run of 4, ahead.
+void NativeRenderer::BindCommitPassBegin(bool render) {
+    // The pass check reads only generations: in the alternating mode it runs in both arms, so a
+    // pass never spans an arm turn.
+    if (BindCommitMode() == 0 || (!Common::DiagnosticsBuilt && !BindCommitOn())) {
+        return;
+    }
+    auto& c = Ctx().commit;
+    // A dispatch run continues while dispatches follow each other outside rendering.
+    if (!render && c.dispatch_run) {
+        return;
+    }
+    c.dispatch_run = !render;
+    const std::array<u64, 3> now{u64(buffer_generation), u64(buffer_hard_generation),
+                                 registry->Generation()};
+    c.previous_pass_generations = c.pass_generations;
+    c.pass_generations = now;
+    if constexpr (Common::DiagnosticsBuilt) {
+        auto& d = CommitDiag();
+        if (d.pass_open) {
+            const u64 ns = d.pass_item_ns;
+            ++d.passes;
+            d.pass_ns += ns;
+            if (now != d.pass_start) {
+                ++d.passes_changed;
+                d.ns_changed += ns;
+            }
+            if (d.pass_stale_1) {
+                ++d.stale_1;
+                d.ns_stale_1 += ns;
+            }
+            if (d.pass_stale_4) {
+                ++d.stale_4;
+                d.ns_stale_4 += ns;
+            }
+        }
+        if (d.pass_frame != frame) {
+            d.pass_frame = frame;
+            d.pass_index = 0;
+        } else {
+            ++d.pass_index;
+        }
+        if (d.pass_index % 4 == 0) {
+            d.run4_previous = d.run4_generations;
+            d.run4_generations = now;
+        }
+        d.pass_stale_1 = d.pass_open && now != c.previous_pass_generations;
+        d.pass_stale_4 = d.pass_index >= 4 && now != d.run4_previous;
+        d.pass_open = true;
+        d.pass_start = now;
+        d.pass_item_ns = 0;
+    }
+    (void)render;
+}
+
+// DIAG-SGT-075 (SHADGT_DIAG_PASS_AUDIT=1, diagnostics builds): phase 2 of plan-multi-recorder.md.
+// A second recorder records whole draws, not only their binding: what in a pass's draws needs the
+// thread that owns the ordered state? Everything done since the previous draw or dispatch ended
+// (jobs between them, target setup, binding, the draw's own work) counts for the pass that draw
+// records into, so a pass's setup is its own. Per pass: lists started, splices, writebacks
+// recorded, work writing guest memory through buffers, picture uploads and inits, PERF-SGT-062
+// content ops in binding (queueable) and outside it, global barriers, and generations moved
+// (regions, mirrors or pictures made or dropped, memory unmapped). Every 5 s, as shares of pass
+// time, for all passes and for the passes a second recorder would take dealt in runs of 4 (odd
+// runs); and whether such a pass, bound while the run before it records, would see a change made
+// there (stale).
+namespace {
+struct PassAuditState {
+    bool on = false;
+    std::array<u64, AuditKinds> count{}, at_last{};
+    u64 gens_last = 0;
+    u64 frame = ~u64{0}, pass = 0;
+    bool open = false, dispatch_run = false;
+    u64 ns = 0;
+    u32 flags = 0; // bit k: kind k; bit 31: a generation moved
+    std::array<bool, 8> structural{}; // by pass index % 8, this frame
+    u64 frames = 0, passes = 0, total_ns = 0, b_ns = 0;
+    std::array<u64, AuditKinds + 1> kind_ns{}, b_kind_ns{}; // last: generations moved
+    u64 clean_ns = 0, b_clean_ns = 0, queueable_ns = 0, b_queueable_ns = 0;
+    u64 stale1_ns = 0, b_stale4_ns = 0, b_stale4_n = 0, b_passes = 0;
+    u64 b_listfree_ns = 0; // B's passes free of ordered work but list starts and splices
+    // Per-range staleness: what the pass binds, and the change logs' positions at the start of
+    // its run and the run before (a B pass binds while the run before records).
+    std::vector<std::pair<VAddr, VAddr>> buffers, pictures;
+    struct Snap {
+        u64 log = 0, registry = 0, hard = 0, unmap = 0;
+    } run_now{}, run_before{};
+    u64 b_range_stale_ns = 0, b_range_stale_n = 0, b_range_lost_n = 0;
+    u64 b_range_buffer_n = 0, b_range_picture_n = 0, b_range_hard_n = 0;
+    std::array<u64, 4> b_picture_kind{}; // lost log, made, dropped, reused (DIAG-GTS-401's kinds)
+    u64 b_picture_exact = 0;
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+};
+PassAuditState& PassAudit() {
+    static PassAuditState d = [] {
+        PassAuditState x;
+        x.on = Common::DiagEnv("SHADGT_DIAG_PASS_AUDIT") != nullptr;
+        return x;
+    }();
+    return d;
+}
+bool PassAuditOn() {
+    if constexpr (!Common::DiagnosticsBuilt) {
+        return false;
+    } else {
+        return PassAudit().on;
+    }
+}
+constexpr u32 AuditGenerations = 1u << 31;
+// What only the thread owning the ordered state can do (a pass with any of it goes to it).
+constexpr u32 AuditOrdered = AuditGenerations | (1u << AuditListStart) | (1u << AuditSplice) |
+                             (1u << AuditWriteback) | (1u << AuditGpuWrites) |
+                             (1u << AuditImageWork) | (1u << AuditContentElse);
+void PassAuditClose(PassAuditState& d) {
+    if (!d.open) return;
+    d.open = false;
+    const bool b = (d.pass / 4) % 2 == 1;
+    const bool ordered = (d.flags & AuditOrdered) != 0;
+    ++d.passes;
+    d.total_ns += d.ns;
+    for (int k = 0; k <= AuditKinds; ++k) {
+        const u32 bit = k == AuditKinds ? AuditGenerations : 1u << k;
+        if (d.flags & bit) {
+            d.kind_ns[k] += d.ns;
+            if (b) d.b_kind_ns[k] += d.ns;
+        }
+    }
+    // A second recorder's list is spliced when its run commits, not where the first one's ends.
+    if (b && (d.flags & AuditOrdered & ~((1u << AuditListStart) | (1u << AuditSplice))) == 0) {
+        d.b_listfree_ns += d.ns;
+    }
+    if (!ordered) {
+        d.queueable_ns += d.ns;
+        if (b) d.b_queueable_ns += d.ns;
+        if (!(d.flags & (1u << AuditContentBind))) {
+            d.clean_ns += d.ns;
+            if (b) d.b_clean_ns += d.ns;
+        }
+    }
+    if (d.pass >= 1 && d.structural[(d.pass - 1) % 8]) d.stale1_ns += d.ns;
+    if (b) {
+        ++d.b_passes;
+        d.b_ns += d.ns;
+        // Bound while the run before records: a change anywhere from that run's start on.
+        bool stale = false;
+        for (u64 p = (d.pass / 4 - 1) * 4; p < d.pass; ++p) {
+            stale = stale || d.structural[p % 8];
+        }
+        if (stale) {
+            d.b_stale4_ns += d.ns;
+            ++d.b_stale4_n;
+        }
+    }
+    d.structural[d.pass % 8] = (d.flags & AuditGenerations) != 0;
+}
+void PassAuditReport(PassAuditState& d) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - d.since < std::chrono::seconds{5} || d.frames == 0 || d.total_ns == 0) return;
+    constexpr std::array<const char*, AuditKinds + 1> names{
+        "lists started", "splices", "writebacks", "guest writes", "uploads/inits",
+        "content ops in binding", "content ops elsewhere", "global barriers", "generations moved"};
+    const auto pct = [](u64 a, u64 t) { return t ? 100.0 * double(a) / double(t) : 0.0; };
+    std::string kinds;
+    for (int k = 0; k <= AuditKinds; ++k) {
+        kinds += fmt::format(" {} {:.0f}% (B {:.0f}%),", names[k], pct(d.kind_ns[k], d.total_ns),
+                             pct(d.b_kind_ns[k], d.b_ns));
+    }
+    const double f = double(d.frames);
+    LOG_INFO(Render_Vulkan,
+             "DIAG-SGT-075: {:.0f} frames; per frame {:.1f} passes, {:.2f} ms in passes; time in "
+             "passes with:{} free of ordered work {:.0f}% (B {:.0f}%), of it with no content op "
+             "{:.0f}% (B {:.0f}%); B free of it but list starts and splices {:.0f}%; B stale by its own "
+             "ranges {:.0f}% of B's time ({:.1f}% of B's passes: buffers {:.1f}%, pictures {:.1f}%, "
+             "unmap or hard change {:.1f}%, log too short {:.1f}%; pictures by the change: made {:.1f}%, "
+             "dropped {:.1f}%, reused {:.1f}%, log lost {:.1f}%; made with a bound picture's exact range "
+             "{:.1f}%); stale bound one "
+             "pass ahead {:.0f}%; B's passes bound while the run before records stale {:.0f}% of "
+             "their time ({:.1f}% of B's passes)",
+             f, d.passes / f, d.total_ns / f / 1e6, kinds, pct(d.queueable_ns, d.total_ns),
+             pct(d.b_queueable_ns, d.b_ns), pct(d.clean_ns, d.total_ns), pct(d.b_clean_ns, d.b_ns),
+             pct(d.b_listfree_ns, d.b_ns), pct(d.b_range_stale_ns, d.b_ns),
+             pct(d.b_range_stale_n, d.b_passes), pct(d.b_range_buffer_n, d.b_passes),
+             pct(d.b_range_picture_n, d.b_passes), pct(d.b_range_hard_n, d.b_passes),
+             pct(d.b_range_lost_n, d.b_passes), pct(d.b_picture_kind[1], d.b_passes),
+             pct(d.b_picture_kind[2], d.b_passes), pct(d.b_picture_kind[3], d.b_passes),
+             pct(d.b_picture_kind[0], d.b_passes), pct(d.b_picture_exact, d.b_passes),
+             pct(d.stale1_ns, d.total_ns), pct(d.b_stale4_ns, d.b_ns),
+             pct(d.b_stale4_n, d.b_passes));
+    d.frames = d.passes = d.total_ns = d.b_ns = 0;
+    d.kind_ns = d.b_kind_ns = {};
+    d.clean_ns = d.b_clean_ns = d.queueable_ns = d.b_queueable_ns = 0;
+    d.stale1_ns = d.b_stale4_ns = d.b_stale4_n = d.b_passes = 0;
+    d.b_listfree_ns = 0;
+    d.b_range_stale_ns = d.b_range_stale_n = d.b_range_lost_n = 0;
+    d.b_range_buffer_n = d.b_range_picture_n = d.b_range_hard_n = 0;
+    d.b_picture_kind = {};
+    d.b_picture_exact = 0;
+    d.since = now;
+}
+void AuditCount(int kind) {
+    auto& d = PassAudit();
+    if (d.on) ++d.count[kind];
+}
+void AuditBoundRange(VAddr address, u64 size, bool picture) {
+    auto& d = PassAudit();
+    if (!d.on || !d.open || size == 0) return;
+    auto& list = picture ? d.pictures : d.buffers;
+    if (list.size() < 4096) list.emplace_back(address, address + size);
+}
+} // namespace
+
+void NativeRenderer::PassAuditBegin(bool render) {
+    if (!PassAuditOn()) return;
+    auto& d = PassAudit();
+    // A dispatch run continues while dispatches follow each other outside rendering.
+    if (!render && d.dispatch_run && d.frame == frame) return;
+    d.dispatch_run = !render;
+    if (d.open && (d.pass / 4) % 2 == 1) {
+        // A B pass: would its own ranges have changed since the run before it started?
+        const auto& s = d.run_before;
+        const bool hard = s.hard != u64(buffer_hard_generation) ||
+                          s.unmap != unmap_generation.load(std::memory_order_relaxed);
+        const u64 log_now = buffer_log.Seq();
+        const bool lost = log_now - s.log >= 1024;
+        const bool buffers = !hard && !lost &&
+                             !buffer_log.Untouched(s.log, {d.buffers.data(), d.buffers.size()});
+        std::array<u64, 4> kinds_before{};
+        for (size_t k = 0; k < 4; ++k) kinds_before[k] = registry->untouched_no[k].load();
+        const bool pictures =
+            !hard && !registry->Untouched(s.registry, {d.pictures.data(), d.pictures.size()});
+        for (size_t k = 0; k < 4; ++k) {
+            d.b_picture_kind[k] += registry->untouched_no[k].load() != kinds_before[k];
+        }
+        if (pictures) { // a picture made with exactly a bound picture's range (Find may return it)
+            d.b_picture_exact += registry->MadeOverSince(
+                s.registry, {d.pictures.data(), d.pictures.size()}, true);
+        }
+        if (hard || lost || buffers || pictures) {
+            d.b_range_stale_ns += d.ns;
+            ++d.b_range_stale_n;
+            d.b_range_hard_n += hard;
+            d.b_range_lost_n += lost && !hard;
+            d.b_range_buffer_n += buffers;
+            d.b_range_picture_n += pictures;
+        }
+    }
+    PassAuditClose(d);
+    d.buffers.clear();
+    d.pictures.clear();
+    if (d.frame != frame) {
+        if (d.frame != ~u64{0}) ++d.frames;
+        d.frame = frame;
+        d.pass = 0;
+        d.structural = {};
+        PassAuditReport(d);
+    } else {
+        ++d.pass;
+    }
+    if (d.pass % 4 == 0) {
+        d.run_before = d.run_now;
+        d.run_now = {buffer_log.Seq(), registry->Generation(), u64(buffer_hard_generation),
+                     unmap_generation.load(std::memory_order_relaxed)};
+    }
+    d.open = true;
+    d.ns = 0;
+    d.flags = 0;
+}
+
+void NativeRenderer::PassAuditDraw(u64 ns) {
+    if (!PassAuditOn()) return;
+    auto& d = PassAudit();
+    const u64 gens = u64(buffer_generation) + u64(buffer_hard_generation) + registry->Generation() +
+                     unmap_generation.load(std::memory_order_relaxed);
+    u32 flags = gens != d.gens_last ? AuditGenerations : 0;
+    for (int k = 0; k < AuditKinds; ++k) {
+        if (d.count[k] != d.at_last[k]) flags |= 1u << k;
+    }
+    d.at_last = d.count;
+    d.gens_last = gens;
+    if (!d.open) return; // before the frame's first pass
+    d.flags |= flags;
+    d.ns += ns;
+}
+
+static int RecorderBUnlocked(); // FEAT-SGT-079 step 22
+
 void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::DrawTotal}; // DIAG-SGT-023
     YieldToMappingChanges(); // PERF-GTS-368
-    std::scoped_lock lock{mutex};
+    std::unique_lock<decltype(mutex)> lock{mutex, std::defer_lock};
+    // DIAG-SGT-089: the overlap's lock times (diagnostics builds, SHADGT_RECORDER_B_OVERLAP on).
+    static const bool lock_timed = Common::DiagnosticsBuilt && [] {
+        const char* env = std::getenv("SHADGT_RECORDER_B_OVERLAP");
+        return env && (env[0] == '1' || env[0] == '2');
+    }();
+    struct LockedTime {
+        NativeRenderer* self = nullptr;
+        u32 thread = 0;
+        std::chrono::steady_clock::time_point start{};
+        ~LockedTime() {
+            if (!self) return;
+            const auto now = std::chrono::steady_clock::now();
+            const auto mid = t_draw_in_record ? record_start : now;
+            self->draw_locked_ns[thread][0].fetch_add(
+                u64(std::chrono::duration_cast<std::chrono::nanoseconds>(mid - start).count()),
+                std::memory_order_relaxed);
+            self->draw_locked_ns[thread][1].fetch_add(
+                u64(std::chrono::duration_cast<std::chrono::nanoseconds>(now - mid).count()),
+                std::memory_order_relaxed);
+            self->draw_locked_count[thread].fetch_add(1, std::memory_order_relaxed);
+            t_draw_in_record = false;
+        }
+        std::chrono::steady_clock::time_point record_start{};
+    } locked_time;
+    if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-088/089: the threads' waits for the lock
+        const bool b = OnRecorderBThread();
+        if (b || (lock_timed && b_outstanding.load(std::memory_order_relaxed))) {
+            const auto from = std::chrono::steady_clock::now();
+            lock.lock();
+            (b ? b_mutex_wait_ns : a_mutex_wait_ns)
+                .fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now() - from)
+                               .count(),
+                           std::memory_order_relaxed);
+        } else {
+            lock.lock();
+        }
+        if (lock_timed) {
+            t_draw_in_record = false;
+            locked_time.self = this;
+            locked_time.thread = b ? 1 : 0;
+            locked_time.start = std::chrono::steady_clock::now();
+        }
+    } else {
+        lock.lock();
+    }
+    struct PassItemTimer { // DIAG-SGT-061, PERF-SGT-062 (diagnostics builds)
+        NativeRenderer* self;
+        std::chrono::steady_clock::time_point start;
+        ~PassItemTimer() {
+            if (self) self->PassDiagItem(u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - start).count()));
+        }
+    };
+    NativeRenderer* const timed_pass =
+        Common::DiagnosticsBuilt && (PassDiagOn() || BindCommitMode() != 0 || PassAuditOn()) ? this : nullptr;
+    const PassItemTimer pass_timer{timed_pass, timed_pass ? std::chrono::steady_clock::now()
+                                                          : std::chrono::steady_clock::time_point{}};
+    struct BWindow { // FEAT-SGT-079 step 22 (the window closes with the draw)
+        bool open = false;
+        ~BWindow() {
+            if (open) t_b_window = false;
+        }
+    } b_window;
+    if (OnRecorderBThread()) {
+        const auto* queued = r.liverpool->RunningQueuedDraw();
+        b_window.open = queued && queued->overlap_ready == 1;
+        t_b_window = b_window.open;
+    }
     EnsureAheadArena(); // PERF-GTS-377
     struct StreamUnwindGuard {
         NativeRenderer& renderer;
@@ -15794,6 +16847,26 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             }
         }
     } stream_unwind_guard{*this};
+    RecorderBDeal(false, r.liverpool->DrawRegs()); // FEAT-SGT-079
+    // PERF-SGT-093: the per-frame textures the job threads missed are made now, by the recorder,
+    // in GPU order (before the draws that sample them; the job threads find them from here on).
+    // Not while recorder B holds work: making a picture touches the pictures over its memory,
+    // which B's handed draws may bind (as the recorder's missing-picture lookups, step 23).
+    if (has_wanted_pictures.load(std::memory_order_acquire) && !OnRecorderBThread() &&
+        !b_outstanding.load(std::memory_order_acquire)) {
+        std::unordered_map<VAddr, VideoCore::ImageInfo> wanted;
+        {
+            std::scoped_lock wanted_lock{wanted_mutex};
+            wanted.swap(wanted_pictures);
+            has_wanted_pictures.store(false, std::memory_order_release);
+        }
+        for (const auto& [address, info] : wanted) {
+            const Native::ImageEntry* made = registry->Find(info, false, frame);
+            if constexpr (Common::DiagnosticsBuilt) {
+                NoteSubmitSite(made ? "wanted picture made by the recorder" : "wanted picture not made", {});
+            }
+        }
+    }
     if (ParallelRecordingRequested() && !parallel_sidecar_init_failed.load(std::memory_order_relaxed) && RytyGtsInRace() && !r.instance.IsIntel() && !FindParallelRuntime(this)) {
         try {
             auto sidecar=std::make_unique<ParallelRuntime>();
@@ -16052,8 +17125,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     // OPT-010: the draw a game job thread prepared, if any (job threads prepare direct draws).
     static const bool prepare = PrepareEnabled();
     PreparedDraw* prepared = nullptr;
+    a_prepared_why = DiagText("A: not looked up"); // FEAT-SGT-079 (diagnostics)
     if (prepare && !indirect && !r.FrameDumpCollecting() && PrepareScope()) { // NAT-161: direct draws only
         prepared = TakePrepared(Rasterizer::t_draw_packet);
+        if (prepared && PreparedPrefetchOn()) PrefetchPreparedParts(*prepared); // PERF-SGT-081
+        a_prepared_why = prepared ? nullptr : DiagText("A: none taken");
+        if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-088
+            if (!prepared && OnRecorderBThread()) NoteSubmitSite("B: draw without prepared", {});
+        }
         // FIX-GTS-492: a prepared draw kept under this packet's address but made for another
         // draw (other programs, or the same ones with other user data: its own frame's tables)
         // is never installed. A cold GT Sport race lost the GPU device on a tessellated pipeline
@@ -16069,12 +17148,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             }
             FreePrepared(prepared);
             prepared = nullptr;
+            a_prepared_why = DiagText("A: made for another draw (FIX-GTS-492)");
         }
         NATIVE_DIAGNOSTIC(stats.prepared_missing += prepared ? 0 : 1);
         Native::OrderedTiming::NotePrepared(prepared ? Native::OrderedTiming::PreparedFound
                                                      : Native::OrderedTiming::PreparedMissing);
     }
     if (!late_bound_done.empty()) { // PERF-GTS-398
+        SHADGT_B_TOUCH("late_bound_done"); // FEAT-SGT-079 step 22
         for (PreparedDraw* done : late_bound_done) FreePrepared(done);
         late_bound_done.clear();
     }
@@ -16738,9 +17819,19 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     bool from_prepared = false;
     bool buffer_freshness_certified = false;
     u64 buffer_freshness_seq = 0;
+    if (prepared && widen_flat) a_prepared_why = DiagText("A: widened");
+    if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-084
+        if (OnRecorderBThread()) {
+            ++b_run_draws;
+            if (!prepared || widen_flat) b_run_flags |= 2;
+        }
+    }
     if (prepared && !widen_flat) {
         PhaseClock clock{stats.phase_ns[2]};
         from_prepared = CommitPrepared(*prepared, *pipeline, regs, trusted);
+        if constexpr (Common::DiagnosticsBuilt) {
+            if (OnRecorderBThread()) b_run_flags |= from_prepared ? 0 : 2; // DIAG-SGT-084
+        }
         if (from_prepared) {
             buffer_freshness_seq = buffer_log.Seq();
             buffer_freshness_certified = true;
@@ -16757,6 +17848,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
            !PreparedBuffersUntouched(*prepared,prepared->buffer_seq)) {
             from_prepared=false;prepared_vertices_valid=false;buffer_freshness_certified=false;
             Native::OrderedTiming::NotePrepared(Native::OrderedTiming::PreparedDropped);
+            a_prepared_why = DiagText("A: dropped after its vertices");
         } else {
             buffer_freshness_seq=buffer_log.Seq();
             buffer_freshness_certified=true;
@@ -16765,7 +17857,50 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     if (from_prepared) {
         Native::OrderedTiming::NotePrepared(Native::OrderedTiming::PreparedUsed);
     }
+    if constexpr (Common::DiagnosticsBuilt) { // FEAT-SGT-079: B's dry run against what A did
+        if (!b_accepted.empty() && b_accepted.erase(Rasterizer::t_draw_packet) != 0) {
+            NoteSubmitSite(from_prepared ? "B draw taken, A used it" : "B draw taken, A did not", {});
+        }
+    }
+    if (AmdGpu::Liverpool::RecorderBMode() == 4) { // FEAT-SGT-079 step 4: what B's thread made of this draw
+        using Q = AmdGpu::Liverpool::QueuedDraw;
+        auto* queued = const_cast<Q*>(r.liverpool->RunningQueuedDraw());
+        if (queued && queued->to_b && !queued->compute) {
+            const u8 b = queued->b_result.exchange(Q::AReached, std::memory_order_acq_rel);
+            if constexpr (Common::DiagnosticsBuilt) {
+                switch (b) {
+                case Q::Pending:
+                    NoteSubmitSite("B4 late (A first)", {});
+                    break;
+                case Q::Ready: {
+                    NoteSubmitSite(from_prepared ? "B4 ready, A used it" : "B4 ready, A did not", {});
+                    if (!from_prepared) {
+                        NoteSubmitSite(a_prepared_why ? a_prepared_why : "A: other", {});
+                    }
+                    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now().time_since_epoch())
+                                        .count();
+                    const s64 ahead = now - queued->b_done_ns;
+                    NoteSubmitSite(ahead < 100'000      ? "B4 ready, ahead < 0.1 ms"
+                                   : ahead < 1'000'000  ? "B4 ready, ahead 0.1-1 ms"
+                                   : ahead < 5'000'000  ? "B4 ready, ahead 1-5 ms"
+                                                        : "B4 ready, ahead > 5 ms", {});
+                    break;
+                }
+                case Q::NoPrepared:
+                    NoteSubmitSite(from_prepared ? "B4 no prepared yet, A used one"
+                                                 : "B4 no prepared, A none", {});
+                    break;
+                default:
+                    NoteSubmitSite(queued->b_why ? queued->b_why : "B4 refused", {});
+                    if (from_prepared) NoteSubmitSite("B4 refused, A used it", {});
+                    break;
+                }
+            }
+        }
+    }
     DrawBindings& b = from_prepared ? prepared->bindings : NextBindings();
+    SHADGT_B_TOUCH("binding_prepared"); // FEAT-SGT-079 step 22
     binding_prepared = from_prepared ? prepared : nullptr; // FEAT-SGT-022: its binds may go to the binder
     // GT7-UW: a HUD draw showing a small picture drawn with depth this frame (the race's maps).
     // DLSS-GT7-001: the same sign, without a HUD layer, tells the prototype a race is on.
@@ -16798,6 +17933,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         b.push = UserData(regs);
         BindStagesStable(pipeline->GetStages(), regs, false, b);
     }
+    if constexpr (Common::DiagnosticsBuilt) PassDiagSampled(b); // DIAG-SGT-061
     WritebacksBefore(b); // includes worker-prepared bindings
     if (b.failed) {
         NATIVE_DIAGNOSTIC(++stats.skipped);
@@ -17233,7 +18369,35 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     Native::OrderedTiming::NoteResolve(resolve_recorded); // DIAG-SGT-023
     // DIAG-SGT-023: the rest of the draw is the encode side (ends with the draw's scope).
     Native::OrderedTiming::Scope encode_phase{Native::OrderedTiming::EncodePhase};
+    if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-089: the encode side's share of the lock
+        if (locked_time.self) {
+            locked_time.record_start = std::chrono::steady_clock::now();
+            t_draw_in_record = true;
+        }
+    }
     auto* parallel=FindParallelRuntime(this);
+    // FEAT-SGT-079 step 25 (SHADGT_RECORDER_B_UNLOCKED=2): recorder B encodes a clean window
+    // draw without the renderer's lock, holding b_pin (what the draw points at stays), and takes
+    // the lock again for what the draw wrote (NoteWrites on).
+    struct BUnlocked {
+        NativeRenderer* self = nullptr;
+        std::unique_lock<decltype(NativeRenderer::mutex)>* lock = nullptr;
+        ~BUnlocked() { // an early return: the lock again before GiveBack's FreePrepared runs
+            if (!self) return;
+            self->b_pin.unlock_shared();
+            if (lock && !lock->owns_lock()) lock->lock();
+        }
+    } b_unlocked;
+    b_unlocked.lock = &lock;
+    if (OnRecorderBThread() && t_b_window && RecorderBUnlocked() == 2 && from_prepared &&
+        prepared_vertices_valid && !parallel && !indirect && !hud_black_state &&
+        !hud_white_state && !Gt7TemporalRequested() && !pipeline->LdsEmulation() &&
+        s.lds_readers.empty() && !r.FrameDumpCollecting() && lock.owns_lock()) {
+        b_pin.lock_shared(); // at once: whoever takes it exclusively holds `mutex` first
+        b_unlocked.self = this;
+        lock.unlock();
+        if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B encode unlocked", {});
+    }
     const auto partition_mode=parallel && parallel->applied_mode.Enabled()?1u:0u;
     RecordPartitionEndGuard end_partition_guard{parallel?&parallel->record_partition[partition_mode][4]:nullptr};
     RecordPartitionClock admission_partition{parallel?&parallel->record_partition[partition_mode][0]:nullptr};
@@ -18629,7 +19793,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     }
     const u32 index_count = vi->index_count;
     const CmdBuf cmdbuf{s.cmd};
-    retired_pipeline_owners.Hold(pipeline_owner);
+    SHADGT_B_TOUCH("retired_pipeline_owners"); { std::scoped_lock owners_lock{retired_owners_mutex}; retired_pipeline_owners.Hold(pipeline_owner); } if (!OnRecorderBThread()) drawn_pipelines.try_emplace(pipeline, frame); // steps 24, 25
     {
         PhaseClock part{stats.record_ns[4]};
         if (!parallel_draw) BindGraphics(s, *pipeline, pipeline_owner);
@@ -18818,7 +19982,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         // WIDE-008/031/060: the draw is split from its preparation, so the 32:9 paths can
         // issue it with their own viewports and scissors (several times for a split HUD element).
         const auto prepare_draw = [&] {
-        retired_pipeline_owners.Hold(pipeline_owner);
+        SHADGT_B_TOUCH("retired_pipeline_owners"); { std::scoped_lock owners_lock{retired_owners_mutex}; retired_pipeline_owners.Hold(pipeline_owner); }
         if (depth_snapshot) {
             // Preparation may splice after the copy. Retain the image again in
             // the actual draw stream immediately before recording its read.
@@ -19291,7 +20455,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         SceneTrace::GpuEnd(s.cmd);
         }
     }
-    retired_pipeline_owners.Hold(pipeline_owner);
+    if (b_unlocked.self) { // step 25: the lock again (b_pin first: never wait for `mutex` holding it)
+        b_pin.unlock_shared();
+        b_unlocked.self = nullptr;
+        lock.lock();
+    }
+    SHADGT_B_TOUCH("retired_pipeline_owners"); { std::scoped_lock owners_lock{retired_owners_mutex}; retired_pipeline_owners.Hold(pipeline_owner); }
     {
         PhaseClock part{stats.record_ns[7]};
         NoteWrites(&targets, b);
@@ -19751,6 +20920,7 @@ bool NativeRenderer::TemporalKeepsResolved() {
 }
 
 void NativeRenderer::CopyPicture(const Native::ImageEntry& from, const Native::ImageEntry& to) {
+    SHADGT_B_TOUCH("CopyPicture"); // DIAG-SGT-089
     Stream& s = Begin();
     GlobalBarrier();
     const vk::ImageSubresourceLayers layers{.aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -20207,22 +21377,26 @@ NativeRenderer::PreparedDraw* NativeRenderer::NewPrepared() {
 }
 
 void NativeRenderer::ReleaseBinderHeld() {
+    SHADGT_B_TOUCH("ReleaseBinderHeld"); // DIAG-SGT-089
     // FEAT-SGT-022: prepared draws whose binder jobs have run go back now (in order: jobs run
     // in order, so the first one still running stops the walk).
-    size_t released = 0;
-    while (released < binder_held.size() && binder &&
-           binder->Done(binder_held[released]->binder_job)) {
-        binder_held[released]->binder_job = 0;
-        FreePrepared(binder_held[released]);
-        ++released;
-    }
-    binder_held.erase(binder_held.begin(), binder_held.begin() + released);
+    // FEAT-SGT-079: with a binder per context, jobs run in order per binder only: every held
+    // draw is looked at.
+    std::erase_if(binder_held, [this](PreparedDraw* draw) {
+        const auto& binder = binders[draw->binder_index];
+        if (binder && !binder->Done(draw->binder_job)) return false;
+        draw->binder_job = 0;
+        FreePrepared(draw);
+        return true;
+    });
 }
 
 void NativeRenderer::FreePrepared(PreparedDraw* draw) {
+    SHADGT_B_TOUCH("FreePrepared"); // DIAG-SGT-089
     // FEAT-SGT-022: a draw whose binds the binder still makes keeps its bindings until then
     // (only the recorder gives back drawn prepared draws; others never had a job).
-    if (draw->binder_job != 0 && binder && !binder->Done(draw->binder_job)) {
+    if (draw->binder_job != 0 && binders[draw->binder_index] &&
+        !binders[draw->binder_index]->Done(draw->binder_job)) {
         binder_held.push_back(draw);
         return;
     }
@@ -20363,7 +21537,56 @@ bool NativeRenderer::HasPrepared(const void* packet) {
     return shard.draws.count(packet) != 0;
 }
 
+const void* NativeRenderer::PreparedAddress(const void* packet) {
+    if (!PrepareScope() || !packet) return nullptr; // as HasPrepared
+    PreparedShard& shard = ShardFor(packet);
+    std::scoped_lock lock{shard.mutex};
+    const auto it = shard.draws.find(packet);
+    return it == shard.draws.end() ? nullptr : static_cast<const void*>(it->second);
+}
+
+bool NativeRenderer::PreparedPrefetchOn() {
+    static const int mode = [] {
+        const char* env = std::getenv("SHADGT_PREPARED_PREFETCH");
+        return env && (env[0] == '1' || env[0] == '2') ? env[0] - '0' : 0;
+    }();
+    return mode == 1 || (mode == 2 && SubmitAbArm().load(std::memory_order_relaxed) == 1);
+}
+
+size_t NativeRenderer::PreparedPrefetchBytes() {
+    return std::min<size_t>(sizeof(PreparedDraw), 4096);
+}
+
+// PERF-SGT-081: what a prepared draw points to and the commit reads (the pictures' records,
+// the regions and mirrors it refreshes, its uploads and vertex state), asked for once the draw
+// is taken: the job thread wrote them on another core, and the commit's first reads of them
+// waited on memory (about 5% of GT7's recorder). The draw is ours here, so its pointers hold.
+void NativeRenderer::PrefetchPreparedParts(const PreparedDraw& p) {
+    const auto ask = [](const void* at, size_t bytes) {
+        const char* const c = static_cast<const char*>(at);
+        for (size_t offset = 0; c && offset < bytes; offset += 64) {
+            _mm_prefetch(c + offset, _MM_HINT_T0);
+        }
+    };
+    const auto ask_all = [&](const auto& v) { ask(v.data(), v.size() * sizeof(v[0])); };
+    ask_all(p.bindings.sampled);
+    ask_all(p.bindings.stored);
+    ask_all(p.uploads);
+    ask_all(p.regions);
+    ask_all(p.mirrors);
+    ask_all(p.image_ranges);
+    ask_all(p.picture_ranges);
+    ask(p.upload_bytes.data(), std::min<size_t>(p.upload_bytes.size(), 1024));
+    if (p.vertex_index) ask(p.vertex_index.get(), 256);
+    constexpr size_t EntryBytes = std::min<size_t>(sizeof(Native::ImageEntry), 512);
+    for (const auto* e : p.bindings.sampled) ask(e, EntryBytes);
+    for (const auto* e : p.bindings.stored) ask(e, EntryBytes);
+    for (const auto& use : p.regions) ask(use.region, 256);
+    for (const auto* m : p.mirrors) ask(m, 256);
+}
+
 const GraphicsPipeline* NativeRenderer::InstallPrepared(PreparedDraw& p) {
+    SHADGT_B_TOUCH("InstallPrepared"); // DIAG-SGT-089
     // As AcquireGraphicsPipeline with the command thread's selection: the stages' user data
     // and flattened user data, the flattened buffers moved in (and the old ones kept here).
     std::array<Rasterizer::SelectedStage, Shader::MaxStageTypes> selected{};
@@ -20391,6 +21614,7 @@ const GraphicsPipeline* NativeRenderer::InstallPrepared(PreparedDraw& p) {
 }
 
 NativeRenderer::PreparedDraw* NativeRenderer::TakePrepared(const void* packet) {
+    SHADGT_B_TOUCH("TakePrepared"); // DIAG-SGT-089
     if (!packet) {
         return nullptr;
     }
@@ -21326,6 +22550,20 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
             continue;
         }
         Native::ImageEntry* entry = registry->Find(desc.info, storage, now_frame, false);
+        // PERF-SGT-093 (SHADGT_PREPARE_WANTED_PICTURES=1): GT7 writes a few small lookup textures
+        // (the light grid) at a new address of its per-frame memory in most frames; the job threads
+        // prepare ahead of the frame's first commit of one, so nearly every draw missed it and the
+        // recorder looked it up again at commit (about 49k a second at Tokyo, DIAG-SGT-092). Such a
+        // texture is asked for here; the recorder makes it at its next draw, in GPU order.
+        if (!entry && !storage && WantedPicturesOn() && desc.info.guest_size != 0 &&
+            desc.info.guest_size <= 1_MB && !desc.info.props.is_depth &&
+            ListedInPlace(desc.info.guest_address, desc.info.guest_size)) {
+            std::scoped_lock wanted_lock{wanted_mutex};
+            if (wanted_pictures.size() < 256) {
+                wanted_pictures.try_emplace(desc.info.guest_address, desc.info);
+                has_wanted_pictures.store(true, std::memory_order_release);
+            }
+        }
         if (!storage && (!entry || entry->needs_upload.load(std::memory_order_relaxed))) {
             warm_upload(desc.info.guest_address, desc.info.guest_size);
         }
@@ -21622,10 +22860,806 @@ bool NativeRenderer::PrepareVertices(PreparedDraw& p, const AmdGpu::Regs& regs,
     return true;
 }
 
+// FEAT-SGT-079 (SHADGT_RECORDER_B=1; =2 on and off in turns every 2 s; off by default): step 1 of
+// recorder B (plan-multi-recorder.md). A prepared draw's commit runs in two parts: first what a
+// second recorder could do for it on its own thread (the checks against the change logs, the
+// upload copies: nothing ordered is touched), then what stays with the recorder that owns the
+// ordered state (CPU writes sorted in, the buffers checked again from where the first part
+// checked, missing pictures, region refreshes, the pictures' rewrites and sources, a list begun,
+// the last check). Today the two are interleaved. Uploads copy the job thread's bytes or a
+// stage's flattened buffer, never a region's contents, so they may come before the refreshes.
+static int RecorderBMode() {
+    static const int mode = [] {
+        const char* env = std::getenv("SHADGT_RECORDER_B");
+        return env && env[0] >= '1' && env[0] <= '8' ? env[0] - '0' : 0;
+    }();
+    return mode;
+}
+// FEAT-SGT-079 step 7 (SHADGT_RECORDER_B=7; 8: in arm 1 of the 2 s A/B, the baton in both):
+// recorder B's context records raw secondaries, as parallel recording's pass workers do: from
+// its thread's own list pool, with the driver called on its thread and its bindings made inline
+// (the binder only takes lists on the ring). B then needs neither the command ring, the shared
+// deferred-list pool nor the binder; the recorder still runs its lists in order at the splice.
+static bool RecorderBRawLists() {
+    const int mode = RecorderBMode();
+    return mode == 7 || (mode == 8 && SubmitAbArm().load(std::memory_order_relaxed) == 1);
+}
+// FEAT-SGT-079 step 22 (SHADGT_RECORDER_B_UNLOCKED): recorder B's draws the recorder readied
+// commit their prepared draw read only (they reject it when anything is to be done: the recorder
+// did it at the hand-over). 1: under the renderer's lock; 2: without it (B holds b_pin).
+static int RecorderBUnlocked() {
+    static const int mode = [] {
+        const char* env = std::getenv("SHADGT_RECORDER_B_UNLOCKED");
+        return env && (env[0] == '1' || env[0] == '2') ? env[0] - '0' : 0;
+    }();
+    return mode;
+}
+
+// Step 22b (diagnosis): which of the window's skips run (SHADGT_RECORDER_B_UNLOCKED_SKIP, a mask:
+// 1 CPU writes sorted, 2 regions, 4 pictures, 8 mirrors, 16 in-place ranges; all by default).
+static u32 BWindowSkips() {
+    static const u32 mask = [] {
+        const char* env = std::getenv("SHADGT_RECORDER_B_UNLOCKED_SKIP");
+        return env && *env ? u32(std::strtoul(env, nullptr, 0)) : 15u; // 16 drew glitches
+    }();
+    return mask;
+}
+
+static bool RecorderBSplit() {
+    const int mode = RecorderBMode();
+    return mode == 2 ? SubmitAbArm().load(std::memory_order_relaxed) == 1 : mode != 0;
+}
+
+void NativeRenderer::RecorderBPrepare(void* queued_draw, const AmdGpu::Regs& regs) {
+    using Q = AmdGpu::Liverpool::QueuedDraw;
+    Q& draw = *static_cast<Q*>(queued_draw);
+    const auto started = std::chrono::steady_clock::now();
+    u8 result = Q::Ready;
+    const char* why = nullptr;
+    if (!draw.packet) {
+        result = Q::Refused;
+        why = DiagText("B refused: no packet");
+    } else {
+        // The shard's lock is held through the checks: A's TakePrepared waits, so the
+        // prepared draw stays alive and unchanged while B reads it.
+        PreparedShard& shard = ShardFor(draw.packet);
+        std::scoped_lock lock{shard.mutex};
+        const auto it = shard.draws.find(draw.packet);
+        const PreparedDraw* p = it == shard.draws.end() ? nullptr : it->second;
+        if (!p) {
+            result = Q::NoPrepared;
+        } else if (!PreparedIsForDraw(*p, regs)) {
+            result = Q::Refused;
+            why = DiagText("B refused: prepared for another draw");
+        } else if (p->unmap_gen != unmap_generation.load(std::memory_order_acquire) ||
+                   p->sampler_drops != samplers_dropped.load(std::memory_order_acquire)) {
+            result = Q::Refused;
+            why = DiagText("B refused: unmap");
+        } else if (!registry->UntouchedHolding(p->image_generation, p->image_ranges,
+                                               p->picture_ranges)) {
+            result = Q::Refused;
+            why = DiagText("B refused: pictures");
+        } else if (!PreparedBuffersUntouched(*p, p->buffer_seq)) {
+            result = Q::Refused;
+            why = DiagText("B refused: buffers");
+        }
+    }
+    draw.b_why = why;
+    const auto done = std::chrono::steady_clock::now();
+    draw.b_done_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(done.time_since_epoch())
+                         .count();
+    if constexpr (Common::DiagnosticsBuilt) {
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(done - started).count();
+        NoteSubmitSite(ns < 1'000 ? "B4 cost < 1 us" : ns < 5'000 ? "B4 cost 1-5 us"
+                       : ns < 20'000 ? "B4 cost 5-20 us" : "B4 cost > 20 us", {});
+    }
+    u8 expected = Q::Pending;
+    draw.b_result.compare_exchange_strong(expected, result, std::memory_order_release,
+                                          std::memory_order_relaxed);
+}
+
+const NativeRenderer::PreparedDraw* NativeRenderer::PeekPrepared(const void* packet) {
+    if (!packet) return nullptr;
+    PreparedShard& shard = ShardFor(packet);
+    std::scoped_lock lock{shard.mutex};
+    const auto it = shard.draws.find(packet);
+    return it == shard.draws.end() ? nullptr : it->second;
+}
+
+// FEAT-SGT-079 step 3 (diagnostics): when A starts a run, recorder B looks at its next run in the
+// queue as it would to record it ahead: its own registers brought up to each draw (the deltas
+// applied in order), and for each of its draws a prepared draw that is this draw's
+// (PreparedIsForDraw on B's registers) and still holds (unmap and sampler generations, the
+// pictures' and buffers' change logs). B takes the run when it is queued whole, holds no other
+// job and every draw passes. The draws it took are compared with what A does with them later.
+void NativeRenderer::RecorderBDryRun(u64 key) {
+    if constexpr (!Common::DiagnosticsBuilt) {
+        static_cast<void>(key);
+        return;
+    } else {
+    static thread_local std::vector<std::pair<u64, const AmdGpu::Liverpool::QueuedDraw*>> jobs;
+    r.liverpool->PeekQueuedDraws(jobs, 4096);
+    static thread_local std::vector<const void*> taken;
+    taken.clear();
+    u64 last = key, boundaries = 0, b_draws = 0, a_draws = 0;
+    bool other = false, can = true;
+    const char* why = nullptr;
+    const auto refuse = [&](const char* reason) {
+        if (can) why = reason;
+        can = false;
+    };
+    for (const auto& [tag, draw] : jobs) {
+        if (tag == 0) {
+            if (boundaries >= 4) other = true;
+            continue;
+        }
+        if (tag != last) {
+            ++boundaries;
+            last = tag;
+            if (boundaries >= 8) break;
+        }
+        const AmdGpu::Regs* const regs_b = draw ? r.liverpool->RecorderBRegsAt(*draw) : nullptr;
+        if (boundaries < 4) { // A's run
+            ++a_draws;
+            continue;
+        }
+        ++b_draws;
+        if (!can) continue;
+        if (!draw || !regs_b) { refuse("B refused: registers"); continue; }
+        if (draw->compute) { refuse("B refused: dispatch"); continue; }
+        if (!draw->packet) { refuse("B refused: no packet"); continue; }
+        const PreparedDraw* p = PeekPrepared(draw->packet);
+        if (!p) { refuse("B refused: no prepared draw"); continue; }
+        if (!PreparedIsForDraw(*p, *regs_b)) { refuse("B refused: prepared for another draw"); continue; }
+        if (p->unmap_gen != unmap_generation.load(std::memory_order_acquire) ||
+            p->sampler_drops != samplers_dropped.load(std::memory_order_acquire)) {
+            refuse("B refused: unmap");
+            continue;
+        }
+        if (!registry->UntouchedHolding(p->image_generation, p->image_ranges, p->picture_ranges)) {
+            refuse("B refused: pictures");
+            continue;
+        }
+        if (!PreparedBuffersUntouched(*p, p->buffer_seq)) { refuse("B refused: buffers"); continue; }
+        taken.push_back(draw->packet);
+    }
+    // Draws by outcome (B's run's draws as far as they were queued), every 5 s.
+    static std::map<std::string, u64> draws_by;
+    static auto since = std::chrono::steady_clock::now();
+    const auto outcome = [&](const char* what) {
+        NoteSubmitSite(what, {});
+        draws_by[what] += b_draws;
+        draws_by["(A's runs, queued part)"] += a_draws;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - since >= std::chrono::seconds{5}) {
+            std::string text;
+            for (const auto& [k, v] : draws_by) text += fmt::format(" {}: {};", k, v);
+            LOG_INFO(Render_Vulkan, "FEAT-SGT-079 dry run, draws of B's runs by outcome in 5 s:{} "
+                     "draws and dispatches recorded in all: {}, of them in B's context: {}",
+                     text, b_deal.draws, b_deal.b_draws);
+            b_deal.draws = b_deal.b_draws = 0;
+            draws_by.clear();
+            since = now;
+        }
+    };
+    if (boundaries < 4) {
+        outcome("B run not queued");
+        return;
+    }
+    if (boundaries < 8) {
+        outcome("B run queued in part");
+        return;
+    }
+    if (other) {
+        outcome("B run holds other jobs");
+        return;
+    }
+    if (!can) {
+        outcome(why);
+        return;
+    }
+    outcome("B run taken");
+    for (const void* packet : taken) {
+        NoteSubmitSite("B draw taken", {});
+        b_accepted.insert(packet);
+    }
+    }
+}
+
+// FEAT-SGT-079 step 2 (SHADGT_RECORDER_B=3): runs of 4 passes go in turns to the main context and
+// to recorder B's, still on this thread. A pass starts where a draw's colour and depth targets
+// differ from the draw before (a run of dispatches is one pass). Every hand-over splices the open
+// list, so lists run in recording order and at most one is open (the submit callback's splice
+// then takes it). This checks that B's context records draws as the main one does: its own
+// streams, pipelines and dynamic state, bindings scratch and memos.
+void NativeRenderer::NoteBDrawEnd() {
+    if constexpr (Common::DiagnosticsBuilt) {
+        if (!b_draw_open) return;
+        b_draw_open = false;
+        static constexpr std::array<const char*, size_t(CommitKind::Count)> names{
+            "B draw ordered: region", "B draw ordered: mirror", "B draw ordered: rewrite",
+            "B draw ordered: depth twin", "B draw ordered: sources"};
+        NoteSubmitSite(b_draw_kinds ? "B draw with ordered work" : "B draw without ordered work", {});
+        for (u32 k = 0; k < names.size(); ++k) {
+            if (b_draw_kinds & (1u << k)) NoteSubmitSite(names[k], {});
+        }
+        if (b_draw_kinds && b_pass_first_dirty < 0) b_pass_first_dirty = s32(b_pass_draw);
+        b_draw_kinds = 0;
+        ++b_pass_draw;
+    }
+}
+
+void NativeRenderer::NoteBPassEnd() {
+    if constexpr (Common::DiagnosticsBuilt) {
+        NoteBDrawEnd();
+        if (b_pass_draw == 0) return;
+        const s32 f = b_pass_first_dirty;
+        NoteSubmitSite(f < 0 ? "B pass: no ordered work" : f == 0 ? "B pass: ordered work at draw 0"
+                       : f < 4 ? "B pass: first ordered work at draws 1-3"
+                       : f < 16 ? "B pass: first ordered work at draws 4-15"
+                                : "B pass: first ordered work at draw 16+", {});
+        for (u32 i = 0; i < b_pass_draw; ++i) {
+            NoteSubmitSite(f < 0 ? "B draw in a pass without ordered work"
+                           : s32(i) < f ? "B draw before its pass's first ordered work"
+                                        : "B draw at or after its pass's first ordered work", {});
+        }
+        b_pass_draw = 0;
+        b_pass_first_dirty = -1;
+    }
+}
+
+s64 NativeRenderer::RecorderBTakeFreeNs(s64 now) {
+    if constexpr (Common::DiagnosticsBuilt) {
+        std::scoped_lock lock{mutex};
+        const s64 free = a_seg_from == 0 ? 0 : a_seg_dep_ns >= 0 ? a_seg_dep_ns : now - a_seg_from;
+        if (a_seg_from != 0 && !b_prev_written.empty()) {
+            const s32 f = a_seg_dep;
+            NoteSubmitSite(f < 0 ? "A after B: never needs B's run" : f == 0 ? "A after B: needs it at once"
+                           : f < 4 ? "A after B: needs it after 1-3 draws"
+                           : f < 16 ? "A after B: needs it after 4-15 draws"
+                                    : "A after B: needs it after 16+ draws", {});
+        }
+        a_seg_from = 0;
+        return free;
+    }
+    return 0;
+}
+
+void NativeRenderer::NoteBRunEnd() {
+    if constexpr (Common::DiagnosticsBuilt) {
+        if (b_run_open) { // DIAG-SGT-086: the run's written pictures; the recorder's segment starts
+            b_prev_written.swap(b_run_written);
+            b_run_written.clear();
+            a_seg_from = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+            a_seg_dep_ns = -1;
+            a_seg_draws = 0;
+            a_seg_dep = -1;
+        }
+        NoteBPassEnd();
+        b_pass_key = 0;
+        if (!b_run_open) return;
+        b_run_open = false;
+        const u32 f = b_run_flags;
+        NoteSubmitSite(f == 0 ? "B run clean" : (f & 4) ? "B run: dispatch"
+                       : (f & 2) ? "B run: draw without prepared" : "B run: ordered content only", {});
+        if (f & 1) NoteSubmitSite("B run: has ordered content", {});
+        for (u32 i = 0; i < b_run_draws; ++i) {
+            NoteSubmitSite(f == 0 ? "B draw in a clean run" : "B draw in another run", {});
+        }
+    }
+}
+
+bool NativeRenderer::RecorderBCanTake(const void* packet, bool hoist) {
+    std::scoped_lock lock{mutex};
+    const auto keep = [&](const char* why) {
+        if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite(why, {});
+        return false;
+    };
+    if (!packet) return keep("B draw kept by A: no packet");
+    PreparedDraw* p = nullptr;
+    {
+        PreparedShard& shard = ShardFor(packet);
+        std::scoped_lock shard_lock{shard.mutex};
+        if (const auto it = shard.draws.find(packet); it != shard.draws.end()) p = it->second;
+    }
+    if (!p) return keep("B draw kept by A: no prepared draw");
+    static const bool seen = [] { // FEAT-SGT-079 step 24
+        const char* env = std::getenv("SHADGT_RECORDER_B_SEEN");
+        return env && env[0] == '1';
+    }();
+    if (seen) {
+        const auto it = drawn_pipelines.find(p->pipeline);
+        if (it == drawn_pipelines.end() || it->second == frame) {
+            return keep("B draw kept by A: pipeline first drawn this frame");
+        }
+    }
+    // Its pointers (regions, mirrors, pictures) hold only while nothing they point at went: the
+    // checks CommitPrepared makes first, before any of them is read.
+    const auto still_holds = [&] {
+        return p->unmap_gen == unmap_generation.load(std::memory_order_acquire) &&
+               p->sampler_drops == samplers_dropped.load(std::memory_order_acquire) &&
+               registry->UntouchedHolding(p->image_generation, p->image_ranges, p->picture_ranges) &&
+               PreparedBuffersUntouched(*p, p->buffer_seq);
+    };
+    if (!still_holds()) return keep("B draw kept by A: prepared draw no longer holds");
+    SortRegionWrites(); // the CPU writes up to here, in the command order (the recorder's)
+    if (!PreparedBuffersUntouched(*p, p->buffer_seq)) {
+        return keep("B draw kept by A: prepared draw no longer holds");
+    }
+    if (hoist) { // FEAT-SGT-079 step 16: the draw's ordered work, here, by the recorder
+        u32 did = 0;
+        for (Mirror* m : p->mirrors) {
+            if (m && !m->dirty_pages.empty()) {
+                if (!RefreshMirror(*m)) return keep("B draw kept by A: mirror refresh failed");
+                ++did;
+            }
+        }
+        for (const auto& use : p->regions) {
+            if (use.region && !use.region->dirty_pages.empty()) {
+                RefreshRegion(*use.region, use.address, use.size);
+                ++did;
+            }
+        }
+        for (const auto* stored : p->bindings.stored) {
+            auto& entry = *const_cast<Native::ImageEntry*>(stored);
+            ApplyRewrite(entry);
+            SyncDepthTwin(entry);
+        }
+        for (const auto* sampled : p->bindings.sampled) {
+            auto& entry = *const_cast<Native::ImageEntry*>(sampled);
+            if (entry.from_cpu) registry->LayersRewritten(entry, frame);
+            ApplyRewrite(entry);
+            SyncDepthTwin(entry);
+            RefreshSources(entry);
+        }
+        if constexpr (Common::DiagnosticsBuilt) {
+            if (did) NoteSubmitSite("B draw: refreshes hoisted to A", {});
+        }
+        // The refreshes may have dropped a mirror or region the draw holds: B's commit then
+        // refuses the prepared draw, so the draw stays the recorder's.
+        if (!still_holds()) return keep("B draw kept by A: changed while hoisting");
+    }
+    for (const auto& use : p->regions) { // the pages the draw reads only (as RefreshRegion)
+        if (!use.region || use.region->dirty_pages.empty()) continue;
+        const VAddr begin = Common::AlignDown(std::max(use.address, use.region->begin), 4096);
+        const VAddr end = std::min(use.region->end, use.address + use.size);
+        for (const VAddr page : use.region->dirty_pages) {
+            if (page >= begin && page < end) return keep("B draw kept by A: region");
+        }
+    }
+    for (const Mirror* m : p->mirrors) {
+        if (m && !m->dirty_pages.empty()) return keep("B draw kept by A: mirror");
+    }
+    using Rewrite = Native::ImageEntry::Rewrite;
+    const auto picture_ok = [](const Native::ImageEntry* e) {
+        return !e || (e->rewrite == Rewrite::None && !e->stencil_clear_pending &&
+                      !e->sources_dirty.load(std::memory_order_relaxed));
+    };
+    for (const auto* e : p->bindings.sampled) {
+        if (!picture_ok(e)) return keep("B draw kept by A: picture");
+    }
+    for (const auto* e : p->bindings.stored) {
+        if (!picture_ok(e)) return keep("B draw kept by A: picture");
+    }
+    if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B draw given to B", {});
+    return true;
+}
+
+void NativeRenderer::RecorderBOverlapEnter() {
+    std::scoped_lock lock{mutex};
+    if (main_record_context.stream.list) Splice();
+}
+
+void NativeRenderer::RecorderBPrepareChunk(std::span<const void* const> packets,
+                                           std::span<u8> results) {
+    std::scoped_lock lock{mutex};
+    for (size_t i = 0; i < packets.size() && i < results.size(); ++i) {
+        results[i] = RecorderBPrepareForB(packets[i], false) ? 1 : 2;
+    }
+    if (main_record_context.stream.list) { // the recorder's own work so far, ahead of B's
+        const bool was = b_outstanding.exchange(false, std::memory_order_acq_rel);
+        Splice();
+        b_outstanding.store(was, std::memory_order_release);
+    }
+}
+
+bool NativeRenderer::RecorderBPrepareForB(const void* packet, bool splice) {
+    if (!RecorderBCanTake(packet, false)) return false; // holds, no ordered work (it locks)
+    std::scoped_lock lock{mutex};
+    PreparedDraw* p = nullptr;
+    {
+        PreparedShard& shard = ShardFor(packet);
+        std::scoped_lock shard_lock{shard.mutex};
+        if (const auto it = shard.draws.find(packet); it != shard.draws.end()) p = it->second;
+    }
+    if (!p) return false;
+    // Its pictures' uploads and every pending init, only when there are any (a list each time
+    // made a splice per draw).
+    const auto stale = [&](const Native::ImageEntry* e) {
+        return e && e->from_cpu && registry->UploadDue(*e);
+    };
+    const bool needed = device->PendingImageInit() || registry->HasPendingUploads() ||
+                        std::ranges::any_of(p->bindings.sampled, stale) ||
+                        std::ranges::any_of(p->bindings.stored, stale);
+    if (needed) {
+        Begin();
+        PrepareImages(p->bindings);
+    }
+    if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-092
+        for (const auto* list : {&p->bindings.sampled, &p->bindings.stored}) {
+            for (const auto* e : *list) {
+                if (e) b_pictures.insert(e);
+            }
+        }
+    }
+    for (const auto& missing : p->missing_pictures) { // step 26
+        b_missing_ranges.emplace_back(missing.info.guest_address,
+                                      missing.info.guest_address +
+                                          std::max<u64>(missing.info.guest_size, 1));
+    }
+    if (splice && main_record_context.stream.list) { // the recorder's own work, ahead of B's
+        const bool was = b_outstanding.exchange(false, std::memory_order_acq_rel);
+        Splice();
+        b_outstanding.store(was, std::memory_order_release);
+    }
+    if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B draw prepared by A", {});
+    return true;
+}
+
+bool NativeRenderer::RecorderAOrderedFree(const void* packet) {
+    const auto no = [](const char* why) { // DIAG-SGT-091: why the recorder's draw syncs B
+        if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite(why, {});
+        return false;
+    };
+    if (!packet) return no("A ordered: no packet");
+    std::scoped_lock lock{mutex};
+    PreparedDraw* p = nullptr;
+    {
+        PreparedShard& shard = ShardFor(packet);
+        std::scoped_lock shard_lock{shard.mutex};
+        if (const auto it = shard.draws.find(packet); it != shard.draws.end()) p = it->second;
+    }
+    if (!p) return no("A ordered: no prepared draw");
+    if (p->unmap_gen != unmap_generation.load(std::memory_order_acquire) ||
+        p->sampler_drops != samplers_dropped.load(std::memory_order_acquire) ||
+        !registry->UntouchedHolding(p->image_generation, p->image_ranges, p->picture_ranges) ||
+        !PreparedBuffersUntouched(*p, p->buffer_seq)) {
+        return no("A ordered: prepared draw no longer holds");
+    }
+    // Step 26: a picture the recorder's draw makes now matters only if one of B's handed draws
+    // also looks it up at its commit (it would find it made, with its first contents in the
+    // recorder's list, after B's).
+    // FEAT-SGT-079 step 27: strict by default (any missing picture syncs B). The narrowed test
+    // below (SHADGT_RECORDER_B_STEP23_STRICT=0) drew glitches once B ran at high priority.
+    static const bool strict = [] {
+        const char* env = std::getenv("SHADGT_RECORDER_B_STEP23_STRICT");
+        return !(env && env[0] == '0');
+    }();
+    if (strict && !p->missing_pictures.empty()) return no("A ordered: missing pictures (strict)");
+    for (const auto& missing : p->missing_pictures) {
+        const auto& mi = missing.info;
+        const VAddr begin = mi.guest_address;
+        const VAddr end = begin + std::max<u64>(mi.guest_size, 1);
+        bool shared = false;
+        for (const auto& [b_begin, b_end] : b_missing_ranges) {
+            shared = shared || (begin < b_end && b_begin < end);
+        }
+        if (!shared) continue;
+        // Made already (the job thread's lookup just did not find it): the commit's lookup
+        // finds it and makes nothing.
+        const bool exists = registry->FindExisting(begin, [&](const Native::ImageEntry& e) {
+                                const auto& o = e.info;
+                                return o.guest_address == begin && o.guest_size == mi.guest_size &&
+                                       o.pixel_format == mi.pixel_format && o.type == mi.type &&
+                                       o.size.width == mi.size.width &&
+                                       o.size.height == mi.size.height;
+                            }) != nullptr;
+        if (!exists) return no("A ordered: a picture B also looks up");
+        if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("A ordered: shared lookup, made already", {});
+    }
+    // FEAT-SGT-079 step 29 (SHADGT_RECORDER_B_STEP23_INPLACE=0, diagnosis): the recorder's draw
+    // with ranges read in place goes ahead beside B (B reads such ranges from guest memory).
+    static const bool inplace_syncs = [] { // the user's run with them free: like B off
+        const char* env = std::getenv("SHADGT_RECORDER_B_STEP23_INPLACE");
+        return env && env[0] == '1';
+    }();
+    if (inplace_syncs && !p->in_place.empty()) return no("A ordered: in place");
+    if (device->PendingImageInit()) return no("A ordered: pending init (any)");
+    if (registry->HasPendingUploads()) return no("A ordered: pending upload (any)");
+    if (BWindowWritesPending(*p)) return no("A ordered: CPU writes pending");
+    for (const auto& use : p->regions) {
+        if (!use.region || use.region->dirty_pages.empty()) continue;
+        const VAddr begin = Common::AlignDown(std::max(use.address, use.region->begin), 4096);
+        const VAddr end = std::min(use.region->end, use.address + use.size);
+        for (const VAddr page : use.region->dirty_pages) {
+            if (page >= begin && page < end) return no("A ordered: region dirty");
+        }
+    }
+    for (const Mirror* m : p->mirrors) {
+        if (m && !m->dirty_pages.empty()) return no("A ordered: mirror dirty");
+    }
+    for (const auto* list : {&p->bindings.stored, &p->bindings.sampled}) {
+        for (const auto* e : *list) {
+            if (e && !BWindowPictureClean(*e)) return no("A ordered: picture");
+        }
+    }
+    return true;
+}
+
+void NativeRenderer::RecorderBCommit() {
+    std::scoped_lock lock{mutex};
+    b_missing_ranges.clear(); // step 26: B's handed draws are all recorded
+    b_pictures.clear();       // DIAG-SGT-092
+    if (!b_record_context.stream.list) return;
+    RecordContext* const was = current_context;
+    current_context = &b_record_context; // this thread splices B's list (B is idle)
+    Splice();
+    current_context = was;
+}
+
+void NativeRenderer::RecorderBEnter() {
+    std::scoped_lock lock{mutex};
+    if (current_context != &main_record_context) {
+        return;
+    }
+    if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-084
+        NoteBRunEnd();
+        b_run_flags = 0;
+        b_run_draws = 0;
+        b_run_open = true;
+    }
+    if (Ctx().stream.list) {
+        Splice();
+    }
+    current_context = &b_record_context;
+    if constexpr (Common::DiagnosticsBuilt) {
+        ++b_deal.switches;
+        NoteSubmitSite("recorder B hand-over", {}); // DIAG-SGT-076
+        NoteSubmitSite("recorder B run", {});
+    }
+}
+
+static bool PassGraphOn() { // DIAG-SGT-087
+    if constexpr (!Common::DiagnosticsBuilt) {
+        return false;
+    } else {
+        static const bool on = Common::DiagEnv("SHADGT_DIAG_PASS_GRAPH") != nullptr;
+        return on;
+    }
+}
+
+void NativeRenderer::GraphFrameEnd(s64 now) {
+    if constexpr (Common::DiagnosticsBuilt) {
+        auto& g = graph;
+        if (!g.passes.empty()) {
+            ++g.frames;
+            g.passes_total += g.passes.size();
+            std::vector<std::pair<u64, bool>> cur(g.passes.size());
+            std::unordered_map<u64, bool> occ_now;
+            std::unordered_map<u64, u32> seen;
+            for (u32 i = 0; i < g.passes.size(); ++i) {
+                const auto& p = g.passes[i];
+                const s64 busy = std::max<s64>(p.end - p.start, 0);
+                const s64 slack = std::max<s64>(
+                    (p.consumer < 0 ? now : p.consumer_start) - p.end, 0);
+                cur[i] = {p.key, slack >= 500'000};
+                { // the nth pass with this key, in either of the last two frames
+                    const u64 occ = PassOccurrenceHash(p.key, seen[p.key]++);
+                    occ_now[occ] = slack >= 500'000;
+                    const bool* was = nullptr;
+                    for (const auto& m : g.by_occurrence) {
+                        if (const auto it = m.find(occ); it != m.end()) {
+                            was = &it->second;
+                            break;
+                        }
+                    }
+                    if (was) {
+                        ++g.occ_matched;
+                        if (*was) {
+                            ++g.occ_predicted;
+                            g.occ_predicted_busy_ms += busy / 1e6;
+                            if (slack >= 500'000) {
+                                ++g.occ_hit;
+                                g.occ_hit_busy_ms += busy / 1e6;
+                            }
+                        }
+                    }
+                }
+                if (i < g.last.size()) { // the last frame's pass at this place predicts this one
+                    ++g.compared;
+                    if (g.last[i].first == p.key) {
+                        ++g.same_key;
+                        if (g.last[i].second) {
+                            ++g.predicted;
+                            g.predicted_busy_ms += busy / 1e6;
+                            if (slack >= 500'000) {
+                                ++g.predicted_hit;
+                                g.predicted_hit_busy_ms += busy / 1e6;
+                            }
+                        }
+                    }
+                }
+                g.busy_ms += busy / 1e6;
+                g.overlap_ms += std::min(busy, slack) / 1e6;
+                if (slack >= 1'000'000) {
+                    g.slack1_ms += slack / 1e6;
+                    g.slack1_busy_ms += busy / 1e6;
+                }
+                const s32 gap = p.consumer < 0 ? -1 : p.consumer - s32(i);
+                ++g.consumer_gap[gap < 0 ? 4 : gap <= 1 ? 0 : gap <= 4 ? 1 : gap <= 16 ? 2 : 3];
+            }
+            g.last.swap(cur);
+            g.by_occurrence[1] = std::move(g.by_occurrence[0]);
+            g.by_occurrence[0] = std::move(occ_now);
+            // FEAT-SGT-079 step 17: what the next frame deals to B.
+            auto learned = std::make_shared<std::unordered_set<u64>>();
+            for (const auto& m : g.by_occurrence) {
+                for (const auto& [occ, slack] : m) {
+                    if (slack) learned->insert(occ);
+                }
+            }
+            learned_b.store(std::move(learned), std::memory_order_release);
+        }
+        g.passes.clear();
+        g.last_writer.clear();
+        g.key = 0;
+        if (g.since == 0) g.since = now;
+        if (now - g.since >= 5'000'000'000 && g.frames != 0) {
+            const double f = double(g.frames);
+            LOG_INFO(Render_Vulkan, "DIAG-SGT-087: pass graph, {} frames: {:.1f} passes a frame, "
+                     "recording {:.2f} ms a frame; the sum of min(pass, its output's slack) "
+                     "{:.2f} ms a frame; passes with 1 ms+ slack: {:.2f} ms of recording a frame. "
+                     "First reader of a pass's output: the next pass {}, 2-4 later {}, 5-16 "
+                     "later {}, 17+ later {}, none in the frame {}",
+                     g.frames, g.passes_total / f, g.busy_ms / f, g.overlap_ms / f,
+                     g.slack1_busy_ms / f, g.consumer_gap[0], g.consumer_gap[1],
+                     g.consumer_gap[2], g.consumer_gap[3], g.consumer_gap[4]);
+            LOG_INFO(Render_Vulkan, "DIAG-SGT-087: frame to frame: {:.1f}% of passes have the last "
+                     "frame's key at their place; of those the last frame had at 0.5 ms+ slack, "
+                     "{:.1f}% have it again ({:.2f} of {:.2f} ms of recording a frame)",
+                     g.compared ? 100.0 * g.same_key / g.compared : 0.0,
+                     g.predicted ? 100.0 * g.predicted_hit / g.predicted : 0.0,
+                     g.predicted_hit_busy_ms / f, g.predicted_busy_ms / f);
+            LOG_INFO(Render_Vulkan, "DIAG-SGT-087: by key and occurrence in the last two frames: "
+                     "{:.1f}% of passes matched; of those with 0.5 ms+ slack before, {:.1f}% have it "
+                     "again ({:.2f} of {:.2f} ms of recording a frame)",
+                     g.passes_total ? 100.0 * g.occ_matched / g.passes_total : 0.0,
+                     g.occ_predicted ? 100.0 * g.occ_hit / g.occ_predicted : 0.0,
+                     g.occ_hit_busy_ms / f, g.occ_predicted_busy_ms / f);
+            g.occ_matched = g.occ_predicted = g.occ_hit = 0;
+            g.occ_predicted_busy_ms = g.occ_hit_busy_ms = 0;
+            g.same_key = g.compared = g.predicted = g.predicted_hit = 0;
+            g.predicted_busy_ms = g.predicted_hit_busy_ms = 0;
+            g.frames = g.passes_total = 0;
+            g.busy_ms = g.overlap_ms = g.slack1_ms = g.slack1_busy_ms = 0;
+            g.consumer_gap = {};
+            g.since = now;
+        }
+    }
+}
+
+u64 NativeRenderer::PassOccurrenceHash(u64 key, u32 occurrence) {
+    return XXH3_64bits_withSeed(&key, sizeof(key), occurrence);
+}
+
+void NativeRenderer::LearnedFrameEnd() {
+    if constexpr (Common::DiagnosticsBuilt) {
+        if (!PassGraphOn()) return;
+        std::scoped_lock lock{mutex};
+        graph_eop_frames = true;
+        GraphFrameEnd(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count());
+    }
+}
+
+bool NativeRenderer::LearnedWantsB(u64 occurrence_hash) const {
+    const auto set = learned_b.load(std::memory_order_acquire);
+    return set && set->contains(occurrence_hash);
+}
+
+void NativeRenderer::GraphDraw(bool dispatch, const AmdGpu::Regs& regs) {
+    if constexpr (Common::DiagnosticsBuilt) {
+        auto& g = graph;
+        const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        if (!graph_eop_frames && g.frame != frame) {
+            GraphFrameEnd(now);
+            g.frame = frame;
+        }
+        u64 key = 1;
+        if (!dispatch) {
+            key = XXH3_64bits(&regs.color_buffers, sizeof(regs.color_buffers));
+            key = XXH3_64bits_withSeed(&regs.depth_buffer, sizeof(regs.depth_buffer), key) | 2;
+        }
+        if (g.passes.empty() || key != g.key) {
+            if (!g.passes.empty()) g.passes.back().end = now;
+            g.passes.push_back({.key = key, .start = now, .end = now});
+            g.key = key;
+        }
+        g.passes.back().end = now;
+        ++g.passes.back().draws;
+    }
+}
+
+void NativeRenderer::RecorderBDeal(bool dispatch, const AmdGpu::Regs& regs) {
+    if (PassGraphOn()) GraphDraw(dispatch, regs); // DIAG-SGT-087
+    if (RecorderBMode() < 3) {
+        return;
+    }
+    static const bool overlap = [] { // FEAT-SGT-079 step 19: the contexts are the threads'
+        const char* env = std::getenv("SHADGT_RECORDER_B_OVERLAP");
+        return env && (env[0] == '1' || env[0] == '2');
+    }();
+    if (overlap) {
+        if constexpr (Common::DiagnosticsBuilt) {
+            if (OnRecorderBThread()) NoteSubmitSite("recorder B overlap draw", {});
+        }
+        return;
+    }
+    u64 key = 1;
+    if (!dispatch) {
+        key = XXH3_64bits(&regs.color_buffers, sizeof(regs.color_buffers));
+        key = XXH3_64bits_withSeed(&regs.depth_buffer, sizeof(regs.depth_buffer), key) | 2;
+    }
+    if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-084: B's draws and passes
+        if (OnRecorderBThread()) {
+            if (key != b_pass_key) {
+                NoteBPassEnd();
+                b_pass_key = key;
+            } else {
+                NoteBDrawEnd();
+            }
+            b_draw_open = true;
+        }
+    }
+    auto& d = b_deal;
+    if (d.frame != frame) {
+        d.frame = frame;
+        d.pass = 0;
+        d.key = key;
+    } else if (key != d.key) {
+        ++d.pass;
+        d.key = key;
+    }
+    RecordContext* want = (d.pass / 4) % 2 == 1 ? &b_record_context : &main_record_context;
+    if (const auto* queued = r.liverpool->RunningQueuedDraw()) { // dealt at push
+        want = queued->to_b ? &b_record_context : &main_record_context;
+    }
+    if constexpr (Common::DiagnosticsBuilt) {
+        ++d.draws;
+        d.b_draws += want == &b_record_context;
+    }
+    if (want == current_context) {
+        return;
+    }
+    if constexpr (Common::DiagnosticsBuilt) {
+        if (want == &main_record_context && RecorderBMode() == 3) {
+            RecorderBDryRun(key);
+        }
+    }
+    if constexpr (Common::DiagnosticsBuilt) {
+        if (want == &main_record_context) NoteBRunEnd(); // DIAG-SGT-084
+    }
+    if (Ctx().stream.list) {
+        Splice();
+    }
+    current_context = want;
+    if constexpr (Common::DiagnosticsBuilt) {
+        ++d.switches;
+        NoteSubmitSite("recorder B hand-over", {}); // DIAG-SGT-076
+        if (want == &b_record_context) NoteSubmitSite("recorder B run", {});
+    }
+}
+
 bool NativeRenderer::CommitPreparedVertices(PreparedDraw& p, const GraphicsPipeline& pipeline,
                                             const AmdGpu::Regs& regs, bool is_indexed,
                                             u32 index_offset, bool quad_triangles,
                                             bool trusted) {
+    SHADGT_B_TOUCH("CommitPreparedVertices"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::CommitPrepared}; // DIAG-SGT-023
     // (The ranges were checked with the bindings'.)
     const auto reject = [&] {
@@ -21655,6 +23689,34 @@ bool NativeRenderer::CommitPreparedVertices(PreparedDraw& p, const GraphicsPipel
     }
     // The ordered part: pages the CPU wrote into the mirrors, and the ranges read in place
     // (noted as mirror candidates).
+    if (t_b_window && RecorderBUnlocked() != 0 && BindCommitMode() == 0 &&
+        (BWindowSkips() & 8)) { // step 22b: read only
+        for (Mirror* mirror : p.mirrors) {
+            if (mirror && !mirror->dirty_pages.empty()) {
+                if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B window: mirror", {});
+                return reject();
+            }
+            if (!mirror) continue;
+            // RefreshMirror's first check: a mirror over a CPU thread's stack is never bound.
+            Native::CpuStackRegistry::Lease lease{Native::CpuStacks()};
+            if (!lease.Allowed(mirror->begin, mirror->end)) {
+                if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B window: stack", {});
+                return reject();
+            }
+        }
+        for (Mirror* mirror : p.mirrors) {
+            if (mirror) mirror->used_frame = frame; // kept, as RefreshMirror's callers do
+        }
+        if (!p.in_place.empty()) {
+            if ((BWindowSkips() & 16) || RecorderBUnlocked() == 2) { // mode 2: never MirrorBuffer
+                if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B window: in place", {});
+                return reject();
+            }
+            for (const auto& [address, size] : p.in_place) MirrorBuffer(address, size); // as before
+        }
+        NATIVE_DIAGNOSTIC(++stats.prepared_vertices);
+        return true;
+    }
     for (Mirror* mirror : p.mirrors) {
         if (!RefreshMirror(*mirror)) return reject();
         mirror->used_frame = frame;
@@ -21667,8 +23729,91 @@ bool NativeRenderer::CommitPreparedVertices(PreparedDraw& p, const GraphicsPipel
     return true;
 }
 
+bool NativeRenderer::BWindowWritesPending(const PreparedDraw& p) {
+    if (!has_pending_region_writes.load(std::memory_order_acquire)) return false;
+    const auto over = [&](VAddr begin, VAddr end) {
+        for (const auto& use : p.regions) {
+            if (use.address < end && use.address + use.size > begin) return true;
+        }
+        for (const Mirror* m : p.mirrors) {
+            if (m && m->begin < end && m->end > begin) return true;
+        }
+        // Everything else it reads: its buffers, the mirrors they are bound through, its pictures.
+        for (const auto* list : {&p.buffer_ranges}) {
+            for (const auto& [b, e] : *list) {
+                if (b < end && e > begin) return true;
+            }
+        }
+        for (const auto& [b, e] : p.mirror_ranges) {
+            if (b < end && e > begin) return true;
+        }
+        for (const auto& [b, e] : p.image_ranges) {
+            if (b < end && e > begin) return true;
+        }
+        return false;
+    };
+    std::scoped_lock lock{region_dirty_mutex};
+    for (const auto& [begin, end] : pending_region_writes) {
+        if (over(begin, end)) return true;
+    }
+    for (const auto& [begin, end] : pending_stack_retirements) {
+        if (over(begin, end)) return true;
+    }
+    return false;
+}
+
+bool NativeRenderer::BWindowPictureClean(const Native::ImageEntry& e) {
+    using Rewrite = Native::ImageEntry::Rewrite;
+    const auto no = [](const char* why) {
+        if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite(why, {});
+        return false;
+    };
+    if (e.rewrite != Rewrite::None) return no("B window picture: rewrite");
+    if (e.stencil_clear_pending) return no("B window picture: stencil clear");
+    if (e.sources_dirty.load(std::memory_order_relaxed)) return no("B window picture: sources");
+    if (e.needs_upload.load(std::memory_order_acquire)) return no("B window picture: upload");
+    const auto& info = e.info;
+    if (e.from_cpu) { // RewrittenSmall's and LayersRewritten's (large layered) are the recorder's
+        if (e.gpu_rewritten.load(std::memory_order_relaxed) > e.rewrite_seen) {
+            return no("B window picture: small rewrite");
+        }
+        // LayersRewritten's (large layered): nothing to do once checked this frame with no
+        // change found since, or once the GPU wrote it.
+        if (info.resources.layers >= 16 && info.guest_size > (4ull << 20) &&
+            !e.gpu_backing_written.load(std::memory_order_acquire)) {
+            const auto& shared = *e.layer_hash;
+            if (shared.changed.load(std::memory_order_acquire) ||
+                shared.checked_frame.load(std::memory_order_acquire) != frame) {
+                return no("B window picture: layered");
+            }
+        }
+        return true;
+    }
+    // SyncDepthTwin's: a twin written since.
+    if (!e.image || info.num_samples != 1 || info.props.has_stencil ||
+        (!info.props.is_depth && !LiverpoolToVK::IsFormatDepthCompatible(info.pixel_format))) {
+        return true;
+    }
+    const Native::ImageEntry* twin =
+        registry->FindExisting(info.guest_address, [&](const Native::ImageEntry& other) {
+            const auto& o = other.info;
+            return &other != &e && !other.from_cpu && other.image &&
+                   o.props.is_depth != info.props.is_depth && !o.props.has_stencil &&
+                   o.num_samples == 1 && o.num_bits == info.num_bits &&
+                   o.size.width == info.size.width && o.size.height == info.size.height &&
+                   o.resources.levels == info.resources.levels &&
+                   o.resources.layers == info.resources.layers && o.type == info.type &&
+                   (o.props.is_depth || LiverpoolToVK::IsFormatDepthCompatible(o.pixel_format));
+        });
+    if (!twin) return true;
+    const u64 version = twin->write_version.load(std::memory_order_relaxed);
+    if (version == 0 || version <= e.write_version.load(std::memory_order_relaxed)) return true;
+    return no("B window picture: depth twin");
+}
+
 bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pipeline,
                                     const AmdGpu::Regs& regs, bool trusted) {
+    SHADGT_B_TOUCH("CommitPrepared"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::CommitPrepared}; // DIAG-SGT-023
     Native::SlowCallTrace<8> trace{t_timed, "commit-prepared",
         {"stage-validation", "image-freshness", "sort-cpu-writes", "buffer-freshness",
@@ -21695,9 +23840,25 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     }
     const auto reject = [&](u32 why) {
         NATIVE_DIAGNOSTIC(++stats.prepared_rejected[why]);
+        if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-088
+            if (OnRecorderBThread()) NoteSubmitSite("B: prepared rejected", {});
+        }
         Native::OrderedTiming::NotePrepared(Native::OrderedTiming::PreparedRejected + why);
+        if constexpr (Common::DiagnosticsBuilt) { // FEAT-SGT-079: by arm (DIAG-SGT-076)
+            static constexpr std::array<const char*, 5> names{
+                "prepared rejected pipeline", "prepared rejected user data",
+                "prepared rejected unmap", "prepared rejected images", "prepared rejected buffers"};
+            NoteSubmitSite(why < names.size() ? names[why] : "prepared rejected", {});
+            static constexpr std::array<const char*, 5> a_names{
+                "A: rejected pipeline", "A: rejected user data", "A: rejected unmap",
+                "A: rejected images", "A: rejected buffers"};
+            a_prepared_why = why < a_names.size() ? a_names[why] : "A: rejected";
+        }
         return false;
     };
+    const bool split = RecorderBSplit(); // FEAT-SGT-079
+    // FEAT-SGT-079 step 22b: B's window commits read only (the recorder readied the draw).
+    const bool window = t_b_window && RecorderBUnlocked() != 0 && BindCommitMode() == 0;
     if (p.pipeline != &pipeline) {
         return reject(0);
     }
@@ -21748,7 +23909,12 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         return reject(3);
     }
     trace.Next(2);
-    SortRegionWrites(); // CPU writes since (may drop mirrors)
+    if (!split && !(window && (BWindowSkips() & 1))) {
+        SortRegionWrites(); // CPU writes since (may drop mirrors)
+    } else if (!split && BWindowWritesPending(p)) { // step 22b: read only
+        if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B window: CPU writes", {});
+        return reject(4);
+    }
     trace.Next(3);
     // A successful first scan certifies history through this earlier checkpoint;
     // the second scan must still check every later change. Sampling after the scan is unsafe.
@@ -21760,14 +23926,127 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         static_cast<void>(lost);
         return reject(4);
     }
+    const u64 alignment = r.instance.StorageMinAlignment();
+    const auto upload_all = [&] {
+    p.upload_receipt_incarnation=0;
+    const u64 upload_incarnation=Ctx().stream.upload_incarnation;
+    const bool receipt_requested=trusted && p.proof_context && p.proof_context->Valid(p.proof_mode_state);
+    bool uploads_proven=receipt_requested && upload_incarnation && !p.uploads.empty();
+    for (const auto& upload : p.uploads) {
+        // PERF-GTS-377: already copied by the job thread, when its bytes still stand.
+        if (upload.ahead != ~u64{0} && (upload.flat_stage < 0 || trusted)) {
+            if (vk::DescriptorBufferInfo info; AheadCommit(upload.ahead, upload.size, info)) {
+                p.bindings.buffers[upload.info] = info;
+                uploads_proven = false;
+                if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("upload: copied ahead", {});
+                continue;
+            }
+        }
+        if constexpr (Common::DiagnosticsBuilt) { // FEAT-SGT-079: what B could take over
+            NoteSubmitSite(upload.flat_stage >= 0 ? "upload: flat, by A" : "upload: copied by A", {});
+            NoteSubmitSite(upload.size <= 256 ? "upload bytes <= 256" : upload.size <= 4096
+                           ? "upload bytes 257-4096" : "upload bytes > 4096", {});
+        }
+        bool backing_proven=false;
+        const u8* source = p.upload_bytes.data() + upload.offset;
+        u32 size = upload.size;
+        if (upload.flat_stage >= 0) {
+            source = reinterpret_cast<const u8*>(stages[upload.flat_stage]->flattened_ud_buf.data());
+        }
+        if (upload.flat_stage >= 0) {
+            p.bindings.buffers[upload.info] =
+                UploadFlatData(static_cast<u32>(upload.flat_stage), source, size, receipt_requested?&backing_proven:nullptr);
+        } else {
+            const auto [buffer, offset, data] = Allocate(size, alignment, receipt_requested?&backing_proven:nullptr);
+            std::memcpy(data, source, size);
+            p.bindings.buffers[upload.info] = vk::DescriptorBufferInfo{buffer, offset, size};
+        }
+        uploads_proven=uploads_proven && backing_proven;
+    }
+    if(uploads_proven && Ctx().stream.upload_incarnation==upload_incarnation)
+        p.upload_receipt_incarnation=upload_incarnation;
+    };
+    if (split) {
+        // FEAT-SGT-079: the first part ends with the uploads; the recorder's part begins with
+        // the CPU writes sorted in, and the buffers checked again from the first part's check
+        // (the regions below are used through pointers).
+        trace.Next(5);
+        upload_all();
+        if (window && (BWindowSkips() & 1)) { // step 22b: read only in B's window
+            if (BWindowWritesPending(p)) {
+                if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B window: CPU writes", {});
+                return reject(4);
+            }
+        } else {
+            SortRegionWrites();
+        }
+        if (!PreparedBuffersUntouched(p, recheck_from)) return reject(4);
+    }
     // PERF-GTS-403: the pictures the job thread did not find are looked up again and made
     // now, in GPU order, as BindTextures makes them; the loop over the sampled pictures below
     // then treats them as the others. The keys were made without their views.
     if (!p.missing_pictures.empty()) {
         for (const auto& missing : p.missing_pictures) {
+            // DIAG-SGT-092: what the recorder's missing-picture lookups do while B holds work.
+            const bool trap = Common::DiagnosticsBuilt && !OnRecorderBThread() &&
+                              b_outstanding.load(std::memory_order_acquire);
+            const u64 made_before =
+                trap ? registry->GetStats().created_textures.load(std::memory_order_relaxed) : 0;
             Native::ImageEntry* const entry = registry->Find(missing.info, false, frame);
             if (!entry) {
                 return reject(3); // the recorder's own lookups bind what there is
+            }
+            if constexpr (Common::DiagnosticsBuilt) { // DIAG-SGT-092: why the job thread missed it
+                NoteSubmitSite(entry->made_frame == frame ? "missing at prepare: made this frame"
+                               : entry->made_frame + 1 == frame ? "missing at prepare: made last frame"
+                                                                : "missing at prepare: made earlier",
+                               {});
+                if (entry->made_frame == frame) { // what came before it at that address
+                    const auto& mi = missing.info;
+                    const Native::ImageEntry* older = registry->FindExisting(
+                        mi.guest_address, [&](const Native::ImageEntry& e) {
+                            return &e != entry && e.made_frame < frame &&
+                                   e.info.size.width == mi.size.width &&
+                                   e.info.size.height == mi.size.height &&
+                                   e.info.num_bits == mi.num_bits;
+                        });
+                    NoteSubmitSite(!older ? "missing made this frame: no older picture there"
+                                   : older->reused.load(std::memory_order_relaxed)
+                                       ? "missing made this frame: older one reused (FIX-157)"
+                                   : older->from_cpu != entry->from_cpu
+                                       ? "missing made this frame: older one, other kind"
+                                       : "missing made this frame: older one, not matched",
+                                   {});
+                    NoteSubmitSite(entry->from_cpu ? "missing made this frame: a texture"
+                                                   : "missing made this frame: a target", {});
+                }
+            }
+            if (trap) {
+                const bool made =
+                    registry->GetStats().created_textures.load(std::memory_order_relaxed) != made_before;
+                const VAddr mb = missing.info.guest_address;
+                const VAddr me = mb + std::max<u64>(missing.info.guest_size, 1);
+                bool shared = b_pictures.contains(entry);
+                for (const auto& [bb, be] : b_missing_ranges) shared = shared || (mb < be && bb < me);
+                for (const auto* e : b_pictures) { // the same memory as one of B's pictures
+                    const VAddr eb = e->info.guest_address;
+                    shared = shared || (mb < eb + std::max<u64>(e->info.guest_size, 1) && eb < me);
+                }
+                NoteSubmitSite(made ? (shared ? "A missing (B holds work): made, shared"
+                                              : "A missing (B holds work): made, not shared")
+                                    : (shared ? "A missing (B holds work): found, shared"
+                                              : "A missing (B holds work): found, not shared"),
+                               {});
+                if (shared) { // what its commit is about to do to it
+                    using Rewrite = Native::ImageEntry::Rewrite;
+                    if (entry->rewrite != Rewrite::None) NoteSubmitSite("A missing shared: rewrite", {});
+                    if (entry->stencil_clear_pending) NoteSubmitSite("A missing shared: stencil clear", {});
+                    if (entry->sources_dirty.load(std::memory_order_relaxed)) NoteSubmitSite("A missing shared: sources", {});
+                    if (entry->needs_upload.load(std::memory_order_acquire)) NoteSubmitSite("A missing shared: upload", {});
+                    if (entry->from_cpu) NoteSubmitSite("A missing shared: CPU picture", {});
+                    else NoteSubmitSite("A missing shared: GPU picture", {});
+                    if (!b_pictures.contains(entry)) NoteSubmitSite("A missing shared: other picture, same memory", {});
+                }
             }
             const auto fallback = static_cast<Shader::MipStorageFallbackMode>(missing.fallback);
             for (u32 i = 0; i < missing.bindings; ++i) {
@@ -21797,43 +24076,28 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     }
     // The ordered part, as BindBuffers and BindTextures do it.
     trace.Next(4);
-    for (const auto& use : p.regions) {
-        RefreshRegion(*use.region, use.address, use.size);
-        NATIVE_DIAGNOSTIC(++stats.region_binds);
-    }
-    const u64 alignment = r.instance.StorageMinAlignment();
-    trace.Next(5);
-    p.upload_receipt_incarnation=0;
-    const u64 upload_incarnation=Ctx().stream.upload_incarnation;
-    const bool receipt_requested=trusted && p.proof_context && p.proof_context->Valid(p.proof_mode_state);
-    bool uploads_proven=receipt_requested && upload_incarnation && !p.uploads.empty();
-    for (const auto& upload : p.uploads) {
-        // PERF-GTS-377: already copied by the job thread, when its bytes still stand.
-        if (upload.ahead != ~u64{0} && (upload.flat_stage < 0 || trusted)) {
-            if (vk::DescriptorBufferInfo info; AheadCommit(upload.ahead, upload.size, info)) {
-                p.bindings.buffers[upload.info] = info;
-                uploads_proven = false;
-                continue;
+    if (window && (BWindowSkips() & 2)) { // step 22b: no page the draw reads waits for a refresh
+        for (const auto& use : p.regions) {
+            if (!use.region || use.region->dirty_pages.empty()) continue;
+            const VAddr begin = Common::AlignDown(std::max(use.address, use.region->begin), 4096);
+            const VAddr end = std::min(use.region->end, use.address + use.size);
+            for (const VAddr page : use.region->dirty_pages) {
+                if (page >= begin && page < end) {
+                    if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B window: region", {});
+                    return reject(4);
+                }
             }
         }
-        bool backing_proven=false;
-        const u8* source = p.upload_bytes.data() + upload.offset;
-        u32 size = upload.size;
-        if (upload.flat_stage >= 0) {
-            source = reinterpret_cast<const u8*>(stages[upload.flat_stage]->flattened_ud_buf.data());
+    } else {
+        for (const auto& use : p.regions) {
+            RefreshRegion(*use.region, use.address, use.size);
+            NATIVE_DIAGNOSTIC(++stats.region_binds);
         }
-        if (upload.flat_stage >= 0) {
-            p.bindings.buffers[upload.info] =
-                UploadFlatData(static_cast<u32>(upload.flat_stage), source, size, receipt_requested?&backing_proven:nullptr);
-        } else {
-            const auto [buffer, offset, data] = Allocate(size, alignment, receipt_requested?&backing_proven:nullptr);
-            std::memcpy(data, source, size);
-            p.bindings.buffers[upload.info] = vk::DescriptorBufferInfo{buffer, offset, size};
-        }
-        uploads_proven=uploads_proven && backing_proven;
     }
-    if(uploads_proven && Ctx().stream.upload_incarnation==upload_incarnation)
-        p.upload_receipt_incarnation=upload_incarnation;
+    if (!split) {
+        trace.Next(5);
+        upload_all();
+    }
     trace.Next(6);
     {
     // DIAG-GTS-379: which of the checks each picture gets costs the 1.0 us a draw of this step.
@@ -21841,12 +24105,30 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         {"stored", "last-use", "layers", "rewrite", "depth-twin", "small-rewrite", "sources"}};
     checks.AccumulateInto(stats.image_check_ns, stats.image_check_calls);
     if (t_timed) stats.image_check_pictures += p.bindings.stored.size() + p.bindings.sampled.size();
+    const bool window_pictures = window && (BWindowSkips() & 4);
+    if (window_pictures) { // step 22b: read only; a picture with something to do turns it down
+        for (const auto* list : {&p.bindings.stored, &p.bindings.sampled}) {
+            for (const auto* e : *list) {
+                if (!BWindowPictureClean(*e)) {
+                    if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("B window: picture", {});
+                    return reject(3);
+                }
+            }
+        }
+        for (const auto* list : {&p.bindings.stored, &p.bindings.sampled}) {
+            for (const auto* e : *list) {
+                const_cast<Native::ImageEntry*>(e)->last_use.store(frame, std::memory_order_relaxed);
+            }
+        }
+    }
+    if (!window_pictures)
     for (const auto* stored : p.bindings.stored) {
         auto& entry = *const_cast<Native::ImageEntry*>(stored);
         entry.last_use.store(frame, std::memory_order_relaxed);
         ApplyRewrite(entry); // NAT-120
         SyncDepthTwin(entry); // FIX-212
     }
+    if (!window_pictures)
     for (const auto* sampled : p.bindings.sampled) {
         auto& entry = *const_cast<Native::ImageEntry*>(sampled);
         checks.Next(1);
@@ -21889,6 +24171,7 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     p.bindings.push.quad_sample_mask = fresh.quad_sample_mask;
     NATIVE_DIAGNOSTIC(stats.null_images += p.null_images);
     NATIVE_DIAGNOSTIC(++stats.prepared_used);
+    if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("prepared used", {}); // FEAT-SGT-079
     return true;
 }
 
@@ -22145,6 +24428,7 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
 }
 
 void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
+    SHADGT_B_TOUCH("ApplyRewrite"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::ApplyRewrite}; // DIAG-SGT-023
     registry->QueueUploadForUse(entry);
     using Rewrite = Native::ImageEntry::Rewrite;
@@ -22158,6 +24442,10 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
         entry.image && entry.image->Desc().dim == Native::Rhi::ImageDim::D3) {
         return;
     }
+    if (QueueCommit(CommitKind::ApplyRewrite, &entry)) {
+        return; // PERF-SGT-062: the rewrite stays pending until the commit
+    }
+    if constexpr (Common::DiagnosticsBuilt) NoteCommitWork(CommitKind::ApplyRewrite); // PERF-SGT-062
     auto claim = registry->ClaimRememberedFill(entry);
     bool fill_pending = false; // FIX-SGT-072 (review): the fill is tried again at the next use
     const auto retire_claim = [&] {
@@ -22419,6 +24707,24 @@ void NativeRenderer::DispatchDirect() {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::DispatchTotal}; // DIAG-SGT-023
     YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
+    if constexpr (Common::DiagnosticsBuilt) {
+        if (OnRecorderBThread()) b_run_flags |= 4; // DIAG-SGT-084
+    }
+    if constexpr (Common::DiagnosticsBuilt) PassDiagBegin(false); // DIAG-SGT-061
+    if constexpr (Common::DiagnosticsBuilt) PassAuditBegin(false); // DIAG-SGT-075
+    BindCommitPassBegin(false); // PERF-SGT-062
+    struct PassItemTimer { // DIAG-SGT-061, PERF-SGT-062 (diagnostics builds)
+        NativeRenderer* self;
+        std::chrono::steady_clock::time_point start;
+        ~PassItemTimer() {
+            if (self) self->PassDiagItem(u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - start).count()));
+        }
+    };
+    NativeRenderer* const timed_pass =
+        Common::DiagnosticsBuilt && (PassDiagOn() || BindCommitMode() != 0 || PassAuditOn()) ? this : nullptr;
+    const PassItemTimer pass_timer{timed_pass, timed_pass ? std::chrono::steady_clock::now()
+                                                          : std::chrono::steady_clock::time_point{}};
     AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Dispatches};
 #if !defined(NDEBUG)
     const auto start = std::chrono::steady_clock::now();
@@ -22454,6 +24760,7 @@ void NativeRenderer::DispatchDirect() {
             reinterpret_cast<std::uintptr_t>(pipeline), 0);
 #endif
     const auto& regs = r.liverpool->DrawRegs();
+    RecorderBDeal(true, regs); // FEAT-SGT-079
     MetaClearDispatch(pipeline->GetStage(Shader::SwStage::Compute));
     if (r.FrameDumpActive()) {
         r.FrameDumpDispatch(pipeline->GetStage(Shader::SwStage::Compute), cs_program,
@@ -22957,6 +25264,7 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 }
 
 void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
+    SHADGT_B_TOUCH("ResolveDraw"); // DIAG-SGT-089
     if (UiHires::Enabled()) {
         ResolveUiDisplay(regs.color_buffers[0].Address(), true);
         ResolveUiDisplay(regs.color_buffers[1].Address(), false);
@@ -23506,6 +25814,7 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
     mapping_waiters.fetch_add(1, std::memory_order_acq_rel); // PERF-GTS-368
     std::scoped_lock lock{mutex};
     mapping_waiters.fetch_sub(1, std::memory_order_acq_rel);
+    const BPinWrite pin{*this}; // FEAT-SGT-079 step 22: the drops and the generations together
     trace.Next(4);
     CancelLinearDownloads(address, size);
     if (FaultAheadEnabled() && size != 0) {
@@ -23521,6 +25830,7 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
 u32 NativeRenderer::DropRegionsOver(VAddr address, u64 size, u32 mirror_reason) {
     // NAT-146, FIX-GT7-086: regions over the range go (the device frees their buffers once the
     // GPU is done with them), and the mirrors over it. With `mutex` held. Returns how many.
+    const BPinWrite pin{*this}; // FEAT-SGT-079 step 22
     u32 dropped = 0;
     {
         std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
@@ -23572,6 +25882,7 @@ void NativeRenderer::OnNewMapping(VAddr address, u64 size) {
     mapping_waiters.fetch_add(1, std::memory_order_acq_rel); // PERF-GTS-368
     std::scoped_lock lock{mutex};
     mapping_waiters.fetch_sub(1, std::memory_order_acq_rel);
+    const BPinWrite pin{*this}; // FEAT-SGT-079 step 22: the dirty pages, drops and generations
     CancelLinearDownloads(address, size);
     std::optional<std::vector<Native::MappingRefreshRange>> plan;
     std::unordered_set<VAddr> prepared_pages;
@@ -24373,6 +26684,7 @@ void NativeRenderer::EvictImages() {
             it = owners.empty() ? stencil_owners.erase(it) : std::next(it);
         }
     };
+    const BPinWrite pin{*this}; // FEAT-SGT-079 step 22: pictures go only here
     registry->Evict(frame - KeepFrames, on_evict, [&](Native::ImageEntry& entry) {
         return kept_textures.contains(&entry) || keep(entry) || keep_new_texture(entry);
     }, 16);
@@ -24589,6 +26901,7 @@ static std::array<std::atomic<u64>, 5> g_fault_part_ns{};
 static std::atomic<u64> g_fault_count{};
 
 void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
+    SHADGT_B_TOUCH("OnCpuWrite"); // DIAG-SGT-089
     SnapshotLease::MarkUnsafe(address, std::max<u64>(size, 1), 2);
     // DIAG-194 (diagnosis, SHADGT_DIAG_FAULT_COST=1)
     static const bool timed = [] {
@@ -24797,6 +27110,7 @@ u32 NativeRenderer::ReadGds(u32 gds_offset) {
 }
 
 void NativeRenderer::Splice(std::source_location where) {
+    SHADGT_B_TOUCH("Splice"); // DIAG-SGT-089
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::Splice}; // DIAG-SGT-023
     std::scoped_lock lock{mutex};
     AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Splices};
@@ -24807,6 +27121,20 @@ void NativeRenderer::Splice(std::source_location where) {
             CollectTemporalPictures(r.scheduler.GetWorkSemaphore()->KnownGpuTick());
         }
         return;
+    }
+    if constexpr (Common::DiagnosticsBuilt) AuditCount(AuditSplice); // DIAG-SGT-075
+    if constexpr (Common::DiagnosticsBuilt) NoteSubmitSite("splice", where); // DIAG-SGT-076
+    if constexpr (Common::DiagnosticsBuilt) NoteRecorderBMain("B: splice", where); // DIAG-SGT-082
+    if constexpr (Common::DiagnosticsBuilt) { // FEAT-SGT-079 step 19: should not happen
+        if (!OnRecorderBThread() && &Ctx() == &main_record_context &&
+            b_outstanding.load(std::memory_order_acquire)) {
+            NoteSubmitSite("A splice while B holds work", where);
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_WARNING(Render_Vulkan, "FEAT-SGT-079: the recorder splices its list while recorder "
+                            "B holds handed work (line {})", where.line());
+            }
+        }
     }
     DrainBinder(); // FEAT-SGT-022: its jobs use the list's pools and binds
     // DIAG-SGT-023: only a splice that ends a list drains (the submit callback after
@@ -24850,7 +27178,17 @@ void NativeRenderer::Splice(std::source_location where) {
         }
     }
     if (!wrapped) {
-        r.scheduler.CommandBuffer().executeCommands(s.cmd);
+        if (CommandRing* own = s.cmd.Ring(); own && own != r.scheduler.CommandThreadRing()) {
+            // FEAT-SGT-079 step 9: B's ring up to here (the list's commands and its binds' and
+            // ends') goes into the command order first.
+            ASSERT_MSG(own == b_ring.get(), "FEAT-SGT-079: a list from an unknown ring");
+            const u64 end = own->Recorded();
+            r.scheduler.RecordChunk(own, b_ring_handed, end);
+            b_ring_handed = end;
+            r.scheduler.CommandBuffer().executeCommandsAfterChunk(s.cmd);
+        } else {
+            r.scheduler.CommandBuffer().executeCommands(s.cmd);
+        }
     }
     // PERF-GTS-398: every pass of the list has been recorded: its packets' prepared draws go
     // (at the next draw: a draw that is being recorded may have asked for this splice).
@@ -24876,9 +27214,11 @@ void NativeRenderer::Splice(std::source_location where) {
     const u64 retire_tick = std::max(tick, boundary_signal);
     SealTemporalPictures(retire_tick);
     CollectTemporalPictures(r.scheduler.GetWorkSemaphore()->KnownGpuTick());
+    std::unique_lock owners_lock{retired_owners_mutex}; // FEAT-SGT-079 step 25
     retired_pipeline_owners.Retire(retire_tick);
     retired_pipeline_owners.Collect(r.scheduler.GetWorkSemaphore()->KnownGpuTick(),
         [&](auto owners) { r.pipeline_cache.ReleaseCompletedPipelineOwners(std::move(owners)); });
+    owners_lock.unlock();
     retired_writeback_plans.Retire(s.writeback_plan_leases, retire_tick);
     retired_writeback_plans.Collect(r.scheduler.GetWorkSemaphore()->KnownGpuTick());
     if (auto* direct = r.buffer_cache.GetDirectMemory()) {
@@ -24960,7 +27300,13 @@ void NativeRenderer::Splice(std::source_location where) {
     // have been appended and owner pins have their submission signal.
     if(auto* sidecar=FindParallelRuntime(this);sidecar && sidecar->mode_controller && !sidecar->closing) {
         const u64 signal=boundary_signal;
-        const auto request=sidecar->mode_controller->Requested();
+        auto request=sidecar->mode_controller->Requested();
+        if(Common::DiagEnv("SHADGT_DIAG_PARALLEL_AB")) { // FEAT-SGT-079: on in arm 1 of the 2 s A/B
+            static u64 ab_generation=0;static bool ab_last=true;
+            const bool want=SubmitAbArm().load(std::memory_order_relaxed)==1;
+            if(want!=ab_last){++ab_generation;ab_last=want;}
+            request={ab_generation,want};
+        }
         if(sidecar->ahead_context && !request.enabled) {
             std::scoped_lock ahead_lock{ahead_context_mutex};
             SetAheadMode(*sidecar->ahead_context,false);

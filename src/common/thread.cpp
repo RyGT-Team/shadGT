@@ -1220,4 +1220,13 @@ std::string GetCurrentThreadName() {
 #endif
 }
 
+bool SetCurrentThreadProcessors(u64 mask) { // FEAT-SGT-079 step 27
+#ifdef _WIN32
+    return mask != 0 && SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(mask)) != 0;
+#else
+    (void)mask;
+    return false;
+#endif
+}
+
 } // namespace Common

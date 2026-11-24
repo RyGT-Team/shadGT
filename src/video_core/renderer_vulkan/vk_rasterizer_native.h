@@ -203,6 +203,74 @@ public:
     /// OPT-012: on the command thread, whether a job thread prepared the draw at the packet
     /// (with its stages): then the command thread doesn't select its pipeline.
     bool HasPrepared(const void* packet);
+    /// PERF-SGT-081: the prepared draw kept for `packet` (null: none), as a prefetch hint only:
+    /// it may be taken, freed or replaced at any time after this returns.
+    const void* PreparedAddress(const void* packet);
+    /// PERF-SGT-081 (SHADGT_PREPARED_PREFETCH: 1 on, 2 in arm 1 of the 2 s A/B, else off): the
+    /// recorder asks for a draw's prepared draw a job ahead, and for what it points to once taken.
+    static bool PreparedPrefetchOn();
+    static size_t PreparedPrefetchBytes();
+    /// FEAT-SGT-079 step 4: recorder B's thread, ahead of A, on one of its draws (a
+    /// Liverpool::QueuedDraw): the checks of its prepared draw on B's registers. Sets its
+    /// b_result unless A got there first.
+    void RecorderBPrepare(void* queued_draw, const AmdGpu::Regs& regs);
+    /// FEAT-SGT-079 step 10: the recorder, before it hands one of B's jobs to B's thread: when
+    /// its own context is the current one, it splices its open list and makes B's current, so
+    /// that B's thread never splices (the command order is the recorder's).
+    void RecorderBEnter();
+    /// FEAT-SGT-079 step 19 (late B / overlap): the recorder splices its own open list before
+    /// handing B a job (no context switch: B's thread records into B's context); RecorderBCommit
+    /// splices B's list once B has recorded what it was handed; while B holds handed work, the
+    /// recorder's size and feed splices wait.
+    void RecorderBOverlapEnter();
+    /// FEAT-SGT-079 step 20: the recorder, before it hands B a draw in late B / overlap: when the
+    /// draw's prepared draw holds and needs no ordered work, its pictures are made ready here
+    /// (pending inits, uploads), in the recorder's list, which is spliced at once (ahead of B's).
+    /// False: the recorder keeps the draw.
+    bool RecorderBPrepareForB(const void* packet, bool splice = true);
+    /// FEAT-SGT-079 step 21: the same for the draws of a chunk B is about to get, under one lock
+    /// (1 readied, 2 kept); the recorder's list is spliced once at the end.
+    void RecorderBPrepareChunk(std::span<const void* const> packets, std::span<u8> results);
+    void RecorderBCommit();
+    /// FEAT-SGT-079 step 23: the recorder's own draw (in B's pass, B holding work) needs no
+    /// ordered work: its prepared draw holds, nothing it reads is dirty or due an upload, and no
+    /// init or upload is pending. False: B's work goes in first.
+    bool RecorderAOrderedFree(const void* packet);
+    /// FEAT-SGT-079 step 26 (with `mutex`): the ranges of the pictures B's handed draws had not
+    /// found when they were prepared (B looks them up at its commit); cleared when B's work is in.
+    std::vector<std::pair<VAddr, VAddr>> b_missing_ranges;
+    /// DIAG-SGT-092 (with `mutex`): the pictures B's handed draws bind; cleared with the ranges.
+    std::unordered_set<const Native::ImageEntry*> b_pictures;
+    void SetRecorderBOutstanding(bool on) {
+        b_outstanding.store(on, std::memory_order_release);
+        g_b_outstanding.store(on, std::memory_order_release);
+    }
+    std::atomic<u64> b_mutex_wait_ns{0}; ///< DIAG-SGT-088: B's thread waiting for `mutex` in Draw
+    /// FEAT-SGT-079 step 24 (SHADGT_RECORDER_B_SEEN=1; with `mutex`): the frame each pipeline was
+    /// first drawn with; B gets only draws whose pipeline was drawn with in an earlier frame.
+    std::unordered_map<const void*, u64> drawn_pipelines;
+    /// DIAG-SGT-089 (diagnostics builds, overlap on): the recorder's wait for `mutex` in Draw while B
+    /// holds work, and each thread's (0 recorder, 1 B) time in Draw with the lock held, before and
+    /// in the encode side (DIAG-SGT-023), and its draws.
+    std::atomic<u64> a_mutex_wait_ns{0};
+    std::array<std::array<std::atomic<u64>, 2>, 2> draw_locked_ns{};
+    std::array<std::atomic<u64>, 2> draw_locked_count{};
+    std::atomic<bool> b_outstanding{false};
+    /// DIAG-SGT-086: the recorder's time since B's last run before it first needed what that run
+    /// drew (all of it when it never did), and the segment's counts noted; a new segment starts.
+    s64 RecorderBTakeFreeNs(s64 now);
+    /// FEAT-SGT-079 step 17: the recorder reached the frame's EOP (the learned deal's frames).
+    void LearnedFrameEnd();
+    /// FEAT-SGT-079 step 17: whether the pass with this key-and-occurrence hash goes to B.
+    bool LearnedWantsB(u64 occurrence_hash) const;
+    static u64 PassOccurrenceHash(u64 key, u32 occurrence);
+    /// FEAT-SGT-079 step 14: the recorder, before it hands one of B's draws to B's thread: whether
+    /// B can record it without ordered work (its prepared draw's regions and mirrors hold no CPU
+    /// writes, its pictures no pending rewrite, stencil clear or dirty sources). Else the
+    /// recorder keeps the draw, at its place in the command order.
+    /// FEAT-SGT-079 step 16 (`hoist`): the recorder first does the draw's ordered work itself, at
+    /// this point of the command order (as CommitPrepared's ordered part does), then checks.
+    bool RecorderBCanTake(const void* packet, bool hoist = false);
     /// FIX-GTS-492: whether a prepared draw ends with the command memory it was made from
     /// (SHADGT_PREPARED_LIFETIME=0: it stays until a draw takes it, as before).
     static bool PreparedLifetimeOn();
@@ -1073,8 +1141,21 @@ private:
         }
     };
     static_assert(sizeof(BufferMemo) == 64);
-    u64 buffer_generation = 0;
-    u64 buffer_hard_generation = 0; ///< PERF-GT7-047: what the change log doesn't tell
+    /// PERF-SGT-062: a counter only the recorder writes (under `mutex`) that other threads may
+    /// read: a relaxed atomic, bumped by a load and a store (no locked add on the hot path), read
+    /// as a plain u64.
+    struct RecorderCounter {
+        std::atomic<u64> value{0};
+        operator u64() const {
+            return value.load(std::memory_order_relaxed);
+        }
+        RecorderCounter& operator++() {
+            value.store(value.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+            return *this;
+        }
+    };
+    RecorderCounter buffer_generation;
+    RecorderCounter buffer_hard_generation; ///< PERF-GT7-047: what the change log doesn't tell
     /// OPT-003: what the last lookup can be remembered as (set by GuestBufferLookup).
     enum class MemoKind : u8 { None, Region, Mirror, InPlace };
     /// OPT-004: the mirror the last GuestBuffer bound from (none when it bound anything else).
@@ -1161,8 +1242,9 @@ private:
     /// WIDE-005: this draw is race HUD drawn in pieces; the 16:9 HUD rectangle in the proxy.
     bool hud_spread = false;
     bool menu_ui = false; // WIDE-019 (diagnosis): a menu UI draw, outside races
-    bool widen_flat = false; // WIDE-030: a menu 3D draw, its flattened cameras widened
-    bool widen_3d = false; // WIDE-031: a menu 3D draw, drawn into a narrowed viewport
+    // FEAT-SGT-079 step 25: per recorder thread.
+    static inline thread_local bool widen_flat = false; // WIDE-030: a menu 3D draw, its flattened cameras widened
+    static inline thread_local bool widen_3d = false; // WIDE-031: a menu 3D draw, drawn into a narrowed viewport
     vk::Rect2D hud_rect{};
     vk::Image hud_image{};      // WIDE-022: the proxy a menu draw goes into (null: the UI layer)
     vk::Extent2D hud_size{};
@@ -1213,6 +1295,33 @@ private:
     u64 ReuseGeneration() const;
     void BindStages(std::span<const Shader::Info* const> stages, const AmdGpu::Regs& regs,
                     bool compute, DrawBindings& b);
+    /// PERF-SGT-062: BindStages as it always was: every state change done where binding asks.
+    void BindStagesNow(std::span<const Shader::Info* const> stages, const AmdGpu::Regs& regs,
+                       bool compute, DrawBindings& b);
+    /// PERF-SGT-062 (SHADGT_BIND_COMMIT): bind with the content-only work queued, then commit it
+    /// in order; on a failed check the queue is dropped and the work binds again at once.
+    void BindStagesCommitted(std::span<const Shader::Info* const> stages, const AmdGpu::Regs& regs,
+                             bool compute, DrawBindings& b);
+    /// PERF-SGT-062: whether bind-then-commit runs for the next work (the switch, or its arm in
+    /// the alternating mode).
+    bool BindCommitOn();
+    /// PERF-SGT-062: while binding queues, puts the op in the commit list (true: queued, the
+    /// caller does nothing now).
+    enum class CommitKind : u8 { RefreshRegion, RefreshMirror, ApplyRewrite, SyncDepthTwin,
+                                 RefreshSources, Count };
+    bool QueueCommit(CommitKind kind, void* target, VAddr address = 0, u64 size = 0);
+    /// PERF-SGT-062 (diagnostics builds): counts an op that does work, queued or not.
+    void NoteCommitWork(CommitKind kind);
+    /// PERF-SGT-062: a pass starts (render scope or dispatch run): the generations binding sees.
+    void BindCommitPassBegin(bool render);
+    u64 PassDiagMutations() const;     ///< DIAG-SGT-061 (diagnostics builds)
+    void PassDiagBegin(bool render);   ///< DIAG-SGT-061: a render scope or a dispatch run starts
+    void PassDiagItem(u64 ns);         ///< DIAG-SGT-061: a draw or dispatch's recorder time
+    void PassDiagSampled(const DrawBindings& b); ///< DIAG-SGT-061: sampled pictures of a draw
+    void PassDiagWritten(const void* entry);     ///< DIAG-SGT-061: a picture written by this pass
+    bool PassDiagOn() const;           ///< DIAG-SGT-061
+    void PassAuditBegin(bool render); ///< DIAG-SGT-075 (diagnostics builds): a pass starts
+    void PassAuditDraw(u64 ns);       ///< DIAG-SGT-075: a draw or dispatch ended
     /// FIX-GT7-090: BindStages again when a region made while binding took in one an earlier
     /// binding of the same draw or dispatch was given (its writes would go to the old buffer).
     void BindStagesStable(std::span<const Shader::Info* const> stages, const AmdGpu::Regs& regs,
@@ -1609,6 +1718,7 @@ private:
         /// FEAT-SGT-022: the last binder job binding from this draw's bindings (0: none); the
         /// draw is given back only once that job has run.
         u64 binder_job = 0;
+        u8 binder_index = 0; ///< FEAT-SGT-079: which context's binder took that job
         const GraphicsPipeline* pipeline = nullptr;
         std::shared_ptr<const void> pipeline_keepalive;
         std::atomic<std::shared_ptr<void>> ahead_descriptor_lease;
@@ -1773,6 +1883,18 @@ private:
     /// OPT-010: regions and mirrors are added and removed under it (exclusive); job threads
     /// look regions up under it (shared).
     std::shared_mutex buffer_map_mutex;
+    /// FEAT-SGT-079 step 22: what a prepared draw points at (regions, mirrors, pictures, samplers)
+    /// stays while recorder B holds this shared, over a draw it records without `mutex`. Whatever
+    /// drops them takes it exclusively, with the generation bumps B re-checks (BPinWrite). Taken
+    /// before buffer_map_mutex; B never waits for `mutex` while holding it.
+    std::shared_mutex b_pin;
+    struct BPinWrite {
+        explicit BPinWrite(NativeRenderer& renderer);
+        ~BPinWrite();
+        BPinWrite(const BPinWrite&) = delete;
+        BPinWrite& operator=(const BPinWrite&) = delete;
+        NativeRenderer* held = nullptr; ///< null when this thread already held it
+    };
     struct PreparedShard {
         std::mutex mutex;
         /// PERF-SGT-034: a flat map (the node map's find and erase were about 2.5% of the GT7
@@ -1819,8 +1941,8 @@ private:
     std::vector<PreparedDraw*> late_bound_done; ///< recorded: given back at the next draw
     /// FEAT-SGT-022 (recorder): prepared draws whose binds the binder still makes, and the
     /// prepared draw the current draw binds from.
-    std::vector<PreparedDraw*> binder_held;
-    PreparedDraw* binding_prepared = nullptr;
+    static inline thread_local std::vector<PreparedDraw*> binder_held; // FEAT-SGT-079 step 25: per thread
+    static inline thread_local PreparedDraw* binding_prepared = nullptr;
     void ReleaseBinderHeld();
     /// FIX-GTS-393: the recorder, for parallel recording: whether `info` (buffer info
     /// `info_index` of the prepared draw) binds bytes of the arena that hold until the GPU ran
@@ -1829,6 +1951,7 @@ private:
                        const vk::DescriptorBufferInfo& info);
     /// The prepared draw for the packet, taken out of the table (none if there is none).
     PreparedDraw* TakePrepared(const void* packet);
+    void PrefetchPreparedParts(const PreparedDraw& p); ///< PERF-SGT-081
     bool PrepareBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs,
                         Shader::Backend::Bindings& binding, PreparedDraw& p);
     bool PrepareTextures(const Shader::Info& stage, const AmdGpu::Regs& regs,
@@ -1853,6 +1976,12 @@ private:
                                                              PreparedDraw& p);
     /// Recorder: whether the prepared draw holds for the draw being recorded (its ordered part
     /// is then done).
+    /// FEAT-SGT-079 step 22b: in B's window, a picture needs nothing done before the draw (no
+    /// rewrite, stencil clear, upload, sources, depth twin, layer or small rewrite): read only.
+    bool BWindowPictureClean(const Native::ImageEntry& entry);
+    /// Step 22b: a CPU write (or stack retirement) not sorted in yet lies over memory the prepared
+    /// draw reads through a region or mirror (SortRegionWrites would make work of it).
+    bool BWindowWritesPending(const PreparedDraw& p);
     bool CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pipeline,
                         const AmdGpu::Regs& regs, bool trusted);
     /// OPT-012: installs the prepared draw's stages for its pipeline (nullptr if they don't
@@ -1945,10 +2074,118 @@ private:
         Region* memo_region = nullptr;
         Mirror* memo_mirror = nullptr;
         Mirror* last_mirror = nullptr;
+        /// PERF-SGT-062 (SHADGT_BIND_COMMIT): the commit list of the work being bound. Binding
+        /// queues the work that changes only contents (region and mirror page copies, picture
+        /// rewrites, depth-twin and source copies: the handles bound stay the same) and the
+        /// commit does it in the order it was asked for, before the work's commands. Work that
+        /// makes or drops something (regions, mirrors, pictures) is still done where binding asks;
+        /// a change of the generations below after the first queued op fails the commit check.
+        struct CommitOp {
+            CommitKind kind;
+            void* target;
+            VAddr address;
+            u64 size;
+        };
+        struct BindCommit {
+            bool queueing = false;
+            bool armed = false; ///< generations taken at the first queued op
+            bool dispatch_run = false; ///< the current pass is a run of dispatches
+            bool binding = false; ///< DIAG-SGT-075 (diagnostics builds): inside BindStages
+            u64 buffer_generation = 0, hard_generation = 0, registry_generation = 0,
+                unmap_generation = 0;
+            std::vector<CommitOp> ops;
+            /// The generations when the current pass started (what a recorder binding the pass
+            /// ahead would bind under), and when the pass before it started.
+            std::array<u64, 3> pass_generations{}, previous_pass_generations{};
+        } commit;
     };
     /// A plain member, not behind a pointer: Ctx() then compiles to what the members did (a
     /// unique_ptr adds a load on every access and keeps the members out of registers).
     RecordContext main_record_context;
+    /// FEAT-SGT-079 step 2 (SHADGT_RECORDER_B=3): recorder B's own context (streams, lists,
+    /// bindings scratch, memos). On the recorder thread for now: runs of passes are dealt to it
+    /// and its list is spliced in order at each hand-over.
+    RecordContext b_record_context;
+    RecordContext* current_context = &main_record_context;
+    /// FEAT-SGT-079 (SHADGT_RECORDER_B_RING): recorder B's own command ring for its context's
+    /// lists, and how far of it has been put into the command order (at B's splices).
+    std::unique_ptr<CommandRing> b_ring;
+    u64 b_ring_handed = 0;
+    struct RecorderBDealState {
+        u64 frame = ~u64{0};
+        u64 pass = 0;
+        u64 key = 0;
+        u64 switches = 0, b_draws = 0, draws = 0; // diagnostics
+    } b_deal;
+    /// DIAG-SGT-084 (diagnostics builds): what B's open run did that it could not throw away
+    /// and leave to the recorder: 1 ordered content work (refreshes, rewrites), 2 a draw without
+    /// its prepared draw, 4 a dispatch; b_run_open while a run is B's.
+    u32 b_run_flags = 0;
+    /// DIAG-SGT-084, per draw of B's: the kinds of ordered work the open draw did (a bit per
+    /// CommitKind), its index in its pass, the pass's first draw with ordered work (-1: none).
+    u32 b_draw_kinds = 0;
+    bool b_draw_open = false;
+    u32 b_pass_draw = 0;
+    s32 b_pass_first_dirty = -1;
+    /// DIAG-SGT-086 (diagnostics builds): the pictures B's open run draws into or stores to, the
+    /// last finished run's, and the recorder's work after it up to its first draw or dispatch
+    /// that samples or draws into one of them (the time it could run ahead of B).
+    std::unordered_set<const void*> b_run_written, b_prev_written;
+    s64 a_seg_from = 0, a_seg_dep_ns = -1;
+    u32 a_seg_draws = 0;
+    s32 a_seg_dep = -1;
+    /// DIAG-SGT-087 (diagnostics builds, SHADGT_DIAG_PASS_GRAPH=1): the frame's passes (a pass
+    /// starts where the targets differ from the draw before; a run of dispatches is one), the
+    /// pictures each writes, and the first later pass reading or writing them: how long each
+    /// pass's output waits before it is needed (its slack), so how much of the frame a second
+    /// recorder could take without the first waiting on it.
+    struct GraphPass {
+        u64 key = 0;
+        s64 start = 0, end = 0;
+        u32 draws = 0;
+        s32 consumer = -1;
+        s64 consumer_start = 0;
+    };
+    struct {
+        u64 frame = ~u64{0};
+        u64 key = 0;
+        std::vector<GraphPass> passes;
+        std::unordered_map<const void*, u32> last_writer;
+        s64 since = 0;
+        u64 frames = 0, passes_total = 0;
+        double busy_ms = 0, overlap_ms = 0, slack1_ms = 0, slack1_busy_ms = 0;
+        std::array<u64, 5> consumer_gap{}; ///< next pass, 2-4, 5-16, 17+, never
+        /// The last frame's passes (key, slack >= 0.5 ms) and how well they predict this one's.
+        std::vector<std::pair<u64, bool>> last;
+        /// (key, its occurrence in the frame) -> slack >= 0.5 ms, for the last two frames.
+        std::array<std::unordered_map<u64, bool>, 2> by_occurrence;
+        u64 occ_matched = 0, occ_predicted = 0, occ_hit = 0;
+        double occ_predicted_busy_ms = 0, occ_hit_busy_ms = 0;
+        u64 same_key = 0, compared = 0, predicted = 0, predicted_hit = 0;
+        double predicted_busy_ms = 0, predicted_hit_busy_ms = 0;
+    } graph;
+    void GraphDraw(bool dispatch, const AmdGpu::Regs& regs);
+    /// FEAT-SGT-079 step 17 (the learned deal, with SHADGT_DIAG_PASS_GRAPH): the passes, by key
+    /// and occurrence, whose output waited 0.5 ms+ in either of the last two frames (frames end
+    /// at the recorder's EOP), for the command thread's deal.
+    std::atomic<std::shared_ptr<const std::unordered_set<u64>>> learned_b;
+    bool graph_eop_frames = false;
+    void GraphFrameEnd(s64 now);
+    u64 b_pass_key = 0;
+    void NoteBDrawEnd();
+    void NoteBPassEnd();
+    u32 b_run_draws = 0;
+    bool b_run_open = false;
+    void NoteBRunEnd();
+    /// FEAT-SGT-079: at a draw's or dispatch's start, before anything is recorded for it: the
+    /// context its run of passes is dealt to (a hand-over splices the open list first).
+    void RecorderBDeal(bool dispatch, const AmdGpu::Regs& regs);
+    /// FEAT-SGT-079 step 3 (diagnostics): recorder B's dry run of its next run, from the queue.
+    void RecorderBDryRun(u64 key);
+    std::unordered_set<const void*> b_accepted; ///< packets B's dry run took (diagnostics)
+    static inline thread_local const char* a_prepared_why = nullptr; ///< FEAT-SGT-079 (diagnostics): why A's draw went without
+    /// FEAT-SGT-079: the prepared draw for a packet, left where it is (null: none).
+    const PreparedDraw* PeekPrepared(const void* packet);
     /// FEAT-SGT-022: the bindings scratch for the next draw or dispatch (a slot no binder job
     /// still reads).
     DrawBindings& NextBindings();
@@ -1962,15 +2199,29 @@ private:
         BindInputs inputs{};
     };
     static void RunBindJob(void* owner, BindJob& job, CommandRing& ring);
-    /// FEAT-SGT-022 (SHADGT_RECORDER_BINDER=1): the binder thread; null when off.
-    std::unique_ptr<Native::RecorderBinder<BindJob>> binder;
+    /// FEAT-SGT-022 (SHADGT_RECORDER_BINDER=1): the binder threads; null when off.
+    /// FEAT-SGT-079: one per record context (0: the main one, 1: recorder B's). A binder has one
+    /// producer, and its placeholders replay in its jobs' order from its context's lists.
+    std::array<std::unique_ptr<Native::RecorderBinder<BindJob>>, 2> binders;
+    u8 ContextIndex() const {
+        return &Ctx() == &b_record_context ? 1 : 0;
+    }
+    Native::RecorderBinder<BindJob>* CtxBinder() const {
+        return binders[ContextIndex()].get();
+    }
+    bool AnyBinder() const {
+        return binders[0] || binders[1];
+    }
     /// FEAT-SGT-022: waits until the binder made every bind handed to it (before the recorder
     /// changes what its jobs read: splices, stream swaps, evictions, dropped samplers).
+    /// FEAT-SGT-079: every context's binder.
     void DrainBinder() const {
-        if (!binder) return;
+        if (!AnyBinder()) return;
         namespace OT = Native::OrderedTiming;
         const std::uint64_t from = OT::Enabled() ? OT::Ticks() : 0;
-        binder->Drain();
+        for (const auto& binder : binders) {
+            if (binder) binder->Drain();
+        }
         if (OT::Enabled()) {
             OT::NoteBinder(OT::BinderDrains);
             OT::NoteBinder(OT::BinderWaitTicks, OT::Ticks() - from);
@@ -1979,14 +2230,17 @@ private:
     /// FEAT-SGT-022: 1 binder thread, 2 the same with a drain after every job (serial, to tell
     /// a wrong hand-off from a race), 0 off.
     int binder_mode = 0;
+    // FEAT-SGT-079 step 11: the current context is the thread's: recorder B's thread always
+    // records into B's; `current_context` is the recorder's (A's) thread's, which it points at
+    // B's while B has the run (and splices B's list from there at the hand-back).
     RecordContext& Ctx() {
-        return main_record_context;
+        return OnRecorderBThread() ? b_record_context : *current_context;
     }
     static bool BufferOrderOn(); ///< PERF-SGT-120
     static u64 BufferOrderHash(const std::array<u64, 3>& key);
     void BufferOrderFrame(); ///< PERF-SGT-120: at the frame's end
     const RecordContext& Ctx() const {
-        return main_record_context;
+        return OnRecorderBThread() ? b_record_context : *current_context;
     }
     u64 frame = 0;
     u64 timing_tick = 0; ///< OPT-001
@@ -2030,6 +2284,7 @@ private:
     Native::RetiredSnapshotPool<Native::Rhi::Buffer> snapshot_pool;
     Native::RetiredWritebackPlans retired_writeback_plans;
     PipelineOwnerRetirement retired_pipeline_owners;
+    std::mutex retired_owners_mutex; ///< FEAT-SGT-079 step 25: B holds owners without `mutex`
     std::deque<Chunk> retiring_chunks;
     std::vector<vk::DescriptorPool> free_pools;
     std::deque<std::pair<u64, vk::DescriptorPool>> retiring_pools;
@@ -2090,6 +2345,12 @@ private:
         u64 features = 0;
     };
     std::mutex recycle_mutex; ///< taken after views_mutex when both are held
+    /// PERF-SGT-093 (SHADGT_PREPARE_WANTED_PICTURES=1): per-frame textures the job threads did not
+    /// find, by address; the recorder makes them at its next draw, in GPU order.
+    std::mutex wanted_mutex;
+    std::unordered_map<VAddr, VideoCore::ImageInfo> wanted_pictures;
+    std::atomic<bool> has_wanted_pictures{false};
+    static bool WantedPicturesOn();
     std::unordered_map<u64, u64> recycle_keys; ///< image handle -> shape key
     /// shape key -> its free images, oldest first: taken in the order they came back, so the
     /// images of a shape go round in a fixed order (and those of several shapes in step).

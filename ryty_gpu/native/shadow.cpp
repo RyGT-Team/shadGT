@@ -24,6 +24,7 @@
 #include <fmt/format.h>
 #include <xxhash.h>
 
+#include "common/diagnostics.h"
 #include "common/logging/log.h"
 #include "ryty_gpu/native/job_walker.h"
 #include "ryty_gpu/native/shadow.h"
@@ -1140,11 +1141,26 @@ void GiveBack(std::unique_ptr<State> state) {
     }
 }
 
+// FEAT-SGT-079 (diagnostics builds, SHADGT_DIAG_PREPARE_WORKERS_AB=<n>): workers from index n on
+// take no jobs in arm 0 of the 2 s A/B, for comparing n workers with all of them in one drive.
+u32 PrepareWorkersAb() {
+    static const u32 n = [] {
+        const char* env = Common::DiagEnv("SHADGT_DIAG_PREPARE_WORKERS_AB");
+        return env && *env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : ~0u;
+    }();
+    return n;
+}
+
 void PrepareWorker(u32 index) {
     const std::wstring name = L"shadGT:Prepare" + std::to_wstring(index);
     SetThreadDescription(GetCurrentThread(), name.c_str());
     auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (true) {
+        if (index >= PrepareWorkersAb() &&
+            Vulkan::SubmitAbArm().load(std::memory_order_relaxed) == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
         QueuedJob item;
         {
             std::unique_lock lock{g_queue_mutex};

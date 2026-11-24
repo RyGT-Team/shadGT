@@ -23,6 +23,9 @@ enum class ThreadPriority : u32 {
 void SetCurrentThreadRealtime(std::chrono::nanoseconds period_ns);
 
 void SetCurrentThreadPriority(ThreadPriority new_priority);
+/// FEAT-SGT-079 step 27: the calling thread runs only on the logical processors in `mask`
+/// (Windows; elsewhere nothing). False when it could not be set.
+bool SetCurrentThreadProcessors(u64 mask);
 
 void SetCurrentThreadName(const char* name);
 

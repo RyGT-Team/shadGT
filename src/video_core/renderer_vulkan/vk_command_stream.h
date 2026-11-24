@@ -355,6 +355,15 @@ public:
         Call([at](vk::CommandBuffer cmd) { cmd.executeCommands(*at); });
     }
 
+    /// FEAT-SGT-079: as executeCommands, for a list recorded through another ring whose
+    /// commands this ring replays first (Scheduler::RecordChunk): its slot is read when this
+    /// command is replayed, after the chunk that made the list.
+    void executeCommandsAfterChunk(const CmdBuf& secondary) const {
+        ASSERT_MSG(secondary.slot, "FEAT-SGT-079: a list without a slot");
+        const vk::CommandBuffer* at = secondary.slot;
+        Call([at](vk::CommandBuffer cmd) { cmd.executeCommands(*at); });
+    }
+
     /// PERF-GT7-018: ends the command buffer (the ring's lists end where they are replayed).
     void end() const {
         Call([](vk::CommandBuffer cmd) { static_cast<void>(cmd.end()); });

@@ -18,6 +18,11 @@
 #include "common/native_thread_priority.h"
 #include "video_core/buffer_cache/direct_memory.h"
 #include "video_core/amdgpu/draw_pipe.h"
+#include "common/diagnostics.h"
+
+namespace Vulkan {
+std::atomic<int>& SubmitAbArm(); // DIAG-SGT-076 (vk_scheduler.cpp)
+}
 
 #ifdef RYTY_GPU
 namespace Vulkan {
@@ -131,10 +136,102 @@ DrawPipe::DrawPipe(std::function<void()> thread_init_, size_t max_pending_,
             stage = std::jthread{[this](std::stop_token stop) { RunStage(stop); }};
         }
     }
+    // PERF-SGT-077 (SHADGT_SELECT_STAGE=1, off by default): pipeline selection, about half of the
+    // command thread's time in GT7 races, runs on a thread of its own between the command thread
+    // and the recorder. =2: on and off in turns every 2 s (an A/B in one drive). Not with the
+    // buffer stage (it needs the selection when the job is pushed).
+    if (const char* env = std::getenv("SHADGT_SELECT_STAGE");
+        env && (env[0] == '1' || env[0] == '2') && !stage_enabled) {
+        select_mode = env[0] - '0';
+        select_enabled = true;
+        select_thread = std::jthread{[this](std::stop_token stop) { RunSelect(stop); }};
+        while (select_id.load(std::memory_order_acquire) == std::thread::id{}) {
+            std::this_thread::yield();
+        }
+    }
+}
+
+bool DrawPipe::SelectHere() {
+    if (select_mode == 1) return true;
+    // In turns: the arm only changes while nothing is in the stage, so jobs stay in order.
+    return Vulkan::SubmitAbArm().load(std::memory_order_relaxed) == 1 ||
+           select_inflight.load(std::memory_order_acquire) != 0;
+}
+
+void DrawPipe::PushSelected(Work&& select, Work&& work, const void* const* hint) {
+    if (!select_enabled || !SelectHere()) {
+        if (select) select();
+        if (hint && *hint) work.SetPrefetchHint(0, *hint, 960);
+        Push(std::move(work), JobKind::Barrier);
+        return;
+    }
+    {
+        std::scoped_lock lk{mutex};
+        exclusive = false;
+        ++pushed;
+        pushed_jobs.store(pushed, std::memory_order_release);
+        ++stats.pushed;
+    }
+    std::unique_lock lk{select_mutex};
+    if (select_queue.size() >= max_pending) {
+        select_space_cv.wait(lk, [this] { return select_queue.size() < max_pending; });
+    }
+    select_inflight.fetch_add(1, std::memory_order_acq_rel);
+    select_queue.push_back(SelectJob{std::move(select), std::move(work), hint});
+    if (select_waiting) {
+        select_cv.notify_one(); // only a sleeping select thread needs the wake
+    }
+}
+
+void DrawPipe::RunSelect(std::stop_token stop) {
+    Common::SetCurrentThreadName("shadGT:GpuSelect");
+    Common::PreferPerformanceCores(); // PERF-088
+    if (select_init) select_init();
+    select_id.store(std::this_thread::get_id(), std::memory_order_release);
+    // The command thread pushes thousands of jobs a frame: they are taken in batches, and the
+    // thread spins a little before it sleeps (a wake per job cost more than the selection saved).
+    std::deque<SelectJob> batch;
+    while (true) {
+        for (u32 spins = 0; spins < 4096 && select_inflight.load(std::memory_order_acquire) == 0 &&
+                            !stop.stop_requested();
+             ++spins) {
+            _mm_pause();
+        }
+        {
+            std::unique_lock lk{select_mutex};
+            select_waiting = true;
+            select_cv.wait(lk, stop, [this] { return !select_queue.empty(); });
+            select_waiting = false;
+            if (select_queue.empty()) {
+                return; // stopped
+            }
+            batch.swap(select_queue);
+            select_space_cv.notify_all();
+        }
+        for (auto& job : batch) {
+            if (job.select) {
+                job.select();
+            }
+            if (job.hint && *job.hint) {
+                job.run.SetPrefetchHint(0, *job.hint, 960); // PERF-GT7-126: the selection
+            }
+            Forward(std::move(job.run));
+            select_inflight.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        batch.clear();
+    }
 }
 
 DrawPipe::~DrawPipe() {
     Drain();
+    if (select_enabled) {
+        select_thread.request_stop();
+        {
+            std::scoped_lock lk{select_mutex};
+            select_cv.notify_all();
+        }
+        select_thread.join();
+    }
     if (stage_enabled) {
         stage.request_stop();
         {
@@ -164,6 +261,11 @@ void DrawPipe::Push(Work&& work) {
 }
 
 void DrawPipe::Push(Work&& work, JobKind kind, Prepare&& prepare, Work&& order) {
+    // PERF-SGT-077: behind the jobs in the select stage.
+    if (select_enabled && select_inflight.load(std::memory_order_acquire) != 0) {
+        PushSelected({}, std::move(work));
+        return;
+    }
     if (stage_enabled) {
         {
             std::scoped_lock lk{mutex};
@@ -441,6 +543,38 @@ void DrawPipe::RunDispatcher(std::stop_token stop) {
     }
 }
 
+void DrawPipe::PeekTags(std::vector<u64>& out, size_t max) {
+    out.clear();
+    if (!OnRecorderThread()) return;
+    if (running_batch) {
+        for (const auto& work : *running_batch) {
+            if (out.size() >= max) return;
+            out.push_back(work.Tag());
+        }
+    }
+    std::scoped_lock lk{mutex};
+    for (const auto& work : queue) {
+        if (out.size() >= max) return;
+        out.push_back(work.Tag());
+    }
+}
+
+void DrawPipe::PeekJobs(std::vector<std::pair<u64, const void*>>& out, size_t max) {
+    out.clear();
+    if (!OnRecorderThread()) return;
+    if (running_batch) {
+        for (const auto& work : *running_batch) {
+            if (out.size() >= max) return;
+            out.emplace_back(work.Tag(), work.Info());
+        }
+    }
+    std::scoped_lock lk{mutex};
+    for (const auto& work : queue) {
+        if (out.size() >= max) return;
+        out.emplace_back(work.Tag(), work.Info());
+    }
+}
+
 bool DrawPipe::QueueIdle() {
     std::scoped_lock lk{mutex};
     return finished == pushed && !recorder_callback_running;
@@ -448,6 +582,14 @@ bool DrawPipe::QueueIdle() {
 
 void DrawPipe::Drain() {
     if (OnRecorderThread()) {
+        return;
+    }
+    if (OnSelectThread()) {
+        // PERF-SGT-077: the drain would wait for the jobs queued behind this one.
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_ERROR(Render, "PERF-SGT-077: a drain asked for on the select thread was skipped");
+        }
         return;
     }
     std::unique_lock lk{mutex};
@@ -551,6 +693,7 @@ void DrawPipe::Run(std::stop_token stop) {
     auto core_since = std::chrono::steady_clock::now();
 
     std::deque<Work> batch;
+    running_batch = &batch; // FEAT-SGT-079
     while (true) {
 #ifdef RYTY_GPU
         native_priority.Update(Vulkan::NativeModeRequested() && Common::NativeCpuPriorityRequested());
@@ -664,6 +807,7 @@ void DrawPipe::Run(std::stop_token stop) {
                 }
                 batch.front().PrefetchHints();
             }
+            if (before_job) before_job(work.Tag(), work.Info()); // FEAT-SGT-079 step 19
             work();
             ++ran;
 #ifndef NDEBUG

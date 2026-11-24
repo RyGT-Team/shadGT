@@ -717,6 +717,29 @@ bool ImageRegistry::Untouched(u64 since, std::span<const std::pair<VAddr, VAddr>
     return change_count <= changes.size();
 }
 
+bool ImageRegistry::MadeOverSince(u64 since, std::span<const std::pair<VAddr, VAddr>> ranges,
+                                  bool exact) {
+    if (generation.load(std::memory_order_acquire) == since) {
+        return false;
+    }
+    std::scoped_lock lock{changes_mutex};
+    const u64 kept = std::min<u64>(change_count, changes.size());
+    for (u64 i = 0; i < kept; ++i) {
+        const Change& change = changes[(change_count - 1 - i) % changes.size()];
+        if (change.generation <= since) {
+            return false;
+        }
+        if (change.kind != 1) continue;
+        for (const auto& [begin, end] : ranges) {
+            if (exact ? (change.begin == begin && change.end == end)
+                      : (change.begin < end && change.end > begin)) {
+                return true;
+            }
+        }
+    }
+    return change_count > changes.size();
+}
+
 bool ImageRegistry::UntouchedHolding(u64 since, std::span<const std::pair<VAddr, VAddr>> ranges,
                                      std::span<const std::pair<VAddr, VAddr>> held) {
     if (generation.load(std::memory_order_acquire) == since) {

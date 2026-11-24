@@ -1356,6 +1356,7 @@ u32 ImageRegistry::RetireTaken(std::vector<std::unique_ptr<ImageEntry>>& taken,
     {
         std::scoped_lock lock{upload_mutex};
         std::erase_if(pending_uploads, [&](ImageEntry* entry) { return gone.contains(entry); });
+        std::erase_if(retry_uploads, [&](ImageEntry* entry) { return gone.contains(entry); }); // FIX-SGT-140
     }
     if (!taken.empty()) {
         std::vector<std::pair<VAddr, VAddr>> ranges;
@@ -2163,6 +2164,22 @@ bool ImageRegistry::LazyUploads() {
     return true;
 }
 
+// FIX-SGT-140 (RyGT #103): an upload left out because device memory ran out. Its hash was
+// already taken for the bytes it was to upload, and its upload was no longer due: the texture
+// kept its old pixels until the game wrote it again. Its hash is forgotten and it is due again
+// from the next frame on (RecordUploads; retried at every bind in this one, each try would fail
+// again).
+static void ForgetUploadedHash(ImageEntry& entry) {
+    entry.content_hash = 0;
+    static std::atomic<u32> logged{};
+    if (const u32 n = logged.fetch_add(1, std::memory_order_relaxed); n < 16 || n % 256 == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-SGT-140: upload of texture {:#x}+{:#x} left for its next use: device "
+                    "memory ran out",
+                    entry.info.guest_address, entry.info.guest_size);
+    }
+}
+
 u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* const> bound,
                                  bool trace_slow_calls) {
     SampleGuestHashCalls hash_sampling{trace_slow_calls};
@@ -2175,6 +2192,24 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
         std::scoped_lock lock{upload_mutex};
         pending.swap(pending_uploads);
     }
+    {
+        // FIX-SGT-140: uploads left out in an earlier frame are due again.
+        std::scoped_lock lock{upload_mutex};
+        const u64 now = upload_frame_now.load(std::memory_order_relaxed);
+        if (!retry_uploads.empty() && retry_uploads_frame != now) {
+            for (ImageEntry* entry : retry_uploads) {
+                entry->needs_upload.store(true, std::memory_order_release);
+                pending.push_back(entry);
+            }
+            retry_uploads.clear();
+        }
+    }
+    const auto retry_later = [&](ImageEntry& entry) { // FIX-SGT-140
+        ForgetUploadedHash(entry);
+        std::scoped_lock lock{upload_mutex};
+        retry_uploads.push_back(&entry);
+        retry_uploads_frame = upload_frame_now.load(std::memory_order_relaxed);
+    };
     // PERF-109: the stale textures the work uses (an entry listed twice is uploaded once).
     for (ImageEntry* entry : bound) {
         if (entry && entry->from_cpu && UploadDue(*entry)) {
@@ -2374,6 +2409,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
                                                    Rhi::BufferUsageTransferSrc,
                                           .memory = Rhi::MemoryKind::Upload});
             if (!source || !source->Mapped()) {
+                retry_later(*entry); // FIX-SGT-140
                 continue;
             }
             // A streamed texture can have unmapped leading mips and resident lower mips.
@@ -2447,6 +2483,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
 #endif
             }
             if (!untile || !params_buffer || !out) {
+                if (untile) retry_later(*entry); // FIX-SGT-140: memory ran out
                 continue;
             }
             // WAR dependency: the preceding copy must finish reading shared scratch
@@ -2714,6 +2751,23 @@ bool ImageRegistry::RecordPartialVolumeFill(Rhi::CommandList& list, ImageEntry& 
     // Also orders this fill's reads of the scratch buffers before the next one's writes.
     list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeCompute | Rhi::ScopeTransfer);
     return true;
+}
+
+bool ImageRegistry::PrepareDownload(ImageEntry& entry, bool batched) {
+    const VideoCore::ImageInfo& info = entry.info;
+    if (!info.props.is_tiled && !info.props.is_bgr_packed_float) {
+        return true; // a plain copy: nothing to make
+    }
+    if (!TilingPipeline(info, true)) {
+        return true; // RecordDownload refuses it for that, not for memory
+    }
+    if (!entry.download_params) {
+        entry.download_params = TilingParamsBuffer(info);
+    }
+    if (!entry.download_params) {
+        return false;
+    }
+    return batched || PrepareTilingScratch(entry, true);
 }
 
 bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, const Rhi::Buffer& out,

@@ -589,8 +589,11 @@ private:
     void ChunkFlushCheck();
 
     /// Upload memory of the stream's list: (buffer, offset, CPU pointer).
-    std::tuple<vk::Buffer, u64, u8*> Allocate(u64 size, u64 align, bool* backing_proven = nullptr);
-    Chunk TakeChunk(u64 size);
+    /// FIX-SGT-140: may_fail, a null buffer and pointer when device memory has run out.
+    std::tuple<vk::Buffer, u64, u8*> Allocate(u64 size, u64 align, bool* backing_proven = nullptr,
+                                              bool may_fail = false);
+    Chunk TakeChunk(u64 size, bool may_fail = false);
+    bool RelieveDeviceMemory(); // FIX-SGT-140
     void TrimIdleChunks();
     vk::DescriptorBufferInfo UploadFlatData(u32 stage, const u8* source, u32 size, bool* backing_proven = nullptr);
     vk::DescriptorPool TakeDescriptorPool();
@@ -2025,6 +2028,8 @@ private:
     }
 
     std::mutex chunk_mutex;
+    /// FIX-SGT-140: the frame RelieveDeviceMemory last waited in.
+    std::atomic<u64> oom_relief_frame{~u64{0}};
     std::vector<Chunk> free_chunks;
     size_t free_chunks_low = 0; // FIX-GT7-046: the fewest free since the last trim
     Native::RetiredSnapshotPool<Native::Rhi::Buffer> snapshot_pool;

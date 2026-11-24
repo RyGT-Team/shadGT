@@ -2182,6 +2182,28 @@ static bool InSmallUnimportedMapping(const VideoCore::DirectMemory& direct, VAdd
 
 static void DecideGtsCpuWritebackNow();
 
+// FIX-SGT-140 (diagnosis, SHADGT_DIAG_OOM_EVERY=<n>, diagnostics builds only): every nth upload
+// chunk a caller can do without, and every nth write-back, fails as if device memory had run
+// out, so the recovery paths run without a full card.
+static bool DiagForcedOutOfMemory() {
+    if constexpr (!Common::DiagnosticsBuilt) {
+        return false;
+    } else {
+        static const u64 every = [] {
+            const char* env = Common::DiagEnv("SHADGT_DIAG_OOM_EVERY");
+            return env && *env ? u64{std::strtoull(env, nullptr, 10)} : u64{0};
+        }();
+        static std::atomic<u64> calls{};
+        return every != 0 && calls.fetch_add(1, std::memory_order_relaxed) % every == every - 1;
+    }
+}
+
+// FIX-SGT-140: out-of-memory lines: the first 16, then one in 256.
+static bool OutOfMemoryLogDue(std::atomic<u32>& logged) {
+    const u32 n = logged.fetch_add(1, std::memory_order_relaxed);
+    return n < 16 || n % 256 == 0;
+}
+
 NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     DecideGtsCpuWritebackNow(); // FIX-GTS-529: before the game sets up its save memory
     SnapshotLease::BackingProtocol::Initialize(r.instance.GetVendorID());
@@ -2245,7 +2267,21 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
                 {"allocate", "mapping", "readable-prefix", "zero-tail", "guarded-copy",
                  "sparse-copy", "wrap-buffer", "local-stage"}};
             detail.Next(0,address,size);
-            const auto [buffer, offset, destination] = Allocate(size, r.instance.StorageMinAlignment());
+            // FIX-SGT-140 (RyGT #103): with device memory gone (an 8 GB card, a track change
+            // while shaders compile) this stopped the renderer (NAT-100). Without upload memory
+            // the registry's own CPU copy is tried, and when that fails too the texture keeps
+            // what it has until its next upload.
+            const auto [buffer, offset, destination] =
+                Allocate(size, r.instance.StorageMinAlignment(), nullptr, true);
+            if (!destination) {
+                static std::atomic<u32> logged{};
+                if (OutOfMemoryLogDue(logged)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-SGT-140: texture {:#x}+{:#x} not staged: upload memory ran out",
+                                address, size);
+                }
+                return staged;
+            }
             detail.Next(1);
             u64 readable = 0;
             if (r.memory->IsValidMapping(address)) {
@@ -4926,12 +4962,32 @@ void NativeRenderer::FlushWritebacks() {
                 UNREACHABLE_MSG("native image download import coverage or alignment failed");
                 return;
             }
-            auto out = chunked ? nullptr : direct_output ? device->WrapBuffer(
-                reinterpret_cast<u64>(static_cast<VkBuffer>(parts->front().buffer)), parts->front().view_size)
-                : device->CreateBuffer({.size = size,
+            const auto make_scatter = [&] {
+                return device->CreateBuffer({.size = size,
                     .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageTransferSrc |
                              Native::Rhi::BufferUsageTransferDst,
                     .memory = Native::Rhi::MemoryKind::DeviceLocal, .name = "native image download scatter"});
+            };
+            auto out = chunked ? nullptr : direct_output ? device->WrapBuffer(
+                reinterpret_cast<u64>(static_cast<VkBuffer>(parts->front().buffer)), parts->front().view_size)
+                : make_scatter();
+            if (!out && !chunked && !direct_output) {
+                RelieveDeviceMemory(); // FIX-SGT-140: the submitted work frees what it held
+                out = make_scatter();
+            }
+            if (!out && !chunked && !direct_output) {
+                // FIX-SGT-140 (RyGT #103): device memory ran out. Nothing is recorded for the
+                // picture yet: its write-back is left out (guest memory keeps what it had until
+                // the picture is drawn and goes back again), not the renderer stopped.
+                static std::atomic<u32> logged{};
+                if (OutOfMemoryLogDue(logged)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-SGT-140: write-back of the picture at {:#x}+{:#x} skipped: "
+                                "no device memory for its scatter buffer",
+                                address, size);
+                }
+                continue;
+            }
             if (!out && !chunked) {
                 UNREACHABLE_MSG("native image download wrapper allocation failed");
                 return;
@@ -5174,6 +5230,32 @@ void NativeRenderer::FlushWritebacks() {
             NATIVE_DIAGNOSTIC(++stats.writebacks);
             continue;
         }
+        // FIX-SGT-140 (RyGT #103): what RecordDownload makes (the tiling parameters, a 64 KB
+        // allocation, and unbatched its scratch) is made here, before anything is recorded for
+        // the picture. With device memory gone it stopped the renderer ("native image download
+        // recording failed"); now, after a wait for the submitted work, the write-back is left
+        // out for this time.
+        const auto prepared = [&] {
+            return !DiagForcedOutOfMemory() && registry->PrepareDownload(*entry, use_batch);
+        };
+        bool ready = prepared();
+        if (!ready) {
+            RelieveDeviceMemory();
+            ready = prepared();
+        }
+        if (!ready) {
+            static std::atomic<u32> logged{};
+            if (OutOfMemoryLogDue(logged)) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-SGT-140: write-back of the picture at {:#x}+{:#x} skipped: "
+                            "no device memory for its tiling buffers",
+                            address, size);
+            }
+            Native::Rhi::g_device_memory_pressure.store(true, std::memory_order_relaxed);
+            s.keep.push_back(std::move(plan.out));
+            for (auto& part : plan.imports) s.imported_view_leases.push_back(std::move(part.lease));
+            continue;
+        }
         if (!plan.scatter.empty()) {
             const vk::Buffer scratch{Handle<VkBuffer_T>(plan.out->NativeHandle())};
             for (const auto& part : plan.imports)
@@ -5363,7 +5445,25 @@ static char NativeNoReuse() {
     return mode;
 }
 
-NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
+// FIX-SGT-140 (RyGT #103): device memory ran out with every upload chunk held by work not yet
+// done, and the texture cache's eviction had not freed enough. At most once a frame, wait for the
+// work already submitted (nothing new is submitted here: the stream being recorded stays open),
+// then free what it held: the images, views and buffers retired since. The frame's end then
+// evicts harder (VRAM-PRESSURE-001). false: already done this frame.
+bool NativeRenderer::RelieveDeviceMemory() {
+    Native::Rhi::g_device_memory_pressure.store(true, std::memory_order_relaxed);
+    if (oom_relief_frame.exchange(frame, std::memory_order_relaxed) == frame) {
+        return false;
+    }
+    const u64 current = r.scheduler.CurrentTick();
+    if (current > 1) {
+        r.scheduler.Wait(current - 1); // the last submitted tick: no flush
+    }
+    device->Collect();
+    return true;
+}
+
+NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size, bool may_fail) {
     Native::SlowCallTrace<6> trace{t_timed, "take-upload-chunk",
         {"mutex", "timeline-query", "trim-free", "reclaim-retired", "take-free", "create-buffer"}};
     trace.Next(0, 0, size);
@@ -5402,11 +5502,17 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
         free_chunks_low = std::min(free_chunks_low, free_chunks.size());
         return chunk;
     }
+    // FIX-SGT-140: memory ran out already this frame (and the wait was spent): a caller that can
+    // do without gets none, and what is left goes to those that can't.
+    if (may_fail && oom_relief_frame.load(std::memory_order_relaxed) == frame) {
+        return {};
+    }
     Chunk chunk;
     trace.Next(5);
-    const auto create = [&] {
+    const bool forced_failure = may_fail && DiagForcedOutOfMemory(); // FIX-SGT-140 (diagnosis)
+    const auto create = [&](u64 capacity, bool recycle = true) {
         Chunk result;
-        const u64 capacity = UploadChunkCapacity(size, ChunkSize());
+        if (forced_failure) return result;
         result.buffer = device->CreateBuffer({
         .size = capacity,
         .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageUniform |
@@ -5418,14 +5524,14 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
         // the standard chunk) took 100 to 145 ms to create, and the chunk cache's 128 MB
         // budget freed it again before the next large texture: a long frame each time.
         // Freed, its memory waits in the upload copy pool for the next one of its size.
-        .recycle = capacity > ChunkSize(),
+        .recycle = recycle && capacity > ChunkSize(),
         });
         return result;
     };
-    chunk = create();
-    if (!chunk.buffer || !chunk.buffer->Mapped()) {
-        LOG_WARNING(Render_Vulkan,
-                    "FIX-276: reclaiming completed upload allocations for {} bytes", size);
+    const u64 capacity = UploadChunkCapacity(size, ChunkSize());
+    const auto usable = [](const Chunk& made) { return made.buffer && made.buffer->Mapped(); };
+    chunk = create(capacity);
+    const auto recover = [&] {
         device->DestroyCompletedBuffer(std::move(chunk.buffer)); // Never submitted.
         chunk = RecoverUploadMemory(
             size, r.scheduler.CurrentTick(), true, free_chunks, retiring_chunks,
@@ -5434,20 +5540,55 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
             [&](std::unique_ptr<Native::Rhi::Buffer> buffer) {
                 device->DestroyCompletedBuffer(std::move(buffer));
             },
-            [&] { device->Collect(); return create(); });
+            [&] { device->Collect(); return create(capacity); });
         free_chunks_low = std::min(free_chunks_low, free_chunks.size());
+    };
+    if (!usable(chunk)) {
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-276: reclaiming completed upload allocations for {} bytes", size);
+        recover();
     }
-    ASSERT_MSG(chunk.buffer && chunk.buffer->Mapped(), "NAT-100: no upload memory ({} bytes)",
-               size);
+    if (!usable(chunk)) {
+        // FIX-SGT-140: the work already submitted frees what it holds once done; then a chunk
+        // of just the size asked for (not the standard 4 MB, or the next power of two).
+        const bool relieved = RelieveDeviceMemory();
+        if (relieved) recover();
+        if (!usable(chunk) && capacity > size) {
+            device->DestroyCompletedBuffer(std::move(chunk.buffer)); // Never submitted.
+            // Not recycled: its size class would round it up again.
+            chunk = create(Common::AlignUp(size, u64{64} << 10), false);
+        }
+        static std::atomic<u32> logged{};
+        if (OutOfMemoryLogDue(logged)) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-SGT-140: upload memory ran out ({} bytes): {} after waiting for "
+                        "the submitted work{}{}",
+                        size, usable(chunk) ? "found" : "none", relieved ? "" : " (waited already this frame)",
+                        usable(chunk) || !may_fail ? "" : "; this upload is skipped");
+        }
+    }
+    if (!usable(chunk) && may_fail) {
+        device->DestroyCompletedBuffer(std::move(chunk.buffer)); // Never submitted.
+        return {};
+    }
+    ASSERT_MSG(usable(chunk), "NAT-100: no upload memory ({} bytes)", size);
     return chunk;
 }
 
-std::tuple<vk::Buffer, u64, u8*> NativeRenderer::Allocate(u64 size, u64 align, bool* backing_proven) {
+std::tuple<vk::Buffer, u64, u8*> NativeRenderer::Allocate(u64 size, u64 align, bool* backing_proven,
+                                                          bool may_fail) {
     Stream& s = Ctx().stream;
     align = std::max<u64>(align, 16);
     if (s.chunks.empty() ||
         Common::AlignUp(s.chunk_used, align) + size > s.chunks.back().buffer->Size()) {
-        s.chunks.push_back(TakeChunk(size));
+        // FIX-SGT-140: may_fail, a caller that can do without (it gets no memory) when device
+        // memory has run out.
+        Chunk chunk = TakeChunk(size, may_fail);
+        if (!chunk.buffer) {
+            if (backing_proven) *backing_proven = false;
+            return {vk::Buffer{}, 0, nullptr};
+        }
+        s.chunks.push_back(std::move(chunk));
         s.chunk_used = 0;
     }
     const auto& buffer = *s.chunks.back().buffer;
@@ -24217,9 +24358,37 @@ void NativeRenderer::EvictImages() {
     // This pass keeps none of them, so the next attempt finds the room.
     const bool pressure = Native::Rhi::g_device_memory_pressure.exchange(false,
                                                                          std::memory_order_relaxed);
-    if (pressure) {
+    // FIX-SGT-140: rate-limited; under lasting pressure this came every frame.
+    static std::atomic<u32> pressure_logged{};
+    if (pressure && OutOfMemoryLogDue(pressure_logged)) {
         LOG_WARNING(Render_Vulkan, "VRAM-PRESSURE-001: device memory ran out; idle textures are "
                                    "released instead of kept");
+    }
+    // FIX-SGT-140 (RyGT #103): that was not enough on an 8 GB card at a track change while
+    // shaders compiled: the pass still retired at most 16 pictures, from 8 of the 64 shards, and
+    // kept per-frame textures in the recycle pool. Under pressure it now goes through every
+    // shard with no cap, lets textures from the CPU go after PressureIdleFrames (they upload
+    // again from guest memory; what the GPU drew keeps KeepFrames) and empties the pool.
+    constexpr u64 PressureIdleFrames = 30;
+    if (pressure && RecycleFrameTextures()) {
+        u32 dropped = 0;
+        std::scoped_lock lock{views_mutex};
+        std::scoped_lock recycle_lock{recycle_mutex};
+        for (auto& [key, pool] : recycle_pool) {
+            for (auto& free : pool) {
+                for (auto& record : free.records) {
+                    retired_views.emplace_back(tick, std::move(record.view));
+                }
+                if (free.image) recycle_keys.erase(free.image->NativeHandle());
+                ++dropped;
+            }
+            pool.clear(); // the images go once the GPU is done with them
+        }
+        recycle_free = 0;
+        if (dropped != 0) {
+            LOG_WARNING(Render_Vulkan, "FIX-SGT-140: {} pooled per-frame textures released",
+                        dropped);
+        }
     }
     if (pressure || texture_budget == 0) {
         kept_textures.clear();
@@ -24335,7 +24504,7 @@ void NativeRenderer::EvictImages() {
                     recycle_views.erase(kept);
                 }
                 if (key != recycle_keys.end() && entry.from_cpu && entry.sources.empty() &&
-                    recycle_free < 96) {
+                    recycle_free < 96 && !pressure) { // FIX-SGT-140
                     RecycledImage free{std::move(entry.image), std::move(waiting),
                                        entry.backend_usage, entry.backend_features};
                     if (const auto it = views.find(&entry); it != views.end()) {
@@ -24373,9 +24542,21 @@ void NativeRenderer::EvictImages() {
             it = owners.empty() ? stencil_owners.erase(it) : std::next(it);
         }
     };
-    registry->Evict(frame - KeepFrames, on_evict, [&](Native::ImageEntry& entry) {
-        return kept_textures.contains(&entry) || keep(entry) || keep_new_texture(entry);
-    }, 16);
+    const u32 evicted = registry->Evict(
+        frame - (pressure ? PressureIdleFrames : KeepFrames), on_evict,
+        [&](Native::ImageEntry& entry) {
+            if (pressure && !entry.from_cpu && // FIX-SGT-140: drawn pictures keep KeepFrames
+                entry.last_use.load(std::memory_order_relaxed) >= frame - KeepFrames) {
+                return true;
+            }
+            return kept_textures.contains(&entry) || keep(entry) || keep_new_texture(entry);
+        },
+        pressure ? ~u32{0} : 16);
+    static std::atomic<u32> evict_logged{};
+    if (pressure && evicted != 0 && OutOfMemoryLogDue(evict_logged)) {
+        LOG_WARNING(Render_Vulkan, "FIX-SGT-140: {} idle pictures released under memory pressure",
+                    evicted);
+    }
     if (RecycleFrameTextures()) {
         // PERF-SGT-021: per-frame textures go after a few idle frames, so a handful of
         // images of each shape go round (not one for each of the last 120 frames).

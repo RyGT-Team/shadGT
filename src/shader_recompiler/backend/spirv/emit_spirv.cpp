@@ -2,13 +2,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <fmt/format.h>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/assert.h"
@@ -513,7 +517,9 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
         ctx.AddCapability(spv::Capability::MultiViewport);
     }
     if (info.uses_dma || info.uses_direct ||
-        (stage == SwStage::TessellationControl && runtime_info.sw.tcs.lds_emulation != 0)) { // FIX-227
+        (stage == SwStage::TessellationControl && runtime_info.sw.tcs.lds_emulation != 0) ||
+        ((stage == SwStage::TessellationEval || stage == SwStage::TessellationControl) &&
+         profile.TesDump(info.pgm_hash))) { // FIX-227
         ctx.AddCapability(spv::Capability::PhysicalStorageBufferAddresses);
         ctx.AddExtension("SPV_KHR_physical_storage_buffer");
     }
@@ -839,7 +845,19 @@ std::vector<u32> EmitSPIRV(const Profile& device_profile, const RuntimeInfo& run
     SetupCapabilities(program.info, profile, runtime_info, ctx);
     SetupFloatMode(ctx, profile, runtime_info, main);
     PatchPhiNodes(program, ctx);
-    return ctx.Assemble();
+    std::vector<u32> code = ctx.Assemble();
+    if (profile.TesDump(program.info.pgm_hash)) {
+        // DIAG-SGT-144: the dump-instrumented module, for spirv-val (NVIDIA's compiler died on
+        // it). Written next to the game (the working directory), one file per call.
+        static std::atomic<u32> count{};
+        const std::string name =
+            fmt::format("tes-dump-{:#x}-{}.spv", program.info.pgm_hash, count++);
+        if (std::FILE* file = std::fopen(name.c_str(), "wb")) {
+            std::fwrite(code.data(), sizeof(u32), code.size(), file);
+            std::fclose(file);
+        }
+    }
+    return code;
 }
 
 Id EmitPhi(EmitContext& ctx, IR::Inst* inst) {

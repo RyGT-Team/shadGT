@@ -273,6 +273,93 @@ void PipelineCache::ReportKeyTrace() noexcept {
     } catch (...) { /* Diagnostics cannot affect rendering. */ }
 }
 #endif
+// DIAG-SGT-144 (RyGT #86, SHADGT_DIAG_TES_DUMP=<hex domain shader hash>): a host-visible buffer
+// with a device address that the domain shader appends to while word 0 is set (EmitTesDump). A file
+// named tes-dump.now in the RyGT folder turns it on for 2 s; then the counts and records are
+// written to captures\tes-dump-<n>.bin (header: 3 u32 words enabled/vertices/patches, then the
+// raw buffer). Allocated once and never freed (diagnosis only).
+static u64 DiagTesDumpHash() {
+    static const u64 hash = [] {
+        const char* env = Common::DiagEnv("SHADGT_DIAG_TES_DUMP");
+        return env && *env ? u64(std::strtoull(env, nullptr, 16)) : 0ull;
+    }();
+    return hash;
+}
+static u64 DiagTesDumpAddress(const Instance& instance) {
+    static const u64 address = [&]() -> u64 {
+        if (DiagTesDumpHash() == 0)
+            return 0;
+        const vk::Device device = instance.GetDevice();
+        constexpr vk::DeviceSize size = 256 + 512ull * 1024 * 8 * 4 + 16ull * 1024 * (4 + 256) * 4;
+        const auto [buffer_result, buffer] = device.createBuffer(vk::BufferCreateInfo{
+            .size = size,
+            .usage = vk::BufferUsageFlagBits::eStorageBuffer |
+                     vk::BufferUsageFlagBits::eShaderDeviceAddress,
+        });
+        if (buffer_result != vk::Result::eSuccess)
+            return 0;
+        const auto requirements = device.getBufferMemoryRequirements(buffer);
+        const auto properties = instance.GetPhysicalDevice().getMemoryProperties();
+        constexpr auto wanted =
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
+        u32 type = ~0u;
+        for (u32 i = 0; i < properties.memoryTypeCount; ++i) {
+            if ((requirements.memoryTypeBits & (1u << i)) &&
+                (properties.memoryTypes[i].propertyFlags & wanted) == wanted) {
+                type = i;
+                break;
+            }
+        }
+        if (type == ~0u)
+            return 0;
+        const vk::MemoryAllocateFlagsInfo flags{.flags =
+                                                    vk::MemoryAllocateFlagBits::eDeviceAddress};
+        const auto [memory_result, memory] = device.allocateMemory(vk::MemoryAllocateInfo{
+            .pNext = &flags, .allocationSize = requirements.size, .memoryTypeIndex = type});
+        if (memory_result != vk::Result::eSuccess)
+            return 0;
+        if (device.bindBufferMemory(buffer, memory, 0) != vk::Result::eSuccess)
+            return 0;
+        const auto [map_result, mapped] = device.mapMemory(memory, 0, size);
+        if (map_result != vk::Result::eSuccess)
+            return 0;
+        std::memset(mapped, 0, size);
+        auto* words = static_cast<volatile u32*>(mapped);
+        const u64 gpu = device.getBufferAddress(vk::BufferDeviceAddressInfo{.buffer = buffer});
+        const auto root = Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path();
+        static std::jthread watch{[words, size, root](std::stop_token stop) {
+            u32 n = 0;
+            while (!stop.stop_requested()) {
+                std::error_code error;
+                if (std::filesystem::remove(root / "tes-dump.now", error)) {
+                    words[1] = 0;
+                    words[2] = 0;
+                    words[3] = 0; // hull read trace count
+                    words[0] = 1;
+                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                    words[0] = 0;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    std::filesystem::create_directories(root / "captures", error);
+                    const auto path = root / "captures" / fmt::format("tes-dump-{}.bin", n++);
+                    std::ofstream out{path, std::ios::binary};
+                    out.write(reinterpret_cast<const char*>(const_cast<const u32*>(words)),
+                              std::streamsize(size));
+                    LOG_WARNING(Render_Vulkan,
+                                "DIAG-SGT-144: TES dump of {:#x}: {} vertices, {} patches, {} "
+                                "hull reads traced -> {}",
+                                DiagTesDumpHash(), words[1], words[2], words[3], path.string());
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            }
+        }};
+        LOG_WARNING(Render_Vulkan,
+                    "DIAG-SGT-144: TES dump for {:#x} ready at {:#x}; create {} to capture",
+                    DiagTesDumpHash(), gpu, (root / "tes-dump.now").string());
+        return gpu;
+    }();
+    return address;
+}
+
 // DIAG-GTS-459 (SHADGT_DIAG_LDS_READS=1): 64 slots of two u32 counters in host-visible memory
 // with a device address; hull shaders with LDS emulation add their reads to them, and the
 // native report prints them. Allocated once and never freed (diagnosis only).
@@ -3198,6 +3285,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                  "attribute(s) (SHADGT_TESS_ATTR_PAD)",
                  profile.tess_attr_pad);
     }
+    profile.tes_dump_address = DiagTesDumpAddress(instance); // DIAG-SGT-144
+    profile.tes_dump_hash = DiagTesDumpHash();
 #ifdef RYTY_GPU
     // FIX-GTS-364 (FIX-GT7-151): an RX 480 drew GT7 right only with the legacy 2D-array cube
     // sampling path, so GCN Radeons take it by default. SHADGT_NATIVE_CUBE=0 picks the legacy

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <string_view>
 #include <chrono>
 #include <cstdlib>
 #include <bit>
@@ -973,17 +974,31 @@ void VulkanDevice::ReadGpuTimings() {
 
 // FIX-SGT-140 (RyGT #103): which heap ran out. The failure lines named no heap: a 4 GB video
 // memory setting did not stop it, and upload memory prefers video memory the CPU can write,
-// which without Resizable BAR is a heap of about 256 MB of its own. Each heap's size, flags and
-// what this allocator holds in it (VMA's count; its budget is an estimate without
-// VK_EXT_memory_budget), the first 8 failures.
+// which without Resizable BAR is a heap of about 256 MB of its own. Each heap's size and kind,
+// what this renderer's allocator holds there, and the driver's use and budget for the process
+// (VK_EXT_memory_budget, when the GPU has it), the first 8 failures.
 static void LogHeapsOnFailure(VmaAllocator allocator, const char* what, u64 size, const char* unit) {
     static std::atomic<u32> logged{};
     if (logged.fetch_add(1, std::memory_order_relaxed) >= 8) return;
     const VkPhysicalDeviceMemoryProperties* props = nullptr;
     vmaGetMemoryProperties(allocator, &props);
     if (!props) return;
-    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
-    vmaGetHeapBudgets(allocator, budgets.data());
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> ours{};
+    vmaGetHeapBudgets(allocator, ours.data());
+    VmaAllocatorInfo info{};
+    vmaGetAllocatorInfo(allocator, &info);
+    const vk::PhysicalDevice physical{info.physicalDevice};
+    bool has_budget = false;
+    if (auto [result, extensions] = physical.enumerateDeviceExtensionProperties();
+        result == vk::Result::eSuccess) {
+        for (const auto& extension : extensions) {
+            has_budget |= std::string_view{extension.extensionName.data()} ==
+                          VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+        }
+    }
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT driver{};
+    vk::PhysicalDeviceMemoryProperties2 props2{.pNext = has_budget ? &driver : nullptr};
+    if (has_budget) physical.getMemoryProperties2(&props2);
     std::string heaps;
     for (u32 i = 0; i < props->memoryHeapCount; ++i) {
         bool host_visible = false;
@@ -991,11 +1006,14 @@ static void LogHeapsOnFailure(VmaAllocator allocator, const char* what, u64 size
             host_visible |= props->memoryTypes[t].heapIndex == i &&
                             (props->memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
         }
-        heaps += fmt::format("{}heap {}: {} MB{}{}, {} MB in use, budget {} MB", i ? "; " : "", i,
+        heaps += fmt::format("{}heap {}: {} MB{}{}, renderer holds {} MB", i ? "; " : "", i,
                              props->memoryHeaps[i].size >> 20,
                              (props->memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ? " video" : " system",
-                             host_visible ? " CPU-visible" : "", budgets[i].usage >> 20,
-                             budgets[i].budget >> 20);
+                             host_visible ? " CPU-visible" : "", ours[i].statistics.blockBytes >> 20);
+        if (has_budget) {
+            heaps += fmt::format(", process uses {} MB of a {} MB budget", driver.heapUsage[i] >> 20,
+                                 driver.heapBudget[i] >> 20);
+        }
     }
     LOG_WARNING(Render_Vulkan, "FIX-SGT-140: {} of {} {} failed; {}", what, size, unit, heaps);
 }

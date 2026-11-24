@@ -1356,6 +1356,7 @@ u32 ImageRegistry::RetireTaken(std::vector<std::unique_ptr<ImageEntry>>& taken,
     {
         std::scoped_lock lock{upload_mutex};
         std::erase_if(pending_uploads, [&](ImageEntry* entry) { return gone.contains(entry); });
+        std::erase_if(retry_uploads, [&](ImageEntry* entry) { return gone.contains(entry); }); // FIX-SGT-140
     }
     if (!taken.empty()) {
         std::vector<std::pair<VAddr, VAddr>> ranges;
@@ -2165,11 +2166,11 @@ bool ImageRegistry::LazyUploads() {
 
 // FIX-SGT-140 (RyGT #103): an upload left out because device memory ran out. Its hash was
 // already taken for the bytes it was to upload, and its upload was no longer due: the texture
-// kept its old pixels until the game wrote it again. It is uploaded at its next use instead
-// (a texture when work binds it, a target from the queue).
-static void RetryUploadLater(ImageEntry& entry) {
+// kept its old pixels until the game wrote it again. Its hash is forgotten and it is due again
+// from the next frame on (RecordUploads; retried at every bind in this one, each try would fail
+// again).
+static void ForgetUploadedHash(ImageEntry& entry) {
     entry.content_hash = 0;
-    entry.needs_upload.store(true, std::memory_order_release);
     static std::atomic<u32> logged{};
     if (const u32 n = logged.fetch_add(1, std::memory_order_relaxed); n < 16 || n % 256 == 0) {
         LOG_WARNING(Render_Vulkan,
@@ -2191,12 +2192,23 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
         std::scoped_lock lock{upload_mutex};
         pending.swap(pending_uploads);
     }
-    const auto retry_later = [&](ImageEntry& entry) { // FIX-SGT-140
-        RetryUploadLater(entry);
-        if (!entry.from_cpu) {
-            std::scoped_lock lock{upload_mutex};
-            pending_uploads.push_back(&entry);
+    {
+        // FIX-SGT-140: uploads left out in an earlier frame are due again.
+        std::scoped_lock lock{upload_mutex};
+        const u64 now = upload_frame_now.load(std::memory_order_relaxed);
+        if (!retry_uploads.empty() && retry_uploads_frame != now) {
+            for (ImageEntry* entry : retry_uploads) {
+                entry->needs_upload.store(true, std::memory_order_release);
+                pending.push_back(entry);
+            }
+            retry_uploads.clear();
         }
+    }
+    const auto retry_later = [&](ImageEntry& entry) { // FIX-SGT-140
+        ForgetUploadedHash(entry);
+        std::scoped_lock lock{upload_mutex};
+        retry_uploads.push_back(&entry);
+        retry_uploads_frame = upload_frame_now.load(std::memory_order_relaxed);
     };
     // PERF-109: the stale textures the work uses (an entry listed twice is uploaded once).
     for (ImageEntry* entry : bound) {

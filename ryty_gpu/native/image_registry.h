@@ -552,6 +552,10 @@ private:
     RecentFills recent_fills;
     std::shared_ptr<std::atomic<u64>> remembered_fill_count = std::make_shared<std::atomic<u64>>(0);
     std::vector<ImageEntry*> pending_uploads;
+    /// FIX-SGT-140: uploads left out when device memory ran out, due again from the next frame
+    /// on (upload_mutex, like pending_uploads).
+    std::vector<ImageEntry*> retry_uploads;
+    u64 retry_uploads_frame = 0;
     std::atomic<u64> generation{0}; ///< OPT-002
     /// OPT-010: the ranges of the pictures made or dropped, by the generation they made.
     struct Change {

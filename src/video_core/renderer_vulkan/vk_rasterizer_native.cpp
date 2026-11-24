@@ -5502,10 +5502,15 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size, bool may_fail) {
         free_chunks_low = std::min(free_chunks_low, free_chunks.size());
         return chunk;
     }
+    // FIX-SGT-140: memory ran out already this frame (and the wait was spent): a caller that can
+    // do without gets none, and what is left goes to those that can't.
+    if (may_fail && oom_relief_frame.load(std::memory_order_relaxed) == frame) {
+        return {};
+    }
     Chunk chunk;
     trace.Next(5);
     const bool forced_failure = may_fail && DiagForcedOutOfMemory(); // FIX-SGT-140 (diagnosis)
-    const auto create = [&](u64 capacity) {
+    const auto create = [&](u64 capacity, bool recycle = true) {
         Chunk result;
         if (forced_failure) return result;
         result.buffer = device->CreateBuffer({
@@ -5519,7 +5524,7 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size, bool may_fail) {
         // the standard chunk) took 100 to 145 ms to create, and the chunk cache's 128 MB
         // budget freed it again before the next large texture: a long frame each time.
         // Freed, its memory waits in the upload copy pool for the next one of its size.
-        .recycle = capacity > ChunkSize(),
+        .recycle = recycle && capacity > ChunkSize(),
         });
         return result;
     };
@@ -5550,7 +5555,8 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size, bool may_fail) {
         if (relieved) recover();
         if (!usable(chunk) && capacity > size) {
             device->DestroyCompletedBuffer(std::move(chunk.buffer)); // Never submitted.
-            chunk = create(Common::AlignUp(size, u64{64} << 10));
+            // Not recycled: its size class would round it up again.
+            chunk = create(Common::AlignUp(size, u64{64} << 10), false);
         }
         static std::atomic<u32> logged{};
         if (OutOfMemoryLogDue(logged)) {

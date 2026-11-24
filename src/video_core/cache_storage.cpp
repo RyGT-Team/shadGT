@@ -184,6 +184,12 @@ void DataBase::Open() {
                     !(env && *env) && Vulkan::AmdLdsBarriersByDefault()) {
                     parts += ", lds barriers";
                 }
+                // FIX-SGT-145: RX 7000/9000 stores made before were translated without the
+                // hand-made interpolation that is now on by default there.
+                if (const char* env = std::getenv("SHADGT_MANUAL_INTERP");
+                    !(env && *env) && Vulkan::AmdManualInterpByDefault()) {
+                    parts += ", manual interp";
+                }
                 // FIX-SGT-143: hull/domain translations with padding attributes (AMD by default)
                 // are kept apart from those made without.
                 if (const u32 pad = Vulkan::TessAttrPad(); pad != 0) {

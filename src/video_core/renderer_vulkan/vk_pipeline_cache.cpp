@@ -3236,7 +3236,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                         instance.GetDriverID() == vk::DriverId::eNvidiaProprietary &&
                         !Common::DiagEnv("SHADGT_DIAG_NO_MANUAL_INTERP")) ||
                        (instance.IsAmdShaderExplicitVertexParameterSupported() &&
-                        instance.IsAmdLegacyShaderCompiler());
+                        instance.IsAmdLegacyShaderCompiler()) ||
+                       AmdManualInterpByDefault(); // FIX-SGT-145
             }(),
         // FIX-SGT-139: GCN code leaves out the shared memory barriers of a 64-thread workgroup,
         // one wave there. RX 7000/9000 on AMD's driver (LLPC) need them too, though their compute

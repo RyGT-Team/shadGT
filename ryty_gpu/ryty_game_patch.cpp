@@ -9,6 +9,8 @@
 // experiments (RVA in GTSport.exe: eboot.bin address + 0x10000).
 
 #include "common/game_title.h"
+#include "common/scope_exit.h"
+#include "ryty_gpu/gt7_car_sign.h"
 #include <cstdio>
 #include <array>
 #include <algorithm>
@@ -4383,7 +4385,44 @@ void Install(u8* base) {
 
 } // namespace Gt7RaceContextGuard
 
+namespace Gt7CarSign {
+thread_local bool recording = false;
+using Render = void(PS4_SYSV_ABI*)(void*, void*);
+static Render render_original{};
+
+static void PS4_SYSV_ABI RenderLabel(void* widget, void* context) {
+    [[maybe_unused]] static const int seen = std::fputs("[native] GT7 CarSign: rendering a competitor label\n", stderr);
+    const bool previous = std::exchange(recording, true);
+    SCOPE_EXIT { recording = previous; };
+    render_original(widget, context);
+}
+
+static void Install(u8* base) {
+    const char* enabled = std::getenv("RYGT_ULTRAWIDE_CAR_SIGNS");
+    if (!Common::IsGt7() || (enabled && enabled[0] == '0') ||
+        Vulkan::RytyDisplayAspect() <= 16.0f / 9.0f + 0.01f) {
+        return;
+    }
+
+    // GT7's GTEngine::CarSign implements MENU::IRender3D. Its render method draws
+    // the rank, logo and name together using the race camera's projection.
+    static constexpr std::array<u8, 12> adapter{
+        0x48, 0x81, 0xc7, 0x60, 0xff, 0xff, 0xff, 0xe9, 0xf4, 0xe9, 0xff, 0xff};
+    const auto* thunk = base + 0x371b990;
+    if (!ReadableRange(thunk, adapter.size()) || std::memcmp(thunk, adapter.data(), adapter.size()) != 0) {
+        std::fputs("[native] GT7 CarSign: unrecognized render method\n", stderr);
+        return;
+    }
+    static constexpr std::array<u8, 13> prologue{
+        0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53};
+    static Native::NearCode code{base};
+    render_original = reinterpret_cast<Render>(Native::HookEntry(
+        code, base, 0x370a390, prologue, reinterpret_cast<void*>(&RenderLabel), "GT7 CarSign"));
+}
+} // namespace Gt7CarSign
+
 void RytyApplyGamePatches() {
+    Gt7CarSign::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallPhotoExport();
     InstallScopedMenuCompiles(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallPhotoCaptureWatch(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // FIX-SGT-049

@@ -125,7 +125,8 @@ public:
         u16 instance_sgpr_offset = 0; ///< where it writes the first instance (0: nowhere)
     };
     /// `indirect` (NAT-161): the draw's counts and offsets are its arguments in memory.
-    void Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect = nullptr);
+    void Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect = nullptr,
+              bool world_hud = false);
     void DispatchDirect();
     void DispatchIndirect(VAddr address, u32 offset, u32 size);
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);

@@ -2220,13 +2220,13 @@ void Rasterizer::applyTemporalDlss(const GraphicsPipeline* pipeline, const Rende
 #endif
 
 
-void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
+void Rasterizer::Draw(bool is_indexed, u32 index_offset, bool world_hud) {
     RENDERER_TRACE;
     ++Common::GetWorkCounters().draws;
 #ifdef RYTY_GPU
     if (native) {
         Common::PhaseTimer native_total_timer{Common::Phase::DrawTotal};
-        native->Draw(is_indexed, index_offset); // NAT-100
+        native->Draw(is_indexed, index_offset, nullptr, world_hud); // NAT-100
         return;
     }
 #endif

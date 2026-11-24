@@ -15785,7 +15785,8 @@ void NativeRenderer::YieldToMappingChanges() {
     }
 }
 
-void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect) {
+void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect,
+                          bool world_hud) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::DrawTotal}; // DIAG-SGT-023
     YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
@@ -16625,6 +16626,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             const vk::Extent2D size{shown.width * layer.scale, shown.height * layer.scale};
             TemporalPicture(layer.black, *targets.colors[0], size);
             TemporalPicture(layer.white, *targets.colors[0], size);
+        } else if (world_hud) {
+            // The scene fills the ultrawide window. Keep camera-projected signs on that
+            // target so both their glyphs and their screen positions follow the cars.
+            [[maybe_unused]] static const int seen =
+                std::fputs("[native] GT7 CarSign: drawing projected labels with the race scene\n", stderr);
         } else if (layer.black && layer.white) {
             const VideoCore::TextureCache::ImageDesc desc{regs.color_buffers[0],
                                                           r.liverpool->DrawCbExtent(0)};

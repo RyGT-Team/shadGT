@@ -413,6 +413,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_NATIVE_PADDED_MIPS|flag|Rendering workarounds|on|0 = off|Mip targets a little larger than the mip still match it (FIX-GT7-134, fixes black depth-of-field backgrounds). 0 turns it off.",
     "RYGTSW1|SHADGT_NATIVE_PART_SYNC|flag|Rendering workarounds|on|0 = off|Copies what was drawn into a larger target into its mip/layer part targets (FIX-210, reflection probes). 0 = off.",
     "RYGTSW1|SHADGT_NATIVE_PERFRAME_GUARD|flag|Rendering workarounds|on|0 = off|Drops regions in GT7's per-frame memory so they cannot grow and cut FPS to 25 (FIX-GT7-122). 0 turns it off.",
+    "RYGTSW1|SHADGT_PERFRAME_READ_CUT|flag|Rendering workarounds|on|0 = off|A shader read from GT7's per-frame memory that reaches far past it is cut at its end (FIX-GT7-195); off, such reads became a 1 GiB copy that stuttered the game to 0 FPS after about 30 minutes.",
     "RYGTSW1|SHADGT_NATIVE_RESOLVE_VIEW|flag|Rendering workarounds|on|0 = off|MSAA resolves between different formats go through a view of the source format (GT7 course map colours, FIX-GT7-044).",
     "RYGTSW1|SHADGT_NATIVE_REWRITE_MADE_OF_TARGETS|flag|Rendering workarounds|on|0 = off|A GPU buffer write over a texture made of targets re-uploads it (FIX-200, fixes black far scenery in replays). 0 ignores such writes.",
     "RYGTSW1|SHADGT_NATIVE_SANITIZE_TINY|flag|Rendering workarounds|on|0 = off|Tiny 4x4 half-float textures holding garbage upload as zeros (FIX-204, fixes random driver glare). 0 turns it off.",

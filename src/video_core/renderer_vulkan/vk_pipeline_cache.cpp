@@ -409,10 +409,21 @@ u64 DiagLdsReadCountersAddress(const Instance& instance) {
     return address;
 }
 
+// PERF-SGT-155: set by the pipeline cache before any draw: AMD's driver runs without the hull
+// shader LDS emulation by default.
+static std::atomic<bool> g_tess_lds_off_by_default{false};
+
 u32 TessLdsEmulation(const AmdGpu::Regs& regs) {
+    // FIX-227 mode 2 (on elsewhere): a writer pass, a full barrier and scratch reads for every
+    // tessellated draw with several patches a group, for hull shaders that read other patches'
+    // control points. PERF-SGT-155: off by default on AMD's driver. On a Radeon 610M it cost 7.7%
+    // of GT7's GPU time (Tokyo rain replay paused on the chase cam: 176.2 -> 162.7 ms a frame),
+    // and GT7's race-start close-ups, the black car patches it was made for (on NVIDIA), showed
+    // none without it. SHADGT_TESS_LDS_EMULATION=<mode> still decides, on any GPU.
     static const u32 mode = [] {
         const char* env = std::getenv("SHADGT_TESS_LDS_EMULATION");
-        return env && *env ? u32(env[0] - '0') : 2u;
+        if (env && *env) return u32(env[0] - '0');
+        return g_tess_lds_off_by_default.load(std::memory_order_relaxed) ? 0u : 2u;
     }();
     if (mode == 0 || !regs.stage_enable.hs_en || regs.ls_hs_config.hs_input_control_points == 0 ||
         regs.ls_hs_config.num_patches <= 1) return 0;
@@ -3149,6 +3160,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     if (liverpool) {
         liverpool->on_command_buffer_start = [this] { ReadAheadAtBufferStart(); };
     }
+    g_tess_lds_off_by_default.store(instance.GetDriverID() == vk::DriverId::eAmdProprietary,
+                                    std::memory_order_relaxed); // PERF-SGT-155
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),

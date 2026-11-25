@@ -346,7 +346,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_HS_WAIT_BUDGET_MS|int|Tessellation|8|milliseconds per 33 ms window; 0 = always wait|How long per window the command thread waits for hull shader translations before skipping the draw a frame or two (PERF-GT7-115).",
     "RYGTSW1|SHADGT_TESSELLATION|flag|Tessellation|on|0 = tessellated surfaces drawn flat|0 limits every tessellation factor to 1, drawing tessellated surfaces (car bodies) flat with no added detail (TESS-001).",
     "RYGTSW1|SHADGT_TESS_DEPTH_BIAS|float|Tessellation|0 (off)|units of minimum resolvable depth|Small depth bias toward the camera for tessellated draws tested against a depth pre-pass, against black patches on cars (FIX-224).",
-    "RYGTSW1|SHADGT_TESS_LDS_EMULATION|int|Tessellation|2|0 = off; first digit is the mode passed on|Mode of hull-shader LDS emulation for tessellated draws with several patches; 0 turns it off. Mode meanings not documented here.",
+    "RYGTSW1|SHADGT_TESS_LDS_EMULATION|int|Tessellation|2, 0 on AMD's driver|0 = off; first digit is the mode passed on|Mode of hull-shader LDS emulation for tessellated draws with several patches; off by default on AMD, where it cost 7.7% of GT7's GPU time (PERF-SGT-155).",
     "RYGTSW1|SHADGT_TESS_LDS_SPREAD|flag|Tessellation|on|0 = off (uses a separate shader store)|Hull shaders' LDS writer pass shares its stores across the patch's invocations as vec4 stores (PERF-GTS-458).",
     // Frame pacing & present
     "RYGTSW1|SHADGT_SWAPCHAIN_TIMEOUT_RECOVERY|flag|Frame pacing & present|on|0 = off|Recreates the presentation swapchain if acquiring or presenting an image times out.",

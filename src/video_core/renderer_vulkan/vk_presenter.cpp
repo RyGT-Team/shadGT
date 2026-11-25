@@ -1680,10 +1680,14 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
                                    {rect[0], rect[1], rect[2], rect[3]}});
         }
     }
+    std::optional<vk::Rect2D> content_rect;
+    if (display->center_menu && frame->width && frame->height) {
+        content_rect = FitImage(16, 9, frame->width, frame->height);
+    }
     pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, hud_settings, ui_layer_view,
                    dlss_scaled, display->output_view ? display->side_x0 : 0.0f,
                    display->output_view ? display->side_x1 : 1.0f, display->hud_black,
-                   display->hud_white, hud_widgets);
+                   display->hud_white, hud_widgets, content_rect);
     if (time_passes) {
         g_presenter_times.Mark(pass_cmdbuf, 2);
         g_presenter_times.End();

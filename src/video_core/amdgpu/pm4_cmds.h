@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstring>
+#include <span>
 #include "common/assert.h"
 #include "common/bit_field.h"
 #include "common/types.h"
@@ -238,12 +239,18 @@ struct PM4CmdNop {
         SetTsharpInUdata = 0x68750005u,     ///< Indicates that T# will be set in the next packet
         SetSsharpInUdata = 0x68750006u,     ///< Indicates that S# will be set in the next packet
         DebugColorMarkerPush = 0x6875000eu, ///< Begin of GPU event scope with color
+        WorldSpaceHudDraw = 0x52594757u, ///< RyGT: the preceding draw belongs to a world-space label
         PatchedFlip = 0x68750776u,          ///< Patched flip marker
         PrepareFlip = 0x68750777u,          ///< Flip marker
         PrepareFlipLabel = 0x68750778u,     ///< Flip marker with label address
         PrepareFlipInterrupt = 0x68750780u, ///< Flip marker with interrupt
         PrepareFlipInterruptLabel = 0x68750781u, ///< Flip marker with interrupt and label
     };
+
+    static bool FollowsWorldSpaceDraw(std::span<const u32> next) {
+        return next.size() >= 4 && next[0] == PM4Type3Header{PM4ItOpcode::Nop, 2}.raw &&
+               next[1] == WorldSpaceHudDraw;
+    }
 };
 
 enum class SourceSelect : u32 {

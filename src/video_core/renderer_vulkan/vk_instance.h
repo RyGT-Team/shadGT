@@ -175,7 +175,7 @@ public:
     }
 
     /// PERF-GTS-482: only whole pipelines go through the binary store (AMD,
-    /// SHADGT_AMD_WHOLE_BINARIES; PERF-GTS-486: by default on RDNA2; PERF-SGT-147: and RX 7000/9000).
+    /// SHADGT_AMD_WHOLE_BINARIES; PERF-GTS-486: by default on RDNA2).
     bool IsPipelineBinaryWholeOnly() const {
         return whole_pipeline_binaries_only;
     }
@@ -486,8 +486,8 @@ public:
     bool IsAmdRdna2() const;
 
     /// PERF-GTS-486: preloading builds whole pipelines instead of libraries
-    /// (SHADGT_PREWARM_WHOLE_PIPELINES; by default on RDNA2 and RX 7000/9000 when whole pipelines
-    /// are stored as pipeline binaries).
+    /// (SHADGT_PREWARM_WHOLE_PIPELINES; by default on RDNA2 when whole pipelines are stored as
+    /// pipeline binaries).
     bool IsWholePrewarm() const {
         return whole_prewarm;
     }

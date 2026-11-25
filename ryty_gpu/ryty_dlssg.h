@@ -11,6 +11,8 @@ VK_DEFINE_HANDLE(VmaAllocator)
 
 namespace Vulkan::RytyFrameGen { struct SceneInputs; }
 
+namespace Vulkan { struct DlssTiming; }
+
 namespace Vulkan::RytyDlssG {
 
 /// ryGT: NVIDIA DLSS frame generation (GPU.dlssg_enabled) through Streamline: dlss\sl.interposer.dll
@@ -59,7 +61,7 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
              vk::Image input_image, vk::ImageView input, vk::Format input_format,
              vk::Extent2D input_size, vk::Image output_image, vk::ImageView output,
              vk::Format output_format, vk::Extent2D output_size,
-             const RytyUpscale::TemporalInputs* temporal = nullptr);
+             const RytyUpscale::TemporalInputs* temporal = nullptr, DlssTiming* timing = nullptr);
 
 /// Around the swapchain present (Reflex/PCL markers DLSS-G needs to pair frames).
 void PresentStart();

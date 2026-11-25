@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "ryty_gpu/ryty_dlss_timing.h"
 #include <windows.h>
 
 #include <algorithm>
@@ -1214,7 +1215,7 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
              vk::Image input_image, vk::ImageView input, vk::Format input_format,
              vk::Extent2D input_size, vk::Image output_image, vk::ImageView output,
              vk::Format output_format, vk::Extent2D output_size,
-             const RytyUpscale::TemporalInputs* temporal) {
+             const RytyUpscale::TemporalInputs* temporal, DlssTiming* timing) {
     if (!UpscaleSupports(input_size, output_size)) {
         return false;
     }
@@ -1347,8 +1348,11 @@ bool Upscale(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
                     vk::to_string(input_format), vk::to_string(output_format));
     }
     const sl::BaseStructure* inputs[] = {&viewport};
-    const sl::Result result = g_sl.evaluate(sl::kFeatureDLSS, *frame, inputs,
-                                            static_cast<u32>(std::size(inputs)), command_buffer);
+    const char* sample_kind = !t ? "single" : constants.reset == sl::Boolean::eTrue ? "reset" : "temporal";
+    const auto result = DlssTiming::Measure(timing, cmdbuf, input_size, output_size, sample_kind,
+        g_sl.sr_mode == static_cast<int>(sl::DLSSMode::eMaxPerformance) ? "performance" : "other", [&] {
+            return g_sl.evaluate(sl::kFeatureDLSS, *frame, inputs, static_cast<u32>(std::size(inputs)), command_buffer);
+        }, sl::Result::eOk);
     if (result != sl::Result::eOk) {
         LOG_ERROR(Render_Vulkan, "ryGT DLSS: Streamline's DLSS failed (result {}){}",
                   static_cast<int>(result), t ? " with the game's depth and motion vectors" : "");

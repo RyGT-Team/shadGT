@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include "ryty_gpu/ryty_dlss_timing.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -518,7 +519,10 @@ void GtsDlssPass::Resolve(u64 frame, GtsSceneImage display) {
     desc.motion_scale_y = float(renderSize.height) * .5f;
     desc.pre_exposure = 1.f; desc.exposure_scale = 1.f;
     desc.frame_time_ms = frameTimeMs;
-    const bool ok = RytyDlss::EvaluateTemporal(scheduler.DirectCommandBuffer(), desc);
+    DlssTiming timing{instance, scheduler};
+    const auto cmd = scheduler.DirectCommandBuffer();
+    const bool ok = DlssTiming::Measure(&timing, cmd, renderSize, outputSize, reset ? "reset" : "temporal",
+        quality == RYGT_DLSS_QUALITY_PERFORMANCE ? "performance" : "other", [&] { return RytyDlss::EvaluateTemporal(cmd, desc); }, true);
     scheduler.GetDynamicState().Invalidate();
     if (!ok) { failed = true; return; }
     ++evaluatedFrames;

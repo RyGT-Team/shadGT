@@ -18,6 +18,8 @@
 #include "video_core/texture_cache/image.h"
 #include "ryty_gpu/rygt_dlss_api.h"
 
+namespace Vulkan { struct DlssTiming; }
+
 namespace Vulkan::RytyDlss {
 
 /// Loads the plugin when DLSS is on; true when it is loaded.
@@ -62,7 +64,7 @@ public:
     vk::ImageView Render(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::ImageView input,
                          vk::Format input_format, vk::Extent2D input_size,
                          vk::Extent2D output_size,
-                         const RytyUpscale::TemporalInputs* temporal = nullptr);
+                         const RytyUpscale::TemporalInputs* temporal = nullptr, DlssTiming* timing = nullptr);
 
 private:
     struct Img {

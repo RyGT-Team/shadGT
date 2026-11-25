@@ -589,29 +589,27 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         }
         // FIX-SGT-158 (SHADGT_FREE_SUPERSEDED_TARGETS=0: as before): a render target of a new layout
         // at an address where older targets of other layouts sit means the game drew over that
-        // memory: those pictures can't come back. GT7 lowers its render resolution a step at a
-        // time when the GPU is busy (its License Test "TRY AGAIN" screen: 3150x1771 down to
-        // 2585x1452 in a second or two), each step a full new set of targets at the same scratch
-        // addresses, and the old sets stayed until two seconds idle: +1.9 GB in a second on an
-        // 8 GB card, over its budget, a hitch, and a crash waiting to happen on less forgiving
-        // drivers. Old targets not used in the last two frames are now stale at once and freed
-        // at the end of the frame. A target used in this frame or the last one stays (a pool
-        // that holds two sizes at one address in turn keeps both).
+        // memory. GT7 lowers its render resolution a step every frame or two when the GPU is busy
+        // (its License Test "TRY AGAIN" screen: 15 sizes from 3150x1771 down to 2513x1415 in a
+        // second), each step a full new set of targets at the same scratch addresses, and the old
+        // sets stayed until two seconds idle: +1.8 GB in a second on an 8 GB card, over its budget,
+        // a hitch, and a crash waiting to happen on less forgiving drivers. The old targets are
+        // noted here and freed at the end of a frame once unused for a few frames (each set was
+        // still in use the frame before the next size came, so checking only now missed them all).
+        // One the game uses again in that time stays usable (a pool that holds two sizes at one
+        // address in turn keeps both), and after four seconds it is left to the idle eviction.
         static const bool free_superseded = [] {
             const char* env = std::getenv("SHADGT_FREE_SUPERSEDED_TARGETS");
             return !(env && env[0] == '0');
         }();
         if (free_superseded && render_target) {
             for (auto it = first; it != last; ++it) {
-                ImageEntry& old = *it->second;
-                if (old.from_cpu || !old.image || SameLayout(old.info, info) ||
-                    old.reused.load(std::memory_order_relaxed) ||
-                    old.last_use.load(std::memory_order_relaxed) + 2 >= frame) {
+                const ImageEntry& old = *it->second;
+                if (old.from_cpu || !old.image || SameLayout(old.info, info)) {
                     continue;
                 }
-                MarkReused(old);
                 std::scoped_lock superseded_lock{superseded_mutex};
-                superseded.push_back(&old);
+                superseded.push_back({info.guest_address, &old, frame});
             }
         }
         shard.images.emplace(info.guest_address, std::move(entry));
@@ -1346,11 +1344,43 @@ u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_
     return RetireTaken(taken, on_evict);
 }
 
-std::vector<const ImageEntry*> ImageRegistry::TakeSuperseded() {
-    std::scoped_lock lock{superseded_mutex};
-    std::vector<const ImageEntry*> taken;
-    taken.swap(superseded);
-    return taken;
+u32 ImageRegistry::EvictSuperseded(u64 frame, const std::function<void(ImageEntry&)>& on_evict) {
+    constexpr u64 IdleFrames = 4;    // unused this long: freed
+    constexpr u64 WatchFrames = 240; // still in use after this long: left to Evict
+    std::vector<Superseded> noted;
+    {
+        std::scoped_lock lock{superseded_mutex};
+        noted.swap(superseded);
+    }
+    if (noted.empty()) {
+        return 0;
+    }
+    std::vector<Superseded> still;
+    std::vector<std::unique_ptr<ImageEntry>> taken;
+    std::unordered_set<const ImageEntry*> seen;
+    for (const Superseded& item : noted) {
+        if (!seen.insert(item.entry).second) {
+            continue;
+        }
+        Shard& shard = ShardOf(item.address);
+        std::unique_lock lock{shard.mutex};
+        const auto [first, last] = shard.images.equal_range(item.address);
+        for (auto it = first; it != last; ++it) {
+            if (it->second.get() != item.entry) continue;
+            if (it->second->last_use.load(std::memory_order_relaxed) + IdleFrames < frame) {
+                taken.push_back(std::move(it->second));
+                shard.images.erase(it);
+            } else if (item.noted + WatchFrames >= frame) {
+                still.push_back(item);
+            }
+            break;
+        }
+    }
+    if (!still.empty()) {
+        std::scoped_lock lock{superseded_mutex};
+        superseded.insert(superseded.end(), still.begin(), still.end());
+    }
+    return taken.empty() ? 0 : RetireTaken(taken, on_evict);
 }
 
 u32 ImageRegistry::EvictListed(std::span<const ImageEntry* const> listed, u64 before,

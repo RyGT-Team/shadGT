@@ -587,6 +587,33 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                 remembered = true;
             }
         }
+        // FIX-SGT-158 (SHADGT_FREE_SUPERSEDED_TARGETS=0: as before): a render target of a new layout
+        // at an address where older targets of other layouts sit means the game drew over that
+        // memory: those pictures can't come back. GT7 lowers its render resolution a step at a
+        // time when the GPU is busy (its License Test "TRY AGAIN" screen: 3150x1771 down to
+        // 2585x1452 in a second or two), each step a full new set of targets at the same scratch
+        // addresses, and the old sets stayed until two seconds idle: +1.9 GB in a second on an
+        // 8 GB card, over its budget, a hitch, and a crash waiting to happen on less forgiving
+        // drivers. Old targets not used in the last two frames are now stale at once and freed
+        // at the end of the frame. A target used in this frame or the last one stays (a pool
+        // that holds two sizes at one address in turn keeps both).
+        static const bool free_superseded = [] {
+            const char* env = std::getenv("SHADGT_FREE_SUPERSEDED_TARGETS");
+            return !(env && env[0] == '0');
+        }();
+        if (free_superseded && render_target) {
+            for (auto it = first; it != last; ++it) {
+                ImageEntry& old = *it->second;
+                if (old.from_cpu || !old.image || SameLayout(old.info, info) ||
+                    old.reused.load(std::memory_order_relaxed) ||
+                    old.last_use.load(std::memory_order_relaxed) + 2 >= frame) {
+                    continue;
+                }
+                MarkReused(old);
+                std::scoped_lock superseded_lock{superseded_mutex};
+                superseded.push_back(&old);
+            }
+        }
         shard.images.emplace(info.guest_address, std::move(entry));
         IndexEntry(*result);
         const std::pair<VAddr, VAddr> range{info.guest_address,
@@ -1317,6 +1344,13 @@ u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_
         }
     }
     return RetireTaken(taken, on_evict);
+}
+
+std::vector<const ImageEntry*> ImageRegistry::TakeSuperseded() {
+    std::scoped_lock lock{superseded_mutex};
+    std::vector<const ImageEntry*> taken;
+    taken.swap(superseded);
+    return taken;
 }
 
 u32 ImageRegistry::EvictListed(std::span<const ImageEntry* const> listed, u64 before,

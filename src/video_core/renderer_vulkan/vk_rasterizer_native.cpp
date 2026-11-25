@@ -24671,6 +24671,19 @@ void NativeRenderer::EvictImages() {
             it = owners.empty() ? stencil_owners.erase(it) : std::next(it);
         }
     };
+    // FIX-SGT-158: render targets a new target of another layout replaced at their address. Before
+    // the idle eviction below, which could free one of them first (the list names live entries).
+    if (const auto superseded = registry->TakeSuperseded(); !superseded.empty()) {
+        const u32 freed = registry->EvictListed(superseded, frame - 2, on_evict);
+        static std::atomic<u32> superseded_logged{};
+        if (freed != 0) {
+            if (const u32 n = superseded_logged++; n < 8 || n % 500 == 0) {
+                LOG_INFO(Render_Vulkan,
+                         "FIX-SGT-158: {} render targets replaced at their address freed "
+                         "(not kept two seconds)", freed);
+            }
+        }
+    }
     const u32 evicted = registry->Evict(
         frame - (pressure ? PressureIdleFrames : KeepFrames), on_evict,
         [&](Native::ImageEntry& entry) {

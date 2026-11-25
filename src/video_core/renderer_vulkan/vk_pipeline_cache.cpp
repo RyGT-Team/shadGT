@@ -1292,6 +1292,92 @@ private:
     ShaderStoreReaders<StoredListing> readers;
 };
 
+// FIX-SGT-146: AMD's shader compiler stops the whole process when an allocation fails ("LLVM
+// ERROR: out of memory", RyGT #101: RX 9070 XT, 32 GB, on the pre-race screen after a race,
+// after the 8-wide backlog had ended). Nothing can catch that, so builds wait for room instead:
+// one always runs, each further one only while the system's free commit (RAM plus page file
+// left) stays above a reserve plus a share per build. SHADGT_COMPILE_RESERVE_MB=<n> sets the
+// reserve (2048 by default, 0 = no check), SHADGT_COMPILE_BUILD_MB=<n> the share (1024).
+class CompileMemoryGate {
+public:
+    void Enter() {
+        if (ReserveMb() == 0) {
+            running.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        std::unique_lock lk{mutex};
+        if (running.load(std::memory_order_relaxed) > 0 && !Fits()) {
+            // A waiting build owns nothing yet (shared libraries are claimed while a build runs,
+            // PERF-GT7-041), so running builds never wait for it. The cap is only a safety net,
+            // and lets one waiter through a second, so a burst of waiters doesn't start at once.
+            constexpr auto MaxWait = std::chrono::seconds{30};
+            const auto start = std::chrono::steady_clock::now();
+            bool fits = false;
+            while (!(fits = running.load(std::memory_order_relaxed) == 0 || Fits())) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now - start >= MaxWait && now - last_forced >= std::chrono::seconds{1}) {
+                    last_forced = now;
+                    break;
+                }
+                cv.wait_for(lk, std::chrono::milliseconds{100});
+            }
+            const double waited = std::chrono::duration<double>(
+                                      std::chrono::steady_clock::now() - start)
+                                      .count();
+            if (const u32 n = ++waits; n <= 10 || n % 200 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-SGT-146: a pipeline build waited {:.2f} s for memory{} ({} "
+                            "running, {} MB free commit, {} MB free RAM; {} waits)",
+                            waited, fits ? "" : ", then went ahead",
+                            running.load(std::memory_order_relaxed), free_commit_mb,
+                            free_phys_mb, n);
+            }
+        }
+        running.fetch_add(1, std::memory_order_relaxed);
+    }
+    void Leave() {
+        running.fetch_sub(1, std::memory_order_relaxed);
+        cv.notify_all();
+    }
+
+private:
+    /// Under the mutex: room for one more build beside those running.
+    bool Fits() {
+#ifdef _WIN32
+        MEMORYSTATUSEX memory{sizeof(memory)};
+        if (!GlobalMemoryStatusEx(&memory)) return true;
+        free_commit_mb = memory.ullAvailPageFile >> 20;
+        free_phys_mb = memory.ullAvailPhys >> 20;
+        const u64 running_now = running.load(std::memory_order_relaxed);
+        return free_commit_mb >= ReserveMb() + (running_now + 1) * BuildMb();
+#else
+        return true;
+#endif
+    }
+    static u64 EnvMb(const char* name, u64 fallback) {
+        if (const char* env = std::getenv(name); env && *env) {
+            return std::strtoull(env, nullptr, 10);
+        }
+        return fallback;
+    }
+    static u64 ReserveMb() {
+        static const u64 mb = EnvMb("SHADGT_COMPILE_RESERVE_MB", 2048);
+        return mb;
+    }
+    static u64 BuildMb() {
+        static const u64 mb = EnvMb("SHADGT_COMPILE_BUILD_MB", 1024);
+        return mb;
+    }
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::atomic<u32> running{};
+    u32 waits{};
+    std::chrono::steady_clock::time_point last_forced{};
+    u64 free_commit_mb{};
+    u64 free_phys_mb{};
+};
+
 class PipelineCache::PipelineBuildWorkers {
 public:
     PipelineBuildWorkers()
@@ -1487,7 +1573,11 @@ private:
                 Common::SetCurrentThreadPriority(want_low ? Common::ThreadPriority::Low
                                                           : Common::ThreadPriority::Normal);
             }
-            job();
+            {
+                memory_gate.Enter(); // FIX-SGT-146
+                SCOPE_EXIT { memory_gate.Leave(); };
+                job();
+            }
             if (background) {
                 queue.FinishedBackground(heavy);
             } else {
@@ -1497,6 +1587,7 @@ private:
     }
 
     BuildQueue queue;
+    CompileMemoryGate memory_gate; // FIX-SGT-146
     std::vector<std::jthread> threads;
     bool catch_up{};
     bool backlog{}; ///< FIX-GT7-106 (port)

@@ -3343,6 +3343,15 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                         instance.IsAmdLegacyShaderCompiler()) ||
                        AmdManualInterpByDefault(); // FIX-SGT-145
             }(),
+        // PERF-SGT-151: only on AMD's older compiler (AMD-315's cause, V_INTERP_MOV making its
+        // attribute per-vertex, is known there). RX 7000/9000 (FIX-SGT-145) keep every attribute.
+        .manual_interp_mov_only =
+            [&] {
+                const char* env = std::getenv("SHADGT_MANUAL_INTERP_ALL");
+                return !(env && env[0] == '1') &&
+                       instance.IsAmdShaderExplicitVertexParameterSupported() &&
+                       instance.IsAmdLegacyShaderCompiler();
+            }(),
         // FIX-SGT-139: GCN code leaves out the shared memory barriers of a 64-thread workgroup,
         // one wave there. RX 7000/9000 on AMD's driver (LLPC) need them too, though their compute
         // runs 64 wide (RyGT #92: GT7 sky flicker on an RX 9050, gone with them).

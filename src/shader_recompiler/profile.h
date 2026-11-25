@@ -69,6 +69,9 @@ struct Profile {
     bool has_broken_spirv_clamp{};
     bool lower_left_origin_mode{};
     bool needs_manual_interpolation{};
+    /// PERF-SGT-151: AMD's older compiler interpolates by hand only the attributes the program
+    /// also reads with V_INTERP_MOV (SHADGT_MANUAL_INTERP_ALL=1: every attribute).
+    bool manual_interp_mov_only{};
     bool needs_lds_barriers{};
     /// FIX-188: #65's Intel Arc translation (memory-only compute barriers, 64-bit shared memory
     /// as two 32-bit halves); other GPUs keep the translation they had before it.

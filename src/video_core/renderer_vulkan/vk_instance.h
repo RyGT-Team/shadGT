@@ -175,7 +175,7 @@ public:
     }
 
     /// PERF-GTS-482: only whole pipelines go through the binary store (AMD,
-    /// SHADGT_AMD_WHOLE_BINARIES; PERF-GTS-486: by default on RDNA2).
+    /// SHADGT_AMD_WHOLE_BINARIES; PERF-GTS-486: by default on RDNA2; PERF-SGT-147: and RX 7000/9000).
     bool IsPipelineBinaryWholeOnly() const {
         return whole_pipeline_binaries_only;
     }
@@ -486,8 +486,8 @@ public:
     bool IsAmdRdna2() const;
 
     /// PERF-GTS-486: preloading builds whole pipelines instead of libraries
-    /// (SHADGT_PREWARM_WHOLE_PIPELINES; by default on RDNA2 when whole pipelines are stored as
-    /// pipeline binaries).
+    /// (SHADGT_PREWARM_WHOLE_PIPELINES; by default on RDNA2 and RX 7000/9000 when whole pipelines
+    /// are stored as pipeline binaries).
     bool IsWholePrewarm() const {
         return whole_prewarm;
     }
@@ -864,6 +864,15 @@ inline u32 TessAttrPad() {
 }
 
 inline bool AmdLdsBarriersByDefault() {
+    const StoreGpuFamily family = GetStoreGpuFamily();
+    return family == StoreGpuFamily::AmdRdna3 || family == StoreGpuFamily::AmdRdna4;
+}
+
+/// FIX-SGT-145: hand-made pixel shader interpolation (AMD-315) is on by default for Radeon RX 7000
+/// and RX 9000 cards too (RyGT #108: flat, single-colour triangles on GT Sport's grass, asphalt and
+/// hills on an RX 7800 XT, gone with SHADGT_MANUAL_INTERP on). Their translations get a store of
+/// their own (cache_storage.cpp).
+inline bool AmdManualInterpByDefault() {
     const StoreGpuFamily family = GetStoreGpuFamily();
     return family == StoreGpuFamily::AmdRdna3 || family == StoreGpuFamily::AmdRdna4;
 }

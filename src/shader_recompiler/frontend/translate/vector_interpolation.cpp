@@ -54,7 +54,8 @@ void Translator::EmitVectorInterpolation(const GcnInst& inst) {
 // its whole attribute per-vertex, so P1/P2 reads of that attribute must be done by hand. Other
 // attributes keep the hardware's interpolation: doing them all by hand cost 8% of a GT7 frame on
 // a Radeon 610M (27 vertex reads in one pixel shader). The KHR barycentric path (NVIDIA, the
-// single-sample barycentric fix) keeps every attribute by hand. SHADGT_MANUAL_INTERP_ALL=1: every
+// single-sample barycentric fix) and RX 7000/9000 (FIX-SGT-145, cause not known there) keep every
+// attribute by hand (Profile::manual_interp_mov_only). SHADGT_MANUAL_INTERP_ALL=1: every
 // attribute by hand on AMD too, as before (part of the shader store key).
 void Translator::NoteInterpMovs(std::span<const GcnInst> program) {
     interp_mov_attrs = 0;
@@ -69,11 +70,7 @@ bool Translator::ManualInterpolation(u32 attr_index) const {
     if (!profile.needs_manual_interpolation) {
         return false;
     }
-    static const bool all = [] {
-        const char* env = std::getenv("SHADGT_MANUAL_INTERP_ALL");
-        return env && env[0] == '1';
-    }();
-    if (all || !profile.supports_amd_shader_explicit_vertex_parameter) {
+    if (!profile.manual_interp_mov_only || !profile.supports_amd_shader_explicit_vertex_parameter) {
         return true;
     }
     return attr_index < 64 && (interp_mov_attrs >> attr_index & 1) != 0;

@@ -1539,7 +1539,8 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     bool dlss_scaled = false;
     vk::ImageView ui_layer_view{};
     std::string upscaler = display->upscaler; // actual Native scene reconstruction
-    const vk::Extent2D game_size = image_size;
+    const vk::Extent2D game_size = RytyUpscale::GuestOutputDlss() && upscaler == "DLSS"
+                                      ? rasterizer->GetTemporalDlss().RenderSize() : image_size;
     if (display->output_view) {
         image_view = display->output_view;
         image_size = display->output_size;

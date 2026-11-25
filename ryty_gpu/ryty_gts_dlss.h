@@ -103,6 +103,7 @@ private:
     RygtDlssQuality quality{RYGT_DLSS_QUALITY_PERFORMANCE};
     u64 sceneFrame{~u64{}}, sceneUid{}, displayUid{}, outputFrame{~u64{}};
     float jitterX{}, jitterY{}, frameTimeMs{1000.f / 60};
+    float motionScaleX{}, motionScaleY{};
     bool reset{true}, failed{}, supportedDisplay{}, nativeDirty{};
     bool useFsr{}; // FSR-200: the scene goes to FSR instead of DLSS
     // FSR-205: the scene depth as R32_SFLOAT for FSR (its Vulkan backend views a D32_SFLOAT_S8_UINT

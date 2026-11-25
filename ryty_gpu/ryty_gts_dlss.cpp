@@ -252,8 +252,11 @@ bool GtsDlssPass::Capture(u64 frame, GtsSceneImage color, GtsSceneImage sourceDe
     sceneUid = resolved.image_uid;
     outputFrame = ~u64{};
     displayUid = 0;
-    jitterX = constants[20] * constants[14];
-    jitterY = constants[21] * constants[15];
+    const float sign = Common::IsGt7() ? -1.f : 1.f;
+    jitterX = sign * constants[20] * constants[14];
+    jitterY = sign * constants[21] * constants[15];
+    motionScaleX = -constants[14];
+    motionScaleY = -constants[15];
     copyInput(sourceDepth, depth);
     {
         if (sourceDepth.info.props.is_depth) copyDepthForFsr();
@@ -515,8 +518,8 @@ void GtsDlssPass::Resolve(u64 frame, GtsSceneImage display) {
     desc.quality = quality;
     desc.flags = reset ? RYGT_DLSS_FRAME_RESET : 0;
     desc.jitter_x = jitterX; desc.jitter_y = jitterY;
-    desc.motion_scale_x = -float(renderSize.width) * .5f;
-    desc.motion_scale_y = float(renderSize.height) * .5f;
+    desc.motion_scale_x = motionScaleX;
+    desc.motion_scale_y = motionScaleY;
     desc.pre_exposure = 1.f; desc.exposure_scale = 1.f;
     desc.frame_time_ms = frameTimeMs;
     DlssTiming timing{instance, scheduler};

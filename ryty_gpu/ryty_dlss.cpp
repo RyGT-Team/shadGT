@@ -50,7 +50,7 @@ bool TemporalRequested() {
     static const bool requested = [] {
         // GT Sport only: the in-frame reconstruction (GtsDlssPass) knows GT Sport's passes.
         // GT7's temporal DLSS is RytyUpscale::TemporalRequested (DLSS-GT7-001).
-        if (Common::IsGt7()) {
+        if (Common::IsGt7() && !RytyUpscale::GuestOutputDlss()) {
             return false;
         }
         const char* value = std::getenv("SHADGT_DLSS_TEMPORAL");
@@ -317,6 +317,7 @@ vk::ImageView Pass::Render(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::
                            vk::Format input_format, vk::Extent2D input_size,
                            vk::Extent2D output_size,
                            const RytyUpscale::TemporalInputs* temporal, DlssTiming* timing) {
+    if (RytyUpscale::GuestOutputDlss()) return input;
     // DLSS-GT7-001: the game's pictures are only changed for DLSS while Streamline's DLSS scales
     // them and takes the inputs (set again by RytyDlssG::Upscale).
     auto& temporal_usable = RytyUpscale::TemporalUsable();

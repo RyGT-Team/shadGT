@@ -1958,13 +1958,16 @@ GtsSceneImage NativeRenderer::TemporalImage(const Native::ImageEntry& entry) {
             }, [this, &entry] { Written(&entry); }};
 }
 
+static bool IsDisplayAddress(VAddr address);
+
 void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Targets& targets,
                                      const DrawBindings& bindings) {
-    // Merge (shadGT): GT Sport's temporal pass; GT7 has its own (NoteTemporalDraw).
-    if (Common::IsGt7() || !r.temporalDlss.Enabled()) return;
+    const bool gt7 = Common::IsGt7();
+    if ((gt7 && !RytyUpscale::GuestOutputDlss()) || !r.temporalDlss.Enabled()) return;
     const auto& regs = r.liverpool->DrawRegs();
     const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
-    if (!fs || regs.num_indices > 6 ||
+    // GT7's 4K race captures identify this TAA draw and its four scene-sized resources.
+    if (!fs || (gt7 && fs->pgm_hash != 0xcfa125dd) || regs.num_indices > 6 ||
         regs.num_instances.NumInstances() != 1 || targets.state.num_color_attachments != 2 ||
         bindings.sampled.size() != 4 || !targets.colors[0] || !targets.colors[1]) { NATIVE_DIAGNOSTIC(static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 1, fs {:#x}", fs ? fs->pgm_hash : 0);); return; }
     const auto* history_out = targets.colors[0];
@@ -1996,16 +1999,17 @@ void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Ta
     for (const auto& buffer : fs->buffers) {
         if (buffer.IsSpecial() || buffer.is_written) continue;
         const auto sharp = buffer.GetSharp(*fs);
-        if (!sharp.base_address || sharp.GetSize() != sizeof(constants)) continue;
+        if (!sharp.base_address || (gt7 ? sharp.GetSize() < sizeof(constants) : sharp.GetSize() != sizeof(constants))) continue;
         if (!Core::RytyMemory::GuardedCopy(constants.data(),
                 reinterpret_cast<const void*>(sharp.base_address), sizeof(constants))) { NATIVE_DIAGNOSTIC(static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 6, fs {:#x}", fs ? fs->pgm_hash : 0);); return; }
-        valid = std::ranges::all_of(constants, [](float v) { return std::isfinite(v); }) &&
-            std::abs(constants[14] - size.width * .5f) <= .01f &&
-            std::abs(constants[15] + size.height * .5f) <= .01f &&
-            ((constants[16] == size.width && constants[17] == size.height) ||
-             // WIDE-062: with the wide scene the game leaves these two at 0 (the half-size pair
-             // above still matches); only that pair and the jitter are used by the capture.
-             (RytyWideScene() && constants[16] == 0.f && constants[17] == 0.f)) &&
+        const bool known_scale = gt7
+            ? constants[14] != 0.f && constants[15] != 0.f &&
+              std::abs(constants[14]) <= size.width && std::abs(constants[15]) <= size.height
+            : std::abs(constants[14] - size.width * .5f) <= .01f &&
+              std::abs(constants[15] + size.height * .5f) <= .01f &&
+              ((constants[16] == size.width && constants[17] == size.height) ||
+               (RytyWideScene() && constants[16] == 0.f && constants[17] == 0.f));
+        valid = known_scale && std::ranges::all_of(constants, [](float v) { return std::isfinite(v); }) &&
             std::abs(constants[20] * constants[14]) <= 1.f &&
             std::abs(constants[21] * constants[15]) <= 1.f;
         break;
@@ -2025,10 +2029,13 @@ void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Ta
 
 bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& targets,
                                    const DrawBindings& bindings) {
-    if (Common::IsGt7() || !r.temporalDlss.Enabled()) return false; // (as CaptureNativeFsr)
+    const bool gt7 = Common::IsGt7();
+    const bool guest_output = RytyUpscale::GuestOutputDlss();
+    if ((gt7 && !guest_output) || !r.temporalDlss.Enabled()) return false;
     const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
     const auto& regs = r.liverpool->DrawRegs();
-    if (!fs || !IsSceneCompositionShader(fs->pgm_hash) || regs.num_indices > 6 ||
+    if (!fs || (gt7 ? fs->pgm_hash != 0xdf75f23b : !IsSceneCompositionShader(fs->pgm_hash)) ||
+        regs.num_indices > 6 ||
         regs.num_instances.NumInstances() != 1 || targets.depth ||
         targets.state.num_color_attachments != 1 || !targets.colors[0] ||
         regs.blend_control[0].enable || regs.color_target_mask.GetMask(0) != 0xf) return false;
@@ -2043,6 +2050,10 @@ bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& t
     });
     if (scene == bindings.sampled.end()) return false;
     const auto size = r.temporalDlss.RenderSize();
+    if (guest_output && (size != vk::Extent2D{1920, 1080} ||
+                         r.temporalDlss.OutputSize() != vk::Extent2D{desc.width, desc.height} ||
+                         desc.width != 3840 || desc.height != 2160 ||
+                         (gt7 && !IsDisplayAddress(target->info.guest_address)))) return false;
     // WIDE-063: the wide race scene is wider than the game's display buffer (3840x1080 against
     // 1920x1080), so the composition cannot be drawn into it at the scene's size. It is drawn
     // into the reconstruction's input image instead (below), and the reconstruction is shown
@@ -2084,7 +2095,9 @@ bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& t
     UiHires::Get().scale = 0.f;
     fsr_wide_full = IsWideRaceComposition(fs->pgm_hash); // WIDE-001
     fsr_game_extent = {targets.state.width, targets.state.height};
-    fsr_wide_drawn = wide && (size.width > desc.width || size.height > desc.height);
+    // Render the entire tone-mapped scene into the input image. The reconstructed result goes
+    // into the real display before HUD drawing, even when that display is already full-size.
+    fsr_wide_drawn = guest_output || (wide && (size.width > desc.width || size.height > desc.height));
     if (fsr_wide_drawn) {
         // WIDE-063: the composition goes straight into the reconstruction's input, at its size.
         auto& attachment = targets.state.color_attachments[0];
@@ -2093,7 +2106,7 @@ bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& t
         targets.state.width = size.width;
         targets.state.height = size.height;
         static std::atomic<u32> logged{};
-        if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+        if (!guest_output && logged.fetch_add(1, std::memory_order_relaxed) < 4) {
             std::fprintf(stderr, "[wide] WIDE-063 race composition drawn at %ux%u for DLSS "
                                  "(display buffer %ux%u)\n",
                          size.width, size.height, desc.width, desc.height);

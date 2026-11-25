@@ -13,6 +13,11 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #ifdef RYTY_GPU
 #include "ryty_gpu/ryty_pro_mode.h"
+#include "video_core/renderer_vulkan/vk_ui_hires.h"
+
+namespace Vulkan {
+float RytyDisplayAspect();
+}
 #endif
 
 #include <algorithm>
@@ -259,7 +264,8 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                                 vk::Extent2D input_size, Frame& frame, Settings settings,
                                 vk::ImageView ui_layer, bool dlss_scaled, float side_x0,
                                 float side_x1, vk::ImageView hud_black, vk::ImageView hud_white,
-                                std::span<const HudWidget> hud_widgets) {
+                                std::span<const HudWidget> hud_widgets,
+                                std::optional<vk::Rect2D> content_rect) {
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
             .pLabelName = "Host/Post processing",
@@ -386,10 +392,16 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
     }
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *output->pipeline);
 
-    // WIDE-009: a 16:9 picture (the boot screens, shown before the high-resolution UI takes
-    // over) on a wide window goes between black bars instead of being stretched over it.
-    vk::Rect2D area{{0, 0}, {frame.width, frame.height}};
-    if (input_size.width != 0 && input_size.height != 0 && frame.height != 0) {
+    // With a widened camera the guest can still submit a 16:9 buffer. Its projection
+    // expects the full window. GT Sport's True wide compositor fits its boot screens.
+    vk::Rect2D area = content_rect.value_or(vk::Rect2D{{0, 0}, {frame.width, frame.height}});
+#ifdef RYTY_GPU
+    static const bool fit_narrow_input =
+        RytyDisplayAspect() == 0.0f || (!Common::IsGt7() && UiHires::Wide());
+#else
+    constexpr bool fit_narrow_input = true;
+#endif
+    if (!content_rect && fit_narrow_input && input_size.width && input_size.height && frame.height) {
         const double input_aspect = double(input_size.width) / input_size.height;
         const double frame_aspect = double(frame.width) / frame.height;
         if (input_aspect < frame_aspect * 0.8) {
@@ -397,11 +409,22 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             area = vk::Rect2D{{s32((frame.width - width) / 2), 0}, {width, frame.height}};
         }
     }
+#ifdef RYTY_GPU
+    static thread_local vk::Extent2D logged_extent{};
+    if (!fit_narrow_input && frame.width * 9u > frame.height * 16u &&
+        area.extent != logged_extent) {
+        LOG_INFO(Render_Vulkan, "Ultrawide viewport: input {}x{}, output {}x{}, scene {}x{} at x={}",
+                 input_size.width, input_size.height, frame.width, frame.height,
+                 area.extent.width, area.extent.height, area.offset.x);
+        logged_extent = area.extent;
+    }
+#endif
     const std::array viewports = {
         vk::Viewport{
             .x = static_cast<float>(area.offset.x),
+            .y = static_cast<float>(area.offset.y),
             .width = static_cast<float>(area.extent.width),
-            .height = static_cast<float>(frame.height),
+            .height = static_cast<float>(area.extent.height),
             .minDepth = 0.0f,
             .maxDepth = 1.0f,
         },

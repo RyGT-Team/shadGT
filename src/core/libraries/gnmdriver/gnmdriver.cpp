@@ -23,6 +23,9 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#ifdef RYTY_GPU
+#include "ryty_gpu/gt7_car_sign.h"
+#endif
 #include "ryty_gpu/ryty_diag.h"
 #include "common/path_util.h"
 #include "video_core/renderdoc.h"
@@ -111,6 +114,17 @@ static inline u32* WriteTrailingNop(u32* cmdbuf) {
     nop->header = PM4Type3Header{PM4ItOpcode::Nop, data_block_size - 1};
     nop->data_block[0] = 0u; // only one out of `data_block_size` is initialized
     return cmdbuf + data_block_size + 1 /* header */;
+}
+
+// Keep the label attached to this command when the game copies its list or the
+// GPU records it on another thread. Ordinary draws retain the standard trailing NOP.
+static void WriteDrawTrailingNop(u32* cmdbuf) {
+    WriteTrailingNop<3>(cmdbuf);
+#ifdef RYTY_GPU
+    if (Gt7CarSign::recording) {
+        cmdbuf[1] = PM4CmdNop::WorldSpaceHudDraw;
+    }
+#endif
 }
 
 static inline u32* ClearContextState(u32* cmdbuf) {
@@ -473,7 +487,7 @@ s32 PS4_SYSV_ABI sceGnmDrawIndex(u32* cmdbuf, u32 size, u32 index_count, uintptr
         draw_index->index_count = index_count;
         draw_index->draw_initiator = sceKernelIsNeoMode() ? flags & 0xe0000000u : 0;
 
-        WriteTrailingNop<3>(cmdbuf + 6);
+        WriteDrawTrailingNop(cmdbuf + 6);
         return ORBIS_OK;
     }
     return -1;
@@ -487,7 +501,7 @@ s32 PS4_SYSV_ABI sceGnmDrawIndexAuto(u32* cmdbuf, u32 size, u32 index_count, u32
         cmdbuf = WritePacket<PM4ItOpcode::DrawIndexAuto>(
             cmdbuf, PM4ShaderType::ShaderGraphics, index_count,
             sceKernelIsNeoMode() ? flags & 0xe0000000u | 2u : 2u);
-        WriteTrailingNop<3>(cmdbuf);
+        WriteDrawTrailingNop(cmdbuf);
         return ORBIS_OK;
     }
     return -1;
@@ -602,7 +616,7 @@ s32 PS4_SYSV_ABI sceGnmDrawIndexOffset(u32* cmdbuf, u32 size, u32 index_offset, 
         cmdbuf = WriteBody(cmdbuf, index_count, index_offset, index_count,
                            sceKernelIsNeoMode() ? flags & 0xe0000000u : 0u);
 
-        WriteTrailingNop<3>(cmdbuf);
+        WriteDrawTrailingNop(cmdbuf);
         return ORBIS_OK;
     }
     return -1;

@@ -21,6 +21,7 @@
 #include "ryty_gpu/native/buffer_sizes.h"
 #include "ryty_gpu/native/descriptor_dead_handles.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/videoout/buffer.h"
 #include "ryty_gpu/native/parallel_rotate_segment.h"
 #include "ryty_gpu/native/natural_scope_boundary.h"
 #include "ryty_gpu/native/attachment_alias.h"
@@ -585,6 +586,9 @@ static std::unique_ptr<Native::Rhi::Buffer> scene_indirect_buffer;
 static std::vector<SceneIndirectArgs> scene_indirect_args;
 
 bool RytyGtsInRace();
+bool RytyGt7RaceHookInstalled();
+u32 RytyGt7MenuWidth(u32 registered_width, u32 height);
+bool RytyGt7MenuActive();
 bool RytyRaceRunning(); // GAME-006, ryty_game_patch.cpp
 static bool PrepareScope(); // PERF-GTS-450: races, or menus with SHADGT_NATIVE_PREPARE_MENUS=1
 bool RytyGtsRaceSession(); // WIDE-015
@@ -2728,34 +2732,35 @@ static bool FaultAheadEnabled() {
     return enabled;
 }
 
-// GT7-UW: the display buffers' addresses (the presenter notes them as the game registers them).
+// VideoOut may register multiple views of the same address, each with its own pitch.
 namespace {
-std::array<std::atomic<VAddr>, 16> g_display_addresses{};
-/// DLSS-GT7-001: the size each was registered with (width << 32 | height; 0 unknown).
-std::array<std::atomic<u64>, 16> g_display_sizes{};
+struct DisplaySlot {
+    std::atomic<VAddr> address{};
+    vk::Extent2D extent{};
+    u32 pitch{};
+};
+std::array<DisplaySlot, Libraries::VideoOut::MaxDisplayBuffers> g_display_slots{};
+std::atomic<std::size_t> g_display_slot_count{};
+std::mutex g_display_slots_mutex;
 } // namespace
 
-void NoteDisplayAddress(VAddr address, u32 width, u32 height) {
-    for (std::size_t i = 0; i < g_display_addresses.size(); ++i) {
-        auto& slot = g_display_addresses[i];
-        VAddr expected = 0;
-        if (slot.load(std::memory_order_relaxed) == address ||
-            slot.compare_exchange_strong(expected, address)) {
-            if (width != 0 && height != 0) {
-                g_display_sizes[i].store((u64{width} << 32) | height, std::memory_order_relaxed);
-            }
-            return;
-        }
+void SetDisplaySlot(std::size_t index, VAddr address, const Libraries::VideoOut::BufferAttribute& view) {
+    std::scoped_lock lock{g_display_slots_mutex};
+    auto& slot = g_display_slots[index];
+    slot.extent = vk::Extent2D{view.width, view.height};
+    slot.pitch = view.pitch_in_pixel;
+    slot.address.store(address, std::memory_order_relaxed);
+    auto count = std::max(index + 1, g_display_slot_count.load(std::memory_order_relaxed));
+    while (count && !g_display_slots[count - 1].address.load(std::memory_order_relaxed)) {
+        --count;
     }
+    g_display_slot_count.store(count, std::memory_order_release);
 }
 
 static bool IsDisplayAddress(VAddr address) {
-    for (const auto& slot : g_display_addresses) {
-        const VAddr value = slot.load(std::memory_order_relaxed);
-        if (value == 0) {
-            return false;
-        }
-        if (value == address) {
+    const auto count = g_display_slot_count.load(std::memory_order_acquire);
+    for (std::size_t i = 0; address && i < count; ++i) {
+        if (g_display_slots[i].address.load(std::memory_order_relaxed) == address) {
             return true;
         }
     }
@@ -2780,22 +2785,25 @@ static bool Gt7TemporalActive() {
 // before a menu's interface) are made that size, so they match what FindDisplay shows. Elsewhere
 // the picture's own size.
 static vk::Extent2D ShownPart(const Native::ImageEntry& picture) {
-    vk::Extent2D size{picture.info.size.width, picture.info.size.height};
-    for (std::size_t i = 0; i < g_display_addresses.size(); ++i) {
-        const VAddr value = g_display_addresses[i].load(std::memory_order_relaxed);
-        if (value == 0) {
-            break;
+    const vk::Extent2D size{picture.info.size.width, picture.info.size.height};
+    std::scoped_lock lock{g_display_slots_mutex};
+    int best_rank = -1;
+    auto shown = size;
+    for (const auto& slot : g_display_slots) {
+        if (slot.address.load(std::memory_order_relaxed) != picture.info.guest_address ||
+            !slot.extent.width || !slot.extent.height) {
+            continue;
         }
-        if (value == picture.info.guest_address) {
-            const u64 shown = g_display_sizes[i].load(std::memory_order_relaxed);
-            if (shown != 0) {
-                size.width = std::min(size.width, static_cast<u32>(shown >> 32));
-                size.height = std::min(size.height, static_cast<u32>(shown & 0xffffffffu));
-            }
-            break;
+        // Prefer the matching row layout. At equal pitch prefer an exact size, then
+        // the first slot (the primary view when a padded Pro target needs cropping).
+        const int rank = 2 * (slot.pitch == picture.info.pitch) + (slot.extent == size);
+        if (rank > best_rank) {
+            best_rank = rank;
+            shown.width = std::min(size.width, slot.extent.width);
+            shown.height = std::min(size.height, slot.extent.height);
         }
     }
-    return size;
+    return shown;
 }
 
 bool NativeRenderer::HudSplitOn() {
@@ -2921,7 +2929,7 @@ void NativeRenderer::SpliceStream(Stream& s, u64 tick) {
 // came out wrong (seen by the user on 2026-11-11).
 bool NativeRenderer::HudSplitNow() const {
     // DLSS-GT7-001: not in a menu frame whose interface goes through DLSS (NoteTemporalDraw).
-    return HudSplitOn() && (RytyDisplayAspect() > 0.0f ||
+    return !center_wide_menu && HudSplitOn() && (RytyDisplayAspect() > 0.0f ||
                             (temporal.frame == frame && temporal.through_frame != frame));
 }
 
@@ -16032,7 +16040,8 @@ void NativeRenderer::YieldToMappingChanges() {
     }
 }
 
-void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect) {
+void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect,
+                          bool world_hud) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::DrawTotal}; // DIAG-SGT-023
     YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
@@ -16872,6 +16881,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             const vk::Extent2D size{shown.width * layer.scale, shown.height * layer.scale};
             TemporalPicture(layer.black, *targets.colors[0], size);
             TemporalPicture(layer.white, *targets.colors[0], size);
+        } else if (world_hud) {
+            // The scene fills the ultrawide window. Keep camera-projected signs on that
+            // target so both their glyphs and their screen positions follow the cars.
+            [[maybe_unused]] static const int seen =
+                std::fputs("[native] GT7 CarSign: drawing projected labels with the race scene\n", stderr);
         } else if (layer.black && layer.white) {
             const VideoCore::TextureCache::ImageDesc desc{regs.color_buffers[0],
                                                           r.liverpool->DrawCbExtent(0)};
@@ -25409,6 +25423,16 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         }
     }
     frame_writebacks.clear();
+    // Use one routing decision for all draws and the presentation of the same frame.
+    const bool finished_wide_menu = center_wide_menu;
+    static const bool fit_gt7_menus = [] {
+        const char* setting = std::getenv("RYGT_ULTRAWIDE_MENUS");
+        return Common::IsGt7() && RytyDisplayAspect() > 16.0f / 9.0f + 0.01f &&
+               !(setting && setting[0] == '0');
+    }();
+    const u32 native_panel = RytyGt7MenuWidth(info.size.width, info.size.height);
+    center_wide_menu = native_panel ? RytyGt7MenuActive()
+                                    : fit_gt7_menus && RytyGt7RaceHookInstalled() && !RytyGtsInRace();
     ++frame;
     BufferOrderFrame(); // PERF-SGT-120
     TrimIdleChunks();
@@ -25446,7 +25470,9 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         registry->FindExisting(info.guest_address, [&](const Native::ImageEntry& candidate) {
             if (gt7_display) {
                 return !candidate.from_cpu && !candidate.info.props.is_depth &&
-                       candidate.info.size.width == info.size.width &&
+                       (candidate.info.size.width == info.size.width ||
+                        (native_panel && candidate.info.size.width == native_panel &&
+                         candidate.info.pitch == info.pitch)) &&
                        candidate.info.size.height == info.size.height &&
                        candidate.info.num_bits == info.num_bits;
             }
@@ -25456,7 +25482,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
                    candidate.info.num_bits == info.num_bits && candidate.info.pitch == info.pitch &&
                    candidate.info.num_samples == 1 && candidate.info.resources.levels == 1 &&
                    candidate.info.resources.layers == 1;
-        });
+        }, native_panel != 0); // A flip address can hold either logical width. Show its latest draw.
     // NEO-GT7-006: in the PS4 Pro mode GT7 draws its 3200x1800 picture into the top left corner of
     // a 3840x2160 surface, registered as 3200x1800 with a pitch of 3840: the display shows that
     // corner, copied below into an image of the display's size each frame. A lookup by the
@@ -25508,7 +25534,10 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     // An uncropped display returns the original entry without the crop path's
     // admission step. Refresh a dirty CPU-backed display before presentation too.
     ApplyRewrite(*entry);
-    const auto* source = CropDisplay(*entry, {info.size.width, info.size.height});
+    const bool narrow_flip = native_panel &&
+                             (entry->info.size.width == native_panel || finished_wide_menu);
+    const auto* source = CropDisplay(*entry, {narrow_flip ? native_panel : info.size.width,
+                                             info.size.height});
     if (!source) {
         return std::nullopt;
     }
@@ -25598,6 +25627,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     Splice();
     Display display{vk::Image{Handle<VkImage_T>(source->image->NativeHandle())}, view,
                     source->info.size.width, source->info.size.height};
+    display.center_menu = native_panel ? narrow_flip : finished_wide_menu;
     r.scheduler.EndRendering(); // WIDE-042: TakeFrame may blit
 #ifndef NDEBUG
     display.capture_format = static_cast<vk::Format>(source->image->Desc().format);

@@ -1,4 +1,4 @@
-name: RyGTS CI artifacts for renderer changes
+name: RyGT CI artifacts for renderer changes
 
 on:
   push:
@@ -14,10 +14,10 @@ concurrency:
 
 jobs:
   release:
-    uses: RyGT-Team/RyGTS/.github/workflows/ci-package-release.yml@development
+    uses: RyGT-Team/RyGT/.github/workflows/ci-package-release.yml@development
     with:
       renderer_sha: ${{ github.sha }}
   diagnostics:
-    uses: RyGT-Team/RyGTS/.github/workflows/ci-package-debug.yml@development
+    uses: RyGT-Team/RyGT/.github/workflows/ci-package-debug.yml@development
     with:
       renderer_sha: ${{ github.sha }}

@@ -4437,8 +4437,134 @@ Configure configure_original;
 ApplyConfig apply_original;
 std::mutex configure_lock;
 
+namespace Rewards {
+// GT7RewardRootEvent.setSceneFace loads this stage before drawing the driver.
+// The race organizer can still be active. The widget owns the stage; the script
+// also saves and disables race rendering on opening and restores the same
+// StateControl on closing.
+std::atomic<void*> active_stage{};
+void* race_control{};
+std::mutex state_lock;
+using QueueFile = void(PS4_SYSV_ABI*)(void*, u16, const char*, void*, u32);
+using Destroy = void(PS4_SYSV_ABI*)(void*);
+using SetRendering = void(PS4_SYSV_ABI*)(void*, void**);
+QueueFile queue_original;
+Destroy destroy_original;
+SetRendering set_rendering_original;
+
+bool IsRewardFile(std::string_view path) {
+    constexpr std::string_view name = "Reward_Sequence.txt";
+    const auto filename = path.substr(path.find_last_of("/\\") + 1);
+    return filename.size() == name.size() &&
+           _strnicmp(filename.data(), name.data(), name.size()) == 0;
+}
+
+void SetStage(void* next) { // called with state_lock held
+    race_control = nullptr;
+    active_stage.store(next, std::memory_order_release);
+    std::fprintf(stderr, "[native] GT7 Rewards: %s\n",
+                 next ? "request 16:9 before scene load" : "release menu layout");
+}
+
+void PS4_SYSV_ABI QueueStage(void* queue, u16 opcode, const char* path, void* callback, u32 id,
+                             void* stage) {
+    {
+        std::scoped_lock lock{state_lock};
+        void* current = active_stage.load();
+        if (path && IsRewardFile(path)) {
+            if (current != stage)
+                SetStage(stage);
+        } else if (current && current == stage) {
+            SetStage(nullptr);
+        }
+    }
+    queue_original(queue, opcode, path, callback, id);
+}
+
+void PS4_SYSV_ABI DestroyFace(void* widget) {
+    {
+        std::scoped_lock lock{state_lock};
+        void* stage = active_stage.load();
+        if (stage && stage == *reinterpret_cast<void**>(static_cast<u8*>(widget) + 0x10)) {
+            SetStage(nullptr);
+        }
+    }
+    destroy_original(widget);
+}
+
+void PS4_SYSV_ABI SetRaceRendering(void* result, void** args) {
+    set_rendering_original(result, args);
+    std::scoped_lock lock{state_lock};
+    if (!active_stage.load())
+        return;
+    void* control = *static_cast<void**>(args[0]);
+    const bool enabled = *static_cast<const u8*>(args[1]) != 0;
+    if (enabled && control == race_control) {
+        // A cached widget can outlive its page. Release as soon as the same control
+        // resumes the race. If rendering was already disabled, widget teardown owns
+        // exit.
+        SetStage(nullptr);
+    } else if (!enabled && !race_control) {
+        race_control = control;
+    }
+}
+
+void Install(Native::NearCode& code, u8* base) {
+    const char* opt = std::getenv("RYGT_GT7_REWARDS_16_9");
+    if (!opt || std::string_view(opt) != "1")
+        return;
+    // SceneFace.loadCommandFile has already acquired a live stage in r14 and
+    // resolved the path in rdx. Observe only its enqueue call, before the worker
+    // can render any commands.
+    const auto matches = [&](u32 rva, std::initializer_list<u8> bytes) {
+        return ReadableRange(base + rva, bytes.size()) &&
+               std::memcmp(base + rva, bytes.begin(), bytes.size()) == 0;
+    };
+    constexpr u32 enqueue = 0xbcfbec, target = 0x2189500, destroy = 0xbb7260, setter = 0x10e1240;
+    if (!matches(0xbbfb78, {0xe8, 0x03, 0x00, 0x01, 0x00}) ||
+        !matches(0xbcfbd1, {0x49, 0x8b, 0xbe, 0x38, 0x02, 0x00, 0x00}) ||
+        !matches(enqueue, {0xe8, 0x0f, 0x99, 0x5b, 0x01}) ||
+        !matches(0xbb7719, {0x48, 0x8b, 0x46, 0x10}) ||
+        !matches(destroy + 6, {0x48, 0x8d, 0x05, 0xc3, 0x41, 0x57, 0x04}) ||
+        !matches(setter + 7,
+                 {0x8a, 0x09, 0x48, 0x8b, 0x00, 0x88, 0x88, 0x74, 0x02, 0x00, 0x00, 0xc3})) {
+        std::fputs("[native] GT7 Rewards: unsupported scene binding\n", stderr);
+        return;
+    }
+    const u8 destroy_entry[]{0x55, 0x48, 0x89, 0xe5, 0x53};
+    const u8 setter_entry[]{0x48, 0x8b, 0x06, 0x48, 0x8b, 0x4e, 0x08};
+    auto* stub = code.Alloc(64);
+    if (!stub)
+        return;
+    Xbyak::CodeGenerator bridge(64, stub);
+    bridge.mov(bridge.r9,
+               bridge.r14); // sixth System V argument, the stage owning the command
+    bridge.mov(bridge.rax, reinterpret_cast<uintptr_t>(&QueueStage));
+    bridge.jmp(bridge.rax);
+    FlushInstructionCache(GetCurrentProcess(), stub, bridge.getSize());
+    destroy_original = reinterpret_cast<Destroy>(
+        Native::HookEntry(code, base, destroy - Native::kEbootToExe, destroy_entry,
+                          reinterpret_cast<void*>(&DestroyFace), "GT7 Rewards scene lifetime"));
+    if (!destroy_original)
+        return;
+    set_rendering_original = reinterpret_cast<SetRendering>(Native::HookEntry(
+        code, base, setter - Native::kEbootToExe, setter_entry,
+        reinterpret_cast<void*>(&SetRaceRendering), "GT7 Rewards race rendering"));
+    if (!set_rendering_original)
+        return;
+    queue_original = reinterpret_cast<QueueFile>(base + target);
+    const s32 rel = static_cast<s32>(stub - (base + enqueue + 5));
+    std::vector<u8> call{0xe8, 0, 0, 0, 0};
+    std::memcpy(call.data() + 1, &rel, sizeof(rel));
+    if (Apply(base, {enqueue, {0xe8, 0x0f, 0x99, 0x5b, 0x01}, call, "GT7 Rewards stage load"})) {
+        std::fputs("[native] GT7 Rewards: scene tracking installed\n", stderr);
+    }
+}
+} // namespace Rewards
+
 u32 RequestedWidth() {
-    return Vulkan::RytyGtsInRace() ? wide_width : menu_width;
+    return Vulkan::RytyGtsInRace() && !Rewards::active_stage.load(std::memory_order_acquire)
+               ? wide_width : menu_width;
 }
 
 void PS4_SYSV_ABI ConfigureTargets() {
@@ -4480,8 +4606,9 @@ void PS4_SYSV_ABI ConfigureTargets() {
             auto* targets = *reinterpret_cast<u8**>(game + 0x641c318);
             const auto* screen = reinterpret_cast<const u32*>(targets + 0x21c);
             const auto* scene = reinterpret_cast<const u32*>(targets + 0x238);
-            std::fprintf(stderr, "[native] GT7 frame layout: %s, screen %ux%u, scene %ux%u\n",
-                         width == menu_width ? "menu" : "track", screen[0], screen[1], scene[0], scene[1]);
+            std::fprintf(stderr, "[native] GT7 frame layout: %s, screen %ux%u, scene %ux%u%s\n",
+                         width == menu_width ? "menu" : "track", screen[0], screen[1], scene[0], scene[1],
+                         width == menu_width && Rewards::active_stage.load() ? " (Rewards)" : "");
         }
     }
 }
@@ -4596,6 +4723,7 @@ void Install(u8* base) {
             near_code, base, target_config - Native::kEbootToExe, prologue,
             reinterpret_cast<void*>(&ConfigureTargets), "GT7 scene and screen targets"));
         if (configure_original) {
+            Rewards::Install(near_code, base);
             std::fprintf(stderr, "[native] GT7 frame layout: installed, menu %ux%u, track %ux%u\n",
                          menu_width, height, wide_width, height);
             return;

@@ -444,6 +444,9 @@ public:
     /// only, as Evict). The caller names live entries.
     u32 EvictListed(std::span<const ImageEntry* const> listed, u64 before,
                     const std::function<void(ImageEntry&)>& on_evict);
+    /// FIX-SGT-158: frees render targets a new target of another layout replaced at their
+    /// address, each once it has gone unused for a few frames (recorder only, before Evict).
+    u32 EvictSuperseded(u64 frame, const std::function<void(ImageEntry&)>& on_evict);
     /// FIX-157: whether guest memory under a picture the GPU wrote still holds what it held
     /// when the picture was last uploaded from it (its content hash).
     bool MemoryUnchanged(const ImageEntry& entry);
@@ -550,6 +553,14 @@ private:
     std::mutex upload_mutex;
     std::mutex recent_fills_mutex;
     RecentFills recent_fills;
+    struct Superseded {                          ///< FIX-SGT-158
+        VAddr address;
+        const ImageEntry* entry;                 ///< compared only, never read unless found
+        u64 noted;                               ///< frame it was replaced
+    };
+    std::mutex superseded_mutex;                 ///< FIX-SGT-158
+    std::vector<Superseded> superseded;          ///< FIX-SGT-158
+    std::atomic<u64> superseded_frame{0};        ///< FIX-SGT-158: last EvictSuperseded frame
     std::shared_ptr<std::atomic<u64>> remembered_fill_count = std::make_shared<std::atomic<u64>>(0);
     std::vector<ImageEntry*> pending_uploads;
     /// FIX-SGT-140: uploads left out when device memory ran out, due again from the next frame

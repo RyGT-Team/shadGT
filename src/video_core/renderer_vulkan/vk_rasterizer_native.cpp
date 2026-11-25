@@ -17147,9 +17147,29 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     const bool sampled_depth = targets.depth &&
         std::ranges::find(b.sampled, targets.depth) != b.sampled.end();
     const auto& db_feedback = targets.state.depth_stencil_attachment;
+    // PERF-SGT-150: the stencil counts as written only when the draw can change it (a write mask
+    // and an op other than Keep), not for every stencil test. GT7's full-screen passes test the
+    // stencil with Keep ops and sample the depth (RDNA2 iGPU, Tokyo rain replay: ~42 a frame);
+    // without the feedback-loop extensions (AMD's Windows driver) each of them copied the whole
+    // 1920x1080 depth-stencil target first. SHADGT_STENCIL_KEEP_READ_ONLY=0: every stencil
+    // test counts as a write, as before.
+    static const bool stencil_keep_read_only = [] {
+        const char* env = std::getenv("SHADGT_STENCIL_KEEP_READ_ONLY");
+        return !(env && env[0] == '0');
+    }();
+    const auto& dc = regs.depth_control;
+    const auto& sc = regs.stencil_control;
+    const bool stencil_writes = db_feedback.has_stencil &&
+        (stencil_keep_read_only
+             ? Native::StencilMayWrite(dc.stencil_enable, dc.backface_enable,
+                   u32(sc.stencil_fail_front), u32(sc.stencil_zpass_front),
+                   u32(sc.stencil_zfail_front), u32(sc.stencil_fail_back),
+                   u32(sc.stencil_zpass_back), u32(sc.stencil_zfail_back),
+                   regs.stencil_ref_front.stencil_write_mask,
+                   regs.stencil_ref_back.stencil_write_mask)
+             : bool(dc.stencil_enable));
     const bool depth_writes = db_feedback.depth_clear || db_feedback.stencil_clear ||
-        (regs.depth_control.depth_enable && regs.depth_control.depth_write_enable) ||
-        (db_feedback.has_stencil && regs.depth_control.stencil_enable);
+        (dc.depth_enable && dc.depth_write_enable) || stencil_writes;
     const auto depth_feedback = Native::DecideDepthFeedback(
         sampled_depth, depth_writes, r.instance.IsAttachmentFeedbackLoopLayoutSupported());
     // NEO-GTS-511: the pixel shader's positions table (the draw's own positions, as given to

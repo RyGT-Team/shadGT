@@ -8734,7 +8734,11 @@ bool NativeRenderer::WritebackRaceDiag() {
 u64 NativeRenderer::SnapshotBelow() {
     static const u64 below = [] {
         const char* env = std::getenv("SHADGT_NATIVE_SNAPSHOT_BELOW");
-        return env && *env ? std::strtoull(env, nullptr, 0) : u64{1_MB};
+        // FIX-SGT-161: 64 KiB, was 1 MiB. GT Sport's car menus bind read-only buffers of
+        // 0.2-0.6 MiB (the car's data) hundreds of times a frame; each bind was copied again:
+        // 217-255 MB a frame over PCIe (~3 GB/s) and the CPU copying it, menus at ~35 fps.
+        // Above 64 KiB they use their video-memory mirror: 29 MB copied, 60 fps, no glitches.
+        return env && *env ? std::strtoull(env, nullptr, 0) : u64{64_KB};
     }();
     // Race/replay buffers can depend on GPU writes not visible to a CPU snapshot.
     // The native session guard also covers attract replays using cached menu scripts.

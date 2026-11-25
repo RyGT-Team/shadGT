@@ -103,7 +103,99 @@ static s64 NowNs() {
 static void CheckIbAtDecode(const u32* data, u32 dwords, u64 decoding); // DIAG-062
 static std::atomic<u64> g_eop_submit{0}; // DIAG-066: submission of the last EOP signaled
 static std::atomic<u64> g_eop_count{0};
+// DIAG-SGT-063 (SHADGT_DIAG_EOP_LATENCY=1, diagnostics builds): is the frame gated by our latency?
+// SubmitGfx stamps each graphics submission; an EOP interrupt signaled for submission N measures
+// N's submit-to-signal time; the next submission after a signal measures the game's reaction.
+// Every 5 s: counts, averages and maxima, and the submissions between two signals.
+static bool EopLatencyDiag() {
+    if constexpr (!Common::DiagnosticsBuilt) {
+        return false;
+    } else {
+        static const bool on = Common::DiagEnv("SHADGT_DIAG_EOP_LATENCY") != nullptr;
+        return on;
+    }
+}
+static std::array<std::atomic<s64>, 1024> g_submit_ns{}; // by submission number
+// By submission number: when the command processor decoded its EOP (0) and when the recorder
+// reached it (1); with the submit and the signal, the chain's three parts.
+static std::array<std::array<std::atomic<s64>, 1024>, 2> g_eop_stage_ns{};
+static std::atomic<s64> g_lat_last_eop_ns{0};
+static std::mutex g_lat_mutex;
+static u64 g_lat_eops = 0, g_lat_submits = 0, g_lat_reactions = 0, g_lat_split = 0;
+static s64 g_lat_sum = 0, g_lat_max = 0, g_react_sum = 0, g_react_max = 0, g_lat_since = 0;
+static std::array<s64, 3> g_part_sum{}, g_part_max{};
+static void NoteEopStage(u64 submit, int stage) {
+    if (!EopLatencyDiag() || submit == 0) return;
+    g_eop_stage_ns[stage][submit % 1024].store(NowNs(), std::memory_order_relaxed);
+}
+static void ReportEopLatency(s64 now) {
+    if (g_lat_since == 0) {
+        g_lat_since = now;
+        return;
+    }
+    if (now - g_lat_since < 5'000'000'000) return;
+    LOG_INFO(Render, "DIAG-SGT-063: in 5 s: {} graphics submits, {} EOP interrupts ({:.1f} submits "
+                     "each); submit to EOP signal avg {:.2f} ms max {:.2f} ms; EOP signal to the "
+                     "next submit ({} times) avg {:.2f} ms max {:.2f} ms",
+             g_lat_submits, g_lat_eops,
+             g_lat_eops ? double(g_lat_submits) / double(g_lat_eops) : 0.0,
+             g_lat_eops ? double(g_lat_sum) / double(g_lat_eops) / 1e6 : 0.0, g_lat_max / 1e6,
+             g_lat_reactions,
+             g_lat_reactions ? double(g_react_sum) / double(g_lat_reactions) / 1e6 : 0.0,
+             g_react_max / 1e6);
+    if (g_lat_split) {
+        const auto avg = [](s64 sum) { return double(sum) / double(g_lat_split) / 1e6; };
+        LOG_INFO(Render, "DIAG-SGT-063: submit to EOP split ({} EOPs): submit -> decoded avg "
+                         "{:.2f} max {:.2f} ms; decoded -> recorder reached it avg {:.2f} max "
+                         "{:.2f} ms; recorder -> signal (GPU tail and fence) avg {:.2f} max {:.2f} ms",
+                 g_lat_split, avg(g_part_sum[0]), g_part_max[0] / 1e6, avg(g_part_sum[1]),
+                 g_part_max[1] / 1e6, avg(g_part_sum[2]), g_part_max[2] / 1e6);
+    }
+    g_lat_eops = g_lat_submits = g_lat_reactions = g_lat_split = 0;
+    g_part_sum = {};
+    g_part_max = {};
+    g_lat_sum = g_lat_max = g_react_sum = g_react_max = 0;
+    g_lat_since = now;
+}
+static void NoteSubmitForLatency(u64 submit) {
+    if (!EopLatencyDiag()) return;
+    const s64 now = NowNs();
+    g_submit_ns[submit % g_submit_ns.size()].store(now, std::memory_order_relaxed);
+    std::scoped_lock lk{g_lat_mutex};
+    ++g_lat_submits;
+    if (const s64 eop = g_lat_last_eop_ns.exchange(0); eop != 0) {
+        const s64 react = now - eop;
+        ++g_lat_reactions;
+        g_react_sum += react;
+        g_react_max = std::max(g_react_max, react);
+    }
+    ReportEopLatency(now);
+}
+static void NoteEopForLatency(u64 submit) {
+    if (!EopLatencyDiag() || submit == 0) return;
+    const s64 now = NowNs();
+    const s64 at = g_submit_ns[submit % g_submit_ns.size()].load(std::memory_order_relaxed);
+    g_lat_last_eop_ns.store(now);
+    std::scoped_lock lk{g_lat_mutex};
+    if (at != 0 && now > at) {
+        ++g_lat_eops;
+        g_lat_sum += now - at;
+        g_lat_max = std::max(g_lat_max, now - at);
+        const s64 decoded = g_eop_stage_ns[0][submit % 1024].load(std::memory_order_relaxed);
+        const s64 reached = g_eop_stage_ns[1][submit % 1024].load(std::memory_order_relaxed);
+        if (decoded >= at && reached >= decoded && now >= reached) {
+            const std::array<s64, 3> parts{decoded - at, reached - decoded, now - reached};
+            ++g_lat_split;
+            for (int i = 0; i < 3; ++i) {
+                g_part_sum[i] += parts[i];
+                g_part_max[i] = std::max(g_part_max[i], parts[i]);
+            }
+        }
+    }
+    ReportEopLatency(now);
+}
 static void NoteEop(u64 submit = 0) {
+    NoteEopForLatency(submit); // DIAG-SGT-063
 #ifndef NDEBUG
     g_last_eop_ns.store(NowNs());
     g_eop_submit.store(submit);
@@ -2734,6 +2826,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::EventWriteEop: {
                 const auto event = *reinterpret_cast<const PM4CmdEventWriteEop*>(header);
                 const u64 eop_submit = decoding_submit.load(std::memory_order_relaxed);
+                NoteEopStage(eop_submit, 0); // DIAG-SGT-063: decoded
                 // FIX-GTS-492: when this event raises the interrupt, the game takes back the
                 // command memory decoded so far (whole buffers, the rest of this one included):
                 // the prepared draws in it are dropped where the event is signaled, before its
@@ -2776,6 +2869,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     reinterpret_cast<VAddr>(event.Address<u32>()),
                     FenceValueBytes(event.data_sel.Value(), event.DataDWord(), event.DataQWord()),
                     [this, event, eop_submit, retire_prepared] {
+                        NoteEopStage(eop_submit, 1); // DIAG-SGT-063: the recorder got here
                         const auto* event_eop = &event;
                         const bool deferred =
                             rasterizer &&
@@ -4309,6 +4403,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     const auto original_dcb = dcb;
     if (!dcb.empty()) {
         const u64 submit = submitted_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        NoteSubmitForLatency(submit); // DIAG-SGT-063
         if (TessSubmitCheckEnabled()) {
             static std::array<u32, 16> hs{}; // only this thread submits graphics work
             const s64 now = NowNs();

@@ -274,6 +274,17 @@ ImageRegistry::ImageRegistry(Rhi::Device& device) : device{device} {
 
 ImageRegistry::~ImageRegistry() = default;
 
+namespace {
+// FIX-SGT-158: SHADGT_FREE_SUPERSEDED_TARGETS=0 turns it off.
+bool FreeSupersededOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_FREE_SUPERSEDED_TARGETS");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+} // namespace
+
 ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_target, u64 frame,
                                 bool create, bool exact_format) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::RegistryFind}; // DIAG-SGT-023
@@ -598,14 +609,17 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         // still in use the frame before the next size came, so checking only now missed them all).
         // One the game uses again in that time stays usable (a pool that holds two sizes at one
         // address in turn keeps both), and after four seconds it is left to the idle eviction.
-        static const bool free_superseded = [] {
-            const char* env = std::getenv("SHADGT_FREE_SUPERSEDED_TARGETS");
-            return !(env && env[0] == '0');
-        }();
-        if (free_superseded && render_target) {
+        // Uploaded pictures of another layout under a new image go too (the guest memory they
+        // came from is uploaded again if one is wanted; GT7's fail screen made ~40 images a frame
+        // for 23 frames over ~150 of them a frame, ~2 GB kept two seconds). A picture drawn by the
+        // GPU under a new texture stays (only the GPU holds what it drew), unless stale.
+        const bool free_superseded = FreeSupersededOn();
+        if (free_superseded) {
             for (auto it = first; it != last; ++it) {
                 const ImageEntry& old = *it->second;
-                if (old.from_cpu || !old.image || SameLayout(old.info, info)) {
+                if (!old.image || SameLayout(old.info, info) ||
+                    (!old.from_cpu && !render_target &&
+                     !old.reused.load(std::memory_order_relaxed))) {
                     continue;
                 }
                 std::scoped_lock superseded_lock{superseded_mutex};
@@ -1347,6 +1361,7 @@ u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_
 u32 ImageRegistry::EvictSuperseded(u64 frame, const std::function<void(ImageEntry&)>& on_evict) {
     constexpr u64 IdleFrames = 4;    // unused this long: freed
     constexpr u64 WatchFrames = 240; // still in use after this long: left to Evict
+    superseded_frame.store(frame, std::memory_order_relaxed);
     std::vector<Superseded> noted;
     {
         std::scoped_lock lock{superseded_mutex};
@@ -1612,6 +1627,13 @@ void ImageRegistry::MarkReused(ImageEntry& entry) {
                                         entry.info.guest_address +
                                             std::max<u64>(entry.info.guest_size, 1)};
     NoteChanges({&range, 1}, 3);
+    // FIX-SGT-158: nothing finds a stale picture any more: freed once unused a few frames, not
+    // kept two seconds.
+    if (FreeSupersededOn() && entry.image) {
+        std::scoped_lock superseded_lock{superseded_mutex};
+        superseded.push_back({entry.info.guest_address, &entry,
+                              superseded_frame.load(std::memory_order_relaxed)});
+    }
 #ifndef NDEBUG
     if (WatchedTexture(entry.info.guest_address, entry.info.guest_address + 1)) {
         LOG_WARNING(Render_Vulkan, "FIX-157 watch: kept {:#x} reused", entry.info.guest_address);

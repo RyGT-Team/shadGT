@@ -560,6 +560,7 @@ private:
     };
     std::mutex superseded_mutex;                 ///< FIX-SGT-158
     std::vector<Superseded> superseded;          ///< FIX-SGT-158
+    std::atomic<u64> superseded_frame{0};        ///< FIX-SGT-158: last EvictSuperseded frame
     std::shared_ptr<std::atomic<u64>> remembered_fill_count = std::make_shared<std::atomic<u64>>(0);
     std::vector<ImageEntry*> pending_uploads;
     /// FIX-SGT-140: uploads left out when device memory ran out, due again from the next frame

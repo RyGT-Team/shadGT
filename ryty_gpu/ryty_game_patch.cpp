@@ -2815,6 +2815,9 @@ TelemetryUpdateFn g_telemetry_update_gt7{};
 void PS4_SYSV_ABI TelemetryUpdateHookGt7(void* service, void* context) {
     g_telemetry_update_gt7(service, context);
     const auto* packet = static_cast<const u8*>(service) + 0x1dc;
+    // FIX-GT7-197: DLSS frame generation runs only while this packet says the car is on track;
+    // without it, GT7 kept frame generation suspended in races (RyGT #122).
+    Vulkan::RytyDlssG::PublishTelemetry(packet);
     Input::TriggerFeedback::Publish(packet);
     Input::TelemetryHaptics::Publish(packet);
     static const bool log = [] {

@@ -507,19 +507,26 @@ bool Instance::CreateDevice() {
     whole_pipeline_binaries_only = whole_pipeline_binaries_only && pipeline_binary;
     // FIX-SGT-192 (SHADGT_PIPELINE_CACHE_FILES): without pipeline binaries (Intel Arc on Windows
     // has none), a driver cache file per pipeline instead of one file loaded whole into memory.
-    // On by default off AMD (AMD's driver keeps no whole pipeline in a VkPipelineCache, and its
-    // libraries are left as they are); 0 turns it off, 1 turns it on anywhere.
+    // On by default off AMD; 0 turns it off, 1 turns it on anywhere. On AMD, unset, the pipeline
+    // cache chooses at its start by the single file's size (SHADGT_PIPELINE_CACHE_FILES_MB): a
+    // small one (the 610M's GT7 file, 89 MB) builds libraries in half the time of the files, but
+    // an RX 9050's GT Sport file reached 935 MB, held whole in memory on 16 GB of RAM (RyGT #104).
+    // With RDNA2 whole binaries (PERF-GTS-482) the files stay off.
     {
         const char* files_env = std::getenv("SHADGT_PIPELINE_CACHE_FILES");
-        pipeline_cache_files = files_env && *files_env ? files_env[0] == '1'
-                                                       : properties.vendorID != 0x1002;
+        const bool files_set = files_env && *files_env;
+        pipeline_cache_files = files_set ? files_env[0] == '1' : properties.vendorID != 0x1002;
         pipeline_cache_files = pipeline_cache_files && !whole_pipeline_binaries_only;
+        pipeline_cache_files_by_size =
+            !files_set && properties.vendorID == 0x1002 && !whole_pipeline_binaries_only;
         LOG_WARNING(Render_Vulkan,
                     "FIX-SGT-192: pipelines kept as {}",
                     pipeline_binary && !whole_pipeline_binaries_only
                         ? "pipeline binaries, a file each"
-                        : pipeline_cache_files ? "driver cache files, one per pipeline"
-                                               : "one driver cache file");
+                    : pipeline_cache_files ? "driver cache files, one per pipeline"
+                    : pipeline_cache_files_by_size
+                        ? "one driver cache file, or a file per pipeline once it is big"
+                        : "one driver cache file");
     }
     if (whole_pipeline_binaries_only) {
         LOG_WARNING(Render_Vulkan, "PERF-GTS-482: whole pipelines are stored as pipeline binaries "

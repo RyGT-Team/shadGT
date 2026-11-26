@@ -604,6 +604,7 @@ private:
     // The driver's VkPipelineCache, kept on disk so cached pipelines are not recompiled by the
     // driver on every launch.
     void CreateDriverCache();
+    void ChooseCacheFilesBySize(const std::filesystem::path& full); // FIX-SGT-192
     void SaveDriverCache(bool wait);
     void MaybeSaveDriverCache();
     /// PERF-GT7-108: the compile pack's start-up compile (SHADGT_COMPILE_PACK=1, with shader

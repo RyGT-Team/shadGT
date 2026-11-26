@@ -3867,6 +3867,56 @@ static bool QuarantineRejectedDriverCache(const std::filesystem::path& source,
 // Preserve any cache that could not be verified or safely quarantined this run.
 static std::atomic<bool> rejected_driver_cache{false};
 
+// FIX-SGT-192 (SHADGT_PIPELINE_CACHE_FILES_MB): on AMD, a file per pipeline once the single
+// driver cache file (or the .old FIX-SGT-010 moved aside) is over this size; unset 512, 0 never.
+// Under both titles' rotate sizes (1024 MB GT7, 2048 MB GT Sport), so the files come first.
+static u64 CacheFilesFromBytes() {
+    static const u64 limit = [] {
+        const char* env = std::getenv("SHADGT_PIPELINE_CACHE_FILES_MB");
+        if (!env || !*env) return u64{512} << 20;
+        const long long mb = std::strtoll(env, nullptr, 10);
+        return mb <= 0 ? ~u64{0} : u64(mb) << 20;
+    }();
+    return limit;
+}
+
+// Once chosen it stays: a <serial>-pipelines-<vendor>-<device>-* folder (this or an earlier
+// driver's, for this GPU only: a laptop's other GPU has its own) keeps the files on, so deleting
+// the old big file or a driver update does not compile everything twice.
+void PipelineCache::ChooseCacheFilesBySize(const std::filesystem::path& full) {
+    std::error_code error;
+    u64 size = 0;
+    auto old = full;
+    old += ".old";
+    for (const auto& path : {full, old}) {
+        const auto bytes = std::filesystem::file_size(path, error);
+        if (!error) size = std::max<u64>(size, bytes);
+        error.clear();
+    }
+    const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
+    const auto props = instance.GetPhysicalDevice().getProperties();
+    const std::string prefix = fmt::format("{}-pipelines-{:04x}-{:04x}-", serial, props.vendorID,
+                                           props.deviceID);
+    bool chosen_before = false;
+    for (std::filesystem::directory_iterator it{full.parent_path(), error}, end;
+         !error && it != end; it.increment(error)) {
+        if (it->is_directory(error) && it->path().filename().string().starts_with(prefix)) {
+            chosen_before = true;
+            break;
+        }
+    }
+    const bool on = chosen_before || size > CacheFilesFromBytes();
+    instance.ChoosePipelineCacheFilesBySize(on);
+    LOG_WARNING(Render_Vulkan,
+                "FIX-SGT-192: AMD driver cache file {} MB ({} MB limit, "
+                "SHADGT_PIPELINE_CACHE_FILES_MB): {}",
+                size >> 20, CacheFilesFromBytes() == ~u64{0} ? 0 : CacheFilesFromBytes() >> 20,
+                on ? (chosen_before && size <= CacheFilesFromBytes()
+                          ? "a file per pipeline, as in earlier runs"
+                          : "a file per pipeline from now on (this run builds them once)")
+                   : "kept as one file");
+}
+
 void PipelineCache::CreateDriverCache() {
     std::vector<u8> data;
     try {
@@ -3884,6 +3934,7 @@ void PipelineCache::CreateDriverCache() {
         // key. It gets a file of its own, so the full one of earlier builds is not loaded whole
         // into memory; that one is left as it is (SHADGT_PIPELINE_BINARIES=0 and
         // SHADGT_PIPELINE_CACHE_FILES=0 use it again).
+        if (instance.IsPipelineCacheFilesBySize()) ChooseCacheFilesBySize(driver_cache_path);
         if (PipelineBinaryStore::StoresEverything(instance)) {
             std::error_code full_error;
             if (std::filesystem::exists(driver_cache_path, full_error)) {
@@ -4003,6 +4054,87 @@ static std::vector<u8> ReadDriverCacheSnapshot(vk::Device device, vk::PipelineCa
     }
 }
 
+#ifdef _WIN32
+// FIX-SGT-192 (SHADGT_DRIVER_CACHE_SAVE_MAPPED, on unless 0): the driver writes its cache data
+// straight into a mapped view of the temporary file. A buffer of the file's size (935 MB on an
+// RX 9050 with 16 GB of RAM, RyGT #104) is then never allocated: the view's pages are backed by
+// the file, not by the page file, so they add no commit charge and Windows may write them out
+// instead of paging. The file's space is reserved first, so a full disk fails here and not as
+// a fault inside the driver. Checked by reading the file back against the view's hash. Returns
+// the bytes written, 0 when it did not work (the buffered save is used then).
+static size_t SaveDriverCacheMapped(vk::Device device, vk::PipelineCache cache,
+                                    const std::filesystem::path& temp, u64* hash) {
+    size_t reported = 0;
+    if (device.getPipelineCacheData(cache, &reported, nullptr) != vk::Result::eSuccess ||
+        reported < 32) {
+        return 0;
+    }
+    reported = static_cast<size_t>(std::min<u64>(reported, DriverCacheMaxBytes()));
+    size_t written = 0;
+    {
+        const HANDLE file = CreateFileW(temp.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) return 0;
+        SCOPE_EXIT {
+            CloseHandle(file);
+        };
+        FILE_ALLOCATION_INFO allocation{};
+        allocation.AllocationSize.QuadPart = static_cast<LONGLONG>(reported);
+        if (!SetFileInformationByHandle(file, FileAllocationInfo, &allocation,
+                                        sizeof(allocation))) {
+            return 0;
+        }
+        LARGE_INTEGER size{};
+        size.QuadPart = static_cast<LONGLONG>(reported);
+        const HANDLE mapping = CreateFileMappingW(file, nullptr, PAGE_READWRITE,
+                                                  static_cast<DWORD>(size.HighPart),
+                                                  size.LowPart, nullptr);
+        if (!mapping) return 0;
+        void* view = MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, reported);
+        CloseHandle(mapping);
+        if (!view) return 0;
+        written = reported;
+        const vk::Result result = device.getPipelineCacheData(cache, &written, view);
+        bool ok = (result == vk::Result::eSuccess || result == vk::Result::eIncomplete) &&
+                  written >= 32 && written <= reported;
+        if (ok) *hash = XXH3_64bits(view, written);
+        ok = ok && FlushViewOfFile(view, 0);
+        UnmapViewOfFile(view);
+        if (!ok) return 0;
+        LARGE_INTEGER end{};
+        end.QuadPart = static_cast<LONGLONG>(written);
+        if (!SetFilePointerEx(file, end, nullptr, FILE_BEGIN) || !SetEndOfFile(file) ||
+            !FlushFileBuffers(file)) {
+            return 0;
+        }
+    }
+    // Read back in pieces: the check needs no second copy either.
+    std::ifstream check{temp, std::ios::binary};
+    XXH3_state_t* state = XXH3_createState();
+    if (!check || !state) {
+        if (state) XXH3_freeState(state);
+        return 0;
+    }
+    XXH3_64bits_reset(state);
+    std::vector<char> piece(1u << 20);
+    size_t read = 0;
+    while (check.read(piece.data(), piece.size()) || check.gcount() > 0) {
+        XXH3_64bits_update(state, piece.data(), static_cast<size_t>(check.gcount()));
+        read += static_cast<size_t>(check.gcount());
+    }
+    const u64 file_hash = XXH3_64bits_digest(state);
+    XXH3_freeState(state);
+    return read == written && file_hash == *hash ? written : 0;
+}
+
+static bool SaveMappedOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_DRIVER_CACHE_SAVE_MAPPED");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+#endif
 
 void PipelineCache::SaveDriverCache(bool wait) {
     // FIX-GT7-050: wait even when a rejected cache or empty path prevents a new save.
@@ -4058,6 +4190,37 @@ void PipelineCache::SaveDriverCache(bool wait) {
                 Common::RecoverableScope recoverable;
                 Common::SetCurrentThreadName("shadGT:DriverCacheSave");
                 const auto start = std::chrono::steady_clock::now();
+#ifdef _WIN32
+                if (SaveMappedOn()) {
+                    auto temp = driver_cache_path;
+                    temp += ".tmp";
+                    u64 hash = 0;
+                    const size_t size = SaveDriverCacheMapped(device, cache, temp, &hash);
+                    if (size != 0) {
+                        if (MoveFileExW(temp.c_str(), driver_cache_path.c_str(),
+                                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) {
+                            LOG_WARNING(Render_Vulkan, "CACHE-SAVE-DEFER: cache replacement "
+                                                       "failed; keeping previous cache");
+                            return;
+                        }
+                        LOG_INFO(Render_Vulkan, "CACHE-SAVED: {} bytes, hash {:016x}, file {}",
+                                 size, hash, driver_cache_path.string());
+                        LOG_WARNING(Render_Vulkan,
+                                    "PERF-036: driver pipeline cache saved off the GPU thread: "
+                                    "{} MB, written through a file mapping in {:.0f} ms "
+                                    "(FIX-SGT-192, no buffer of its size)",
+                                    size >> 20,
+                                    std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() - start)
+                                        .count());
+                        return;
+                    }
+                    std::error_code remove_error;
+                    std::filesystem::remove(temp, remove_error);
+                    LOG_WARNING(Render_Vulkan, "FIX-SGT-192: mapped driver cache save failed; "
+                                               "saving through a buffer");
+                }
+#endif
                 auto data = ReadDriverCacheSnapshot(device, cache);
                 const auto read_end = std::chrono::steady_clock::now();
                 if (!data.empty()) {

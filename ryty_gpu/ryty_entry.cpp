@@ -40,7 +40,7 @@
 #include "core/memory.h"
 #include "ryty_gpu/native/job_walker.h"
 #include "ryty_gpu/native/cpu_stack_registry.h"
-#include "ryty_gpu/fault_xstate_repair.h"
+#include "ryty_gpu/fault_xstate_check.h"
 #include "common/decoder.h"
 #include "core/signals.h"
 #include "core/loader/symbols_resolver.h"
@@ -997,9 +997,10 @@ extern "C" int RytyGpuHandleWriteFaultBody(void* exception_pointers) {
 // the renderer whose store is 16 bytes or wider or crosses a page, logged on stderr by
 // ryty_fault_xstate.cpp's shim (FIX-SGT-194) after the handler ran: fault and store addresses,
 // the instruction's bytes, both pages, which handler took it, and the AVX state the exception's
-// context named before the repair. The first 4000 and then every 1000th.
+// context named (FIX-SGT-194). The first 4000 and then every 1000th.
 extern "C" void RytyGpuLogFaultStore(void* exception_pointers, int result,
-                                     const RytyFaultXState::RepairResult* repair) {
+                                     const RytyFaultXState::CheckResult* check,
+                                     unsigned long long in_use) {
     auto* pointers = static_cast<EXCEPTION_POINTERS*>(exception_pointers);
     if (pointers == nullptr || pointers->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
         pointers->ExceptionRecord->NumberParameters < 2) {
@@ -1071,12 +1072,11 @@ extern "C" void RytyGpuLogFaultStore(void* exception_pointers, int result,
     const char* handler = result == 1   ? "renderer (page tracking, resumed)"
                           : result == 2 ? "renderer's guarded read (passed on)"
                                         : "not the renderer's (Ryty's handlers next)";
-    const char* outcome[] = {"complete", "repaired", "no XSTATE in context", "too small",
-                             "foreign components"};
+    const char* outcome[] = {"complete", "AVX STATE LEFT OUT (Windows bug)", "no XSTATE in context"};
     std::fprintf(stderr,
                  "[fault] DIAG-SGT-195 #%llu: write fault at %#llx, rip %#llx (exe+%#llx) bytes %s "
                  "(%s%s, %llu bytes at %#llx, pages %#llx and %#llx%s); handler: %s; AVX state in "
-                 "use %#llx, context XSTATE_BV %#llx XCOMP_BV %#llx flags %#lx rsp %#llx: %s\n",
+                 "use at the handler %#llx, context XSTATE_BV %#llx XCOMP_BV %#llx flags %#lx rsp %#llx: %s\n",
                  static_cast<unsigned long long>(n), static_cast<unsigned long long>(fault),
                  static_cast<unsigned long long>(ctx->Rip),
                  static_cast<unsigned long long>(ctx->Rip - base), hex.c_str(),
@@ -1085,10 +1085,9 @@ extern "C" void RytyGpuLogFaultStore(void* exception_pointers, int result,
                  static_cast<unsigned long long>(store & ~0xFFFull),
                  static_cast<unsigned long long>((store + std::max<u64>(store_size, 1) - 1) & ~0xFFFull),
                  crosses ? ", crosses" : "", handler,
-                 static_cast<unsigned long long>(repair->live),
-                 static_cast<unsigned long long>(repair->named),
-                 static_cast<unsigned long long>(repair->compacted), ctx->ContextFlags,
-                 static_cast<unsigned long long>(ctx->Rsp), outcome[repair->outcome]);
+                 in_use, static_cast<unsigned long long>(check->named),
+                 static_cast<unsigned long long>(check->compacted), ctx->ContextFlags,
+                 static_cast<unsigned long long>(ctx->Rsp), outcome[check->outcome]);
 }
 #endif
 

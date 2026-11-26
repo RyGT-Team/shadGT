@@ -1,19 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// FIX-SGT-194: a write fault resumed from a context whose XSAVE header names no AVX state loses
-// the upper halves of the YMM registers, with or without FIX-SGT-121's save and restore, and
-// RytyFaultXState::Repair keeps them.
+// FIX-SGT-194 / FIX-GT7-201: on Windows 11 kernels with JDK-8365196, a write fault can be
+// dispatched with a context whose XSAVE header names no AVX state, and the thread's YMM upper
+// halves are already zero when the handler runs. This test checks that:
+//  - RytyFaultXState::Check tells such a context from a complete one;
+//  - GT7's frame-job copy (two 256-bit loads, stores at +0x08 and +0x18) loses the job's
+//    +0x28..+0x37 when its store faults on such a kernel, and FIX-GT7-201's 128-bit copy does not.
 //
-// GT7's frame-job producer (GT7.exe+0x220f22b, also +0x239b2eb): two 256-bit loads from the
-// stack, then vmovups [r12+8], ymm0 and vmovups [r12+0x18], ymm1. The job here straddles a
-// write-protected page, as in RyGT issue 83. Affected Windows 11 kernels build that context from
-// a stale header on the stack (JDK-8365196); this test writes such a header into the context
-// itself (CONTEXT_XSTATE stays set, XSTATE_BV 0, XCOMP_BV 0x8000000000000000), which is what
-// those kernels hand the handler, so it runs on any Windows. Those kernels also reset the omitted
-// components on resume, where older ones keep the live registers; the handler zeroes the upper
-// halves last to model that.
+// This machine's kernel may not have the bug, so the handler writes such a header into the
+// context (CONTEXT_XSTATE set, XSTATE_BV 0, XCOMP_BV 0x8000000000000000) and zeroes the upper
+// halves, which is what an affected kernel leaves the thread with.
 //
-// Build: clang-cl /O2 /EHsc /std:c++20 -mavx2 -I.. fault_xstate_test.cpp
-// (the shim function is built without AVX by its target attribute, like ryty_fault_xstate.cpp.)
+// Build: clang-cl /O2 /EHsc /std:c++20 -mavx2 fault_xstate_test.cpp
 #include <windows.h>
 #include <immintrin.h>
 #include <intrin.h>
@@ -21,84 +18,54 @@
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
-#include "../fault_xstate_repair.h"
+#include "../fault_xstate_check.h"
 
 namespace {
 
 std::uint8_t* g_page2;
-int g_simulate_stale = 0; // 1: the context names no AVX (affected kernel)
-int g_mode = 0;           // 0: no shim; 1: FIX-SGT-121 save/restore; 2: + FIX-SGT-194 repair
+bool g_affected = false;
 std::uint64_t g_mask = 0;
-bool g_live_upper_ok = false;
-RytyFaultXState::RepairResult g_result;
-bool g_locate_matches = true;
-
-// The renderer's handler: AVX code that leaves the upper halves clobbered.
-__declspec(noinline) void AvxBody() {
-    volatile __m256 junk = _mm256_set1_ps(-7.0f);
-    (void)junk;
-    _mm256_zeroupper();
-}
-
-__attribute__((target("xsave"), noinline)) void Shim(EXCEPTION_POINTERS* p) {
-    alignas(64) unsigned char area[4096];
-    for (int i = 512; i < 576; ++i) area[i] = 0;
-    _xsave64(area, g_mask);
-    // The second load's upper half (src[32..48) = c0..cf) in some register's upper half, as the
-    // shim saw it (AVX area: standard offset 576, 16 bytes per register).
-    g_live_upper_ok = false;
-    for (int r = 0; r < 16; ++r) {
-        bool same = true;
-        for (int i = 0; i < 16; ++i) same &= area[576 + 16 * r + i] == 0xC0 + i;
-        g_live_upper_ok |= same;
-    }
-    AvxBody();
-    if (g_mode == 2) {
-        g_result = RytyFaultXState::Repair(p->ContextRecord, area, g_mask);
-    }
-    _xrstor64(area, g_mask);
-}
+RytyFaultXState::CheckResult g_check;
 
 LONG CALLBACK Handler(EXCEPTION_POINTERS* p) {
     if (p->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
     DWORD old;
     VirtualProtect(g_page2, 4096, PAGE_READWRITE, &old);
     auto* ctx = p->ContextRecord;
-    if (g_simulate_stale && (ctx->ContextFlags & CONTEXT_XSTATE) == CONTEXT_XSTATE) {
+    if (g_affected && (ctx->ContextFlags & CONTEXT_XSTATE) == CONTEXT_XSTATE) {
         auto* ex = reinterpret_cast<RytyFaultXState::ContextEx*>(ctx + 1);
         auto* header = reinterpret_cast<std::uint64_t*>(reinterpret_cast<unsigned char*>(ex) + ex->xstate.offset);
         header[0] = 0;
         header[1] = 0x8000000000000000ull;
     }
-    if (g_mode == 0) {
-        AvxBody();
-    } else {
-        Shim(p);
-    }
-    // An affected kernel resets the components the context omits when it resumes (JDK-8365196);
-    // older kernels leave them as the registers hold them. Zeroing the upper halves here makes
-    // the outcome depend only on the context, as on an affected kernel.
-    _mm256_zeroupper();
-    if (g_mode == 2 && g_result.outcome == RytyFaultXState::RepairResult::Repaired) {
-        // The repaired layout must be the one Windows reads.
-        auto* ex = reinterpret_cast<RytyFaultXState::ContextEx*>(ctx + 1);
-        auto* chunk = reinterpret_cast<unsigned char*>(ex) + ex->xstate.offset;
-        DWORD len = 0;
-        auto* avx = static_cast<unsigned char*>(LocateXStateFeature(ctx, XSTATE_AVX, &len));
-        std::uint64_t comp;
-        std::memcpy(&comp, chunk + 8, 8);
-        const auto* c = RytyFaultXState::Components();
-        const std::uint64_t expected = (comp >> 63) ? 576 : c[2].standard_offset;
-        g_locate_matches = avx == chunk + (expected - 512) && len == c[2].size;
+    g_check = RytyFaultXState::Check(ctx, g_mask);
+    if (g_affected) {
+        _mm256_zeroupper(); // what an affected kernel leaves the thread with
     }
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
-__declspec(noinline) void Produce(std::uint8_t* job, const std::uint8_t* src) {
+// GT7.exe+0x220f22b: vmovups ymm0,[rbp-0x60]; vmovups ymm1,[rbp-0x50];
+// vmovups [r12+8],ymm0; vmovups [r12+0x18],ymm1.
+__declspec(noinline) void CopyYmm(std::uint8_t* job, const std::uint8_t* src) {
     __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src));
     __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + 16));
     _mm256_storeu_si256(reinterpret_cast<__m256i*>(job + 0x08), a);
     _mm256_storeu_si256(reinterpret_cast<__m256i*>(job + 0x18), b);
+}
+
+// FIX-GT7-201's stub, instruction for instruction (src in place of rbp-0x60, job in r12).
+__declspec(noinline) void CopyXmm(std::uint8_t* job, const std::uint8_t* src) {
+    __asm__ volatile("vmovups (%1), %%xmm0\n\t"
+                     "vmovups 0x10(%1), %%xmm1\n\t"
+                     "vmovups %%xmm0, 0x08(%0)\n\t"
+                     "vmovups %%xmm1, 0x18(%0)\n\t"
+                     "vmovups 0x20(%1), %%xmm1\n\t"
+                     "vmovups %%xmm1, 0x28(%0)\n\t"
+                     "vmovups 0x10(%1), %%xmm1\n\t"
+                     :
+                     : "r"(job), "r"(src)
+                     : "memory", "xmm0", "xmm1");
 }
 
 } // namespace
@@ -116,37 +83,32 @@ int main() {
     g_page2 = base + 4096;
     alignas(32) std::uint8_t src[48];
     for (int i = 0; i < 48; ++i) src[i] = std::uint8_t(0xA0 + i);
-    struct Case { int stale, mode; const char* what; bool expect_ok; };
+    struct Case { bool affected, xmm; const char* what; bool expect_kept; };
     const Case cases[] = {
-        {0, 0, "complete context, no shim", true},
-        {1, 0, "context names no AVX, no shim", false},
-        {1, 1, "context names no AVX, FIX-SGT-121 save/restore", false},
-        {1, 2, "context names no AVX, FIX-SGT-194 repair", true},
-        {0, 2, "complete context, FIX-SGT-194 repair (nothing to do)", true},
+        {false, false, "complete context, YMM copy (the game's)", true},
+        {true, false, "AVX state left out, YMM copy (the game's)", false},
+        {false, true, "complete context, XMM copy (FIX-GT7-201)", true},
+        {true, true, "AVX state left out, XMM copy (FIX-GT7-201)", true},
     };
     int failures = 0;
     for (const auto& c : cases) {
-        g_simulate_stale = c.stale;
-        g_mode = c.mode;
-        for (int job_off : {0x28, 0x10, 0x20, 0x08}) { // job starts this far before the page edge
+        g_affected = c.affected;
+        for (int job_off : {0x28, 0x10, 0x20, 0x08}) { // the job starts this far before the page edge
             std::memset(base, 0, 8192);
             DWORD old;
             VirtualProtect(g_page2, 4096, PAGE_READONLY, &old);
-            g_result = {};
-            g_locate_matches = true;
+            g_check = {};
             std::uint8_t* job = g_page2 - job_off;
-            Produce(job, src);
-            const bool ok = std::memcmp(job + 0x08, src, 16) == 0 && std::memcmp(job + 0x18, src + 16, 32) == 0;
-            const bool pass = ok == c.expect_ok && g_locate_matches;
-            std::printf("%-55s job %#04x before the edge: %s (expected %s)%s%s\n", c.what, job_off,
-                        ok ? "kept" : "LOST", c.expect_ok ? "kept" : "lost",
-                        c.mode ? (g_live_upper_ok ? ", live upper right at the shim" : ", live upper WRONG at the shim") : "",
-                        g_locate_matches ? "" : ", LocateXStateFeature disagrees");
-            if (c.mode == 2) {
-                std::printf("    repair outcome %d, live %#llx, named %#llx, XCOMP_BV %#llx\n", int(g_result.outcome),
-                            (unsigned long long)g_result.live, (unsigned long long)g_result.named,
-                            (unsigned long long)g_result.compacted);
-            }
+            (c.xmm ? CopyXmm : CopyYmm)(job, src);
+            const bool kept = std::memcmp(job + 0x08, src, 48) == 0;
+            const auto expected_check = c.affected ? RytyFaultXState::CheckResult::Omitted
+                                                   : RytyFaultXState::CheckResult::Complete;
+            const bool pass = kept == c.expect_kept && g_check.outcome == expected_check;
+            std::printf("%-46s job %#04x before the edge: %s (expected %s), check %s (XCOMP_BV %#llx)\n", c.what,
+                        job_off, kept ? "kept" : "LOST", c.expect_kept ? "kept" : "lost",
+                        g_check.outcome == RytyFaultXState::CheckResult::Omitted ? "left out"
+                        : g_check.outcome == RytyFaultXState::CheckResult::Complete ? "complete" : "no XSTATE",
+                        (unsigned long long)g_check.compacted);
             failures += !pass;
         }
     }

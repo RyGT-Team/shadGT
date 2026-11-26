@@ -4278,6 +4278,110 @@ void Install(u8* base) {
 
 } // namespace GtsProOptions
 
+// FIX-GT7-201 (RyGT #83): GT7 crashed mid-race on Windows 11 kernels that drop AVX state from an
+// exception's context (FIX-SGT-194, JDK-8365196). Four frame-job producers (two per function, at
+// GT7.exe+0x220f22b, +0x220f522, +0x239b2eb, +0x239b54b) copy a 48-byte block from their frame
+// into a new job with two 256-bit loads and two overlapping 256-bit stores. When the job straddles
+// a page the renderer write-protects, a store faults; on those kernels the upper halves of ymm0
+// and ymm1 are already zero when any handler runs, so the job's +0x28/+0x30 stay zero and a later
+// job reads a null pointer. Each copy goes to a stub that does it with 128-bit moves (three
+// copies), which a resume keeps on every kernel. The registers end with the same low halves as
+// before (xmm0 = block[0..16), xmm1 = block[16..32)); their upper halves are dead (xmm0 is
+// loaded again and xmm1 is not read before both functions return). Applied only where all four
+// sites hold GT7 1.71's bytes. SHADGT_GT7_JOB_XMM_COPY=0 turns it off.
+namespace Gt7JobXmmCopy {
+
+struct Site {
+    u64 rva;
+    bool r12; // the job in r12 (else rbx)
+};
+constexpr Site kSites[] = {{0x220f22b, true}, {0x220f522, false}, {0x239b2eb, true}, {0x239b54b, false}};
+// vmovups ymm0,[rbp-0x60]; vmovups ymm1,[rbp-0x50]; vmovups [job+8],ymm0; vmovups [job+0x18],ymm1
+constexpr u8 kR12Bytes[] = {0xc5, 0xfc, 0x10, 0x45, 0xa0, 0xc5, 0xfc, 0x10, 0x4d, 0xb0, 0xc4, 0xc1,
+                            0x7c, 0x11, 0x44, 0x24, 0x08, 0xc4, 0xc1, 0x7c, 0x11, 0x4c, 0x24, 0x18};
+constexpr u8 kRbxBytes[] = {0xc5, 0xfc, 0x10, 0x45, 0xa0, 0xc5, 0xfc, 0x10, 0x4d, 0xb0,
+                            0xc5, 0xfc, 0x11, 0x43, 0x08, 0xc5, 0xfc, 0x11, 0x4b, 0x18};
+
+void Install(u8* base) {
+    const char* env = std::getenv("SHADGT_GT7_JOB_XMM_COPY");
+    if (env && env[0] == '0') {
+        return;
+    }
+    for (const Site& site : kSites) {
+        const u8* bytes = site.r12 ? kR12Bytes : kRbxBytes;
+        const size_t size = site.r12 ? sizeof(kR12Bytes) : sizeof(kRbxBytes);
+        if (!ReadableRange(base + site.rva, size) || std::memcmp(base + site.rva, bytes, size) != 0) {
+            // GT Sport, or another GT7 build: silent unless the switch was set.
+            if (env && env[0]) {
+                std::fprintf(stderr, "[patch] FIX-GT7-201: original bytes differ, not applied\n");
+            }
+            return;
+        }
+    }
+    u8* const stubs = AllocNear(base);
+    if (!stubs) {
+        std::fprintf(stderr, "[patch] FIX-GT7-201: no memory near the game's code, not applied\n");
+        return;
+    }
+    std::vector<u8> code;
+    std::vector<size_t> starts;
+    const auto bytes = [&](std::initializer_list<u8> list) { code.insert(code.end(), list); };
+    for (const Site& site : kSites) {
+        starts.push_back(code.size());
+        const auto store = [&](u8 reg, u8 disp) { // vmovups [job+disp], xmm<reg>
+            if (site.r12) {
+                bytes({0xc4, 0xc1, 0x78, 0x11, static_cast<u8>(0x44 | (reg << 3)), 0x24, disp});
+            } else {
+                bytes({0xc5, 0xf8, 0x11, static_cast<u8>(0x43 | (reg << 3)), disp});
+            }
+        };
+        bytes({0xc5, 0xf8, 0x10, 0x45, 0xa0}); // vmovups xmm0, [rbp-0x60]
+        bytes({0xc5, 0xf8, 0x10, 0x4d, 0xb0}); // vmovups xmm1, [rbp-0x50]
+        store(0, 0x08);
+        store(1, 0x18);
+        bytes({0xc5, 0xf8, 0x10, 0x4d, 0xc0}); // vmovups xmm1, [rbp-0x40]
+        store(1, 0x28);
+        bytes({0xc5, 0xf8, 0x10, 0x4d, 0xb0}); // vmovups xmm1, [rbp-0x50] (as the game leaves it)
+        const u64 back = reinterpret_cast<u64>(base + site.rva + (site.r12 ? sizeof(kR12Bytes)
+                                                                           : sizeof(kRbxBytes)));
+        bytes({0xff, 0x25, 0, 0, 0, 0}); // jmp [rip] -> after the game's four instructions
+        for (int i = 0; i < 8; ++i) code.push_back(static_cast<u8>(back >> (8 * i)));
+    }
+    std::memcpy(stubs, code.data(), code.size());
+    DWORD previous = 0;
+    if (!VirtualProtect(stubs, 0x1000, PAGE_EXECUTE_READ, &previous)) {
+        std::fprintf(stderr, "[patch] FIX-GT7-201: stubs not executable, not applied\n");
+        VirtualFree(stubs, 0, MEM_RELEASE);
+        return;
+    }
+    FlushInstructionCache(GetCurrentProcess(), stubs, code.size());
+    int applied = 0;
+    for (size_t i = 0; i < std::size(kSites); ++i) {
+        const Site& site = kSites[i];
+        const u8* original = site.r12 ? kR12Bytes : kRbxBytes;
+        const size_t size = site.r12 ? sizeof(kR12Bytes) : sizeof(kRbxBytes);
+        const auto distance = reinterpret_cast<intptr_t>(stubs + starts[i]) -
+                              reinterpret_cast<intptr_t>(base + site.rva + 5);
+        if (distance < INT32_MIN || distance > INT32_MAX) {
+            continue;
+        }
+        // jmp stub; int3 for the rest (nothing branches into these instructions).
+        std::vector<u8> replacement(size, 0xcc);
+        replacement[0] = 0xe9;
+        const s32 relative = static_cast<s32>(distance);
+        std::memcpy(replacement.data() + 1, &relative, sizeof(relative));
+        applied += Apply(base, Patch{site.rva, std::vector<u8>(original, original + size),
+                                     replacement, "FIX-GT7-201 frame-job copy with XMM moves"})
+                       ? 1
+                       : 0;
+    }
+    if (applied == 0) {
+        VirtualFree(stubs, 0, MEM_RELEASE);
+    }
+}
+
+} // namespace Gt7JobXmmCopy
+
 // FIX-GT7-162: launching a replay crashed once (a read of address 0 on a Job thread at GT7.exe
 // +0x1eaac3b). Each frame of an event, GT7's work module org_race (the std::function of
 // GTFramework::Organizer::Impl::initialize's lambda $_7, GT7.exe+0x1eaa5d0) sets the race sound
@@ -4798,6 +4902,7 @@ void RytyApplyGamePatches() {
     InstallGt7JobIdle(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));      // GAME-008
     Gt7Cipher::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));     // PERF-GT7-113
     Gt7RaceContextGuard::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // FIX-GT7-162
+    Gt7JobXmmCopy::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));       // FIX-GT7-201
 #ifndef NDEBUG
     InstallTextEntryDiag(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
 #endif

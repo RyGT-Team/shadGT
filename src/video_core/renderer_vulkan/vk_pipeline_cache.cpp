@@ -3265,7 +3265,12 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .support_int16 = instance.IsShaderInt16Supported(),
         .support_int64 = instance.IsShaderInt64Supported(),
         .support_float16 = instance.IsShaderFloat16Supported(),
-        .support_float64 = instance.IsShaderFloat64Supported(),
+        // FIX-SGT-193: SHADGT_FLOAT64=0 translates as for a GPU without 64-bit floats (Intel Arc
+        // A-series), to check that path on another GPU.
+        .support_float64 = instance.IsShaderFloat64Supported() && [] {
+            const char* env = std::getenv("SHADGT_FLOAT64");
+            return !(env && env[0] == '0');
+        }(),
         .supports_denorm_behavior_independence =
             vk12_props.denormBehaviorIndependence != vk::ShaderFloatControlsIndependence::eNone,
         .supports_rounding_mode_independence =
@@ -8854,6 +8859,17 @@ vk::ShaderModule PipelineCache::LoadStoredModule(u64 pgm_hash, size_t perm_idx,
         }
         return {};
     }
+    if (HasNullConstant(spv)) {
+        static u32 reports = 0;
+        if (reports++ < 20) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-SGT-193: stored shader {:#x} permutation {} has a constant without a "
+                        "result id (64-bit float immediates without 64-bit floats); translating "
+                        "it again",
+                        pgm_hash, perm_idx);
+        }
+        return {};
+    }
     if (++loaded % 500 == 0) {
         LOG_WARNING(Render_Vulkan,
                     "PERF-032: {} shader S().modules loaded from the store instead of translated",
@@ -8882,6 +8898,9 @@ void PipelineCache::PrefetchStoredModule(u64 pgm_hash, size_t perm_idx,
                           ? FloatAtomicEmulation::OneAtomic
                           : FloatAtomicEmulation::BothAtomics)) {
         return; // FIX-GT7-011: translated again on the command thread
+    }
+    if (HasNullConstant(words)) {
+        return; // FIX-SGT-193: translated again on the command thread
     }
     const u64 key = HashCombine(pgm_hash, u64{perm_idx});
     {

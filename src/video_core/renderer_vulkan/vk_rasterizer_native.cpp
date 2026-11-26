@@ -22982,6 +22982,35 @@ void NativeRenderer::DispatchDirect() {
         }
     }
     if (!transferred) {
+        // FIX-SGT-193: a compute pipeline without a handle is never bound (RyGT #124: the A750
+        // crashed in the driver's bind); the dispatch is skipped, once logged.
+        if (!pipeline->Handle()) {
+            static std::atomic<bool> logged{};
+            if (!logged.exchange(true)) {
+                LOG_ERROR(Render_Vulkan,
+                          "FIX-SGT-193: compute pipeline of cs {:#x} has no handle; its dispatches "
+                          "are skipped",
+                          cs.pgm_hash);
+            }
+            NATIVE_DIAGNOSTIC(++stats.skipped);
+            SceneTrace::GpuEnd(s.cmd);
+            return;
+        }
+        // FIX-SGT-193: on Intel (or with SHADGT_FLOAT64=0), the first bind of each compute program
+        // is logged (first 400) with the pipeline key the build lines name, and the program bound
+        // last is kept for the GPU-thread fault line: a crash in the driver's bind names it.
+        Shader::LastComputeBindProgram().store(cs.pgm_hash, std::memory_order_relaxed);
+        if (r.instance.IsIntel() || !r.GetPipelineCache().GetProfile().support_float64) {
+            static std::mutex seen_mutex;
+            static std::unordered_set<u64> seen;
+            std::scoped_lock seen_lock{seen_mutex};
+            if (seen.size() < 400 && seen.insert(cs.pgm_hash).second) {
+                LOG_INFO(Render_Vulkan,
+                         "FIX-SGT-193: first bind of compute program {:#x} (pipeline {:#x}), "
+                         "64-bit floats {}",
+                         cs.pgm_hash, pipeline->KeyHash(), cs.uses_fp64);
+            }
+        }
         // FIX-188: Intel Arc (#65) binds the pipeline every time (tile work runs between).
         s.pipelines.Compute(pipeline->Handle(), r.instance.IsIntel(), [&] {
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());

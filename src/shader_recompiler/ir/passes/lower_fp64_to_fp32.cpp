@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/ir_emitter.h"
@@ -155,6 +156,31 @@ void LowerFp64ToFp32(IR::Program& program) {
     for (IR::Block* const block : program.blocks) {
         for (IR::Inst& inst : block->Instructions()) {
             Lower(*block, inst);
+        }
+    }
+    // FIX-SGT-193: 64-bit float immediates (inline constants and literals of V_*_F64, output
+    // multipliers) are arguments, not instructions, so the loop above left them 64-bit while the
+    // instructions using them became 32-bit. With no 64-bit instruction left the module declared
+    // no 64-bit float type, and each such immediate became an OpConstant of type id 0: invalid
+    // SPIR-V, only on GPUs without shaderFloat64 (Intel Arc A-series). GT7's race-start compute
+    // program 0x1c0f802e has them, and the A750 driver crashed when its pipeline was bound
+    // (RyGT #124). They become the 32-bit floats the lowered instructions take.
+    // SHADGT_FP64_IMMEDIATES=0: left as before.
+    static const bool lower_immediates = [] {
+        const char* env = std::getenv("SHADGT_FP64_IMMEDIATES");
+        return !(env && env[0] == '0');
+    }();
+    if (!lower_immediates) {
+        return;
+    }
+    for (IR::Block* const block : program.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            for (size_t i = 0; i < inst.NumArgs(); ++i) {
+                const IR::Value arg{inst.Arg(i)};
+                if (arg.IsImmediate() && arg.Type() == IR::Type::F64) {
+                    inst.SetArg(i, IR::Value{static_cast<f32>(arg.F64())});
+                }
+            }
         }
     }
 }

@@ -79,6 +79,9 @@ public:
         SetCanonicalStage(u32(Shader::SwStage::Compute), &info);
     }
 
+    /// FIX-SGT-193: the hash "Compiling compute pipeline" names.
+    u64 KeyHash() const;
+
 private:
     ComputePipelineKey compute_key;
     std::vector<vk::DescriptorSetLayoutBinding> recipe_bindings; ///< PERF-GT7-037

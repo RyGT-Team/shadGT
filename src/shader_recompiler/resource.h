@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdlib>
 #include "common/types.h"
@@ -198,6 +199,13 @@ inline bool MsaaArrayEnabled() {
 inline bool IsMsaaView(AmdGpu::ImageType type) {
     return type == AmdGpu::ImageType::Color2DMsaa ||
            (type == AmdGpu::ImageType::Color2DMsaaArray && MsaaArrayEnabled());
+}
+
+/// FIX-SGT-193: the program of the compute pipeline the recorder bound last (0 before any), for
+/// the GPU-thread fault line (DIAG-049): a crash in the driver's bind names its program.
+inline std::atomic<u64>& LastComputeBindProgram() {
+    static std::atomic<u64> program{};
+    return program;
 }
 
 enum class MipStorageFallbackMode : u16 {

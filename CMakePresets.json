@@ -16,6 +16,30 @@
       }
     },
     {
+      "name": "x64-Clang-Debug-RyGT",
+      "displayName": "Clang x64 Debug renderer for RyGT (FEAT-SGT-196: /Od, debug CRT, asserts, full symbols)",
+      "inherits": ["x64-Clang-Base"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_LINKER": "lld-link",
+        "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreadedDebugDLL",
+        "CMAKE_C_FLAGS_DEBUG": "/Od /Ob0 /Zi /Oy- /UNDEBUG",
+        "CMAKE_CXX_FLAGS_DEBUG": "/Od /Ob0 /Zi /Oy- /UNDEBUG",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "SHADGT_RYTY_GPU": "ON",
+        "ENABLE_DISCORD_RPC": "ON"
+      }
+    },
+    {
+      "name": "x64-Clang-Debug-RyGT-Light",
+      "displayName": "Clang x64 Debug renderer for RyGT, lightly optimized (FEAT-SGT-196: /O1 /Ob1, debug CRT, asserts)",
+      "inherits": ["x64-Clang-Debug-RyGT"],
+      "cacheVariables": {
+        "CMAKE_C_FLAGS_DEBUG": "/O1 /Ob1 /Zi /Oy- /UNDEBUG",
+        "CMAKE_CXX_FLAGS_DEBUG": "/O1 /Ob1 /Zi /Oy- /UNDEBUG"
+      }
+    },
+    {
       "name": "x64-Clang-Release",
       "displayName": "Clang x64 Release",
       "inherits": ["x64-Clang-Base"],

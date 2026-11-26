@@ -1960,6 +1960,7 @@ GtsSceneImage NativeRenderer::TemporalImage(const Native::ImageEntry& entry) {
 }
 
 static bool IsDisplayAddress(VAddr address);
+static bool IsPrimaryDisplayExtent(vk::Extent2D extent);
 
 void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Targets& targets,
                                      const DrawBindings& bindings) {
@@ -1974,9 +1975,12 @@ void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Ta
     const auto* history_out = targets.colors[0];
     const auto* resolved = targets.colors[1];
     const vk::Extent2D size{resolved->info.size.width, resolved->info.size.height};
-    // Full-resolution menus keep the game's TAA and do not allocate upscale history.
-    if (RytyUpscale::GuestOutputDlss() &&
-        (size != vk::Extent2D{1920, 1080} || RytyGt7NativeDlssMenu())) return;
+    if (RytyUpscale::GuestOutputDlss()) {
+        if (RytyGt7NativeDlssMenu()) return;
+        if (r.temporalDlss.ActiveQuality() == RYGT_DLSS_QUALITY_DLAA) {
+            if (!RytyGtsInRace() || !IsPrimaryDisplayExtent(size)) return;
+        } else if (size != vk::Extent2D{1920, 1080}) return;
+    }
     if (history_out->info.pixel_format != vk::Format::eR16G16B16A16Sfloat ||
         resolved->info.pixel_format != vk::Format::eB10G11R11UfloatPack32 ||
         history_out->info.size.width != size.width || history_out->info.size.height != size.height)
@@ -2054,10 +2058,14 @@ bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& t
     });
     if (scene == bindings.sampled.end()) return false;
     const auto size = r.temporalDlss.RenderSize();
-    if (guest_output && (size != vk::Extent2D{1920, 1080} ||
-                         r.temporalDlss.OutputSize() != vk::Extent2D{desc.width, desc.height} ||
-                         desc.width != 3840 || desc.height != 2160 ||
-                         (gt7 && !IsDisplayAddress(target->info.guest_address)))) return false;
+    if (guest_output) {
+        const vk::Extent2D output{desc.width, desc.height};
+        if (r.temporalDlss.OutputSize() != output ||
+            (gt7 && !IsDisplayAddress(target->info.guest_address))) return false;
+        if (r.temporalDlss.ActiveQuality() == RYGT_DLSS_QUALITY_DLAA) {
+            if (size != output || !RytyGtsInRace()) return false;
+        } else if (size != vk::Extent2D{1920, 1080} || output != vk::Extent2D{3840, 2160}) return false;
+    }
     // WIDE-063: the wide race scene is wider than the game's display buffer (3840x1080 against
     // 1920x1080), so the composition cannot be drawn into it at the scene's size. It is drawn
     // into the reconstruction's input image instead (below), and the reconstruction is shown
@@ -2778,6 +2786,12 @@ void SetDisplaySlot(std::size_t index, VAddr address, const Libraries::VideoOut:
         --count;
     }
     g_display_slot_count.store(count, std::memory_order_release);
+}
+
+static bool IsPrimaryDisplayExtent(vk::Extent2D extent) {
+    std::scoped_lock lock{g_display_slots_mutex};
+    return g_display_slots[0].address.load(std::memory_order_relaxed) &&
+           g_display_slots[0].extent == extent;
 }
 
 static bool IsDisplayAddress(VAddr address) {
@@ -17176,6 +17190,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     // addresses its rectangle inside the UHD display.
     const auto& guest_vp = regs.viewports[0];
     const bool scale_guest_display = RytyUpscale::GuestOutputDlss() && !native_fsr_composition &&
+        r.temporalDlss.ActiveQuality() == RYGT_DLSS_QUALITY_PERFORMANCE &&
         targets.state.num_color_attachments == 1 && targets.colors[0] &&
         targets.state.width == 3840 && targets.state.height == 2160 &&
         std::abs(guest_vp.xscale) <= 960.f && std::abs(guest_vp.yscale) <= 540.f &&

@@ -4457,6 +4457,7 @@ constexpr u32 projection_aspect = 0x3f5f510;
 u8* game;
 u32 wide_width, menu_width, height, menu_height;
 bool dlss_layout;
+bool native_dlaa;
 std::atomic<u32> active_width{};
 using Configure = void(PS4_SYSV_ABI*)();
 using ApplyConfig = void(PS4_SYSV_ABI*)(void*, int);
@@ -4538,7 +4539,7 @@ void PS4_SYSV_ABI SetRaceRendering(void* result, void** args) {
 
 void Install(Native::NearCode& code, u8* base) {
     const char* opt = std::getenv("RYGT_GT7_REWARDS_16_9");
-    if (opt ? std::string_view(opt) != "1" : !dlss_layout)
+    if (opt ? std::string_view(opt) != "1" : !(dlss_layout || native_dlaa))
         return;
     // SceneFace.loadCommandFile has already acquired a live stage in r14 and
     // resolved the path in rdx. Observe only its enqueue call, before the worker
@@ -4681,6 +4682,14 @@ void Install(u8* base) {
     const bool enabled = dlss ? !(native_menus && native_menus[0] == '0')
                               : opt && std::string_view(opt) == "1" && !(menus && menus[0] == '0');
     if (!enabled || !g_gt7_race_hook_installed.load()) return;
+    const char* dlaa = std::getenv("RYGT_NATIVE_DLAA");
+    if (dlss && dlaa && std::string_view(dlaa) == "1") {
+        // Menus and races already have the same size. Rewards can open before the race ends.
+        native_dlaa = true;
+        Native::NearCode near_code{base};
+        Rewards::Install(near_code, base);
+        return;
+    }
     constexpr u32 target_config = 0x27cac80, apply_config = 0x1bcc520;
     constexpr u32 screen_constant = 0x27cadc6;
     // Read the launcher's scene extent and verify its matching flip allocation.
@@ -4854,6 +4863,7 @@ u32 RytyGt7MenuWidth(u32 registered_width, u32 height) {
 }
 bool RytyGt7NativeDlssMenu() {
     using namespace Gt7NativeMenu;
+    if (native_dlaa) return Rewards::active_stage.load(std::memory_order_acquire) != nullptr;
     return dlss_layout && active_width.load(std::memory_order_acquire) != wide_width;
 }
 bool RytyGt7MenuActive() {

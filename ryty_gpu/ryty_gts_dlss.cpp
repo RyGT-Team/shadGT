@@ -524,8 +524,10 @@ void GtsDlssPass::Resolve(u64 frame, GtsSceneImage display) {
     desc.frame_time_ms = frameTimeMs;
     DlssTiming timing{instance, scheduler};
     const auto cmd = scheduler.DirectCommandBuffer();
-    const bool ok = DlssTiming::Measure(&timing, cmd, renderSize, outputSize, reset ? "reset" : "temporal",
-        quality == RYGT_DLSS_QUALITY_PERFORMANCE ? "performance" : "other", [&] { return RytyDlss::EvaluateTemporal(cmd, desc); }, true);
+    const char* preset = quality == RYGT_DLSS_QUALITY_DLAA ? "dlaa" :
+                         quality == RYGT_DLSS_QUALITY_PERFORMANCE ? "performance" : "other";
+    const bool ok = DlssTiming::Measure(&timing, cmd, renderSize, outputSize,
+        reset ? "reset" : "temporal", preset, [&] { return RytyDlss::EvaluateTemporal(cmd, desc); }, true);
     scheduler.GetDynamicState().Invalidate();
     if (!ok) { failed = true; return; }
     ++evaluatedFrames;

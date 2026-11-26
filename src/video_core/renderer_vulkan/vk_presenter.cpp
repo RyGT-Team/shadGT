@@ -1651,9 +1651,15 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
                                      {frame->width, frame->height}, fsr_settings, frame->is_hdr);
         if (image_view != before) upscaler = "FSR 1";
     }
-    RytyUpscalerStatus::ReportResolution(frame->width, frame->height,
-                                          game_size.width, game_size.height, upscaler,
-                                          RytyFrameGen::Working());
+    if (guest_dlss) {
+        const auto output = rasterizer->GetTemporalDlss().OutputSize();
+        RytyUpscalerStatus::Report(game_size == output ? "DLAA" :
+            "DLSS " + RytyUpscalerStatus::QualityMode(output.width, output.height, game_size.width, game_size.height));
+    } else {
+        RytyUpscalerStatus::ReportResolution(frame->width, frame->height,
+                                              game_size.width, game_size.height, upscaler,
+                                              RytyFrameGen::Working());
+    }
     if (time_passes) {
         g_presenter_times.Mark(pass_cmdbuf, 1);
     }

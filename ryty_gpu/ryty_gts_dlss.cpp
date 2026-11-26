@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "ryty_gpu/ryty_dlss_timing.h"
+#include "ryty_gpu/ryty_dlss_layout.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -182,6 +183,8 @@ bool GtsDlssPass::Capture(u64 frame, GtsSceneImage color, GtsSceneImage sourceDe
                                             : vk::Extent2D{std::max(requestedSize.width, input.width),
                                                            std::max(requestedSize.height, input.height)}
                         : input;
+    if (!useFsr && !useXess && RytyUpscale::DlssLayout().output.width)
+        output = RytyUpscale::DlssLayout().output;
     // Window resizing changes presentation, not the fixed guest scene resolution.
     // Keep the established DLSS reconstruction extent for an unchanged input;
     // the presenter already scales that image to the current swapchain extent.
@@ -525,7 +528,9 @@ void GtsDlssPass::Resolve(u64 frame, GtsSceneImage display) {
     DlssTiming timing{instance, scheduler};
     const auto cmd = scheduler.DirectCommandBuffer();
     const char* preset = quality == RYGT_DLSS_QUALITY_DLAA ? "dlaa" :
-                         quality == RYGT_DLSS_QUALITY_PERFORMANCE ? "performance" : "other";
+                         quality == RYGT_DLSS_QUALITY_QUALITY ? "quality" :
+                         quality == RYGT_DLSS_QUALITY_BALANCED ? "balanced" :
+                         quality == RYGT_DLSS_QUALITY_ULTRA_PERFORMANCE ? "ultra_performance" : "performance";
     const bool ok = DlssTiming::Measure(&timing, cmd, renderSize, outputSize,
         reset ? "reset" : "temporal", preset, [&] { return RytyDlss::EvaluateTemporal(cmd, desc); }, true);
     scheduler.GetDynamicState().Invalidate();

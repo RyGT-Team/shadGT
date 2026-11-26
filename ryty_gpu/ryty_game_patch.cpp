@@ -52,6 +52,7 @@
 #include "input/telemetry_haptics_output.h"
 #include "input/trigger_feedback.h"
 #include "ryty_gpu/ryty_dlssg.h"
+#include "ryty_gpu/ryty_dlss_layout.h"
 #include "core/file_format/psf.h"
 #include "common/ryty_param_sfo.h"
 #include "ryty_gpu/gt7_preset_options.h"
@@ -2556,6 +2557,8 @@ RytySceneExtent RytySceneSize() {
         if (Common::IsGt7()) {
             return result;
         }
+        const auto& dlss = RytyUpscale::DlssLayout();
+        if (dlss.Wide() && RytyWideScene()) return RytySceneExtent{dlss.scene.width, dlss.scene.height};
         const char* viewport = std::getenv("SHADGT_EXPERIMENTAL_SCENE_VIEWPORT");
         if (viewport && std::strcmp(viewport, "1") == 0) {
             const char* w = std::getenv("SHADGT_SCENE_WIDTH");
@@ -3443,7 +3446,7 @@ static void SetWidePro1080Flip(u8* base) {
 // WIDE-001: the scene allocated at the screen's shape. The same three sites the launcher's scene
 // render scale patches (RenderResolution.cs), from the game's bytes or from the launcher's.
 static void InstallWideSceneAllocation(u8* base) {
-    if (!Vulkan::RytyWideScene() || !ConfigFlag("wide_scene_alloc", true)) {
+    if (!Vulkan::RytyWideScene() || (!Vulkan::RytyUpscale::DlssLayout().Wide() && !ConfigFlag("wide_scene_alloc", true))) {
         return;
     }
     const auto [width, height] = Vulkan::RytySceneSize();
@@ -4455,10 +4458,10 @@ constexpr u32 scene_size = 0x595f610;
 constexpr u32 first_flip_size = 0x62ef29c;
 constexpr u32 projection_aspect = 0x3f5f510;
 u8* game;
-u32 wide_width, menu_width, height, menu_height;
+u32 wide_width, menu_width, height, menu_height, output_width;
 bool dlss_layout;
 bool native_dlaa;
-std::atomic<u32> active_width{};
+std::atomic<u32> active_extent{};
 using Configure = void(PS4_SYSV_ABI*)();
 using ApplyConfig = void(PS4_SYSV_ABI*)(void*, int);
 Configure configure_original;
@@ -4590,68 +4593,61 @@ void Install(Native::NearCode& code, u8* base) {
 }
 } // namespace Rewards
 
-u32 RequestedWidth() {
-    return Vulkan::RytyGtsInRace() && !Rewards::active_stage.load(std::memory_order_acquire)
-               ? wide_width : menu_width;
+u32 PackedExtent(u32 w, u32 h) { return (h << 16) | w; }
+
+bool TrackRequested() {
+    return Vulkan::RytyGtsInRace() && !Rewards::active_stage.load(std::memory_order_acquire);
 }
 
 void PS4_SYSV_ABI ConfigureTargets() {
     std::scoped_lock lock{configure_lock};
-    const u32 width = RequestedWidth();
-    const float ratio = width == menu_width ? 16.f / 9.f : float(wide_width) / height;
+    const bool track = TrackRequested();
+    const u32 width = track ? wide_width : menu_width;
+    const u32 scene_height = track ? height : menu_height;
+    const u32 extent = PackedExtent(width, scene_height);
+    const bool wide = output_width > menu_width;
+    const float ratio = track ? float(output_width) / menu_height : 16.f / 9.f;
     auto* aspect = reinterpret_cast<float*>(game + projection_aspect);
-    const bool changed = active_width.load(std::memory_order_relaxed) != width;
+    const bool changed = active_extent.load(std::memory_order_relaxed) != extent;
     bool applied = false;
     const bool base_targets = !game[0x62ef250] && !game[0x62ef608] && !game[0x62f5518];
-    if (dlss_layout && base_targets && changed) {
-        // The three flip allocations keep their output extent, including in a race.
-        const u32 output = (menu_height << 16) | menu_width;
-        const auto* flip = game + first_flip_size;
-        auto* scene = reinterpret_cast<u32*>(game + scene_size);
-        if (*reinterpret_cast<const u32*>(flip) == output &&
-            *reinterpret_cast<const u32*>(flip + 0x40) == output &&
-            *reinterpret_cast<const u32*>(flip + 0x80) == output &&
-            ((scene[0] == wide_width && scene[1] == height) ||
-             (scene[0] == menu_width && scene[1] == menu_height))) {
-            scene[0] = width;
-            scene[1] = width == menu_width ? menu_height : height;
-            applied = true;
-        }
-    } else if (!dlss_layout && base_targets &&
-               (changed || std::atomic_ref<float>(*aspect).load(std::memory_order_relaxed) != ratio)) {
-        // The unmodified initializer builds all three GNM color descriptors before this call.
-        const auto packed = [=](u32 w) { return (height << 16) | w; };
+    if (base_targets && (changed || (wide && std::atomic_ref<float>(*aspect).load(std::memory_order_relaxed) != ratio))) {
+        const u32 race_flip = PackedExtent(output_width, menu_height);
+        const u32 menu_flip = PackedExtent(menu_width, menu_height);
         bool ready = true;
         for (u32 i = 0; i < 3; ++i) {
-            const auto size = *reinterpret_cast<u32*>(game + first_flip_size + i * 0x40);
-            ready &= size == packed(wide_width) || size == packed(menu_width);
+            const auto flip = *reinterpret_cast<u32*>(game + first_flip_size + i * 0x40);
+            ready &= flip == race_flip || flip == menu_flip;
         }
         auto* scene = reinterpret_cast<u32*>(game + scene_size);
-        if (ready && scene[1] == height && (scene[0] == menu_width || scene[0] == wide_width)) {
+        if (ready && ((scene[0] == wide_width && scene[1] == height) ||
+                      (scene[0] == menu_width && scene[1] == menu_height))) {
             DWORD old{};
-            if (VirtualProtect(aspect, sizeof(float), PAGE_READWRITE, &old)) {
-                std::atomic_ref<float>(*aspect).store(ratio, std::memory_order_relaxed);
-                DWORD ignored{};
-                VirtualProtect(aspect, sizeof(float), old, &ignored);
-                for (u32 i = 0; i < 3; ++i) {
-                    *reinterpret_cast<u32*>(game + first_flip_size + i * 0x40) = packed(width);
+            if (!wide || VirtualProtect(aspect, sizeof(float), PAGE_READWRITE, &old)) {
+                if (wide) {
+                    std::atomic_ref<float>(*aspect).store(ratio, std::memory_order_relaxed);
+                    DWORD ignored{};
+                    VirtualProtect(aspect, sizeof(float), old, &ignored);
+                    for (u32 i = 0; i < 3; ++i)
+                        *reinterpret_cast<u32*>(game + first_flip_size + i * 0x40) = track ? race_flip : menu_flip;
                 }
                 scene[0] = width;
+                scene[1] = scene_height;
                 applied = true;
             }
         }
     }
     configure_original();
     if (applied) {
-        active_width.store(width, std::memory_order_release);
+        active_extent.store(extent, std::memory_order_release);
         if (changed) {
             // The dimensions GT7 accepted, after updating its descriptor under its own lock.
             auto* targets = *reinterpret_cast<u8**>(game + 0x641c318);
             const auto* screen = reinterpret_cast<const u32*>(targets + 0x21c);
             const auto* scene = reinterpret_cast<const u32*>(targets + 0x238);
             std::fprintf(stderr, "[native] GT7 frame layout: %s, screen %ux%u, scene %ux%u%s\n",
-                         width == menu_width ? "menu" : "track", screen[0], screen[1], scene[0], scene[1],
-                         width == menu_width && Rewards::active_stage.load() ? " (Rewards)" : "");
+                         track ? "track" : "menu", screen[0], screen[1], scene[0], scene[1],
+                         !track && Rewards::active_stage.load() ? " (Rewards)" : "");
         }
     }
 }
@@ -4659,12 +4655,13 @@ void PS4_SYSV_ABI ConfigureTargets() {
 void PS4_SYSV_ABI ApplyGraphicsConfig(void* config, int force) {
     // This is the game's own render-settings boundary. Let it retire the previous
     // render targets and rebuild its dependent surfaces once on each transition.
-    const u32 requested = RequestedWidth();
-    const float ratio = requested == menu_width ? 16.f / 9.f : float(wide_width) / height;
+    const bool track = TrackRequested();
+    const u32 requested = track ? PackedExtent(wide_width, height) : PackedExtent(menu_width, menu_height);
+    const float ratio = track ? float(output_width) / menu_height : 16.f / 9.f;
     auto* aspect = reinterpret_cast<float*>(game + projection_aspect);
     // libScePad can initialize its projection constant once after the first menu frame.
-    apply_original(config, force || active_width.load(std::memory_order_acquire) != requested ||
-                           (!dlss_layout && std::atomic_ref<float>(*aspect).load(std::memory_order_relaxed) != ratio));
+    apply_original(config, force || active_extent.load(std::memory_order_acquire) != requested ||
+                           (output_width > menu_width && std::atomic_ref<float>(*aspect).load(std::memory_order_relaxed) != ratio));
 }
 
 template <typename T>
@@ -4683,7 +4680,8 @@ void Install(u8* base) {
                               : opt && std::string_view(opt) == "1" && !(menus && menus[0] == '0');
     if (!enabled || !g_gt7_race_hook_installed.load()) return;
     const char* dlaa = std::getenv("RYGT_NATIVE_DLAA");
-    if (dlss && dlaa && std::string_view(dlaa) == "1") {
+    const auto& layout = Vulkan::RytyUpscale::DlssLayout();
+    if (dlss && !layout.Wide() && dlaa && std::string_view(dlaa) == "1") {
         // Menus and races already have the same size. Rewards can open before the race ends.
         native_dlaa = true;
         Native::NearCode near_code{base};
@@ -4699,21 +4697,26 @@ void Install(u8* base) {
     std::memcpy(&w, base + screen_constant + 2, 4);
     std::memcpy(&h, base + screen_constant + 6, 4);
     if (dlss) {
-        if (w != 1920 || h != 1080) return;
+        if (layout.scene.width ? (w != layout.scene.width || h != layout.scene.height)
+                               : (w != 1920 || h != 1080)) return;
     } else if (h < 360 || h > 2160 || w > 7680 || w % 16 || w <= h * 16 / 9 ||
                u64(w) * h > 3840 * 2160 ||
                std::abs(Vulkan::RytyDisplayAspect() - float(w) / h) > .01f) return;
-    const u32 panel = dlss ? 3840 : (h * 16 + 4) / 9;
-    const u32 panel_height = dlss ? 2160 : h;
+    const u32 display_w = !dlss ? w : layout.output.width ? layout.output.width : 3840;
+    const u32 panel_height = !dlss ? h : layout.output.height ? layout.output.height : 2160;
+    const u32 panel = std::min(display_w, (panel_height * 16 + 4) / 9);
+    const bool wide = display_w > panel;
     if (!dlss && panel >= w) return;
     const auto matches = [&](u32 rva, const std::vector<u8>& bytes) {
         return ReadableRange(base + rva, bytes.size()) &&
                std::memcmp(base + rva, bytes.data(), bytes.size()) == 0;
     };
     const std::vector<u8> prologue{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
-    if (dlss && (!matches(0x17a7aa5, {0x41,0xb8,0x00,0x0f,0,0,0x90}) ||
-                 !matches(0x17a7aac, {0x41,0xb9,0x70,0x08,0,0,0x90}))) return;
-    if (!matches(target_config, prologue) || !matches(0x17a7417, Bytes(dlss ? panel : w)) ||
+    if (dlss && (display_w != w || panel_height != h) &&
+        (!matches(0x17a7aa5, {0x41,0xb8}) || !matches(0x17a7aa7, Bytes(display_w)) ||
+         !matches(0x17a7aac, {0x41,0xb9}) || !matches(0x17a7aae, Bytes(panel_height)) ||
+         !matches(0x17a7aab, {0x90}) || !matches(0x17a7ab2, {0x90}))) return;
+    if (!matches(target_config, prologue) || !matches(0x17a7417, Bytes(display_w)) ||
         !matches(0x17a7427, Bytes(w)) || !matches(0x17a7422, Bytes(h)) ||
         !matches(0x17a741d, Bytes(panel_height)) ||
         !matches(0x1b4c3f0, {0xc5,0xfa,0x10,0x05,0x18,0x31,0x41,0x02,0xc3}) ||
@@ -4746,7 +4749,7 @@ void Install(u8* base) {
     // projection getter reads. Read the getter's data at both stores, including after
     // a change of session. xmm0 is overwritten at the following instruction at both sites.
     Native::NearCode near_code{base};
-    if (!dlss) {
+    if (wide) {
         for (const u32 site : {0x1e990ebu, 0x20b7938u}) {
             const bool race_camera = site == 0x1e990eb;
             std::vector<u8> store = race_camera ? std::vector<u8>{0xc7,0x83,0x94,0xe8,0x09,0}
@@ -4754,7 +4757,7 @@ void Install(u8* base) {
             if (!matches(site, store)) return;
             float literal;
             std::memcpy(&literal, base + site + store.size(), sizeof(literal));
-            if (literal != 16.f / 9.f && literal != float(w) / h) return;
+            if (literal != 16.f / 9.f && literal != float(display_w) / panel_height) return;
             auto bytes = Bytes(literal);
             store.insert(store.end(), bytes.begin(), bytes.end());
             auto* memory = near_code.Alloc(64);
@@ -4781,6 +4784,7 @@ void Install(u8* base) {
     }
     game = base;
     wide_width = w;
+    output_width = display_w;
     menu_width = panel;
     menu_height = panel_height;
     height = h;
@@ -4858,17 +4862,17 @@ void RytyApplyGamePatches() {
 namespace Vulkan {
 u32 RytyGt7MenuWidth(u32 registered_width, u32 height) {
     using namespace Gt7NativeMenu;
-    const u32 width = active_width.load(std::memory_order_acquire);
-    return !dlss_layout && width && registered_width == wide_width && height == Gt7NativeMenu::height ? menu_width : 0;
+    return active_extent.load(std::memory_order_acquire) && output_width > menu_width &&
+           registered_width == output_width && height == menu_height ? menu_width : 0;
 }
 bool RytyGt7NativeDlssMenu() {
     using namespace Gt7NativeMenu;
     if (native_dlaa) return Rewards::active_stage.load(std::memory_order_acquire) != nullptr;
-    return dlss_layout && active_width.load(std::memory_order_acquire) != wide_width;
+    return dlss_layout && active_extent.load(std::memory_order_acquire) != PackedExtent(wide_width, height);
 }
 bool RytyGt7MenuActive() {
     using namespace Gt7NativeMenu;
-    return active_width.load(std::memory_order_acquire) == menu_width;
+    return active_extent.load(std::memory_order_acquire) == PackedExtent(menu_width, menu_height);
 }
 // GAME-006: the race runs (from its start countdown to its finish), and whether a hook reads it.
 bool RytyRaceRunning() {

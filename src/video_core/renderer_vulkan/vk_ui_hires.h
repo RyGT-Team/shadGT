@@ -27,6 +27,7 @@
 
 #include "common/logging/log.h"
 #include "ryty_gpu/ryty_dlss.h"
+#include "ryty_gpu/ryty_dlss_layout.h"
 #include "ryty_gpu/ryty_pro_mode.h"
 #include "ryty_gpu/ryty_hdr_ui.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -927,6 +928,8 @@ inline std::optional<Shown> TakeFrame(const Instance& instance, vk::CommandBuffe
     if (!Enabled()) {
         return std::nullopt;
     }
+    const bool dlss_wide = Wide() && RytyUpscale::DlssLayout().Wide();
+    if (dlss_wide) output = RytyUpscale::DlssLayout().output;
     auto& state = Get();
     std::scoped_lock lock{state.mutex};
     ++state.frames;
@@ -1045,7 +1048,7 @@ inline std::optional<Shown> TakeFrame(const Instance& instance, vk::CommandBuffe
     const bool same_shape = output.width > native.width && output.height > native.height &&
                             std::abs(s64(output.width) * native.height -
                                      s64(output.height) * native.width) <= s64(native.height);
-    const bool wide = Wide() && output.width >= native.width && output.height >= native.height &&
+    const bool wide = Wide() && (dlss_wide || (output.width >= native.width && output.height >= native.height)) &&
                       s64(output.width) * native.height > s64(output.height) * native.width;
     const bool wanted = same_shape || wide;
     const vk::Extent2D size = wanted ? output : vk::Extent2D{};

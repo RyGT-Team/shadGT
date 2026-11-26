@@ -1,3 +1,4 @@
+#include "ryty_gpu/ryty_dlss_layout.h"
 #include "ryty_gpu/native/ordered_timing.h"
 #include <exception>
 #include "ryty_gpu/native/cpu_stack_registry.h"
@@ -1977,7 +1978,10 @@ void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Ta
     const vk::Extent2D size{resolved->info.size.width, resolved->info.size.height};
     if (RytyUpscale::GuestOutputDlss()) {
         if (RytyGt7NativeDlssMenu()) return;
-        if (r.temporalDlss.ActiveQuality() == RYGT_DLSS_QUALITY_DLAA) {
+        const auto& layout = RytyUpscale::DlssLayout();
+        if (layout.scene.width) {
+            if (size != layout.scene || !RytyGtsInRace()) return;
+        } else if (r.temporalDlss.ActiveQuality() == RYGT_DLSS_QUALITY_DLAA) {
             if (!RytyGtsInRace() || !IsPrimaryDisplayExtent(size)) return;
         } else if (size != vk::Extent2D{1920, 1080}) return;
     }
@@ -2060,9 +2064,15 @@ bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& t
     const auto size = r.temporalDlss.RenderSize();
     if (guest_output) {
         const vk::Extent2D output{desc.width, desc.height};
-        if (r.temporalDlss.OutputSize() != output ||
+        const auto& layout = RytyUpscale::DlssLayout();
+        // GT Sport's wide UI proxy receives the full reconstruction after composing its display.
+        const bool wide_proxy = !gt7 && layout.Wide() && UiHires::Wide() &&
+                                IsWideRaceComposition(fs->pgm_hash) && IsDisplayAddress(target->info.guest_address);
+        if ((!wide_proxy && r.temporalDlss.OutputSize() != output) ||
             (gt7 && !IsDisplayAddress(target->info.guest_address))) return false;
-        if (r.temporalDlss.ActiveQuality() == RYGT_DLSS_QUALITY_DLAA) {
+        if (layout.scene.width) {
+            if (size != layout.scene || r.temporalDlss.OutputSize() != layout.output) return false;
+        } else if (r.temporalDlss.ActiveQuality() == RYGT_DLSS_QUALITY_DLAA) {
             if (size != output || !RytyGtsInRace()) return false;
         } else if (size != vk::Extent2D{1920, 1080} || output != vk::Extent2D{3840, 2160}) return false;
     }
@@ -17189,15 +17199,21 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     // The race HUD uses scene coordinates. A native menu sub-viewport already
     // addresses its rectangle inside the UHD display.
     const auto& guest_vp = regs.viewports[0];
+    const auto& layout = RytyUpscale::DlssLayout();
+    // Older launchers supplied only the 4K Performance flag.
+    const auto hud_scene = layout.scene.width ? layout.scene : vk::Extent2D{1920, 1080};
+    const auto hud_output = layout.output.width ? layout.output : vk::Extent2D{3840, 2160};
     const bool scale_guest_display = RytyUpscale::GuestOutputDlss() && !native_fsr_composition &&
-        r.temporalDlss.ActiveQuality() == RYGT_DLSS_QUALITY_PERFORMANCE &&
+        r.temporalDlss.ActiveQuality() != RYGT_DLSS_QUALITY_DLAA && !UiHires::Wide() &&
         targets.state.num_color_attachments == 1 && targets.colors[0] &&
-        targets.state.width == 3840 && targets.state.height == 2160 &&
-        std::abs(guest_vp.xscale) <= 960.f && std::abs(guest_vp.yscale) <= 540.f &&
+        targets.state.width == hud_output.width && targets.state.height == hud_output.height &&
+        std::abs(guest_vp.xscale) <= hud_scene.width * .5f &&
+        std::abs(guest_vp.yscale) <= hud_scene.height * .5f &&
         IsDisplayAddress(targets.colors[0]->info.guest_address) && !RytyGt7NativeDlssMenu();
     if (scale_guest_display) {
         auto& ui = UiHires::Get();
-        ui.scale = ui.scale_y = 2.f;
+        ui.scale = float(hud_output.width) / hud_scene.width;
+        ui.scale_y = float(hud_output.height) / hud_scene.height;
         ui.offset_x = ui.offset_y = 0.f;
     }
     for (unsigned attempt = 0; b.region_writeback && !RegionPlanValid(*b.region_writeback) && attempt < 4; ++attempt) {

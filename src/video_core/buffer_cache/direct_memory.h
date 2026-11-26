@@ -6,6 +6,7 @@
 #include <functional>
 
 #include <atomic>
+#include <chrono>
 #include <map>
 #include <memory>
 #include <optional>
@@ -165,6 +166,8 @@ private:
     ImportedPageCoverage<> imported_coverage;
     std::map<VAddr, View> views; // by begin
     std::map<VAddr, View> span_views; // FIX-SGT-014: by begin; may overlap `views` and each other
+    /// FIX-SGT-191: ranges no span view could alias, by begin: end and when it was tried.
+    std::map<VAddr, std::pair<VAddr, std::chrono::steady_clock::time_point>> span_refused;
     bool hold_native_releases{};
     std::vector<std::shared_ptr<void>> held_native_releases;
     std::map<VAddr, VAddr> failed; // failed view base -> committed end; invalidated on unmap

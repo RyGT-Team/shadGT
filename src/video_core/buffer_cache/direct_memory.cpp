@@ -310,8 +310,23 @@ std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindOrImportSpan(VAdd
     VAddr base = address & ~(Granularity - 1);
     VAddr end = (want_end + Granularity - 1) & ~(Granularity - 1);
     if (end - base > MaxSpan) return refuse("over 1 GiB");
+    // FIX-SGT-191 (RyGT #120): a range that could not be aliased is not tried again for 2 s, nor
+    // a range holding it (it can't be aliased either). GT7's weather radar in rain binds a 310 MB
+    // write from the per-frame memory at every draw; each try was two or three failed aliases
+    // (each a caught exception in the runtime). An unmap over the range forgets it at once.
+    const auto now = std::chrono::steady_clock::now();
+    std::erase_if(span_refused, [&](const auto& refused_range) {
+        return now - refused_range.second.second > std::chrono::seconds{2};
+    });
+    for (const auto& [refused_begin, refused_until] : span_refused) {
+        if (refused_begin >= end) break;
+        if (refused_begin >= base && refused_until.first <= end) {
+            return std::nullopt; // logged when it was refused
+        }
+    }
     // A smaller span view at the same start (the read grew: 77 then 85 MB in one race) is
-    // retired like an unmapped one and replaced.
+    // retired like an unmapped one and replaced. FIX-SGT-191: only once the new alias is made;
+    // a failed one left the reads it held to import it again (14-24 ms each, every frame).
     const auto retire_at = [&](VAddr at) {
         if (const auto old = span_views.find(at); old != span_views.end()) {
             held_native_releases.push_back(std::move(old->second.lease));
@@ -335,7 +350,6 @@ std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindOrImportSpan(VAdd
         hi = std::min(hi, target) & ~(Granularity - 1);
         if (hi > end) padded_end = hi;
     }
-    retire_at(base);
     void* alias = map_alias(base, padded_end - base);
     if (alias) {
         end = padded_end;
@@ -345,10 +359,12 @@ std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindOrImportSpan(VAdd
     if (!alias) {
         base = address & ~(PageSize - 1);
         end = (want_end + PageSize - 1) & ~(PageSize - 1);
-        retire_at(base);
         alias = map_alias(base, end - base);
     }
-    if (!alias) return refuse("no alias over the range");
+    if (!alias) {
+        span_refused[base] = {end, now}; // FIX-SGT-191
+        return refuse("no alias over the range");
+    }
     const auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
     const VkDevice device = instance.GetDevice();
     VkMemoryHostPointerPropertiesEXT ptr_props{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
@@ -411,6 +427,7 @@ std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindOrImportSpan(VAdd
                 VULKAN_HPP_DEFAULT_DISPATCHER.vkFreeMemory(device, memory, nullptr);
                 unmap_alias(alias);
             });
+        retire_at(base); // FIX-SGT-191: the new alias is made
         span_views.emplace(base, View{base, end, alias, memory, buffer, device_address, lease,
                                       wrapper});
     } catch (...) {
@@ -982,6 +999,9 @@ void DirectMemory::OnUnmap(VAddr address, u64 size) {
     if (spans_dropped && !hold_native_releases) {
         RetireLeasesAfterSplice(held_native_releases, scheduler.CurrentTick());
     }
+    std::erase_if(span_refused, [&](const auto& refused_range) { // FIX-SGT-191
+        return refused_range.first < end && refused_range.second.first > address;
+    });
     // Even a partial unmap can replace part of a failed view with importable memory.
     std::erase_if(failed, [&](const auto& view) {
         return view.first < end && (view.second > address || view.first >= address);

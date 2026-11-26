@@ -128,11 +128,18 @@ void Translator::V_INTERP_MOV_F32(const GcnInst& inst) {
     auto& interp = info.fs_interpolation[attr_index];
     const u32 src_select = inst.src[0].code;
     ASSERT_MSG(src_select < 3, "Invalid V_INTERP_MOV_F32 selector {}", src_select);
-    ASSERT(attr.is_flat || src_select == 2 ||
-           profile.supports_amd_shader_explicit_vertex_parameter ||
-           profile.supports_fragment_shader_barycentric);
-    if (profile.supports_amd_shader_explicit_vertex_parameter ||
-        profile.supports_fragment_shader_barycentric) {
+    const bool per_vertex = profile.supports_amd_shader_explicit_vertex_parameter ||
+                            profile.supports_fragment_shader_barycentric;
+    if (!per_vertex && !attr.is_flat && src_select != 2) {
+        // FIX-SGT-190 (RyGT #124): without either extension (Intel Arc on Windows) a shader
+        // cannot read one vertex's attribute, so the P10/P20 deltas are taken as 0. A shader
+        // that interpolates by hand (P0 + i * P10 + j * P20) then gets the flat P0 value.
+        // This used to be an assertion: the shader failed to translate, its draws were skipped
+        // and it was translated again on every draw (175 GT7 shaders, 3 fps at the menus).
+        SetDst(inst.dst[0], ir.Imm32(0.f));
+        return;
+    }
+    if (per_vertex) {
         // VSRC 0=P10, 1=P20, 2=P0
         interp.primary = Qualifier::PerVertex;
         IR::F32 result = ir.GetAttribute(attrib, inst.control.vintrp.chan, (src_select + 1) % 3);

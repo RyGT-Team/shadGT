@@ -11,6 +11,7 @@
 #include "ryty_gpu/ryty_gts_dlss.h"
 #include "ryty_gpu/ryty_dlssg.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
@@ -209,6 +210,7 @@ bool GtsDlssPass::Capture(u64 frame, GtsSceneImage color, GtsSceneImage sourceDe
         scheduler.EndRendering();
         runtime.FlushBarriers();
         scheduler.Finish();
+        colorViews.clear();
         renderSize = input;
         outputSize = output;
         create(this->color, color.info.pixel_format, input);
@@ -406,21 +408,36 @@ bool GtsDlssPass::HasScene(u64 frame, u64 uid) const {
     return !failed && sceneFrame == frame && sceneUid == uid && outputFrame != frame;
 }
 
-void GtsDlssPass::PrepareScene(u64 frame, GtsSceneImage resolved) {
-    if (!HasScene(frame, resolved.image_uid)) return;
-    const auto previous = resolved.State();
-    scheduler.EndRendering();
-    transit(color, vk::ImageLayout::eTransferSrcOptimal);
-    transitSource(resolved, vk::ImageLayout::eTransferDstOptimal,
-                    vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferWrite);
-    runtime.FlushBarriers();
-    const vk::ImageCopy region{.srcSubresource = ColorLayer, .dstSubresource = ColorLayer,
-                              .extent = {renderSize.width, renderSize.height, 1}};
-    scheduler.CommandBuffer().copyImage(color.image, vk::ImageLayout::eTransferSrcOptimal,
-        resolved.GetImage(), vk::ImageLayout::eTransferDstOptimal, region);
-    resolved.MarkGpuModified();
-    transitSource(resolved, previous.layout, previous.pl_stage, previous.access_mask);
-    runtime.FlushBarriers();
+void GtsSceneBinding::Restore() {
+    if (slot) {
+        *slot = original;
+        slot = nullptr;
+    }
+}
+
+bool GtsDlssPass::BindSceneColor(const VideoCore::ImageViewInfo& info, vk::DescriptorImageInfo& slot,
+                                GtsSceneBinding& binding) {
+    if (info.is_storage || info.format != color.format ||
+        info.type != AmdGpu::ImageType::Color2D ||
+        info.range.base.level || info.range.base.layer || !slot.imageView) return false;
+
+    auto view = color.view.get();
+    if (info.mapping != AmdGpu::IdentityMapping) {
+        auto found = std::ranges::find_if(colorViews, [&](const auto& v) { return v.first == info.mapping; });
+        if (found == colorViews.end()) {
+            auto [result, mapped] = instance.GetDevice().createImageViewUnique({
+                .image = color.image, .viewType = vk::ImageViewType::e2D, .format = color.format,
+                .components = LiverpoolToVK::ComponentMapping(info.mapping),
+                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}});
+            if (result != vk::Result::eSuccess) return false;
+            found = colorViews.emplace(colorViews.end(), info.mapping, std::move(mapped));
+        }
+        view = found->second.get();
+    }
+    binding = {&slot, slot};
+    slot.imageView = view;
+    slot.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    return true;
 }
 
 void GtsDlssPass::Resolve(u64 frame, GtsSceneImage display) {
@@ -534,7 +551,11 @@ void GtsDlssPass::Resolve(u64 frame, GtsSceneImage display) {
     const bool ok = DlssTiming::Measure(&timing, cmd, renderSize, outputSize,
         reset ? "reset" : "temporal", preset, [&] { return RytyDlss::EvaluateTemporal(cmd, desc); }, true);
     scheduler.GetDynamicState().Invalidate();
-    if (!ok) { failed = true; return; }
+    if (!ok) {
+        failed = true;
+        LOG_WARNING(Render_Vulkan, "Temporal DLSS: NGX failed on frame {}; returning to game TAA", frame);
+        return;
+    }
     ++evaluatedFrames;
     static u32 loggedFrames = 0;
     if (loggedFrames++ < 8) {

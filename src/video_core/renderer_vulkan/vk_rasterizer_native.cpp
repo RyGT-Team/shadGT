@@ -2040,7 +2040,7 @@ void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Ta
 }
 
 bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& targets,
-                                   const DrawBindings& bindings) {
+                                    DrawBindings& bindings, GtsSceneBinding& scene_binding) {
     const bool gt7 = Common::IsGt7();
     const bool guest_output = RytyUpscale::GuestOutputDlss();
     if ((gt7 && !guest_output) || !r.temporalDlss.Enabled() || RytyGt7NativeDlssMenu()) return false;
@@ -2060,7 +2060,8 @@ bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& t
     const auto scene = std::ranges::find_if(bindings.sampled, [&](const auto* e) {
         return r.temporalDlss.HasScene(now, e->image->NativeHandle());
     });
-    if (scene == bindings.sampled.end()) return false;
+    if (scene == bindings.sampled.end() || bindings.region_writeback || bindings.writes_buffers ||
+        !bindings.stored.empty()) return false; // A failed reconstruction can replay this draw.
     const auto size = r.temporalDlss.RenderSize();
     if (guest_output) {
         const vk::Extent2D output{desc.width, desc.height};
@@ -2111,8 +2112,26 @@ bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& t
         fsr_composition = std::move(scratch);
         PrepareImages();
     }
+    // Substitute only the descriptor that reads the TAA result in this composition draw.
+    // Leave unusual or ambiguous views to the game.
+    {
+        std::scoped_lock lock{views_mutex};
+        const auto found = views.find(*scene);
+        if (found == views.end()) return false;
+        vk::DescriptorImageInfo* slot{};
+        const VideoCore::ImageViewInfo* info{};
+        for (const auto& record : found->second) {
+            for (auto& descriptor : bindings.images) {
+                if (descriptor.imageView != *record.view) continue;
+                if (slot || record.use != ViewUse::Sampled) return false;
+                slot = &descriptor;
+                info = &record.info;
+            }
+        }
+        if (!slot || !r.temporalDlss.BindSceneColor(*info, *slot, scene_binding)) return false;
+        bindings.key_layout = nullptr;
+    }
     Splice();
-    r.temporalDlss.PrepareScene(now, TemporalImage(**scene));
     Begin();
     UiHires::Get().scale = 0.f;
     fsr_wide_full = IsWideRaceComposition(fs->pgm_hash); // WIDE-001
@@ -2143,7 +2162,7 @@ bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& t
     return true;
 }
 
-void NativeRenderer::FinishNativeFsr(const Targets& targets) {
+bool NativeRenderer::FinishNativeFsr(const Targets& targets) {
     EndRendering();
     GlobalBarrier();
     auto& s = Begin();
@@ -2181,27 +2200,12 @@ void NativeRenderer::FinishNativeFsr(const Targets& targets) {
                 size.width, size.height, r.temporalDlss.OutputSize().width,
                 r.temporalDlss.OutputSize().height, target->info.size.width, target->info.size.height);
     } else {
-        if (drawn_in_scratch) {
-            static std::atomic<u32> logged{};
-            if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
-                std::fprintf(stderr, "[wide] WIDE-063 DLSS reconstruction of the wide scene "
-                                     "failed; showing the composition scaled\n");
-            }
-        }
-        // Preserve a complete output picture even if the optional provider fails.
-        auto& fallback = Begin();
-        GlobalBarrier();
-        vk::ImageBlit blit{};
-        blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
-        blit.dstSubresource = blit.srcSubresource;
-        blit.srcOffsets[1] = {s32(size.width), s32(size.height), 1};
-        blit.dstOffsets[1] = {s32(target->info.size.width), s32(target->info.size.height), 1};
-        fallback.cmd.blitImage(scratch, vk::ImageLayout::eGeneral, source,
-                               vk::ImageLayout::eGeneral, blit, vk::Filter::eLinear);
-        fallback.list->Barrier(Native::Rhi::ScopeAll, Native::Rhi::ScopeAll);
+        Begin(); // NGX may already have recorded commands before reporting an error.
+        return false;
     }
     Written(target);
     Begin(); // Direct backend commands invalidate cached Native pipeline/dynamic state.
+    return true;
 }
 
 // PERF-GT7-130: whether the range is not imported yet and starts in a guest mapping of at most
@@ -16089,6 +16093,16 @@ void NativeRenderer::YieldToMappingChanges() {
 
 void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect,
                           bool world_hud) {
+    bool use_game_taa = false;
+    RecordDraw(is_indexed, index_offset, indirect, world_hud, use_game_taa);
+    if (use_game_taa) {
+        // Record the original composition through the usual display/ultrawide routing.
+        RecordDraw(is_indexed, index_offset, indirect, world_hud, use_game_taa);
+    }
+}
+
+void NativeRenderer::RecordDraw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect,
+                                bool world_hud, bool& use_game_taa) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::DrawTotal}; // DIAG-SGT-023
     YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
@@ -17190,7 +17204,16 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         PhaseClock clock{stats.phase_ns[6]};
         PrepareImages(b); // PERF-109
     }
-    const bool native_fsr_composition = BeginNativeFsr(*pipeline, targets, b);
+    GtsSceneBinding scene_binding;
+    const bool native_fsr_composition = !use_game_taa && !indirect &&
+        BeginNativeFsr(*pipeline, targets, b, scene_binding);
+    SCOPE_EXIT {
+        if (scene_binding.slot) {
+            DrainBinder(); // A queued descriptor bind may still refer to this slot.
+            scene_binding.Restore();
+            b.key_layout = nullptr;
+        }
+    };
     if (native_fsr_composition) scale_composition = false;
     if (!native_fsr_composition && !PrepareUiTarget(targets, *pipeline)) {
         NATIVE_DIAGNOSTIC(++stats.skipped);
@@ -19791,8 +19814,15 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     }
 
 #endif
-    if (native_fsr_composition) FinishNativeFsr(targets);
-    else CaptureNativeFsr(*pipeline, targets, b);
+    if (native_fsr_composition) {
+        use_game_taa = !FinishNativeFsr(targets);
+    } else if (use_game_taa) {
+        const auto* fs = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        LOG_INFO(Render_Vulkan, "Temporal fallback: composed game TAA with shader {:#x} into {}x{}",
+                 fs->pgm_hash, targets.state.width, targets.state.height);
+    } else {
+        CaptureNativeFsr(*pipeline, targets, b);
+    }
 
     if (scale_composition) {
         EndRendering();

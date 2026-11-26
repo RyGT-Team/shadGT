@@ -2,8 +2,10 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <memory>
+#include <vector>
 #include <functional>
 #include "ryty_gpu/ryty_dlss.h"
 #include "ryty_gpu/ryty_fsr3.h"
@@ -39,11 +41,18 @@ struct GtsSceneImage {
     VideoCore::Image::State State() const;
 };
 
+// Override only the composition descriptor. The game keeps its own TAA image and history.
+struct GtsSceneBinding {
+    vk::DescriptorImageInfo* slot{};
+    vk::DescriptorImageInfo original{};
+    void Restore();
+};
+
 class GtsDlssPass {
 public:
     GtsDlssPass(const Instance& instance, Scheduler& scheduler, Runtime& runtime);
     /// Temporal DLSS, or FSR-200 temporal FSR when DLSS is not on.
-    bool Enabled() const { return RytyDlss::TemporalEnabled() || useFsr || useXess; }
+    bool Enabled() const { return !failed.load(std::memory_order_relaxed) && (RytyDlss::TemporalEnabled() || useFsr || useXess); }
     void SetOutputSize(vk::Extent2D size, bool hdrEncoded) {
         requestedSize = size;
         supportedDisplay = !hdrEncoded;
@@ -54,7 +63,8 @@ public:
     bool HasScene(u64 frame, u64 resolvedUid) const;
     bool CopyFrameGenerationInputs(u64 frame, RytyFrameGen::SceneSnapshot& snapshot,
                                    bool native_hudless = false);
-    void PrepareScene(u64 frame, GtsSceneImage resolved);
+    bool BindSceneColor(const VideoCore::ImageViewInfo& info, vk::DescriptorImageInfo& slot,
+                        GtsSceneBinding& binding);
     void Resolve(u64 frame, GtsSceneImage display);
     bool ResolveNativeComposition(u64 frame, GtsSceneImage scene, GtsSceneImage display);
     /// WIDE-001: the last reconstructed picture (outputSize) into `rect` of `dst`, which is in the
@@ -97,6 +107,7 @@ private:
     Scheduler& scheduler;
     Runtime& runtime;
     Texture color, depth, motion, reconstruction, native;
+    std::vector<std::pair<AmdGpu::CompMapping, vk::UniqueImageView>> colorViews;
     std::unique_ptr<VideoCore::BlitHelper> colorCopy;
     vk::Extent2D requestedSize{}, renderSize{}, outputSize{};
     vk::Extent2D rejectedInput{}, rejectedOutput{};
@@ -104,7 +115,8 @@ private:
     u64 sceneFrame{~u64{}}, sceneUid{}, displayUid{}, outputFrame{~u64{}};
     float jitterX{}, jitterY{}, frameTimeMs{1000.f / 60};
     float motionScaleX{}, motionScaleY{};
-    bool reset{true}, failed{}, supportedDisplay{}, nativeDirty{};
+    bool reset{true}, supportedDisplay{}, nativeDirty{};
+    std::atomic_bool failed{};
     bool useFsr{}; // FSR-200: the scene goes to FSR instead of DLSS
     // FSR-205: the scene depth as R32_SFLOAT for FSR (its Vulkan backend views a D32_SFLOAT_S8_UINT
     // image as D32_SFLOAT, an invalid view that lost the device on an RX 7600), through a buffer.

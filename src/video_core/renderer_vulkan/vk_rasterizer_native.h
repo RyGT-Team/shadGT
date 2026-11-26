@@ -103,6 +103,7 @@ template <class Buffer> class AsyncMirrorBuffer;
 
 class Rasterizer;
 struct GtsSceneImage;
+struct GtsSceneBinding;
 class GraphicsPipeline;
 class ComputePipeline;
 
@@ -1149,9 +1150,11 @@ private:
     GtsSceneImage TemporalImage(const Native::ImageEntry& entry);
     void CaptureNativeFsr(const GraphicsPipeline& pipeline, const Targets& targets,
                           const DrawBindings& bindings);
-    bool BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& targets,
-                        const DrawBindings& bindings);
-    void FinishNativeFsr(const Targets& targets);
+    bool BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& targets, DrawBindings& bindings,
+                        GtsSceneBinding& scene_binding);
+    bool FinishNativeFsr(const Targets& targets);
+    void RecordDraw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect, bool world_hud,
+                    bool& use_game_taa);
     struct FsrComposition;
     std::unique_ptr<FsrComposition> fsr_composition;
     u64 fsr_display_frame = ~u64{};

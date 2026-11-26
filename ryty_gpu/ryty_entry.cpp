@@ -3,6 +3,8 @@
 
 #include <windows.h>
 #include <tlhelp32.h>
+#include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <algorithm>
@@ -38,6 +40,8 @@
 #include "core/memory.h"
 #include "ryty_gpu/native/job_walker.h"
 #include "ryty_gpu/native/cpu_stack_registry.h"
+#include "ryty_gpu/fault_xstate_repair.h"
+#include "common/decoder.h"
 #include "core/signals.h"
 #include "core/loader/symbols_resolver.h"
 #include "input/controller.h"
@@ -987,6 +991,106 @@ extern "C" int RytyGpuHandleWriteFaultBody(void* exception_pointers) {
     }
     return Core::RytyMemory::InGuardedRead() ? 2 : 0;
 }
+
+#ifdef SHADGT_DIAGNOSTICS
+// DIAG-SGT-195 (SHADGT_DIAG_FAULT_STORES=1, diagnostics builds): every access fault Ryty offers
+// the renderer whose store is 16 bytes or wider or crosses a page, logged on stderr by
+// ryty_fault_xstate.cpp's shim (FIX-SGT-194) after the handler ran: fault and store addresses,
+// the instruction's bytes, both pages, which handler took it, and the AVX state the exception's
+// context named before the repair. The first 4000 and then every 1000th.
+extern "C" void RytyGpuLogFaultStore(void* exception_pointers, int result,
+                                     const RytyFaultXState::RepairResult* repair) {
+    auto* pointers = static_cast<EXCEPTION_POINTERS*>(exception_pointers);
+    if (pointers == nullptr || pointers->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
+        pointers->ExceptionRecord->NumberParameters < 2) {
+        return;
+    }
+    const auto* record = pointers->ExceptionRecord;
+    const auto* ctx = pointers->ContextRecord;
+    const bool write = record->ExceptionInformation[0] == 1;
+    const u64 fault = record->ExceptionInformation[1];
+    std::array<u8, 15> bytes{};
+    SIZE_T got = 0;
+    ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(ctx->Rip), bytes.data(),
+                      bytes.size(), &got);
+    ZydisDecodedInstruction instruction{};
+    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+    u64 store = 0, store_size = 0;
+    bool vector = false;
+    if (got != 0 && ZYAN_SUCCESS(Common::Decoder::Instance()->decodeInstruction(
+                        instruction, operands, bytes.data(), got))) {
+        ZydisRegisterContext regs{};
+        const std::pair<ZydisRegister, u64> gprs[] = {
+            {ZYDIS_REGISTER_RAX, ctx->Rax}, {ZYDIS_REGISTER_RBX, ctx->Rbx},
+            {ZYDIS_REGISTER_RCX, ctx->Rcx}, {ZYDIS_REGISTER_RDX, ctx->Rdx},
+            {ZYDIS_REGISTER_RSI, ctx->Rsi}, {ZYDIS_REGISTER_RDI, ctx->Rdi},
+            {ZYDIS_REGISTER_RBP, ctx->Rbp}, {ZYDIS_REGISTER_RSP, ctx->Rsp},
+            {ZYDIS_REGISTER_R8, ctx->R8},   {ZYDIS_REGISTER_R9, ctx->R9},
+            {ZYDIS_REGISTER_R10, ctx->R10}, {ZYDIS_REGISTER_R11, ctx->R11},
+            {ZYDIS_REGISTER_R12, ctx->R12}, {ZYDIS_REGISTER_R13, ctx->R13},
+            {ZYDIS_REGISTER_R14, ctx->R14}, {ZYDIS_REGISTER_R15, ctx->R15},
+            {ZYDIS_REGISTER_RIP, ctx->Rip}};
+        for (const auto& [reg, value] : gprs) {
+            regs.values[reg] = value;
+        }
+        for (u32 i = 0; i < instruction.operand_count_visible; ++i) {
+            const auto& operand = operands[i];
+            if (operand.type != ZYDIS_OPERAND_TYPE_MEMORY ||
+                (operand.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) == 0) {
+                continue;
+            }
+            ZyanU64 address = 0;
+            if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddressEx(&instruction, &operand, ctx->Rip, &regs,
+                                                        &address))) {
+                store = address;
+                store_size = operand.size / 8;
+            }
+        }
+        for (u32 i = 0; i < instruction.operand_count_visible; ++i) {
+            if (operands[i].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                operands[i].reg.value >= ZYDIS_REGISTER_XMM0 &&
+                operands[i].reg.value <= ZYDIS_REGISTER_ZMM31) {
+                vector = true;
+            }
+        }
+    }
+    const bool crosses = store_size != 0 && (store & 0xFFF) + store_size > 0x1000;
+    if (!write || (!crosses && store_size < 16)) {
+        return;
+    }
+    static std::atomic<u64> count{0};
+    const u64 n = ++count;
+    if (n > 4000 && n % 1000 != 0) {
+        return;
+    }
+    std::string hex;
+    for (SIZE_T i = 0; i < std::min<SIZE_T>(got, instruction.length ? instruction.length : got); ++i) {
+        hex += fmt::format("{:02x}", bytes[i]);
+    }
+    const u64 base = reinterpret_cast<u64>(GetModuleHandleA(nullptr));
+    const char* handler = result == 1   ? "renderer (page tracking, resumed)"
+                          : result == 2 ? "renderer's guarded read (passed on)"
+                                        : "not the renderer's (Ryty's handlers next)";
+    const char* outcome[] = {"complete", "repaired", "no XSTATE in context", "too small",
+                             "foreign components"};
+    std::fprintf(stderr,
+                 "[fault] DIAG-SGT-195 #%llu: write fault at %#llx, rip %#llx (exe+%#llx) bytes %s "
+                 "(%s%s, %llu bytes at %#llx, pages %#llx and %#llx%s); handler: %s; AVX state in "
+                 "use %#llx, context XSTATE_BV %#llx XCOMP_BV %#llx flags %#lx rsp %#llx: %s\n",
+                 static_cast<unsigned long long>(n), static_cast<unsigned long long>(fault),
+                 static_cast<unsigned long long>(ctx->Rip),
+                 static_cast<unsigned long long>(ctx->Rip - base), hex.c_str(),
+                 ZydisMnemonicGetString(instruction.mnemonic), vector ? ", vector" : "",
+                 static_cast<unsigned long long>(store_size), static_cast<unsigned long long>(store),
+                 static_cast<unsigned long long>(store & ~0xFFFull),
+                 static_cast<unsigned long long>((store + std::max<u64>(store_size, 1) - 1) & ~0xFFFull),
+                 crosses ? ", crosses" : "", handler,
+                 static_cast<unsigned long long>(repair->live),
+                 static_cast<unsigned long long>(repair->named),
+                 static_cast<unsigned long long>(repair->compacted), ctx->ContextFlags,
+                 static_cast<unsigned long long>(ctx->Rsp), outcome[repair->outcome]);
+}
+#endif
 
 // FIX-044 for Ryty: the guest's TSC, which stands still while the GPU command thread compiles
 // shaders or pipelines (common/guest_clock.h). Ryty's libkernel derives the game's monotonic clocks

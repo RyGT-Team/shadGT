@@ -999,9 +999,15 @@ void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
 #endif
     gameplay_ready = gameplay_ready && inputs_ready && in_race && !clock_paused && !threads_paused;
     const bool resized = size != g_sl.aux_size;
+    // FIX-GT7-200 (RyGT #122): GT7 never waits, as ryGT7's frame generation never did: no
+    // suspension for menus, loading, pauses, shader compilation or the settling second after
+    // them. Only missing inputs stop it; a resize or a cut still restarts its history.
+    const bool fresh = std::exchange(g_sl.fresh_frame, false);
     const auto reason =
-        g_sl.gate.Update(now, gameplay_ready, std::exchange(g_sl.fresh_frame, false),
-                         CompilationInProgress() || CompileSlowMotion(), resized);
+        Common::IsGt7()
+            ? (inputs_ready ? Suspension::None : Suspension::Gameplay)
+            : g_sl.gate.Update(now, gameplay_ready, fresh,
+                               CompilationInProgress() || CompileSlowMotion(), resized);
     const bool enabled = reason == Suspension::None;
     if (reason != g_sl.suspension) {
         g_sl.suspension = reason;

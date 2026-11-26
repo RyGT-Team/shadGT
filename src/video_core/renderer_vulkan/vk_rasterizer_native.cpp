@@ -8600,6 +8600,39 @@ static u64 PerFrameReadCut(VAddr base, u64 size, bool written) {
     return end - base;
 }
 
+/// FIX-SGT-191 (RyGT #120, SHADGT_PERFRAME_WRITE_CUT=0: as before): a written range that starts in
+/// GT7's per-frame memory and reaches more than 64 MB past its listed end is cut where the memory
+/// stops being committed, and at the per-frame memory's end at most. GT7's weather radar in rain
+/// (PS4 Pro mode) binds a 310 MB written buffer (0x13681180 bytes, from 0x2008xxxxx-0x205axxxxx)
+/// over a per-frame memory committed to 0x206000000: no span view could alias it ("not all shared
+/// views", two or three failed tries a draw), and it fell back to a 310-550 MB video-memory region
+/// refreshed every frame: heavy stutter, then the GPU device was lost. FIX-GT7-195 cuts only
+/// reads. The shader's writes past the cut are dropped (robust buffer access), as the GPU could
+/// not write memory that isn't there.
+static u64 PerFrameWriteCut(VAddr base, u64 size, bool written) {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_PERFRAME_WRITE_CUT");
+        return !(env && env[0] == '0');
+    }();
+    if (!on || !written || size == 0) {
+        return size;
+    }
+    const auto [begin, listed_end] = PerFrameListed();
+    const VAddr end = PerFrameEnd();
+    if (begin == 0 || base < begin || base >= end || base + size <= listed_end + 64_MB) {
+        return size;
+    }
+    const u64 cut = Native::ReadablePrefix(reinterpret_cast<const void*>(base), end - base);
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-SGT-191: written range {:#x}+{:#x} cut to {:#x} (GT7's per-frame memory "
+                    "ends at {:#x}, committed to {:#x})",
+                    base, size, cut, end, base + cut);
+    }
+    return cut;
+}
+
 /// FIX-GT7-196 (RyGT #99, SHADGT_LISTED_READ_CUT=0: as before): a read over one of the other listed
 /// in-place ranges (GT7's culling block at 0x1020000000) that reaches more than 64 MB past that
 /// range's end is cut there. It is FIX-GT7-195's read outside the per-frame memory: an unbounded
@@ -12178,6 +12211,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                 [&](u64 a, u64 n) { return readable_direct->EnsureImported(a, n); },
                 [&](u64 a, u64 n) { return Native::ReadablePrefix(reinterpret_cast<const void*>(a), n); });
             if (bindable) size = PerFrameReadCut(base, size, desc.is_written); // FIX-GT7-195
+            if (bindable) size = PerFrameWriteCut(base, size, desc.is_written); // FIX-SGT-191
             if (bindable) size = ListedReadCut(base, size, desc.is_written); // FIX-GT7-196
             if (bindable && size != 0) {
 #if !defined(NDEBUG)
@@ -21377,6 +21411,7 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                 [&](u64 a, u64 n) { return readable_direct->EnsureImported(a, n); },
                 [&](u64 a, u64 n) { return Native::ReadablePrefix(reinterpret_cast<const void*>(a), n); });
             if (bindable) size = PerFrameReadCut(base, size, desc.is_written); // FIX-GT7-195
+            if (bindable) size = PerFrameWriteCut(base, size, desc.is_written); // FIX-SGT-191
             if (bindable) size = ListedReadCut(base, size, desc.is_written); // FIX-GT7-196
             // A region can appear after a worker's overlap check. Recheck any
             // truncated/empty range on the serialized recorder rather than

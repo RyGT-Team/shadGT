@@ -92,6 +92,9 @@ inline std::vector<u8> SnapshotLocked(const Table& t) {
 inline void Write(const std::vector<u8>& bytes) {
     const auto path = Path();
     auto temp = path;
+    // A temporary of this thread's own: the periodic save and the one at exit may overlap.
+    temp += ".";
+    temp += std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
     temp += ".tmp";
     {
         std::ofstream file{temp, std::ios::binary | std::ios::trunc};
@@ -130,11 +133,17 @@ inline void Save() {
     detail::Write(bytes);
 }
 
-/// A draw used this pipeline: counted once a session. Saved about every two minutes, off the
-/// calling thread (a few hundred KB).
+/// Reads the table now (at the pipeline cache's start), so no draw waits for the file.
+inline void Preload() {
+    auto& t = detail::Get();
+    std::scoped_lock lock{t.mutex};
+    detail::LoadLocked(t);
+}
+
+/// A draw used this pipeline: counted once a session. Saved about every two minutes; the copy
+/// and the write are made on a thread of their own, so the caller only starts it.
 inline void NoteUse(u64 hash) {
     auto& t = detail::Get();
-    std::vector<u8> bytes;
     {
         std::scoped_lock lock{t.mutex};
         detail::LoadLocked(t);
@@ -143,11 +152,9 @@ inline void NoteUse(u64 hash) {
         t.dirty = true;
         const auto now = std::chrono::steady_clock::now();
         if (now - t.saved_at < std::chrono::minutes{2}) return;
-        t.saved_at = now;
-        t.dirty = false;
-        bytes = detail::SnapshotLocked(t);
+        t.saved_at = now; // no other save starts meanwhile
     }
-    std::thread([bytes = std::move(bytes)] { detail::Write(bytes); }).detach();
+    std::thread([] { Save(); }).detach();
 }
 
 } // namespace Vulkan::PipelineUses

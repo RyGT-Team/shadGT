@@ -3266,6 +3266,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     if (liverpool) {
         liverpool->on_command_buffer_start = [this] { ReadAheadAtBufferStart(); };
     }
+    PipelineUses::Preload(); // FIX-SGT-192: the use counts are read here, not by a draw
     g_tess_lds_off_by_default.store(instance.GetDriverID() == vk::DriverId::eAmdProprietary,
                                     std::memory_order_relaxed); // PERF-SGT-155
     const auto& vk12_props = instance.GetVk12Properties();

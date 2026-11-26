@@ -1539,7 +1539,13 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     bool dlss_scaled = false;
     vk::ImageView ui_layer_view{};
     std::string upscaler = display->upscaler; // actual Native scene reconstruction
-    const vk::Extent2D game_size = RytyUpscale::GuestOutputDlss() && upscaler == "DLSS"
+    const bool guest_dlss = RytyUpscale::GuestOutputDlss() && upscaler == "DLSS";
+    if (guest_dlss && logged_dlss_display_size != image_size) {
+        LOG_INFO(Render_Vulkan, "DLSS guest display after HUD: {}x{}",
+                 image_size.width, image_size.height);
+        logged_dlss_display_size = image_size;
+    }
+    const vk::Extent2D game_size = guest_dlss
                                       ? rasterizer->GetTemporalDlss().RenderSize() : image_size;
     if (display->output_view) {
         image_view = display->output_view;

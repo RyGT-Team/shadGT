@@ -17168,6 +17168,19 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
+    // The guest places its HUD and menu draws in scene coordinates. Only the
+    // registered output images need these coordinates mapped to the full display.
+    const auto& guest_vp = regs.viewports[0];
+    const bool scale_guest_display = RytyUpscale::GuestOutputDlss() && !native_fsr_composition &&
+        targets.state.num_color_attachments == 1 && targets.colors[0] &&
+        targets.state.width == 3840 && targets.state.height == 2160 &&
+        std::abs(guest_vp.xscale) <= 960.f && std::abs(guest_vp.yscale) <= 540.f &&
+        IsDisplayAddress(targets.colors[0]->info.guest_address);
+    if (scale_guest_display) {
+        auto& ui = UiHires::Get();
+        ui.scale = ui.scale_y = 2.f;
+        ui.offset_x = ui.offset_y = 0.f;
+    }
     for (unsigned attempt = 0; b.region_writeback && !RegionPlanValid(*b.region_writeback) && attempt < 4; ++attempt) {
         b.Clear();
         b.push = UserData(regs);
@@ -17616,7 +17629,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         parallel_bindings.ordinary_images=worker_result->ordinary_images;
     };
     // NAT-161 indirect draws and GT7-UW HUD draws stay on the serial recorder.
-    if(parallel && !parallel->closing && parallel->applied_mode.Enabled() && !indirect && !hud_black_state) {
+    if(parallel && !parallel->closing && parallel->applied_mode.Enabled() && !indirect && !hud_black_state && !scale_guest_display) {
 #if !defined(NDEBUG)
         static const bool whole_enabled=[] {const char* p=std::getenv("SHADGT_PARALLEL_WHOLE_PREFLIGHT");return p && p[0]=='1' && p[1]=='\0';}();
         const bool whole_sample=whole_enabled && ((++parallel->whole_seq & 127u)==0);

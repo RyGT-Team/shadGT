@@ -937,15 +937,48 @@ void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     }
     const auto now = Clock::now();
     bool gameplay_ready;
+    bool telemetry_valid;
+    u16 telemetry_flags;
+    long long telemetry_age;
     {
         std::scoped_lock telemetry_lock{g_sl.telemetry_mutex};
         gameplay_ready = g_sl.gameplay.Ready(now);
+        telemetry_valid = g_sl.gameplay.Valid();
+        telemetry_flags = g_sl.gameplay.Flags();
+        telemetry_age = g_sl.gameplay.AgeMs(now);
     }
     const bool scene_valid = scene && scene->valid && scene->size.width && scene->size.height &&
         scene->depth && scene->motion && scene->depth_view && scene->motion_view &&
         scene->hudless && scene->hudless_view && scene->hudless_size == size;
-    gameplay_ready = gameplay_ready && scene_valid && RytyGtsInRace() &&
-                     !Common::GuestClock::IsPaused() && !DebugState.IsGuestThreadsPaused();
+    const bool in_race = RytyGtsInRace();
+    const bool clock_paused = Common::GuestClock::IsPaused();
+    const bool threads_paused = DebugState.IsGuestThreadsPaused();
+    {
+        // DIAG-GT7-198 (RyGT #122): the gameplay suspension has several causes behind one line;
+        // name them each time the set of failing ones changes.
+        const u32 failing = (gameplay_ready ? 0u : 1u) | (scene_valid ? 0u : 2u) |
+                            (in_race ? 0u : 4u) | (clock_paused ? 8u : 0u) |
+                            (threads_paused ? 16u : 0u);
+        static u32 last_failing = ~0u;
+        if (failing != last_failing) {
+            last_failing = failing;
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-GT7-198: DLSS-G gate: telemetry {} (valid {}, flags {:#x}, {} ms "
+                        "old), scene inputs {} (valid {}, size {}x{}, depth {}, motion {}, "
+                        "hud-less {} {}x{} for output {}x{}), race flag {}, guest clock {}, "
+                        "guest threads {}",
+                        gameplay_ready ? "ready" : "NOT ready", telemetry_valid, telemetry_flags,
+                        telemetry_age, scene_valid ? "ready" : "NOT ready",
+                        scene && scene->valid, scene ? scene->size.width : 0u,
+                        scene ? scene->size.height : 0u, scene && scene->depth_view,
+                        scene && scene->motion_view, scene && scene->hudless_view,
+                        scene ? scene->hudless_size.width : 0u,
+                        scene ? scene->hudless_size.height : 0u, size.width, size.height,
+                        in_race ? "up" : "DOWN", clock_paused ? "PAUSED" : "running",
+                        threads_paused ? "PAUSED" : "running");
+        }
+    }
+    gameplay_ready = gameplay_ready && scene_valid && in_race && !clock_paused && !threads_paused;
     const bool resized = size != g_sl.aux_size;
     const auto reason =
         g_sl.gate.Update(now, gameplay_ready, std::exchange(g_sl.fresh_frame, false),

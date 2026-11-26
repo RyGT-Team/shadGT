@@ -25673,6 +25673,12 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     if (temporal.swapped_out) {
         TemporalSwapOut(); // no tone mapping came: the result goes back as it was
     }
+    // FIX-SGT-186: the temporal pass is matched against the picture shown, not the surface
+    // it is cut from. In the PS4 Pro mode on a 1080p TV GT7 draws its display into a 3840x2160
+    // surface and shows its 1920x1080 top left corner (CropDisplay, NEO-GT7-006), the size of
+    // the race's temporal pass and of its depth and motion vectors; checked against the surface,
+    // temporal DLSS gave up after 8 frames and ran on single frames for the whole run.
+    const auto& shown_size = source->info.size;
     // DLSS-GT7-001: a frame left as the game drew it is shown from the prototype's own display
     // picture (the tone-mapped un-resolved scene), with the HUD pictures laid over it as in a
     // race. Without that picture the game's display is shown as it is, HUD and all.
@@ -25681,8 +25687,8 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     bool raw_shown = false;
     if (mirror_frame && temporal.raw_display && temporal.raw_frame + 1 == frame &&
         temporal.raw_address == entry->info.guest_address &&
-        temporal.raw_display->info.size.width == entry->info.size.width &&
-        temporal.raw_display->info.size.height == entry->info.size.height) {
+        temporal.raw_display->info.size.width == shown_size.width &&
+        temporal.raw_display->info.size.height == shown_size.height) {
         if (const vk::ImageView raw = View(*temporal.raw_display, view_info, ViewUse::Sampled)) {
             display.image =
                 vk::Image{Handle<VkImage_T>(temporal.raw_display->image->NativeHandle())};
@@ -25695,13 +25701,14 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         display.hud_black = vk::ImageView{};
         display.hud_white = vk::ImageView{};
     }
-    // DLSS-GT7-001: a pass whose result is not the display's size (a picture cropped or scaled
-    // before it is shown, as NEO-GT7-006 crops the PS4 Pro's) cannot give DLSS its inputs, and
+    // DLSS-GT7-001: a pass whose result is not the shown picture's size (a picture scaled before
+    // it is shown; the PS4 Pro's crop is compared as shown, FIX-SGT-186) cannot give DLSS its
+    // inputs, and
     // its replaced result would reach DLSS un-resolved as a single frame: after a few such frames
     // in a row the pass is left to the game for the run.
     if (temporal.frame + 1 == frame && temporal.result && !temporal.size_refused) {
-        const bool same_size = temporal.result->info.size.width == entry->info.size.width &&
-                               temporal.result->info.size.height == entry->info.size.height;
+        const bool same_size = temporal.result->info.size.width == shown_size.width &&
+                               temporal.result->info.size.height == shown_size.height;
         temporal.size_mismatches = same_size ? 0 : temporal.size_mismatches + 1;
         if (temporal.size_mismatches >= 8) {
             temporal.size_refused = true;
@@ -25709,7 +25716,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
                         "DLSS-GT7-001: the temporal pass's result is {}x{}, the display {}x{}: "
                         "left to the game for this run (classic DLSS)",
                         temporal.result->info.size.width, temporal.result->info.size.height,
-                        entry->info.size.width, entry->info.size.height);
+                        shown_size.width, shown_size.height);
         }
     }
     // DLSS-GT7-001: the depth and motion vectors of the frame just finished, when it had the
@@ -25719,8 +25726,8 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         temporal.replaced_frame != ~u64{0} && temporal.replaced_frame + 1 == frame;
     if (Gt7TemporalActive() && (!mirror_frame || raw_shown) &&
         (replaced || raw_shown) && temporal.frame + 1 == frame && temporal.depth &&
-        temporal.motion && temporal.depth->info.size.width == entry->info.size.width &&
-        temporal.depth->info.size.height == entry->info.size.height) {
+        temporal.motion && temporal.depth->info.size.width == shown_size.width &&
+        temporal.depth->info.size.height == shown_size.height) {
         VideoCore::ImageViewInfo depth_info{};
         depth_info.format = vk::Format::eR32Sfloat;
         VideoCore::ImageViewInfo motion_info{};
@@ -25732,7 +25739,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         inputs.motion = vk::Image{Handle<VkImage_T>(temporal.motion->image->NativeHandle())};
         inputs.motion_view = View(*temporal.motion, motion_info, ViewUse::Sampled);
         inputs.motion_format = static_cast<vk::Format>(temporal.motion->image->Desc().format);
-        inputs.size = vk::Extent2D{entry->info.size.width, entry->info.size.height};
+        inputs.size = vk::Extent2D{shown_size.width, shown_size.height};
         inputs.jitter[0] = temporal.jitter[0];
         inputs.jitter[1] = temporal.jitter[1];
         inputs.mvec_scale[0] = temporal.mvec_scale[0];
@@ -25743,8 +25750,8 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         const auto& ui_scene = temporal.ui_scene[temporal.ui_scene_slot];
         if (ui_scene && temporal.ui_scene_frame + 1 == frame &&
             temporal.ui_scene_address == entry->info.guest_address &&
-            ui_scene->info.size.width == entry->info.size.width &&
-            ui_scene->info.size.height == entry->info.size.height &&
+            ui_scene->info.size.width == shown_size.width &&
+            ui_scene->info.size.height == shown_size.height &&
             RytyUpscale::TemporalUiMask().load(std::memory_order_relaxed)) {
             inputs.ui_scene_view = View(*ui_scene, view_info, ViewUse::Sampled);
             display.temporal_images[3] = ui_scene;

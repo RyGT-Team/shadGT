@@ -2094,7 +2094,13 @@ bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& t
     Begin();
     UiHires::Get().scale = 0.f;
     fsr_wide_full = IsWideRaceComposition(fs->pgm_hash); // WIDE-001
-    fsr_game_extent = {targets.state.width, targets.state.height};
+    // GT7 can request a scene-sized viewport for this draw on a full-sized display image.
+    // In that case its coordinates already address the DLSS input directly.
+    const auto& vp = regs.viewports[0];
+    const bool scene_viewport = guest_output && vp.xscale == size.width * 0.5f &&
+        std::abs(vp.yscale) == size.height * 0.5f && vp.xoffset == size.width * 0.5f &&
+        vp.yoffset == size.height * 0.5f;
+    fsr_game_extent = scene_viewport ? size : vk::Extent2D{targets.state.width, targets.state.height};
     // Render the entire tone-mapped scene into the input image. The reconstructed result goes
     // into the real display before HUD drawing, even when that display is already full-size.
     fsr_wide_drawn = guest_output || (wide && (size.width > desc.width || size.height > desc.height));

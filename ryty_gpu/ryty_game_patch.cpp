@@ -4455,7 +4455,8 @@ constexpr u32 scene_size = 0x595f610;
 constexpr u32 first_flip_size = 0x62ef29c;
 constexpr u32 projection_aspect = 0x3f5f510;
 u8* game;
-u32 wide_width, menu_width, height;
+u32 wide_width, menu_width, height, menu_height;
+bool dlss_layout;
 std::atomic<u32> active_width{};
 using Configure = void(PS4_SYSV_ABI*)();
 using ApplyConfig = void(PS4_SYSV_ABI*)(void*, int);
@@ -4537,7 +4538,7 @@ void PS4_SYSV_ABI SetRaceRendering(void* result, void** args) {
 
 void Install(Native::NearCode& code, u8* base) {
     const char* opt = std::getenv("RYGT_GT7_REWARDS_16_9");
-    if (!opt || std::string_view(opt) != "1")
+    if (opt ? std::string_view(opt) != "1" : !dlss_layout)
         return;
     // SceneFace.loadCommandFile has already acquired a live stage in r14 and
     // resolved the path in rdx. Observe only its enqueue call, before the worker
@@ -4600,8 +4601,23 @@ void PS4_SYSV_ABI ConfigureTargets() {
     auto* aspect = reinterpret_cast<float*>(game + projection_aspect);
     const bool changed = active_width.load(std::memory_order_relaxed) != width;
     bool applied = false;
-    if ((changed || std::atomic_ref<float>(*aspect).load(std::memory_order_relaxed) != ratio) &&
-        !game[0x62ef250] && !game[0x62ef608] && !game[0x62f5518]) {
+    const bool base_targets = !game[0x62ef250] && !game[0x62ef608] && !game[0x62f5518];
+    if (dlss_layout && base_targets && changed) {
+        // The three flip allocations keep their output extent, including in a race.
+        const u32 output = (menu_height << 16) | menu_width;
+        const auto* flip = game + first_flip_size;
+        auto* scene = reinterpret_cast<u32*>(game + scene_size);
+        if (*reinterpret_cast<const u32*>(flip) == output &&
+            *reinterpret_cast<const u32*>(flip + 0x40) == output &&
+            *reinterpret_cast<const u32*>(flip + 0x80) == output &&
+            ((scene[0] == wide_width && scene[1] == height) ||
+             (scene[0] == menu_width && scene[1] == menu_height))) {
+            scene[0] = width;
+            scene[1] = width == menu_width ? menu_height : height;
+            applied = true;
+        }
+    } else if (!dlss_layout && base_targets &&
+               (changed || std::atomic_ref<float>(*aspect).load(std::memory_order_relaxed) != ratio)) {
         // The unmodified initializer builds all three GNM color descriptors before this call.
         const auto packed = [=](u32 w) { return (height << 16) | w; };
         bool ready = true;
@@ -4647,7 +4663,7 @@ void PS4_SYSV_ABI ApplyGraphicsConfig(void* config, int force) {
     auto* aspect = reinterpret_cast<float*>(game + projection_aspect);
     // libScePad can initialize its projection constant once after the first menu frame.
     apply_original(config, force || active_width.load(std::memory_order_acquire) != requested ||
-                           std::atomic_ref<float>(*aspect).load(std::memory_order_relaxed) != ratio);
+                           (!dlss_layout && std::atomic_ref<float>(*aspect).load(std::memory_order_relaxed) != ratio));
 }
 
 template <typename T>
@@ -4659,28 +4675,38 @@ std::vector<u8> Bytes(const T& value) {
 void Install(u8* base) {
     const char* opt = std::getenv("RYGT_GT7_NATIVE_MENU_16_9");
     const char* menus = std::getenv("RYGT_ULTRAWIDE_MENUS");
-    if (!opt || std::string_view(opt) != "1" || (menus && menus[0] == '0') ||
-        !g_gt7_race_hook_installed.load()) return;
+    const char* guest_output = std::getenv("RYGT_DLSS_GUEST_OUTPUT");
+    const char* native_menus = std::getenv("RYGT_DLSS_NATIVE_MENUS");
+    const bool dlss = guest_output && std::string_view(guest_output) == "1";
+    const bool enabled = dlss ? !(native_menus && native_menus[0] == '0')
+                              : opt && std::string_view(opt) == "1" && !(menus && menus[0] == '0');
+    if (!enabled || !g_gt7_race_hook_installed.load()) return;
     constexpr u32 target_config = 0x27cac80, apply_config = 0x1bcc520;
     constexpr u32 screen_constant = 0x27cadc6;
-    // These sites must already contain the native ultrawide launcher's validated patch.
+    // Read the launcher's scene extent and verify its matching flip allocation.
     if (!ReadableRange(base + screen_constant, 10) || base[screen_constant] != 0x48 ||
         base[screen_constant + 1] != 0xb9) return;
     u32 w{}, h{};
     std::memcpy(&w, base + screen_constant + 2, 4);
     std::memcpy(&h, base + screen_constant + 6, 4);
-    if (h < 360 || h > 2160 || w > 7680 || w % 16 || w <= h * 16 / 9 ||
-        u64(w) * h > 3840 * 2160 || std::abs(Vulkan::RytyDisplayAspect() - float(w) / h) > .01f) return;
-    const u32 panel = (h * 16 + 4) / 9;
-    if (panel >= w) return;
+    if (dlss) {
+        if (w != 1920 || h != 1080) return;
+    } else if (h < 360 || h > 2160 || w > 7680 || w % 16 || w <= h * 16 / 9 ||
+               u64(w) * h > 3840 * 2160 ||
+               std::abs(Vulkan::RytyDisplayAspect() - float(w) / h) > .01f) return;
+    const u32 panel = dlss ? 3840 : (h * 16 + 4) / 9;
+    const u32 panel_height = dlss ? 2160 : h;
+    if (!dlss && panel >= w) return;
     const auto matches = [&](u32 rva, const std::vector<u8>& bytes) {
         return ReadableRange(base + rva, bytes.size()) &&
                std::memcmp(base + rva, bytes.data(), bytes.size()) == 0;
     };
     const std::vector<u8> prologue{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
-    if (!matches(target_config, prologue) || !matches(0x17a7417, Bytes(w)) ||
+    if (dlss && (!matches(0x17a7aa5, {0x41,0xb8,0x00,0x0f,0,0,0x90}) ||
+                 !matches(0x17a7aac, {0x41,0xb9,0x70,0x08,0,0,0x90}))) return;
+    if (!matches(target_config, prologue) || !matches(0x17a7417, Bytes(dlss ? panel : w)) ||
         !matches(0x17a7427, Bytes(w)) || !matches(0x17a7422, Bytes(h)) ||
-        !matches(0x17a741d, Bytes(h)) ||
+        !matches(0x17a741d, Bytes(panel_height)) ||
         !matches(0x1b4c3f0, {0xc5,0xfa,0x10,0x05,0x18,0x31,0x41,0x02,0xc3}) ||
         !matches(0x27cad27, {0x80,0x3d,0xea,0xa7,0xb2,0x03,0x00}) ||
         !matches(0x27cadd0, {0x48,0x89,0x4d,0xb4}) ||
@@ -4702,37 +4728,44 @@ void Install(u8* base) {
     patches.push_back({screen_constant, {base + screen_constant, base + screen_constant + 10},
                        load, "GT7 active screen extent"});
 
+    if (dlss) {
+        // The title's first frame may precede the first GraphicsConfig.apply.
+        patches.push_back({0x17a7427, Bytes(w), Bytes(panel), "GT7 initial menu width"});
+        patches.push_back({0x17a7422, Bytes(h), Bytes(panel_height), "GT7 initial menu height"});
+    }
     // The two camera initializers normally embed the same 16:9 float that the game's
     // projection getter reads. Read the getter's data at both stores, including after
     // a change of session. xmm0 is overwritten at the following instruction at both sites.
     Native::NearCode near_code{base};
-    for (const u32 site : {0x1e990ebu, 0x20b7938u}) {
-        const bool race_camera = site == 0x1e990eb;
-        std::vector<u8> store = race_camera ? std::vector<u8>{0xc7,0x83,0x94,0xe8,0x09,0}
-                                            : std::vector<u8>{0xc7,0x47,0x34};
-        if (!matches(site, store)) return;
-        float literal;
-        std::memcpy(&literal, base + site + store.size(), sizeof(literal));
-        if (literal != 16.f / 9.f && literal != float(w) / h) return;
-        auto bytes = Bytes(literal);
-        store.insert(store.end(), bytes.begin(), bytes.end());
-        auto* memory = near_code.Alloc(64);
-        if (!memory) return;
-        const auto offset = memory - (base + site + 5);
-        const auto data_offset = (base + projection_aspect) - (memory + 8);
-        if (std::abs(static_cast<s64>(offset)) > INT32_MAX - 64 ||
-            std::abs(static_cast<s64>(data_offset)) > INT32_MAX - 64) return;
-        Xbyak::CodeGenerator code(64, memory);
-        code.vmovss(code.xmm0, code.ptr[code.rip + (base + projection_aspect)]);
-        if (race_camera) code.vmovss(code.ptr[code.rbx + 0x9e894], code.xmm0);
-        else code.vmovss(code.ptr[code.rdi + 0x34], code.xmm0);
-        code.jmp(base + site + store.size(), Xbyak::CodeGenerator::T_NEAR);
-        FlushInstructionCache(GetCurrentProcess(), memory, code.getSize());
-        std::vector<u8> jump(store.size(), 0x90);
-        jump[0] = 0xe9;
-        const auto rel = static_cast<s32>(offset);
-        std::memcpy(jump.data() + 1, &rel, 4);
-        patches.push_back({site, store, jump, "GT7 session camera"});
+    if (!dlss) {
+        for (const u32 site : {0x1e990ebu, 0x20b7938u}) {
+            const bool race_camera = site == 0x1e990eb;
+            std::vector<u8> store = race_camera ? std::vector<u8>{0xc7,0x83,0x94,0xe8,0x09,0}
+                                                : std::vector<u8>{0xc7,0x47,0x34};
+            if (!matches(site, store)) return;
+            float literal;
+            std::memcpy(&literal, base + site + store.size(), sizeof(literal));
+            if (literal != 16.f / 9.f && literal != float(w) / h) return;
+            auto bytes = Bytes(literal);
+            store.insert(store.end(), bytes.begin(), bytes.end());
+            auto* memory = near_code.Alloc(64);
+            if (!memory) return;
+            const auto offset = memory - (base + site + 5);
+            const auto data_offset = (base + projection_aspect) - (memory + 8);
+            if (std::abs(static_cast<s64>(offset)) > INT32_MAX - 64 ||
+                std::abs(static_cast<s64>(data_offset)) > INT32_MAX - 64) return;
+            Xbyak::CodeGenerator code(64, memory);
+            code.vmovss(code.xmm0, code.ptr[code.rip + (base + projection_aspect)]);
+            if (race_camera) code.vmovss(code.ptr[code.rbx + 0x9e894], code.xmm0);
+            else code.vmovss(code.ptr[code.rdi + 0x34], code.xmm0);
+            code.jmp(base + site + store.size(), Xbyak::CodeGenerator::T_NEAR);
+            FlushInstructionCache(GetCurrentProcess(), memory, code.getSize());
+            std::vector<u8> jump(store.size(), 0x90);
+            jump[0] = 0xe9;
+            const auto rel = static_cast<s32>(offset);
+            std::memcpy(jump.data() + 1, &rel, 4);
+            patches.push_back({site, store, jump, "GT7 session camera"});
+        }
     }
     for (const auto& p : patches) {
         if (!matches(static_cast<u32>(p.rva), p.original)) return;
@@ -4740,6 +4773,7 @@ void Install(u8* base) {
     game = base;
     wide_width = w;
     menu_width = panel;
+    menu_height = panel_height;
     height = h;
     // No guest threads are running yet. Restore the previous profile if any write fails.
     size_t applied = 0;
@@ -4749,9 +4783,10 @@ void Install(u8* base) {
             near_code, base, target_config - Native::kEbootToExe, prologue,
             reinterpret_cast<void*>(&ConfigureTargets), "GT7 scene and screen targets"));
         if (configure_original) {
+            dlss_layout = dlss;
             Rewards::Install(near_code, base);
             std::fprintf(stderr, "[native] GT7 frame layout: installed, menu %ux%u, track %ux%u\n",
-                         menu_width, height, wide_width, height);
+                         menu_width, menu_height, wide_width, height);
             return;
         }
     }
@@ -4815,7 +4850,11 @@ namespace Vulkan {
 u32 RytyGt7MenuWidth(u32 registered_width, u32 height) {
     using namespace Gt7NativeMenu;
     const u32 width = active_width.load(std::memory_order_acquire);
-    return width && registered_width == wide_width && height == Gt7NativeMenu::height ? menu_width : 0;
+    return !dlss_layout && width && registered_width == wide_width && height == Gt7NativeMenu::height ? menu_width : 0;
+}
+bool RytyGt7NativeDlssMenu() {
+    using namespace Gt7NativeMenu;
+    return dlss_layout && active_width.load(std::memory_order_acquire) != wide_width;
 }
 bool RytyGt7MenuActive() {
     using namespace Gt7NativeMenu;

@@ -589,6 +589,7 @@ bool RytyGtsInRace();
 bool RytyGt7RaceHookInstalled();
 u32 RytyGt7MenuWidth(u32 registered_width, u32 height);
 bool RytyGt7MenuActive();
+bool RytyGt7NativeDlssMenu();
 bool RytyRaceRunning(); // GAME-006, ryty_game_patch.cpp
 static bool PrepareScope(); // PERF-GTS-450: races, or menus with SHADGT_NATIVE_PREPARE_MENUS=1
 bool RytyGtsRaceSession(); // WIDE-015
@@ -1973,6 +1974,9 @@ void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Ta
     const auto* history_out = targets.colors[0];
     const auto* resolved = targets.colors[1];
     const vk::Extent2D size{resolved->info.size.width, resolved->info.size.height};
+    // Full-resolution menus keep the game's TAA and do not allocate upscale history.
+    if (RytyUpscale::GuestOutputDlss() &&
+        (size != vk::Extent2D{1920, 1080} || RytyGt7NativeDlssMenu())) return;
     if (history_out->info.pixel_format != vk::Format::eR16G16B16A16Sfloat ||
         resolved->info.pixel_format != vk::Format::eB10G11R11UfloatPack32 ||
         history_out->info.size.width != size.width || history_out->info.size.height != size.height)
@@ -2031,7 +2035,7 @@ bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& t
                                    const DrawBindings& bindings) {
     const bool gt7 = Common::IsGt7();
     const bool guest_output = RytyUpscale::GuestOutputDlss();
-    if ((gt7 && !guest_output) || !r.temporalDlss.Enabled()) return false;
+    if ((gt7 && !guest_output) || !r.temporalDlss.Enabled() || RytyGt7NativeDlssMenu()) return false;
     const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
     const auto& regs = r.liverpool->DrawRegs();
     if (!fs || (gt7 ? fs->pgm_hash != 0xdf75f23b : !IsSceneCompositionShader(fs->pgm_hash)) ||
@@ -17168,14 +17172,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
-    // The guest places its HUD and menu draws in scene coordinates. Only the
-    // registered output images need these coordinates mapped to the full display.
+    // The race HUD uses scene coordinates. A native menu sub-viewport already
+    // addresses its rectangle inside the UHD display.
     const auto& guest_vp = regs.viewports[0];
     const bool scale_guest_display = RytyUpscale::GuestOutputDlss() && !native_fsr_composition &&
         targets.state.num_color_attachments == 1 && targets.colors[0] &&
         targets.state.width == 3840 && targets.state.height == 2160 &&
         std::abs(guest_vp.xscale) <= 960.f && std::abs(guest_vp.yscale) <= 540.f &&
-        IsDisplayAddress(targets.colors[0]->info.guest_address);
+        IsDisplayAddress(targets.colors[0]->info.guest_address) && !RytyGt7NativeDlssMenu();
     if (scale_guest_display) {
         auto& ui = UiHires::Get();
         ui.scale = ui.scale_y = 2.f;

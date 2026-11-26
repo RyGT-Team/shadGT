@@ -180,6 +180,11 @@ public:
         return whole_pipeline_binaries_only;
     }
 
+    /// FIX-SGT-192: a driver cache file per pipeline where binaries are not used.
+    bool IsPipelineCacheFiles() const {
+        return pipeline_cache_files;
+    }
+
     /// Returns true if VK_KHR_maintenance8 is supported
     bool IsMaintenance8Supported() const {
         return maintenance_8;
@@ -822,6 +827,8 @@ private:
     bool anti_lag{};
     bool pipeline_binary{}; // BIN-001
     bool whole_pipeline_binaries_only{}; // PERF-GTS-482
+    bool pipeline_binary_internal_cache_off{}; // FIX-SGT-192
+    bool pipeline_cache_files{};               // FIX-SGT-192
     bool whole_prewarm{};                // PERF-GTS-486
     bool amd_overallocation{}; // AMD-VRAM-002
     bool memory_priority{};    // AMD-VRAM-003

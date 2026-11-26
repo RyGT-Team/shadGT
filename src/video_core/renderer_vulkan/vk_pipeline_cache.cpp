@@ -97,6 +97,8 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/spirv_check.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_pipeline_binary_store.h" // FIX-SGT-192
+#include "video_core/renderer_vulkan/pipeline_use_counts.h"     // FIX-SGT-192
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/shader_usage_serde.h"
 #include "video_core/renderer_vulkan/required_pipeline_wait.h"
@@ -3011,6 +3013,7 @@ static int BuildPackLibrary(const Instance& instance, vk::PipelineCache cache,
         if (result != vk::Result::eSuccess) {
             return 0;
         }
+        RememberModuleHash(*module, code); // FIX-SGT-192
         const size_t index = stages.size();
         subgroups[index] = {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
@@ -3128,8 +3131,20 @@ static int BuildPackLibrary(const Instance& instance, vk::PipelineCache cache,
     };
     const auto start = std::chrono::steady_clock::now();
     VkPipeline pipeline = VK_NULL_HANDLE;
-    const VkResult result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateGraphicsPipelines(
-        device, static_cast<VkPipelineCache>(cache), 1, &info, nullptr, &pipeline);
+    VkResult result;
+    // FIX-SGT-192: where the binary store keeps every pipeline, the recipe's library goes there,
+    // not into the driver cache; a stored one is "already in the cache" without loading it.
+    if (PipelineBinaryStore::StoresEverything(instance)) {
+        const vk::GraphicsPipelineCreateInfo& wrapped =
+            reinterpret_cast<const vk::GraphicsPipelineCreateInfo&>(info);
+        if (PipelineBinaryStore::Stored(instance, device, wrapped)) return 2;
+        auto made = PipelineBinaryStore::CreateGraphics(instance, device, cache, wrapped);
+        result = static_cast<VkResult>(made.result);
+        pipeline = made.value;
+    } else {
+        result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateGraphicsPipelines(
+            device, static_cast<VkPipelineCache>(cache), 1, &info, nullptr, &pipeline);
+    }
     const double ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     if (pipeline) {
@@ -3689,6 +3704,8 @@ PipelineCache::~PipelineCache() {
     FlushCompletedPipelineOwners(); // PERF-SGT-017
     PipelineRetirementWorker().Drain();
     SaveDriverCache(true);
+    PipelineBinaryStore::Summary(); // FIX-SGT-192
+    PipelineUses::Save();           // FIX-SGT-192
 }
 
 // PERF-167: the driver cache file's size limit, from the launcher's Graphics page
@@ -3861,6 +3878,22 @@ void PipelineCache::CreateDriverCache() {
         driver_cache_path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
             fmt::format("{}-{:04x}-{:04x}-{:08x}-{}.vkpipelinecache", serial,
                         identity.vendorID, identity.deviceID, identity.driverVersion, uuid);
+        // FIX-SGT-192: with every pipeline kept in a file of its own (binaries or a driver
+        // cache each), the shared driver cache holds only fast links and pipelines without a
+        // key. It gets a file of its own, so the full one of earlier builds is not loaded whole
+        // into memory; that one is left as it is (SHADGT_PIPELINE_BINARIES=0 and
+        // SHADGT_PIPELINE_CACHE_FILES=0 use it again).
+        if (PipelineBinaryStore::StoresEverything(instance)) {
+            std::error_code full_error;
+            if (std::filesystem::exists(driver_cache_path, full_error)) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-SGT-192: pipelines are kept a file each; {} ({} MB) is not loaded "
+                            "and may be deleted",
+                            driver_cache_path.filename().string(),
+                            std::filesystem::file_size(driver_cache_path, full_error) >> 20);
+            }
+            driver_cache_path.replace_extension(".binstore.vkpipelinecache");
+        }
         RotateOversizedDriverCache(driver_cache_path); // FIX-SGT-010
         std::error_code exists_error;
         const bool existing_cache = std::filesystem::exists(driver_cache_path, exists_error);
@@ -6613,6 +6646,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
 
         if (!S().key_uses_legacy) { // D10: old translations are not in this store
             RegisterPipelineData(S().graphics_key, pipeline_hash, sdata);
+            PipelineUses::NoteUse(pipeline_hash); // FIX-SGT-192
         } else {
 #ifndef NDEBUG
             ++legacy_stats.pipelines;
@@ -6637,8 +6671,9 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             auto sdata = std::move(unclaimed.value().sdata);
             prewarm_unclaimed.erase(unclaimed);
             if (!S().key_uses_legacy) {
-                RegisterPipelineData(S().graphics_key,
-                                     std::hash<GraphicsPipelineKey>{}(S().graphics_key), sdata);
+                const u64 hash = std::hash<GraphicsPipelineKey>{}(S().graphics_key);
+                RegisterPipelineData(S().graphics_key, hash, sdata);
+                PipelineUses::NoteUse(hash); // FIX-SGT-192
             }
         }
     }
@@ -8048,8 +8083,25 @@ void PipelineCache::PrewarmRead(std::stop_token stop) {
     if (stop.stop_requested()) return;
     auto keys = store.ListBlobs(Storage::BlobType::PipelineKey);
     std::erase_if(keys, [](const auto& key) { return !key.first.starts_with("g_"); });
-    // Most recently used first: a pipeline's key is stored again each session that uses it.
-    std::ranges::sort(keys, [](const auto& a, const auto& b) { return a.second > b.second; });
+    // FIX-SGT-192: most used first (sessions that used it, PipelineUses), then most recently
+    // used: a pipeline's key is stored again each session that uses it. The keep after the
+    // precompile (PrecompileKeep) holds the first ones built, so the ones played most.
+    {
+        std::unordered_map<std::string, u32> uses;
+        uses.reserve(keys.size());
+        for (const auto& [name, time] : keys) {
+            uses.emplace(name, PipelineUses::Count(std::strtoull(name.c_str() + 2, nullptr, 16)));
+        }
+        std::ranges::sort(keys, [&uses](const auto& a, const auto& b) {
+            const u32 ua = uses[a.first], ub = uses[b.first];
+            return ua != ub ? ua > ub : a.second > b.second;
+        });
+        const size_t counted = std::ranges::count_if(uses, [](const auto& u) { return u.second; });
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-SGT-192: stored pipelines built most used first: {} of {} used in an "
+                    "earlier session, the first has {} sessions",
+                    counted, keys.size(), keys.empty() ? 0u : uses[keys.front().first]);
+    }
     if (const char* limit = std::getenv("SHADGT_PREWARM_LIMIT"); limit && *limit) {
         keys.resize(std::min<size_t>(keys.size(), std::strtoull(limit, nullptr, 10)));
     }
@@ -11228,20 +11280,26 @@ void PipelineCache::TrimUnusedPipelines() {
     const auto trim = [&](auto& cache) {
         using Entry = typename std::remove_reference_t<decltype(cache)>::value_type;
         using Key = std::remove_const_t<typename Entry::first_type>;
-        std::vector<std::pair<steady_clock::time_point, Key>> candidates;
+        // FIX-SGT-192: the least used (sessions, PipelineUses) go first, then the oldest.
+        std::vector<std::tuple<u32, steady_clock::time_point, Key>> candidates;
         for (const auto& [key, pipeline] : cache) {
             if (!pipeline || pipeline.use_count() != 1) continue;
+            u32 uses = 0;
             if constexpr (std::is_same_v<Key, GraphicsPipelineKey>) {
                 if (!pipeline->CanRetire()) continue;
+                uses = PipelineUses::Count(std::hash<GraphicsPipelineKey>{}(key));
             }
             const auto found = pipeline_last_use.find(pipeline.get());
             if (found != pipeline_last_use.end()) {
                 const auto last_use = std::max(found->second, pipeline->LastRetentionUse());
-                if (last_use < cutoff) candidates.emplace_back(last_use, key);
+                if (last_use < cutoff) candidates.emplace_back(uses, last_use, key);
             }
         }
-        std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-        for (const auto& [used, key] : candidates) {
+        std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+            return std::get<0>(a) != std::get<0>(b) ? std::get<0>(a) < std::get<0>(b)
+                                                    : std::get<1>(a) < std::get<1>(b);
+        });
+        for (const auto& [uses, used, key] : candidates) {
             if (retired.size() >= retire_batch) break;
             auto it = cache.find(key);
             pipeline_last_use.erase(it->second.get());

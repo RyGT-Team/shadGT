@@ -531,6 +531,9 @@ struct Streamline {
     PFun_slDLSSGetOptimalSettings* dlss_get_optimal{};
     PFun_slDLSSSetOptions* dlss_set_options{};
     AuxImages sr;
+    // FIX-GT7-199: zero motion and flat depth at the output's size, for frame generation in GT7
+    // when the scene's own inputs are missing (as ryGT7's frame generation always ran).
+    AuxImages fg;
     vk::Extent2D sr_in{}, sr_out{};
     int sr_mode = -1; // DLSSMode for sr_in -> sr_out, -1 when not supported
     bool sr_options_set{};
@@ -937,26 +940,40 @@ void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     }
     const auto now = Clock::now();
     bool gameplay_ready;
+#ifdef SHADGT_DIAGNOSTICS
     bool telemetry_valid;
     u16 telemetry_flags;
     long long telemetry_age;
+#endif
     {
         std::scoped_lock telemetry_lock{g_sl.telemetry_mutex};
         gameplay_ready = g_sl.gameplay.Ready(now);
+#ifdef SHADGT_DIAGNOSTICS
         telemetry_valid = g_sl.gameplay.Valid();
         telemetry_flags = g_sl.gameplay.Flags();
         telemetry_age = g_sl.gameplay.AgeMs(now);
+#endif
     }
     const bool scene_valid = scene && scene->valid && scene->size.width && scene->size.height &&
         scene->depth && scene->motion && scene->depth_view && scene->motion_view &&
         scene->hudless && scene->hudless_view && scene->hudless_size == size;
+    // FIX-GT7-199 (RyGT #122): GT7's depth and motion come only from temporal DLSS
+    // (DLSS-GT7-001), which stays off while frame generation is on (TemporalWanted), and GT7 has
+    // no hud-less picture: the scene inputs never arrive, and generation waited for them in every
+    // race. GT7 generates frames from zero motion and a flat depth instead, as ryGT7 did.
+    const bool flat_inputs = !scene_valid && Common::IsGt7();
+    if (flat_inputs && !g_sl.fg.Ready(size)) {
+        CreateAuxImages(g_sl.fg, device, allocator, cmdbuf, size);
+    }
+    const bool inputs_ready = scene_valid || (flat_inputs && g_sl.fg.Ready(size));
     const bool in_race = RytyGtsInRace();
     const bool clock_paused = Common::GuestClock::IsPaused();
     const bool threads_paused = DebugState.IsGuestThreadsPaused();
+#ifdef SHADGT_DIAGNOSTICS
     {
         // DIAG-GT7-198 (RyGT #122): the gameplay suspension has several causes behind one line;
         // name them each time the set of failing ones changes.
-        const u32 failing = (gameplay_ready ? 0u : 1u) | (scene_valid ? 0u : 2u) |
+        const u32 failing = (gameplay_ready ? 0u : 1u) | (inputs_ready ? 0u : 2u) |
                             (in_race ? 0u : 4u) | (clock_paused ? 8u : 0u) |
                             (threads_paused ? 16u : 0u);
         static u32 last_failing = ~0u;
@@ -964,11 +981,12 @@ void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
             last_failing = failing;
             LOG_WARNING(Render_Vulkan,
                         "DIAG-GT7-198: DLSS-G gate: telemetry {} (valid {}, flags {:#x}, {} ms "
-                        "old), scene inputs {} (valid {}, size {}x{}, depth {}, motion {}, "
+                        "old), scene inputs {}{} (valid {}, size {}x{}, depth {}, motion {}, "
                         "hud-less {} {}x{} for output {}x{}), race flag {}, guest clock {}, "
                         "guest threads {}",
                         gameplay_ready ? "ready" : "NOT ready", telemetry_valid, telemetry_flags,
                         telemetry_age, scene_valid ? "ready" : "NOT ready",
+                        flat_inputs ? ", flat ones used (FIX-GT7-199)" : "",
                         scene && scene->valid, scene ? scene->size.width : 0u,
                         scene ? scene->size.height : 0u, scene && scene->depth_view,
                         scene && scene->motion_view, scene && scene->hudless_view,
@@ -978,7 +996,8 @@ void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
                         threads_paused ? "PAUSED" : "running");
         }
     }
-    gameplay_ready = gameplay_ready && scene_valid && in_race && !clock_paused && !threads_paused;
+#endif
+    gameplay_ready = gameplay_ready && inputs_ready && in_race && !clock_paused && !threads_paused;
     const bool resized = size != g_sl.aux_size;
     const auto reason =
         g_sl.gate.Update(now, gameplay_ready, std::exchange(g_sl.fresh_frame, false),
@@ -1042,8 +1061,13 @@ void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
 
     const sl::Extent extent{0, 0, size.width, size.height};
     sl::Resource mvec{sl::ResourceType::eTex2d,
-                      static_cast<VkImage>(scene_valid ? scene->motion : vk::Image{}), nullptr,
-                      static_cast<VkImageView>(scene_valid ? scene->motion_view : vk::ImageView{}),
+                      static_cast<VkImage>(scene_valid    ? scene->motion
+                                           : flat_inputs ? static_cast<vk::Image>(g_sl.fg.motion_vectors)
+                                                         : vk::Image{}),
+                      nullptr,
+                      static_cast<VkImageView>(scene_valid    ? scene->motion_view
+                                               : flat_inputs ? *g_sl.fg.motion_vectors_view
+                                                             : vk::ImageView{}),
                       static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)};
     const auto render_size = scene_valid ? scene->size : size;
     const sl::Extent render_extent{0, 0, render_size.width, render_size.height};
@@ -1055,8 +1079,13 @@ void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     mvec.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     sl::Resource dep{sl::ResourceType::eTex2d,
-                     static_cast<VkImage>(scene_valid ? scene->depth : vk::Image{}), nullptr,
-                     static_cast<VkImageView>(scene_valid ? scene->depth_view : vk::ImageView{}),
+                     static_cast<VkImage>(scene_valid    ? scene->depth
+                                          : flat_inputs ? static_cast<vk::Image>(g_sl.fg.depth)
+                                                        : vk::Image{}),
+                     nullptr,
+                     static_cast<VkImageView>(scene_valid    ? scene->depth_view
+                                              : flat_inputs ? *g_sl.fg.depth_view
+                                                            : vk::ImageView{}),
                      static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)};
     dep.width = render_size.width;
     dep.height = render_size.height;
@@ -1081,7 +1110,8 @@ void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
                         sl::ResourceLifecycle::eValidUntilPresent, &render_extent},
         sl::ResourceTag{valid_inputs ? &dep : nullptr, sl::kBufferTypeDepth,
                         sl::ResourceLifecycle::eValidUntilPresent, &render_extent},
-        sl::ResourceTag{valid_inputs ? &hudless : nullptr, sl::kBufferTypeHUDLessColor,
+        sl::ResourceTag{valid_inputs && scene_valid ? &hudless : nullptr,
+                        sl::kBufferTypeHUDLessColor,
                         sl::ResourceLifecycle::eValidUntilPresent, &extent},
     };
     auto* command_buffer =
@@ -1442,6 +1472,7 @@ void Shutdown() {
     RytyFrameGen::ReportWorking(false);
     g_sl.aux_size = {};
     g_sl.sr.Destroy();
+    g_sl.fg.Destroy();
     g_sl.sr_in = g_sl.sr_out = {};
     g_sl.sr_mode = -1;
     g_sl.sr_options_set = false;

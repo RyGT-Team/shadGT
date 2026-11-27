@@ -174,7 +174,7 @@ std::vector<HudPiece> DefaultHudPieces() {
         piece("Track map", 1420, 5, 500, 300),
         piece("Position", 1670, 310, 250, 200),
         piece("Race time", 5, 990, 250, 90),
-        piece("Dashboard", 235, 950, 1120, 130), // FEAT-SGT-201: below "AUTO DRIVE"
+        piece("Dashboard", 235, 880, 1120, 200), // FEAT-SGT-201: "AUTO DRIVE" above it too
         piece("Course map", 1560, 790, 360, 290),
     };
 }

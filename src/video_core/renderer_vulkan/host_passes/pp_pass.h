@@ -95,6 +95,19 @@ private:
     VmaAllocation hud_allocation{};
     u8* hud_mapped = nullptr;
     u32 hud_slot = 0;
+    // FEAT-SGT-235: the top bar of a menu fitted at 16:9 on a taller screen (menu_edges.comp),
+    // found once a frame for post_process.frag.
+    vk::UniqueDescriptorSetLayout edges_set_layout{};
+    vk::UniquePipelineLayout edges_layout{};
+    vk::UniquePipeline edges_pipeline{};
+    vk::Buffer edges_buffer{};
+    VmaAllocation edges_allocation{};
+    // FEAT-SGT-235: the race HUD's menu bar (the pre-race page) on a taller screen (hud_bar.comp).
+    vk::UniqueDescriptorSetLayout hud_bar_set_layout{};
+    vk::UniquePipelineLayout hud_bar_layout{};
+    vk::UniquePipeline hud_bar_pipeline{};
+    vk::Buffer hud_bar_buffer{};
+    VmaAllocation hud_bar_allocation{};
 };
 
 } // namespace Vulkan::HostPasses

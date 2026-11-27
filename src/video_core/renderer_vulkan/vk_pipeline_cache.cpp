@@ -10457,7 +10457,16 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
     // FIX-018: stored permutations of a program with an else after an empty if were translated
     // with the else running for every invocation. Translate those programs again, once; the new
     // permutations start after the stored ones, so their pipelines are new as well.
-    const bool first_use = else_scope_checked.insert(params.hash).second;
+    static const bool reuse_fix_checks = [] {
+        const char* setting = std::getenv("SHADGT_REUSE_SHADER_FIX_CHECKS"); // PERF-SGT-227
+        return setting && std::string_view(setting) == "1";
+    }();
+    const bool first_use = [&] {
+        if (reuse_fix_checks && it_pgm.value()->use_checked) return false;
+        const bool first = else_scope_checked.insert(params.hash).second;
+        if (reuse_fix_checks) it_pgm.value()->use_checked = true;
+        return first;
+    }();
 #ifndef NDEBUG
     if (first_use && IsWatchedShader(params.hash)) {
         // DIAG-031: the guest code of watched shaders, raw and as a listing, in the log folder.
@@ -10542,10 +10551,13 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
                         use.dpp, use.mimg_g16, use.mimg_a16, use.mimg_d16);
         }
     }
-    const auto known = else_scope_fixed.find(params.hash);
-    const auto session = session_fix_marks.find(params.hash);
-    const u32 applied_fixes = (known != else_scope_fixed.end() ? known->second.fixes : 0u) |
-                              (session != session_fix_marks.end() ? session->second : 0u);
+    const u32 applied_fixes = [&] {
+        if (reuse_fix_checks && needed_fixes == 0) return 0u;
+        const auto known = else_scope_fixed.find(params.hash);
+        const auto session = session_fix_marks.find(params.hash);
+        return (known != else_scope_fixed.end() ? known->second.fixes : 0u) |
+               (session != session_fix_marks.end() ? session->second : 0u);
+    }();
     if ((needed_fixes & ~applied_fixes) != 0) {
         auto& boundary = stored_perm_end[params.hash];
         boundary = std::max(boundary, it_pgm.value()->modules.size());

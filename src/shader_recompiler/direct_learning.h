@@ -59,12 +59,22 @@ inline State& GetState() {
     return state;
 }
 
-/// SHADGT_LEARNED_DIRECT=0 keeps every direct path (and stops learning).
+/// FIX-SGT-202: the learning is off unless SHADGT_LEARNED_DIRECT=1. A wrong guess did not cost
+/// "a copy": a buffer learned off is bound whole, from guest memory, where its direct path read
+/// only the bytes the shader used. GT Sport at Northern Isle (base PS4, 1080p) went from 59 to
+/// 18 fps with a store whose shaders had been translated after its learned file had grown (10,653
+/// shaders learned, 13 GiB/s received by the GPU over PCIe, 2-5 GB bound in place per frame, 64 W);
+/// the same store and stack with the learning off ran at 58 fps, 1.8 GiB/s. The learned-back
+/// path (NoteWouldReadInPlace) had not undone it over five such runs. Measured on an RTX 4070
+/// only. Off, stored translations without a direct path are refused (LearnedDirectMatches) and
+/// translated again once with it.
+inline bool EnabledFrom(const char* env) {
+    return env && env[0] == '1';
+}
+
+/// SHADGT_LEARNED_DIRECT=1 turns the learning on (FIX-SGT-202: off by default).
 inline bool Enabled() {
-    static const bool enabled = [] {
-        const char* env = std::getenv("SHADGT_LEARNED_DIRECT");
-        return !(env && env[0] == '0');
-    }();
+    static const bool enabled = EnabledFrom(std::getenv("SHADGT_LEARNED_DIRECT"));
     return enabled;
 }
 

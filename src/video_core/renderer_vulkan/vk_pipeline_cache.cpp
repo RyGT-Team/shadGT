@@ -3379,6 +3379,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     profile.direct_buffers =
         VideoCore::DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported();
     // PERF-GTS-479: buffers earlier runs never read in place, read before any translation.
+    // FIX-SGT-202: only with SHADGT_LEARNED_DIRECT=1.
+    if (profile.direct_buffers && !Shader::DirectLearning::Enabled()) {
+        LOG_INFO(Render_Vulkan, "FIX-SGT-202: every buffer keeps its direct-memory path; learning "
+                                "from shaders/<serial>.direct-reads is off (SHADGT_LEARNED_DIRECT=1: on)");
+    }
     if (profile.direct_buffers && Shader::DirectLearning::Enabled()) {
         const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
         const auto path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
@@ -3386,7 +3391,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         const size_t shaders = Shader::DirectLearning::Load(path);
         LOG_INFO(Render_Vulkan,
                  "PERF-GTS-479: {} shaders in {}; buffers they never read in place are "
-                 "translated without the direct-memory path (SHADGT_LEARNED_DIRECT=0: off)",
+                 "translated without the direct-memory path (SHADGT_LEARNED_DIRECT=1)",
                  shaders, path.string());
     }
     LOG_INFO(Render_Vulkan, "FIX-SGT-139: shared memory barriers in 64-thread compute: {}",

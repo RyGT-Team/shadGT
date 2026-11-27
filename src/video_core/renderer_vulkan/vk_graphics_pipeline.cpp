@@ -59,6 +59,50 @@
 #endif
 
 namespace Vulkan {
+static bool ConsecutiveVertexSharps(const Shader::Gcn::FetchShaderData& fetch) {
+    const auto& attrs = fetch.attributes;
+    if (attrs.size() < 2 || attrs.size() > MaxVertexBufferCount ||
+        attrs.front().sgpr_base == Shader::IR::NumScalarRegs) {
+        return false;
+    }
+    for (size_t i = 1; i < attrs.size(); ++i) {
+        if (attrs[i].sgpr_base != attrs.front().sgpr_base ||
+            attrs[i].dword_offset != attrs.front().dword_offset + i * sizeof(AmdGpu::Buffer) / sizeof(u32)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ReadVertexSharpTable(const Shader::Gcn::FetchShaderData& fetch, const Shader::Info& info,
+                                 std::array<AmdGpu::Buffer, MaxVertexBufferCount>& raw) {
+#ifdef RYTY_GPU
+    if (Shader::t_replay || Common::t_read_capture || Common::t_guest_read_log ||
+        !info.pinned_fetch_sharps.empty()) {
+        return false;
+    }
+#ifdef SHADGT_DIAGNOSTICS
+    if (Common::t_guest_reads_forbidden) {
+        return false;
+    }
+#endif
+    const auto& first = fetch.attributes.front();
+    if (size_t(first.sgpr_base) + 2 > info.user_data.size()) {
+        return false;
+    }
+    VAddr table;
+    std::memcpy(&table, info.user_data.data() + first.sgpr_base, sizeof(table));
+    const VAddr start = (table & 0xFFFFFFFFFFFFull) + sizeof(u32) * first.dword_offset;
+    const size_t bytes = fetch.attributes.size() * sizeof(AmdGpu::Buffer);
+    if ((start & (Common::ReadCapture::PageSize - 1)) + bytes > Common::ReadCapture::PageSize) {
+        return false;
+    }
+    return Core::RytyMemory::GuardedCopy(raw.data(), reinterpret_cast<const void*>(start), bytes);
+#else
+    return false;
+#endif
+}
+
 std::counting_semaphore<64>& HeavyPipelineGate() {
     static std::counting_semaphore<64> semaphore{CompilerWorkerBudget::HeavyPipelineLimit};
     return semaphore;
@@ -470,6 +514,13 @@ GraphicsPipeline::GraphicsPipeline(
     }
     if (fetch_shader_) {
         fetch_shader = *fetch_shader_;
+#ifdef RYTY_GPU
+        static const bool group = [] {
+            const char* env = std::getenv("SHADGT_GROUP_VERTEX_SHARPS"); // PERF-SGT-213
+            return env && std::string_view(env) == "1";
+        }();
+        group_vertex_sharps = group && ConsecutiveVertexSharps(fetch_shader);
+#endif
     }
 
     const vk::Device device = instance.GetDevice();
@@ -2157,27 +2208,24 @@ GraphicsPipeline::~GraphicsPipeline() {
     }
 }
 
-template <typename Attribute, typename Binding>
-void GraphicsPipeline::GetVertexInputs(
+template <typename Attribute, typename Binding, typename ReadSharp>
+static void FillVertexInputs(const Shader::Gcn::FetchShaderData& fetch_shader, u32 max_stride,
+    std::atomic<u32>& undefined_formats, std::atomic<u32>& excessive_strides, ReadSharp read,
     VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
     VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1,
-    const Shader::Info& vs_info) const {
+    const Shader::Info& vs_info) {
     using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
-    if (fetch_shader.Empty() || fetch_shader.attributes.empty()) {
-        return;
-    }
     for (u32 semantic = 0; semantic < fetch_shader.attributes.size(); ++semantic) {
         const auto& attrib = fetch_shader.attributes[semantic];
         const auto step_rate = attrib.GetStepRate();
-        const auto buffer = attrib.GetSharp(vs_info);
+        const auto buffer = read(attrib, semantic);
         auto format = LiverpoolToVK::TrySurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt());
         if (format == vk::Format::eUndefined) {
             // FIX-052: a garbage V# (data format 13 with number format 1 in a GT Sport race)
             // asserted and stopped the game. Its attribute reads four floats instead; the draw's
             // data is garbage either way.
-            static std::atomic<u32> logged{};
-            if (logged++ < 10) {
+            if (undefined_formats++ < 10) {
                 LOG_WARNING(Render_Vulkan,
                             "FIX-052: vertex attribute {} has no format (data {}, number {})",
                             semantic, static_cast<u32>(buffer.GetDataFmt()),
@@ -2193,25 +2241,20 @@ void GraphicsPipeline::GetVertexInputs(
         });
         // DIAG-GTS-427: a guest stride (up to 16383) above the device's limit (2048 on NVIDIA)
         // makes the vertex input undefined; validation saw 16023 once in a GT Sport race.
-        if (const u32 stride = buffer.GetStride();
-            stride > instance.GetImageLimits().maxVertexInputBindingStride) {
-            static std::atomic<u32> logged{};
-            if (const u32 n = ++logged; n <= 20 || n % 1000 == 0) {
+        if (const u32 stride = buffer.GetStride(); stride > max_stride) {
+            if (const u32 n = ++excessive_strides; n <= 20 || n % 1000 == 0) {
                 LOG_WARNING(Render_Vulkan,
                             "DIAG-GTS-427: vs {:#x} attribute {} stride {} > limit {} (base {:#x}, "
                             "step {}, {} times)",
                             vs_info.pgm_hash, semantic, stride,
-                            instance.GetImageLimits().maxVertexInputBindingStride,
+                            max_stride,
                             u64(buffer.base_address), u32(step_rate), n);
             }
         }
         // FIX-GTS-430: a stride above the limit is undefined behaviour; a GT Sport race passed
         // 16256 for an attribute with no buffer (base 0) 16 times right before a device loss.
         // Such a binding gets stride 0 (valid: every vertex reads the same element).
-        const u32 bound_stride =
-            buffer.GetStride() > instance.GetImageLimits().maxVertexInputBindingStride
-                ? 0u
-                : buffer.GetStride();
+        const u32 bound_stride = buffer.GetStride() > max_stride ? 0u : buffer.GetStride();
         bindings.push_back(Binding{
             .binding = semantic,
             .stride = bound_stride,
@@ -2231,6 +2274,38 @@ void GraphicsPipeline::GetVertexInputs(
         }
         guest_buffers.emplace_back(buffer);
     }
+}
+
+template <typename Build>
+SHAD_NO_INLINE static bool BuildGroupedInputs(const Shader::Gcn::FetchShaderData& fetch,
+                                              const Shader::Info& info, Build&& build) {
+    std::array<AmdGpu::Buffer, MaxVertexBufferCount> raw;
+    if (!ReadVertexSharpTable(fetch, info, raw)) {
+        return false;
+    }
+    build([&](const auto& attrib, u32 i) { return attrib.ApplyFetchOverrides(raw[i]); });
+    return true;
+}
+
+template <typename Attribute, typename Binding>
+void GraphicsPipeline::GetVertexInputs(
+    VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
+    VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
+    VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1,
+    const Shader::Info& vs_info) const {
+    if (fetch_shader.Empty() || fetch_shader.attributes.empty()) {
+        return;
+    }
+    static std::atomic<u32> undefined_formats{}, excessive_strides{};
+    const auto build = [&](auto read) {
+        FillVertexInputs(fetch_shader, instance.GetImageLimits().maxVertexInputBindingStride,
+                         undefined_formats, excessive_strides, read, attributes, bindings, divisors,
+                         guest_buffers, step_rate_0, step_rate_1, vs_info);
+    };
+    if (group_vertex_sharps && BuildGroupedInputs(fetch_shader, vs_info, build)) {
+        return;
+    }
+    build([&](const auto& attrib, u32) { return attrib.GetSharp(vs_info); });
 }
 
 // Declare templated GetVertexInputs for necessary types.

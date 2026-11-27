@@ -177,6 +177,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     // Native recorder & sync
     "RYGTSW1|SHADGT_IN_PLACE_STORAGE_WRITES|flag|Native recorder & sync|off|0 = off, 1 = on|Constructs storage-buffer descriptor writes directly in the output vector.",
     "RYGTSW1|SHADGT_SKIP_UNUSED_DEPENDENT_COPY|flag|Native recorder & sync|off|0 = off, 1 = on|Skips copying dependent image pointers when second-level invalidation is disabled.",
+    "RYGTSW1|SHADGT_GROUP_VERTEX_SHARPS|flag|Native recorder & sync|off|0 = off, 1 = on|Read consecutive vertex buffer descriptors within one guest page together.",
     "RYGTSW1|SHADGT_LONG_LIVED_SETS|flag|Native recorder & sync|on|unset or 1 = on, any other value = off (needs SHADGT_DYNAMIC_BUFFER_OFFSETS on)|Keeps descriptor sets across command lists and drops one when an object it uses is destroyed (PERF-GTS-375). Experimental.",
     "RYGTSW1|SHADGT_LISTED_IN_PLACE|flag|Native recorder & sync|on|0 = off|Ranges in the listed in-place ranges (GT7's launcher sets them) are always read and written in guest memory, even under a video-memory copy, so GPU culling reads what it wrote (FIX-SGT-004, FIX-SGT-009)",
     "RYGTSW1|SHADGT_REGION_AVOID_LISTED|flag|Native recorder & sync|on|0 = off|Video-memory copies of guest memory never grow over GT7's listed in-place ranges; fixes the road going dark for single frames in the rain (FIX-SGT-012).",

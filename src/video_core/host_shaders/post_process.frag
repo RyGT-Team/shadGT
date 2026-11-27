@@ -154,7 +154,18 @@ void main() {
         // (but not what a piece shows elsewhere).
         bool shown = false;
         vec2 hud_uv = vec2(0.0);
-        const uint count = min(layout_.count.x, 16u);
+        // FEAT-SGT-201: a full-screen overlay (the pause menu's dimming) is part of the HUD too, so
+        // moved pieces would take their share of it along. When two spots a race HUD leaves empty
+        // (top centre, bottom right between the dashboard and the course map) are both covered,
+        // the HUD shows as the plain centred band.
+        const float cover_top =
+            dot(texture(hudWhite, vec2(0.5, 0.03)).rgb - texture(hudBlack, vec2(0.5, 0.03)).rgb,
+                vec3(1.0 / 3.0));
+        const float cover_bottom =
+            dot(texture(hudWhite, vec2(0.75, 0.95)).rgb - texture(hudBlack, vec2(0.75, 0.95)).rgb,
+                vec3(1.0 / 3.0));
+        const bool overlay = cover_top < 0.9 && cover_bottom < 0.9;
+        const uint count = overlay ? 0u : min(layout_.count.x, 16u);
         for (uint i = 0u; i < count; ++i) {
             const HudWidget w = layout_.widgets[i];
             if (inside(uv, w.dst)) {

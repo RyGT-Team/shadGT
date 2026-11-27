@@ -19842,6 +19842,13 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
     if (temporal.size_refused) {
         return; // the result's size is not the display's (FindDisplay): left to the game
     }
+    // FIX-SGT-200: a menu shown at 16:9 in a window of another shape (RYGT_ULTRAWIDE_MENUS) does
+    // not split its HUD (HudSplitNow), so the mirror's second HUD draw below has no interface to
+    // lay over the scene: World Circuits' zoomed map came out without its track list, header and
+    // event panel (16:10 and 21:9, with DLSS on). Such a menu's pass is left to the game.
+    if (center_wide_menu) {
+        return;
+    }
     // Only in a race, and only while the interface does not read the display back. The game
     // runs the same pass behind menus that have a 3D scene (the title screen over the world
     // map, the layout cards over the globe, the pre-race page; seen by the user on 2026-11-12),

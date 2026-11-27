@@ -13,6 +13,19 @@
 // row a lap, growing down); the bottom row (lap time, gauges, course map) from y 0.76. So the
 // top edge's pieces end at 0.13 in the left column and at 0.265 elsewhere: the standings and the
 // lap times stay whole in the middle band. The bottom row starts at 0.70 everywhere.
+//
+// FIX-SGT-240, from the owner's captures at 1920x1440 (2026-11-27, RTX 4070). A cut must lie
+// between two elements, never inside one: an element moves whole (Move, with its slack) while
+// the copies between the HUD's picture and the game's display go by these regions, so the rows
+// of a moved element past its region's cut were read from the middle band's place.
+//  - The track map's box reaches 0.2685 (290 lines of 1080), past the 0.265 cut: four lines of
+//    the scene from 180 lines lower showed as a dark rule under the map, as wide as its box.
+//    The right column's top pieces now end at 0.272, between the map and the lap times (0.275).
+//  - The bumper and bonnet views' dashboard starts higher than the chase view's row: AUTO
+//    DRIVE at 0.623, the shift lights at 0.656, the rev bar and the speed's panel at 0.667. With
+//    the cut at 0.70 the digits and gauges went down and the panel, the rev bar and AUTO DRIVE
+//    stayed 180 lines above them. The middle column's bottom row now starts at 0.617, under the
+//    start countdown's ring (which ends at 0.610).
 
 #include <array>
 
@@ -21,8 +34,10 @@ namespace Vulkan::HudTall {
 constexpr float LeftColumn = 0.30f;  // x below it: the left column
 constexpr float RightColumn = 0.70f; // x above it: the right column
 constexpr float LeftTop = 0.13f;     // the left column's top pieces end there
-constexpr float OtherTop = 0.265f;   // the middle and right columns' top pieces end there
-constexpr float Bottom = 0.70f;      // the bottom row starts there
+constexpr float OtherTop = 0.265f;   // the middle column's top pieces end there
+constexpr float RightTop = 0.272f;   // FIX-SGT-240: the right column's, under the track map's box
+constexpr float Bottom = 0.70f;      // the bottom row starts there in the left and right columns
+constexpr float MiddleBottom = 0.617f; // FIX-SGT-240: in the middle column (the large dashboard)
 
 /// Which column (-1, 0, 1) a horizontal position belongs to.
 constexpr int Column(float x) {
@@ -31,7 +46,12 @@ constexpr int Column(float x) {
 
 /// Where the top pieces of that column end.
 constexpr float TopEnd(int column) {
-    return column < 0 ? LeftTop : OtherTop;
+    return column < 0 ? LeftTop : column == 0 ? OtherTop : RightTop;
+}
+
+/// Where the bottom row of that column starts.
+constexpr float BottomStart(int column) {
+    return column == 0 ? MiddleBottom : Bottom;
 }
 
 /// Where an element of the HUD (its box) goes: -1 up to the top edge, 1 down to the bottom edge,
@@ -42,7 +62,7 @@ constexpr int Move(float x0, float x1, float y0, float y1, float slack = 0.005f)
     if (y1 <= TopEnd(column) + slack) {
         return -1;
     }
-    if (y0 >= Bottom - slack) {
+    if (y0 >= BottomStart(column) - slack) {
         return 1;
     }
     return 0;
@@ -65,7 +85,7 @@ constexpr std::array<Region, 12> Regions = [] {
     std::array<Region, 12> regions{};
     constexpr float cols[4]{0.0f, LeftColumn, RightColumn, 1.0f};
     for (int c = 0; c < 3; ++c) {
-        const float rows[5]{0.0f, TopEnd(c - 1), Bottom, 0.80f, 1.0f};
+        const float rows[5]{0.0f, TopEnd(c - 1), BottomStart(c - 1), 0.80f, 1.0f};
         for (int r = 0; r < 4; ++r) {
             regions[size_t(c * 4 + r)] = Region{cols[c], rows[r], cols[c + 1], rows[r + 1], c - 1,
                                                 r == 0 ? -1 : r == 1 ? 0 : 1, r == 1 || r == 2};

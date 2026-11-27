@@ -2306,6 +2306,8 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer)
         read_clean_sources = value[0] == '1' && value[1] == '\0';
         LOG_INFO(Render_Vulkan, "Texture source refresh: {}", read_clean_sources ? "read first" : "stock");
     }
+    const char* skip_upkeep = std::getenv("SHADGT_SKIP_EMPTY_DESCRIPTOR_UPKEEP"); // PERF-SGT-234
+    skip_empty_long_sets_upkeep = skip_upkeep && std::strcmp(skip_upkeep, "1") == 0;
     DecideGtsCpuWritebackNow(); // FIX-GTS-529: before the game sets up its save memory
     SnapshotLease::BackingProtocol::Initialize(r.instance.GetVendorID());
     sampler_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
@@ -13472,10 +13474,14 @@ void NativeRenderer::LongSetsUpkeep() {
     static thread_local std::vector<u64> dead;
     const bool some = Native::DeadHandles::Take(dead);
     if (some) g_buffer_size_epoch.fetch_add(1, std::memory_order_release); // PERF-SGT-020
+    if (skip_empty_long_sets_upkeep && !some && !long_sets_over_limit.load(std::memory_order_acquire)) {
+        return;
+    }
     std::unique_lock<std::mutex> lock{long_sets_mutex, std::defer_lock};
     if (ParallelRecordingRequested() || binder) lock.lock(); // FEAT-SGT-022: the binder's too
     if (some) DropLongSets(dead);
-    if (long_sets.entries.Size() > 200000 || long_sets.unused_sets > 20000) FlushLongSets();
+    if (long_sets.entries.Size() > LongSetLimit || long_sets.unused_sets > 20000) FlushLongSets();
+    if (skip_empty_long_sets_upkeep) long_sets_over_limit.store(false, std::memory_order_release);
 }
 
 bool NativeRenderer::CanBindLate(const Pipeline& pipeline, DrawBindings& b) {
@@ -13682,6 +13688,9 @@ bool NativeRenderer::StoreLongSet(u64 hash, u64 check, vk::DescriptorSetLayout l
         return false;
     }
     long_sets.entries.Insert(hash, check, u64(VkDescriptorSetLayout(layout)), set);
+    if (skip_empty_long_sets_upkeep && long_sets.entries.Size() == LongSetLimit + 1) {
+        long_sets_over_limit.store(true, std::memory_order_release);
+    }
     // PERF-GTS-378: a list per handle (a multimap walked a handle they all hold at each insert).
     // FIX-SGT-044: the set goes once into each distinct handle's list, and a list is thinned by
     // ids and serials (Native::KeptSetUsers), so a pass always removes more than half of it.

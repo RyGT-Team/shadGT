@@ -636,9 +636,12 @@ private:
         u64 late_hits = 0, late_made = 0, late_not_kept = 0;
     };
     LongSets long_sets;
+    static constexpr size_t LongSetLimit = 200000;
+    alignas(64) std::atomic<bool> long_sets_over_limit{false};
+    bool skip_empty_long_sets_upkeep = false;
     /// PERF-GTS-398: with parallel recording the pass workers look sets up and make them too:
     /// then everything of `long_sets` is read and changed under this.
-    std::mutex long_sets_mutex;
+    alignas(64) std::mutex long_sets_mutex;
     /// The recorder: dead handles' sets dropped, the table flushed when it is too large.
     void LongSetsUpkeep();
     /// PERF-GTS-377: upload memory the job threads copy a prepared draw's constants into, so

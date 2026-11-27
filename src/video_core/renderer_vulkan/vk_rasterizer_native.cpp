@@ -9068,6 +9068,11 @@ static void NoteBoundBytes(VAddr address, u64 size, bool write, int kind, u64 fr
     since = now;
 }
 
+static bool MirrorOutsideCpuStacks(VAddr begin, VAddr end) {
+    static thread_local Native::CpuStackRegistry::PointQuery query{Native::CpuStacks()};
+    return query.Allowed(begin, end);
+}
+
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr address, u64 size,
                                                                       bool write, bool mirror) {
     if (size == 0) {
@@ -9143,10 +9148,8 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
         if (memo_r || memo_m) {
             SortRegionWrites(); // CPU writes since: pages to copy in (may drop a mirror)
         }
-        const bool mirror_allowed = memo.generation == buffer_generation && (!memo_m || [&] {
-            Native::CpuStackRegistry::Lease lease{Native::CpuStacks()};
-            return lease.Allowed(memo_m->begin, memo_m->end);
-        }());
+        const bool mirror_allowed = memo.generation == buffer_generation &&
+            (!memo_m || MirrorOutsideCpuStacks(memo_m->begin, memo_m->end));
         const bool fresh =
             mirror_allowed && memo.generation == buffer_generation &&
             (!memo_r || memo_r->dirty_pages.empty()) &&
@@ -14477,10 +14480,8 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
             const char* env = std::getenv("SHADGT_NATIVE_VERTEX_NEAR");
             return !(env && env[0] == '0');
         }();
-        const bool near_allowed = near && near_generation == buffer_generation && [&] {
-            Native::CpuStackRegistry::Lease lease{Native::CpuStacks()};
-            return lease.Allowed(near->begin, near->end);
-        }();
+        const bool near_allowed = near && near_generation == buffer_generation &&
+                                  MirrorOutsideCpuStacks(near->begin, near->end);
         bool via_near = false; // DIAG-170
         if (near_on && near_allowed && !sampled && base != 0 && sharp_size > 0 &&
             near_generation == buffer_generation && base >= near->begin &&

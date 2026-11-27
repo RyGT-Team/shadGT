@@ -53,6 +53,7 @@
 #include "input/trigger_feedback.h"
 #include "ryty_gpu/ryty_dlssg.h"
 #include "ryty_gpu/gt7_menu_layout.h"
+#include "ryty_gpu/gt7_mirror_size.h"
 #include "ryty_gpu/ryty_dlss_layout.h"
 #include "core/file_format/psf.h"
 #include "common/ryty_param_sfo.h"
@@ -4466,6 +4467,66 @@ static void Install(u8* base) {
 }
 } // namespace Gt7CarSign
 
+namespace Gt7Mirror {
+// FIX-SGT-242: the rear-view mirror of the bumper and bonnet views keeps its 16:9 size in a native
+// wide or tall scene. GT7 sizes it as a share of the scene (800/1920 of the width, 128/1080 of the
+// height) and gives it a camera made for 800:128, so it came out 1600 pixels wide at 3840x1080
+// and 170 lines high at 1920x1440 (the owner's captures of 2026-11-27, RTX 4070), stretched. Its
+// setting is five values the game initialises once (Ghidra, GT7 1.71: the view angle, the width,
+// the height, the centre and a scale, from 0x1463d5620) and reads every frame; they are set for
+// the scene's size at each change of layout (Gt7MirrorSize). Left alone when they are not the
+// values of that version. RYGT_GT7_MIRROR_16_9=0: off.
+constexpr u32 setting = 0x63d5620;
+
+void Apply(u8* game, u32 scene_width, u32 scene_height) {
+    struct Raw {
+        float angle;
+        s32 width, height, centre;
+        float scale;
+    };
+    static_assert(sizeof(Raw) == 20);
+    u8* const at = game + setting;
+    static const bool known = [at] {
+        const char* env = std::getenv("RYGT_GT7_MIRROR_16_9");
+        if (env && env[0] == '0') {
+            return false;
+        }
+        MEMORY_BASIC_INFORMATION info{};
+        Raw raw{};
+        const bool writable = ReadableRange(at, sizeof(Raw)) && VirtualQuery(at, &info, sizeof(info)) &&
+                              (info.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0;
+        if (writable) {
+            std::memcpy(&raw, at, sizeof(raw));
+        }
+        const auto& d = Gt7MirrorSize::Default;
+        const bool ok = writable && raw.angle == d.angle && raw.width == d.width &&
+                        raw.height == d.height && raw.centre == 960 && raw.scale == d.scale;
+        if (!ok) {
+            std::fputs("[native] GT7 mirror: setting not recognized, left as the game has it\n", stderr);
+        }
+        return ok;
+    }();
+    if (!known) {
+        return;
+    }
+    const Gt7MirrorSize::Setting wanted = Gt7MirrorSize::ForScene(scene_width, scene_height);
+    Raw raw{};
+    std::memcpy(&raw, at, sizeof(raw));
+    if (raw.width == wanted.width && raw.height == wanted.height && raw.scale == wanted.scale &&
+        raw.angle == wanted.angle) {
+        return;
+    }
+    raw.angle = wanted.angle;
+    raw.width = wanted.width;
+    raw.height = wanted.height;
+    raw.scale = wanted.scale;
+    std::memcpy(at, &raw, sizeof(raw));
+    std::fprintf(stderr, "[native] GT7 mirror: %d x %d of 1920x1080, scale %.4f, angle %.3f for a "
+                         "%ux%u scene\n", wanted.width, wanted.height, wanted.scale, wanted.angle,
+                 scene_width, scene_height);
+}
+} // namespace Gt7Mirror
+
 namespace Gt7NativeMenu {
 // GT7 keeps three flip allocations until shutdown. Their pitch, addresses and allocation
 // size stay fixed. GraphicsConfig rebuilds the scene targets when the logical size changes.
@@ -4704,6 +4765,7 @@ void PS4_SYSV_ABI ConfigureTargets() {
     configure_original();
     if (applied) {
         active_extent.store(extent, std::memory_order_release);
+        Gt7Mirror::Apply(game, width, scene_height); // FIX-SGT-242
         if (changed) {
             // The dimensions GT7 accepted, after updating its descriptor under its own lock.
             auto* targets = *reinterpret_cast<u8**>(game + 0x641c318);

@@ -1734,6 +1734,8 @@ std::atomic<u64> g_gt7_org_race_ms{0};
 // it (PERF-GTS-494); SHADGT_RACE_START_SIGNAL=0 leaves the play state to the frame-time measure.
 std::atomic<bool> g_race_running{false};
 std::atomic<bool> g_race_signal{false}; ///< GAME-006: a hook reads the start bytes
+/// FIX-SGT-241: for how many of the race module's frames in a row the race has been running.
+std::atomic<u32> g_race_running_frames{0};
 std::atomic<u64> g_race_signal_ms{0};
 
 bool RaceStartSignalOn() {
@@ -1767,7 +1769,13 @@ void StartRaceSignal() {
 
 void NoteRaceRunning(bool running, const char* game) {
     g_race_signal_ms.store(GetTickCount64(), std::memory_order_relaxed);
-    if (g_race_running.exchange(running, std::memory_order_relaxed) == running) {
+    const bool was = g_race_running.exchange(running, std::memory_order_relaxed);
+    // FIX-SGT-241: counted in the module's own frames, so the count means the same at any frame
+    // rate. Only this thread writes it.
+    const u32 frames = g_race_running_frames.load(std::memory_order_relaxed);
+    g_race_running_frames.store(!running ? 0u : !was ? 1u : std::min<u32>(frames + 1, 1u << 20),
+                                std::memory_order_relaxed);
+    if (was == running) {
         return;
     }
     SYSTEMTIME now;
@@ -4625,13 +4633,32 @@ bool InterfaceLayoutOn() {
     return on;
 }
 
+// FIX-SGT-241: the track's layout only once the race has run for three of the race module's
+// frames. Leaving the pause menu with Retry or Exit, GT7 clears the pause one frame before it
+// ends the session: the race "ran" for that frame (17 ms on the owner's play of 2026-11-27 at
+// 1920x1200, RTX 4070: "race starts", the track's layout, "not running", the menus' layout, four
+// lines of the journal within 17 ms, at each Retry and Exit), and GT7 rebuilt its render targets
+// twice for it. A real start or Continue takes the track's layout two frames later than before.
+// RYGT_GT7_TRACK_HOLD=0: at once, as before.
+bool TrackHoldOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_GT7_TRACK_HOLD");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
 bool TrackRequested() {
     if (!Vulkan::RytyGtsInRace() || Rewards::active_stage.load(std::memory_order_acquire)) {
         return false;
     }
-    if (!dlss_layout && !native_dlaa && InterfaceLayoutOn() && Vulkan::RytyRaceStartSignal() &&
-        !Vulkan::RytyRaceRunning()) {
-        return false;
+    if (!dlss_layout && !native_dlaa && InterfaceLayoutOn() && Vulkan::RytyRaceStartSignal()) {
+        if (!Vulkan::RytyRaceRunning()) {
+            return false;
+        }
+        if (TrackHoldOn() && g_race_running_frames.load(std::memory_order_relaxed) < 3) {
+            return false;
+        }
     }
     return true;
 }

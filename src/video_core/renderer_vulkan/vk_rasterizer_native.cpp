@@ -13754,6 +13754,8 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     if (!binder && RecorderBinderWanted() != 0 && s.cmd.Ring()) {
         binder = std::make_unique<Native::RecorderBinder<BindJob>>(this, &RunBindJob);
         binder_mode = RecorderBinderWanted();
+        LOG_WARNING(Render_Vulkan, "Descriptor binder publication: {}",
+                    binder->Ring().PublishesAtJobEnd() ? "per job" : "per command");
         LOG_WARNING(Render_Vulkan, "FEAT-SGT-022: descriptor binds are made on a binder thread{}",
                     binder_mode == 2 ? ", one at a time (SHADGT_RECORDER_BINDER=2)" : "");
     }

@@ -95,7 +95,10 @@ public:
 
     static constexpr size_t Capacity = size_t{32} << 20;
 
-    CommandRing() : storage{new (std::align_val_t{64}) u8[Capacity]} {}
+    enum class Publication { PerCommand, AtJobEnd };
+
+    explicit CommandRing(Publication mode = Publication::PerCommand)
+        : storage{new (std::align_val_t{64}) u8[Capacity]}, publication{mode} {}
     ~CommandRing() {
         ::operator delete[](storage, std::align_val_t{64});
     }
@@ -120,6 +123,17 @@ public:
 
     /// Bytes recorded so far (a position the command thread reaches).
     u64 Recorded() const noexcept {
+        return head_local;
+    }
+
+    bool PublishesAtJobEnd() const noexcept {
+        return publication == Publication::AtJobEnd;
+    }
+
+    u64 FinishJob() noexcept {
+        if (PublishesAtJobEnd()) {
+            head.store(head_local, std::memory_order_release);
+        }
         return head_local;
     }
 
@@ -219,6 +233,9 @@ private:
 
     void Publish(u32 bytes) noexcept {
         head_local += bytes;
+        if (PublishesAtJobEnd()) {
+            return;
+        }
         head.store(head_local, std::memory_order_seq_cst);
         if (sleeping.load(std::memory_order_seq_cst)) {
             Wake();
@@ -226,6 +243,7 @@ private:
     }
 
     u8* storage;
+    const Publication publication;
     u64 head_local{}; ///< Recorder side.
     alignas(64) std::atomic<u64> head{};
     alignas(64) std::atomic<u64> tail{};

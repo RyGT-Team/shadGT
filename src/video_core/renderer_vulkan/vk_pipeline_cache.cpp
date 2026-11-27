@@ -10669,12 +10669,21 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
             if (fast_mode && permutation.inputs.valid &&
                 Shader::StageSpecialization::Packable(info) &&
                 permutation.inputs.start == binding && permutation.inputs.runtime_info == runtime_info) {
-                thread_local std::vector<u64> words;
-                thread_local Shader::Gcn::FetchShaderData fetch;
-                words.clear();
-                Shader::StageSpecialization::PackInputs(info, words, fetch);
-                packed_match = words == permutation.inputs.words &&
-                               fetch == permutation.spec.fetch_shader_data;
+                static const bool compare_fragment_inputs = [] {
+                    const char* setting = std::getenv("SHADGT_COMPARE_FRAGMENT_INPUTS"); // PERF-SGT-229
+                    return setting && std::string_view(setting) == "1";
+                }();
+                if (compare_fragment_inputs && info.sw_stage == SwStage::Fragment) {
+                    packed_match = Shader::StageSpecialization::MatchesFragmentInputs(
+                        info, permutation.inputs.words, permutation.spec.fetch_shader_data);
+                } else {
+                    thread_local std::vector<u64> words;
+                    thread_local Shader::Gcn::FetchShaderData fetch;
+                    words.clear();
+                    Shader::StageSpecialization::PackInputs(info, words, fetch);
+                    packed_match = words == permutation.inputs.words &&
+                                   fetch == permutation.spec.fetch_shader_data;
+                }
             }
             bool matched = packed_match && fast_mode == 1;
             if (matched) NoteSearch(hw_stage, SearchLastPacked); // DIAG-SGT-024

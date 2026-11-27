@@ -3,7 +3,11 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <bitset>
+#include <span>
+#include <type_traits>
 
 #include "common/perf_monitor.h"
 #include "common/types.h"
@@ -290,27 +294,76 @@ struct StageSpecialization {
                !(info.sw_stage == SwStage::Vertex && info.has_fetch_shader);
     }
 
+private:
+    struct FragmentWords {
+        std::array<u64, 4 + 2 * NUM_BUFFERS + 2 * NUM_IMAGES + NUM_FMASKS + NUM_SAMPLERS> words;
+        u64* next = words.data();
+
+        void push_back(u64 word) {
+            DEBUG_ASSERT(next < words.data() + words.size());
+            *next++ = word;
+        }
+    };
+
+    struct ImageFormat {
+        u8 number;
+        u8 conversion;
+    };
+
+    static ImageFormat FragmentImageFormat(const AmdGpu::Image& sharp) {
+        static constexpr auto table = [] {
+            std::array<ImageFormat, 1024> result{};
+            for (u32 i = 0; i < result.size(); ++i) {
+                const auto data = static_cast<AmdGpu::DataFormat>(i & 63);
+                const auto number = static_cast<AmdGpu::NumberFormat>(i >> 6);
+                result[i] = {u8(AmdGpu::RemapNumberFormat(number, data)),
+                             u8(AmdGpu::MapNumberConversion(number, data))};
+            }
+            return result;
+        }();
+        return table[sharp.data_format | (sharp.num_format << 6)];
+    }
+
+public:
     /// PERF-GT7-058: what the constructor above reads of the sharps and of the fetch shader, as the
     /// values it derives from them, packed into words without making a specialization. A stage
     /// with equal words, an equal runtime info, start bindings and fetch shader data, and the same
     /// info makes an equal specialization, for a stage Packable allows. Keep in step with the
     /// constructor.
     static void PackInputs(const Info& info, std::vector<u64>& out, Gcn::FetchShaderData& fetch) {
+        WritePackedInputs(info, out, &fetch);
+    }
+
+    static bool MatchesFragmentInputs(const Info& info, std::span<const u64> expected,
+                                      const Gcn::FetchShaderData& saved_fetch) {
+        DEBUG_ASSERT(info.sw_stage == SwStage::Fragment);
+        FragmentWords out;
+        WritePackedInputs(info, out, nullptr);
+        return std::equal(out.words.data(), out.next, expected.begin(), expected.end()) &&
+               Gcn::FetchShaderData{} == saved_fetch;
+    }
+
+private:
+    template <typename Words>
+    static void WritePackedInputs(const Info& info, Words& out, Gcn::FetchShaderData* fetch) {
         const auto mapping = [](const AmdGpu::CompMapping& m) {
             return u64(m.array[0]) | u64(m.array[1]) << 8 | u64(m.array[2]) << 16 |
                    u64(m.array[3]) << 24;
         };
-        fetch = {};
-        if (info.sw_stage == SwStage::Vertex && Gcn::ParseFetchShader(info, fetch)) {
-            for (const auto& desc : fetch.attributes) {
-                const auto sharp = desc.GetSharp(info);
-                if (!sharp) {
-                    out.push_back(0);
-                } else if (Gcn::VertexAttribute::IsGarbage(sharp)) {
-                    out.push_back(1);
-                } else {
-                    out.push_back(2 | u64(AmdGpu::GetNumberClass(sharp.GetNumberFmt())) << 8 |
-                                  mapping(sharp.DstSelect()) << 16);
+        constexpr bool fragment_key = std::is_same_v<Words, FragmentWords>;
+        if constexpr (!fragment_key) {
+            *fetch = {};
+            if (info.sw_stage == SwStage::Vertex && Gcn::ParseFetchShader(info, *fetch)) {
+                for (const auto& desc : fetch->attributes) {
+                    const auto sharp = desc.GetSharp(info);
+                    if (!sharp) {
+                        out.push_back(0);
+                    } else if (Gcn::VertexAttribute::IsGarbage(sharp)) {
+                        out.push_back(1);
+                    } else {
+                        out.push_back(2 | u64(AmdGpu::GetNumberClass(sharp.GetNumberFmt())) << 8 |
+                                      mapping(sharp.DstSelect()) << 16);
+                    }
                 }
             }
         }
@@ -361,16 +414,27 @@ struct StageSpecialization {
                                   ? AmdGpu::ImageType::Invalid
                                   : sharp.GetViewType(desc.is_array);
             w |= u64(type) << 1;
-            w |= u64(AmdGpu::IsInteger(sharp.GetNumberFmt())) << 8;
+            const auto number = [&] {
+                if constexpr (fragment_key) {
+                    return AmdGpu::NumberFormat(FragmentImageFormat(sharp).number);
+                } else {
+                    return sharp.GetNumberFmt();
+                }
+            }();
+            w |= u64(AmdGpu::IsInteger(number)) << 8;
             w |= u64(desc.is_written) << 9;
             if (desc.is_written) {
                 w |= mapping(sharp.DstSelect()) << 16;
             } else if (!usage_known || info.image_srgb_used[i]) {
-                w |= u64(sharp.GetNumberFmt() == AmdGpu::NumberFormat::Srgb) << 10;
+                w |= u64(number == AmdGpu::NumberFormat::Srgb) << 10;
             }
             w |= u64(desc.NumBindings(info)) << 48;
             out.push_back(w);
-            out.push_back(u64(sharp.GetNumberConversion()));
+            if constexpr (fragment_key) {
+                out.push_back(FragmentImageFormat(sharp).conversion);
+            } else {
+                out.push_back(u64(sharp.GetNumberConversion()));
+            }
         }
         out.push_back(0xf3a5);
         for (const auto& desc : info.fmasks) {
@@ -400,6 +464,7 @@ struct StageSpecialization {
         }
     }
 
+public:
     void ForEachSharp(auto& spec_list, auto& desc_list, auto&& func) {
         for (const auto& desc : desc_list) {
             auto& spec = spec_list.emplace_back();

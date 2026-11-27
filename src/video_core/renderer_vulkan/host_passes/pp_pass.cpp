@@ -42,9 +42,9 @@ struct PostProcessingConstants {
     float side_dim = 1.0f;
 };
 // Must match the push-constant block in post_process.frag.
-static_assert(sizeof(PostProcessingPass::Settings) == 56);
-static_assert(offsetof(PostProcessingConstants, dlss_sharpening) == 56);
-static_assert(sizeof(PostProcessingConstants) == 72);
+static_assert(sizeof(PostProcessingPass::Settings) == 64);
+static_assert(offsetof(PostProcessingConstants, dlss_sharpening) == 64);
+static_assert(sizeof(PostProcessingConstants) == 80);
 } // namespace
 
 void PostProcessingPass::Create(vk::Device device, vk::PhysicalDevice physical_device) {

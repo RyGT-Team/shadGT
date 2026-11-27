@@ -51,6 +51,10 @@ public:
         u32 hud = 0;
         float hud_x0 = 0.0f;
         float hud_x1 = 1.0f;
+        /// FIX-SGT-200: and between these vertical positions, on a screen taller than 16:9
+        /// (16:10, 4:3), where the HUD keeps its 16:9 shape in the middle.
+        float hud_y0 = 0.0f;
+        float hud_y1 = 1.0f;
     };
 
     /// FIX-GT7-145: the format of a frame shown on an HDR10 output, the swapchain's own 10 bits.

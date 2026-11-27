@@ -25460,9 +25460,12 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     frame_writebacks.clear();
     // Use one routing decision for all draws and the presentation of the same frame.
     const bool finished_wide_menu = center_wide_menu;
+    // FIX-SGT-200: also on a screen taller than 16:9 (16:10, 4:3): the menus' 16:9 picture
+    // goes between bars at the top and bottom instead of being stretched to the window's height
+    // (the race camera's aspect is widened only for races, so menus are drawn for 16:9).
     static const bool fit_gt7_menus = [] {
         const char* setting = std::getenv("RYGT_ULTRAWIDE_MENUS");
-        return Common::IsGt7() && RytyDisplayAspect() > 16.0f / 9.0f + 0.01f &&
+        return Common::IsGt7() && RytyDisplayAspect() > 0.0f &&
                !(setting && setting[0] == '0');
     }();
     const u32 native_panel = RytyGt7MenuWidth(info.size.width, info.size.height);

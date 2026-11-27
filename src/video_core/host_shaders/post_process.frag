@@ -40,6 +40,9 @@ layout (push_constant) uniform settings {
     uint hud;
     float hud_x0;
     float hud_x1;
+    // FIX-SGT-200: and between hud_y0 and hud_y1 of the height (a screen taller than 16:9).
+    float hud_y0;
+    float hud_y1;
     float dlss_sharpening;
     // ryGT WIDE-042: the ambient sides (outside side_x0..side_x1 of the width) dimmed by side_dim.
     float side_x0;
@@ -160,8 +163,10 @@ void main() {
                 break;
             }
         }
-        if (!shown && uv.x >= pp.hud_x0 && uv.x <= pp.hud_x1) {
-            hud_uv = vec2((uv.x - pp.hud_x0) / (pp.hud_x1 - pp.hud_x0), uv.y);
+        if (!shown && uv.x >= pp.hud_x0 && uv.x <= pp.hud_x1 && uv.y >= pp.hud_y0 &&
+            uv.y <= pp.hud_y1) {
+            hud_uv = vec2((uv.x - pp.hud_x0) / (pp.hud_x1 - pp.hud_x0),
+                          (uv.y - pp.hud_y0) / (pp.hud_y1 - pp.hud_y0));
             shown = true;
             for (uint i = 0u; i < count; ++i) {
                 if (inside(hud_uv, layout_.widgets[i].src)) {

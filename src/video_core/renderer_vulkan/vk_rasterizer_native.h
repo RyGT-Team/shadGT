@@ -1597,6 +1597,8 @@ private:
     static bool PartSyncOn();
     /// FIX-207: textures made of targets made of targets (SHADGT_NATIVE_WHOLE_SOURCES=0 off), and
     /// the version of such a whole: that of its newest part.
+    static bool KeepDependentSnapshot();
+    const bool keep_dependent_snapshot = KeepDependentSnapshot();
     static bool WholeSourcesOn();
     static u64 WholeVersion(Native::ImageEntry& source);
 

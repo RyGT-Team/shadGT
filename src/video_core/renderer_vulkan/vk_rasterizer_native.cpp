@@ -15239,9 +15239,15 @@ void NativeRenderer::WrittenSubresources(const Native::ImageEntry* entry, u64 at
         } else if (!subs.empty()) {
             std::fill(subs.begin(), subs.end(), version);
         }
-        for (auto* texture : written->dependents) {
-            texture->sources_dirty.store(true, std::memory_order_relaxed);
-            dependents.push_back(texture);
+        if (keep_dependent_snapshot) {
+            for (auto* texture : written->dependents) {
+                texture->sources_dirty.store(true, std::memory_order_relaxed);
+                dependents.push_back(texture);
+            }
+        } else {
+            for (auto* texture : written->dependents) {
+                texture->sources_dirty.store(true, std::memory_order_relaxed);
+            }
         }
     }
     // FIX-207: and the textures made of those (see RefreshSources).
@@ -15253,6 +15259,11 @@ void NativeRenderer::WrittenSubresources(const Native::ImageEntry* entry, u64 at
             }
         }
     }
+}
+
+bool NativeRenderer::KeepDependentSnapshot() {
+    const char* value = std::getenv("SHADGT_SKIP_UNUSED_DEPENDENT_COPY"); // PERF-SGT-212
+    return !value || std::strcmp(value, "1") != 0 || WholeSourcesOn();
 }
 
 bool NativeRenderer::WholeSourcesOn() {

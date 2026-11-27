@@ -186,6 +186,12 @@ void main() {
                 }
             }
         }
+        if (!shown && overlay) {
+            // FEAT-SGT-201: outside the 16:9 band the overlay's plain dimming (from the top-centre
+            // spot checked above), so the whole screen dims as at 16:9.
+            hud_uv = vec2(0.5, 0.03);
+            shown = true;
+        }
         if (shown) {
             // Over black the HUD left its colour times its coverage; over white also
             // 1 - coverage. Blended as the game blends it, in the display buffer's encoding.

@@ -1022,8 +1022,15 @@ inline std::optional<Shown> TakeFrame(const Instance& instance, vk::CommandBuffe
         const vk::ImageLayout src_layout =
             general ? vk::ImageLayout::eGeneral : vk::ImageLayout::eTransferSrcOptimal;
         display_barrier(display_layout, src_layout);
-        ProxyBarrier(cmdbuf, proxy, vk::ImageLayout::eTransferDstOptimal,
-                     vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+        if (Tall()) {
+            // FEAT-SGT-203: no ambient light fills the bands above and below (Ambient takes the
+            // sides only): black, not what an earlier frame left there.
+            ClearProxyForBlit(cmdbuf, proxy);
+        } else {
+            ProxyBarrier(cmdbuf, proxy, vk::ImageLayout::eTransferDstOptimal,
+                         vk::PipelineStageFlagBits2::eTransfer,
+                         vk::AccessFlagBits2::eTransferWrite);
+        }
         const auto region = IntoProxy(proxy, native);
         cmdbuf.blitImage2(vk::BlitImageInfo2{
             .srcImage = display,

@@ -252,7 +252,15 @@ std::array<float, 4> HudPieceRect(const HudPiece& piece, const std::array<float,
     if (piece.placed) {
         return {piece.dst[0], piece.dst[1], piece.dst[2], piece.dst[3]};
     }
-    return HudAreaRect(piece.src, span);
+    auto rect = HudAreaRect(piece.src, span);
+    // FEAT-SGT-201: on a screen taller than 16:9 the race view is taller too (FEAT-GT7-202), so
+    // the pieces go out to the edges: those in the HUD's top half to the top, the rest to the
+    // bottom, at their 16:9 size. What isn't a piece stays in the centred 16:9 band.
+    if (span[2] > 0.0f) {
+        const float centre = piece.src[1] + piece.src[3] / 2.0f;
+        rect[1] += centre < 0.5f ? -span[2] : 1.0f - span[3];
+    }
+    return rect;
 }
 } // namespace
 

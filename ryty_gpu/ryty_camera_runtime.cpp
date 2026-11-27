@@ -1,11 +1,13 @@
 #include "common/game_title.h"
 #include "ryty_gpu/ryty_camera.h"
 #include "ryty_gpu/ryty_camera_validation.h"
+#include "ryty_gpu/ryty_taller_view.h"
 #include <windows.h>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -18,6 +20,7 @@
 namespace Vulkan {
 float RytyDisplayAspect(); // ryty_game_patch.cpp (GTS-009)
 bool RytyWideScene();      // WIDE-001
+bool RytyTallScreen();     // FEAT-SGT-203
 int RytyGtsMenuScreen();   // WIDE-020: 2 = Home
 }
 
@@ -333,6 +336,26 @@ void WideProbe(float* view, unsigned camera, std::uintptr_t flags, bool shown) {
         }
     }
 }
+// FEAT-SGT-207: on a screen taller than 16:9 with FEAT-SGT-203's picture, the screen's aspect
+// for a taller race view; 0 otherwise. The camera aspect there is the screen's (GTS-009,
+// WIDE-002/004) and GT Sport keeps each camera's vertical angle, so the view lost its sides
+// (Hor-). The driving cameras' angle is opened up instead, to keep their 16:9 width and show
+// more above and below (as GT7's FEAT-GT7-202 does). Only these four cameras: the replay's TV and
+// track cameras keep theirs. RYGT_TALLER_VIEW=0 leaves the angles alone.
+float TallerViewAspect() {
+    static const float aspect = [] {
+        const char* env = std::getenv("RYGT_TALLER_VIEW");
+        if (!Vulkan::RytyWideScene() || !Vulkan::RytyTallScreen() || (env && env[0] == '0')) {
+            return 0.0f;
+        }
+        const float value = Vulkan::RytyDisplayAspect();
+        std::fprintf(stderr, "[camera] FEAT-SGT-207: taller race view for aspect %.3f (chase "
+                             "52 -> %.1f degrees)\n",
+                     double(value), double(TallerViewFov(52.0f, value)));
+        return value;
+    }();
+    return aspect;
+}
 template<View camera>
 std::uintptr_t __attribute__((sysv_abi)) CameraView(void* a, void* b, void* c, float* view, std::uintptr_t flags) {
     constexpr unsigned index = static_cast<unsigned>(camera);
@@ -367,6 +390,9 @@ std::uintptr_t __attribute__((sysv_abi)) CameraView(void* a, void* b, void* c, f
     struct DispatchRequest { void* object; ~DispatchRequest() { if (object == active_camera) ProcessViewRequest(); } } dispatch{a};
     if (std::isfinite(view[22]) && view[22] > 0 && view[22] < 180) hook.native_fov.store(view[22]);
     if (settings.fov != 0) view[22] = settings.fov;
+    // FEAT-SGT-207: the camera writes its angle every frame (0x86b030: 52 or 40 degrees for the
+    // chase view), so it is opened up from that each time, a preset's angle included.
+    if (const float tall = TallerViewAspect(); tall > 0.0f) view[22] = TallerViewFov(view[22], tall);
     if constexpr (camera == View::Cockpit) {
         Offset(view, settings.height, settings.distance);
     } else {

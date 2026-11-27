@@ -1785,6 +1785,25 @@ void NativeRenderer::DrawBindings::PrepareDescriptorKeys(const Pipeline& pipelin
     key_layout = pipeline.GetLayout();
 }
 
+void NativeRenderer::DrawBindings::AppendStorageWrite(u32 slot, bool in_place) {
+    if (in_place) {
+        auto& write = writes.emplace_back();
+        write.dstBinding = slot;
+        write.descriptorCount = 1;
+        write.descriptorType = vk::DescriptorType::eStorageBuffer;
+        write.pBufferInfo = &buffers.back();
+        return;
+    }
+    writes.push_back(vk::WriteDescriptorSet{
+        .dstSet = VK_NULL_HANDLE,
+        .dstBinding = slot,
+        .dstArrayElement = 0,
+        .descriptorCount = 1,
+        .descriptorType = vk::DescriptorType::eStorageBuffer,
+        .pBufferInfo = &buffers.back(),
+    });
+}
+
 void NativeRenderer::DrawBindings::PrepareWriteGroups() {
     grouped_writes = GroupDescriptorWrites<vk::WriteDescriptorSet>(
         std::span<const vk::WriteDescriptorSet>{writes.data(), writes.size()},
@@ -2253,7 +2272,13 @@ static bool OutOfMemoryLogDue(std::atomic<u32>& logged) {
     return n < 16 || n % 256 == 0;
 }
 
-NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
+static bool InPlaceStorageWritesRequested() {
+    const char* value = std::getenv("SHADGT_IN_PLACE_STORAGE_WRITES"); // PERF-SGT-211
+    return value && std::strcmp(value, "1") == 0;
+}
+
+NativeRenderer::NativeRenderer(Rasterizer& rasterizer)
+    : r{rasterizer}, in_place_storage_writes{InPlaceStorageWritesRequested()} {
     DecideGtsCpuWritebackNow(); // FIX-GTS-529: before the game sets up its save memory
     SnapshotLease::BackingProtocol::Initialize(r.instance.GetVendorID());
     sampler_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
@@ -12513,14 +12538,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
         if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-buffer id={} stage={} program={:#x} binding={} descriptor={} special={} written={} handle={:#x} offset={} range={} direct={}",SceneTrace::Id(),u32(stage.sw_stage),stage.pgm_hash,binding.unified,buffer_index,desc.IsSpecial(),desc.is_written,reinterpret_cast<u64>(static_cast<VkBuffer>(info.buffer)),info.offset,info.range,stage.uses_direct));
         b.buffers.push_back(info);
         b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
-        b.writes.push_back(vk::WriteDescriptorSet{
-            .dstSet = VK_NULL_HANDLE,
-            .dstBinding = binding.unified++,
-            .dstArrayElement = 0,
-            .descriptorCount = 1,
-            .descriptorType = vk::DescriptorType::eStorageBuffer,
-            .pBufferInfo = &b.buffers.back(),
-        });
+        b.AppendStorageWrite(binding.unified++, in_place_storage_writes);
         ++binding.buffer;
     }
     (void)compute;
@@ -21580,14 +21598,7 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
         }
         b.buffers.push_back(info);
         b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
-        b.writes.push_back(vk::WriteDescriptorSet{
-            .dstSet = VK_NULL_HANDLE,
-            .dstBinding = binding.unified++,
-            .dstArrayElement = 0,
-            .descriptorCount = 1,
-            .descriptorType = vk::DescriptorType::eStorageBuffer,
-            .pBufferInfo = &b.buffers.back(),
-        });
+        b.AppendStorageWrite(binding.unified++, in_place_storage_writes);
         ++binding.buffer;
     }
     return true;

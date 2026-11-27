@@ -263,6 +263,7 @@ private:
         std::array<std::vector<vk::WriteDescriptorSet>, Shader::Backend::MaxDescriptorSets> grouped_storage;
         std::array<std::span<const vk::WriteDescriptorSet>, Shader::Backend::MaxDescriptorSets> grouped_writes{};
         bool groups_ready = false;
+        void AppendStorageWrite(u32 slot, bool in_place);
         void PrepareWriteGroups();
         std::array<PreparedDescriptorKey, Shader::Backend::MaxDescriptorSets> descriptor_keys;
         vk::PipelineLayout key_layout{};
@@ -1895,6 +1896,7 @@ private:
     } prepare_stats;
 
     Rasterizer& r;
+    const bool in_place_storage_writes;
     std::unique_ptr<Native::Rhi::Device> device;
     std::shared_ptr<OneOffObserver> one_off_observer;
     std::unique_ptr<AsyncMirrorBuffer<Native::Rhi::Buffer>> mirror_preparation;

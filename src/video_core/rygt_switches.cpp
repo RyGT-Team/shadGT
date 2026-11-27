@@ -175,6 +175,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_RACE_REBUILD_WAIT_US|int|Shader compiling|3000|microseconds a draw waits in a race for its released pipeline's rebuild; twice that per 16 ms window|How long a race draw waits for a released pipeline's rebuild before it is skipped (FIX-SGT-036). Larger: fewer pop-ins, longer hitches.",
     "RYGTSW1|SHADGT_DIAG_SPEC_MISS|flag|Diagnostics & tracing|off|1 = on|Logs why stored shader translations (also another GPU's manifest) did not match when the game has to translate a shader again.",
     // Native recorder & sync
+    "RYGTSW1|SHADGT_IN_PLACE_STORAGE_WRITES|flag|Native recorder & sync|off|0 = off, 1 = on|Constructs storage-buffer descriptor writes directly in the output vector.",
     "RYGTSW1|SHADGT_LONG_LIVED_SETS|flag|Native recorder & sync|on|unset or 1 = on, any other value = off (needs SHADGT_DYNAMIC_BUFFER_OFFSETS on)|Keeps descriptor sets across command lists and drops one when an object it uses is destroyed (PERF-GTS-375). Experimental.",
     "RYGTSW1|SHADGT_LISTED_IN_PLACE|flag|Native recorder & sync|on|0 = off|Ranges in the listed in-place ranges (GT7's launcher sets them) are always read and written in guest memory, even under a video-memory copy, so GPU culling reads what it wrote (FIX-SGT-004, FIX-SGT-009)",
     "RYGTSW1|SHADGT_REGION_AVOID_LISTED|flag|Native recorder & sync|on|0 = off|Video-memory copies of guest memory never grow over GT7's listed in-place ranges; fixes the road going dark for single frames in the rain (FIX-SGT-012).",

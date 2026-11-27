@@ -1539,7 +1539,10 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     bool dlss_scaled = false;
     vk::ImageView ui_layer_view{};
     std::string upscaler = display->upscaler; // actual Native scene reconstruction
-    const bool guest_dlss = RytyUpscale::GuestOutputDlss() && upscaler == "DLSS";
+    // FEAT-SGT-198: or FSR 3.1 (XeSS), which rebuilt the scene in the frame the same way.
+    const std::string guest_backend = rasterizer->GetTemporalDlss().BackendName();
+    const bool guest_dlss = RytyUpscale::GuestOutputDlss() && !upscaler.empty() &&
+                            upscaler == guest_backend;
     if (guest_dlss && logged_dlss_display_size != image_size) {
         LOG_INFO(Render_Vulkan, "DLSS guest display after HUD: {}x{}",
                  image_size.width, image_size.height);
@@ -1631,7 +1634,8 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         dlss_scaled = true;
         upscaler = "DLSS";
     }
-    if (!scaled && fsr_settings.enable) {
+    // FEAT-SGT-198: a frame FSR rebuilt in the frame is not upscaled again here.
+    if (!scaled && fsr_settings.enable && !guest_dlss) {
         const float sharpness =
             fsr_settings.use_rcas ? 1.0f - fsr_settings.rcas_attenuation / 2.0f : -1.0f;
         if (const auto fsr3_view =
@@ -1645,7 +1649,7 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
             upscaler = RytyFsr3::ActiveVersionName();
         }
     }
-    if (!scaled) {
+    if (!scaled && !(guest_dlss && fsr_settings.enable)) { // FEAT-SGT-198: not FSR 1 over FSR 3.1
         const auto before = image_view;
         image_view = fsr_pass.Render(pass_cmdbuf, image_view, image_size,
                                      {frame->width, frame->height}, fsr_settings, frame->is_hdr);
@@ -1653,8 +1657,9 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     }
     if (guest_dlss) {
         const auto output = rasterizer->GetTemporalDlss().OutputSize();
-        RytyUpscalerStatus::Report(game_size == output ? "DLAA" :
-            "DLSS " + RytyUpscalerStatus::QualityMode(output.width, output.height, game_size.width, game_size.height));
+        const bool dlss = guest_backend == "DLSS";
+        RytyUpscalerStatus::Report(game_size == output ? (dlss ? "DLAA" : guest_backend + " Native AA") :
+            guest_backend + " " + RytyUpscalerStatus::QualityMode(output.width, output.height, game_size.width, game_size.height));
     } else {
         RytyUpscalerStatus::ReportResolution(frame->width, frame->height,
                                               game_size.width, game_size.height, upscaler,

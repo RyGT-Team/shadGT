@@ -15949,7 +15949,7 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
         for (const auto* entry : targets->colors) {
             attached(entry);
         }
-        attached(targets->depth);
+        if (!targets->depth_read_only) attached(targets->depth); // PERF-SGT-167
         for (size_t cb = 0; cb < targets->colors.size(); ++cb) {
             const auto* entry = targets->colors[cb];
             note(entry, &targets->color_ranges[cb]);
@@ -16005,7 +16005,7 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
                 }
             }
         }
-        note(targets->depth);
+        if (!targets->depth_read_only) note(targets->depth); // PERF-SGT-167
     }
     for (const auto* entry : b.stored) {
         note(entry);
@@ -17222,8 +17222,24 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
              : bool(dc.stencil_enable));
     const bool depth_writes = db_feedback.depth_clear || db_feedback.stencil_clear ||
         (dc.depth_enable && dc.depth_write_enable) || stencil_writes;
-    const auto depth_feedback = Native::DecideDepthFeedback(
+    auto depth_feedback = Native::DecideDepthFeedback(
         sampled_depth, depth_writes, r.instance.IsAttachmentFeedbackLoopLayoutSupported());
+    // PERF-SGT-167 (SHADGT_DEPTH_READ_IN_GENERAL, 0 = off): a draw that samples its depth target
+    // and writes neither depth nor stencil leaves the target in the GENERAL layout it is kept in,
+    // which allows both uses. It used to go to the read-only layout and back around every such
+    // draw, with the render pass ended and begun again each time. On AMD's driver each change is
+    // real GPU work: RGP showed a depth-stencil expand before and a HiZ resummarize after each of
+    // GT7's ~18 such draws a frame in a race (36 indices each), ~0.33 ms a draw on a Radeon 610M.
+    // The depth is then not counted as written by the draw either, so a run of such draws stays
+    // in one pass; the first one still waits for earlier writes to its depth (NeedsBarrierFor).
+    static const bool depth_read_in_general = [] {
+        const char* env = std::getenv("SHADGT_DEPTH_READ_IN_GENERAL");
+        return !env || env[0] != '0';
+    }();
+    if (depth_read_in_general && depth_feedback.read_only) {
+        depth_feedback = {};
+        targets.depth_read_only = true;
+    }
     // NEO-GTS-511: the pixel shader's positions table (the draw's own positions, as given to
     // Vulkan) replaces PA_SC_AA_MASK in the push constants: such a pipeline has no AA mask and
     // no hull shader (vk_pipeline_cache.cpp). Before any push of the bindings below.

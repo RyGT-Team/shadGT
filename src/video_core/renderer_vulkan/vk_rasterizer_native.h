@@ -252,6 +252,7 @@ private:
         std::array<vk::Format, 8> color_formats{};
         std::array<DrawnRange, 8> color_ranges{}; ///< FIX-208
         const Native::ImageEntry* depth = nullptr;
+        bool depth_read_only = false; ///< PERF-SGT-167: the draw tests and samples the depth, writes none
     };
 
     struct WritebackPlan;

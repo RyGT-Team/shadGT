@@ -2298,6 +2298,10 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer)
     : r{rasterizer}, in_place_storage_writes{InPlaceStorageWritesRequested()} {
     const char* dedup = std::getenv("SHADGT_DEDUP_DOWNLOAD_PAGES"); // PERF-SGT-231
     dedup_download_pages = dedup && dedup[0] == '1' && dedup[1] == '\0';
+    if (const char* value = std::getenv("SHADGT_COPY_LITERAL_SAMPLERS")) { // PERF-SGT-232
+        copy_literal_samplers = value[0] == '1' && value[1] == '\0';
+        LOG_INFO(Render_Vulkan, "Literal sampler copies {}", copy_literal_samplers);
+    }
     DecideGtsCpuWritebackNow(); // FIX-GTS-529: before the game sets up its save memory
     SnapshotLease::BackingProtocol::Initialize(r.instance.GetVendorID());
     sampler_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
@@ -3442,6 +3446,19 @@ u64 MemoHash(const u64* words, size_t count, u64 seed) {
     h *= 0xC4CEB9FE1A85EC53ULL;
     return h ^ (h >> 29);
 }
+static AmdGpu::Sampler ReadBindingSampler(const Shader::SamplerResource& resource,
+                                          const Shader::Info& stage, bool copy_literals) {
+    const auto& fetch = resource.sharp_fetch;
+    using Summary = Shader::SharpFetch<AmdGpu::Sampler>::Summary;
+    if (copy_literals && fetch.summary == Summary::MultiLoad && fetch.load_mask == 0 &&
+        resource.post_op == Shader::SharpFetchPostOp::None && !resource.is_cube) {
+        AmdGpu::Sampler result;
+        std::memcpy(&result, fetch.immediates.data(), sizeof(result));
+        return result;
+    }
+    return resource.GetSharp(stage);
+}
+
 } // namespace
 
 // DLSS-GT7-002: the bias temporal DLSS adds to a guest sampler (ryty_upscale.h), zero for those
@@ -13172,7 +13189,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         add_write();
     }
     for (const auto& sampler : stage.samplers) {
-        auto ssharp = sampler.GetSharp(stage);
+        auto ssharp = ReadBindingSampler(sampler, stage, copy_literal_samplers);
         if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
                                 regs.ta_bc_base.Address() == 0)) {
             ssharp = AmdGpu::Sampler{};
@@ -21936,7 +21953,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
         add_write();
     }
     for (const auto& sampler : stage.samplers) {
-        auto ssharp = sampler.GetSharp(stage);
+        auto ssharp = ReadBindingSampler(sampler, stage, copy_literal_samplers);
         if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
                                 regs.ta_bc_base.Address() == 0)) {
             ssharp = AmdGpu::Sampler{};

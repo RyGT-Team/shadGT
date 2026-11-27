@@ -2333,6 +2333,7 @@ private:
 #else
     std::chrono::steady_clock::time_point last_report{};
 #endif
+    bool copy_literal_samplers = false;
 };
 
 } // namespace Vulkan

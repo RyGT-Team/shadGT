@@ -187,9 +187,12 @@ void main() {
             }
         }
         if (!shown && overlay) {
-            // FEAT-SGT-201: outside the 16:9 band the overlay's plain dimming (from the top-centre
-            // spot checked above), so the whole screen dims as at 16:9.
-            hud_uv = vec2(0.5, 0.03);
+            // FEAT-SGT-201: outside the 16:9 band the overlay's nearest edge pixel, so the pause
+            // menu's dimming (or the pre-race header and panel) reaches the screen's edges as at 16:9.
+            const vec2 half_texel = 0.5 / vec2(textureSize(hudBlack, 0));
+            hud_uv = clamp(vec2((uv.x - pp.hud_x0) / (pp.hud_x1 - pp.hud_x0),
+                                (uv.y - pp.hud_y0) / (pp.hud_y1 - pp.hud_y0)),
+                           half_texel, 1.0 - half_texel);
             shown = true;
         }
         if (shown) {

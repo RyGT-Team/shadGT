@@ -136,6 +136,7 @@ public:
     // Sticky: a later CPU write does not replace untouched GPU-owned bytes.
     std::atomic<bool> gpu_backing_written{false};
     bool from_cpu = false; ///< texture data the CPU wrote; render targets are GPU-only
+    std::atomic<bool> possible_depth_twin{true};
     std::atomic<bool> needs_upload{false};
     /// PERF-GTS-384: the frame of its last upload (see ImageRegistry::UploadDue).
     std::atomic<u64> upload_frame{UINT64_MAX};

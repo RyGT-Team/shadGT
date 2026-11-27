@@ -640,6 +640,22 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                 superseded.push_back({info.guest_address, &old, frame});
             }
         }
+        static const bool depth_twin_hint = [] {
+            const char* value = std::getenv("SHADGT_DEPTH_TWIN_HINT"); // PERF-SGT-216
+            return value && value[0] == '1' && value[1] == '\0';
+        }();
+        if (depth_twin_hint && render_target) {
+            bool possible = false;
+            for (auto it = first; it != last; ++it) {
+                auto& other = *it->second;
+                if (!other.from_cpu && other.info.props.is_depth != info.props.is_depth &&
+                    other.info.size.width == info.size.width && other.info.size.height == info.size.height) {
+                    other.possible_depth_twin.store(true, std::memory_order_release);
+                    possible = true;
+                }
+            }
+            result->possible_depth_twin.store(possible, std::memory_order_relaxed);
+        }
         shard.images.emplace(info.guest_address, std::move(entry));
         IndexEntry(*result);
         const std::pair<VAddr, VAddr> range{info.guest_address,

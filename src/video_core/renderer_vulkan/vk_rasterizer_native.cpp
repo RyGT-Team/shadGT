@@ -15628,7 +15628,8 @@ void NativeRenderer::SyncDepthTwin(Native::ImageEntry& entry) {
     const auto& info = entry.info;
     if (!on || entry.from_cpu || !entry.image || info.num_samples != 1 ||
         info.props.has_stencil ||
-        (!info.props.is_depth && !LiverpoolToVK::IsFormatDepthCompatible(info.pixel_format))) {
+        (!info.props.is_depth && !LiverpoolToVK::IsFormatDepthCompatible(info.pixel_format)) ||
+        !entry.possible_depth_twin.load(std::memory_order_acquire)) {
         return;
     }
     Native::ImageEntry* twin =

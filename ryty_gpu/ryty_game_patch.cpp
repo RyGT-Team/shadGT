@@ -2530,7 +2530,8 @@ bool RytyWideScene() {
 // race picture fills the screen (its camera at the screen's shape, GTS-009 and WIDE-002/004),
 // while the menus and the race HUD keep their 16:9 shape between bands at the top and bottom
 // (UiHires::UiRect centres the game's picture both ways). The scene stays allocated at 16:9
-// (wide_scene_alloc is ignored), and the HUD is not spread (WIDE-005 moves pieces sideways).
+// (wide_scene_alloc is ignored); the race HUD's pieces go to the top and bottom edges
+// (FEAT-SGT-209, RytyHudSpread) instead of the sides.
 // The game keeps its vertical field of view, so the race view loses a little at the sides.
 // Not GT7 (its taller screens go through its own path). RYGT_TALL_SCREEN=0 keeps GTS-009's
 // stretched picture. Decided once; WIDE-001's own switches (SHADGT_WIDE_SCENE, GPU.wide_scene,
@@ -2560,11 +2561,16 @@ bool RytyWideViews() {
 
 // WIDE-005: the race HUD's left and right parts moved out to the screen's edges.
 // GPU.wide_hud_spread=false or SHADGT_WIDE_HUD_SPREAD=0 keeps the HUD 16:9 in the middle.
+// FEAT-SGT-209: on a taller screen its top pieces move up to the top edge and its bottom row down
+// to the bottom edge instead (HudTall); RYGT_TALL_HUD_EDGES=0 keeps it whole in the middle band
+// there (FEAT-SGT-203's HUD), as the two switches above also do.
 bool RytyHudSpread() {
     static const bool spread = [] {
-        // FEAT-SGT-203: on a taller screen the pieces would not move (no sides), so the HUD is
-        // drawn whole, 16:9, in the middle band.
-        if (!RytyWideScene() || RytyTallScreen()) return false;
+        if (!RytyWideScene()) return false;
+        if (const char* tall = std::getenv("RYGT_TALL_HUD_EDGES");
+            RytyTallScreen() && tall && tall[0] == '0') {
+            return false;
+        }
         if (const char* env = std::getenv("SHADGT_WIDE_HUD_SPREAD")) return env[0] == '1';
         return ConfigFlag("wide_hud_spread", true);
     }();

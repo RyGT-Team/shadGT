@@ -30,6 +30,7 @@
 #include "ryty_gpu/ryty_dlss_layout.h"
 #include "ryty_gpu/ryty_pro_mode.h"
 #include "ryty_gpu/ryty_hdr_ui.h"
+#include "video_core/renderer_vulkan/hud_tall_layout.h"
 #include "video_core/renderer_vulkan/ui_fit_policy.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -417,6 +418,29 @@ inline std::vector<vk::ImageBlit2> FromProxySpread(const Proxy& proxy, vk::Exten
     }
     const vk::Rect2D rect = UiRect(proxy);
     const float w = float(rect.extent.width), h = float(rect.extent.height);
+    if (Tall()) {
+        // FEAT-SGT-209: each part of the HUD from where its pieces were moved up or down.
+        for (const auto& region : HudTall::Regions) {
+            const s32 dy = region.move * rect.offset.y;
+            const s32 x0 = s32(std::lround(region.u0 * w)), x1 = s32(std::lround(region.u1 * w));
+            const s32 y0 = s32(std::lround(region.v0 * h)), y1 = s32(std::lround(region.v1 * h));
+            const s32 dx0 = s32(std::lround(region.u0 * to.width));
+            const s32 dx1 = s32(std::lround(region.u1 * to.width));
+            const s32 dy0 = s32(std::lround(region.v0 * to.height));
+            const s32 dy1 = s32(std::lround(region.v1 * to.height));
+            if (x1 <= x0 || y1 <= y0 || dx1 <= dx0 || dy1 <= dy0) {
+                continue;
+            }
+            regions.push_back(vk::ImageBlit2{
+                .srcSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 1},
+                .srcOffsets = std::array{vk::Offset3D{rect.offset.x + x0, rect.offset.y + y0 + dy, 0},
+                                         vk::Offset3D{rect.offset.x + x1, rect.offset.y + y1 + dy, 1}},
+                .dstSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 1},
+                .dstOffsets = std::array{vk::Offset3D{dx0, dy0, 0}, vk::Offset3D{dx1, dy1, 1}},
+            });
+        }
+        return regions;
+    }
     for (const auto& piece : HudPieces) {
         const s32 dx = piece.side * rect.offset.x;
         const s32 sx0 = rect.offset.x + s32(std::lround(piece.u0 * w)) + dx;

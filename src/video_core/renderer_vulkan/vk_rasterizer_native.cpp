@@ -161,6 +161,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/hud_tall_layout.h"
 #include "video_core/renderer_vulkan/vk_native_ui.h"
 #include "shader_recompiler/direct_learning.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -755,6 +756,21 @@ constexpr std::array<Zone, kZones> Zones = [] {
     }
     return zones;
 }();
+// FEAT-SGT-209: on a screen taller than 16:9 the zones are HudTall's regions (three columns, each
+// with its top pieces, the middle band and the bottom row); `move` is then vertical: -1 up to the
+// top edge, 1 down to the bottom edge.
+constexpr std::array<Zone, kZones> TallZones = [] {
+    std::array<Zone, kZones> zones{};
+    static_assert(HudTall::Regions.size() == kZones);
+    for (u32 z = 0; z < kZones; ++z) {
+        const auto& r = HudTall::Regions[z];
+        zones[z] = Zone{r.u0, r.v0, r.u1, r.v1, r.column, r.move, r.middle_band};
+    }
+    return zones;
+}();
+const std::array<Zone, kZones>& ActiveZones() {
+    return UiHires::Tall() ? TallZones : Zones;
+}
 struct Verdict {
     Place place = Place::Split;
     u32 equals = 0; // draws with the same key in the measured frame
@@ -821,8 +837,9 @@ void Apply(vk::Device device, State& st, Slot& slot) {
                 ok = false;
                 break;
             }
-            side[Zones[z].side + 1] += q[0];
-            band += Zones[z].middle_band ? q[0] : 0;
+            const auto& zone = ActiveZones()[z]; // FEAT-SGT-209: the tall zones there
+            side[zone.side + 1] += q[0];
+            band += zone.middle_band ? q[0] : 0;
             total += q[0];
         }
         if (!ok || total == 0) {
@@ -833,7 +850,13 @@ void Apply(vk::Device device, State& st, Slot& slot) {
         Place place = Place::Split;
         if (l && m && r && double(total) >= 0.85 * st.hud_area) {
             place = Place::Fill;
-        } else if (l && r && band * 100 <= total && double(total) >= 0.04 * st.hud_area) {
+        } else if (!UiHires::Tall() && l && r && band * 100 <= total &&
+                   double(total) >= 0.04 * st.hud_area) {
+            // FEAT-SGT-209: not on a taller screen, whose regions' middle band is not 20..80% of
+            // the height (the lap timer is in a top region there): a draw with only the timer
+            // in the middle would come out a bar and not be drawn. There a draw across the whole
+            // width is cut into the regions like any other (the pit stop's black bars go to the
+            // top and bottom edges); bars told by their scissor are still left out.
             place = Place::Bar;
         }
         if (place != Place::Split) {
@@ -19346,6 +19369,10 @@ void NativeRenderer::RecordDraw(bool is_indexed, u32 index_offset, const Indirec
                 WideHud::Place place = WideHud::Place::Split;
                 u64 key = 0, id = 0;
                 float item_y0 = -1.0f; // WIDE-055: top of an element placed on its own
+                // FEAT-SGT-209: on a taller screen, where an element placed on its own goes up or
+                // down (HudTall::Move of its box); 0 for the others.
+                s32 tall_move = 0;
+                const bool tall = UiHires::Tall();
                 // WIDE-010: from the geometry where it can be read (the scissor still clips it).
                 std::optional<std::array<float, 4>> bounds;
                 if (fx1 > fx0 && fy1 > fy0) {
@@ -19356,6 +19383,9 @@ void NativeRenderer::RecordDraw(bool is_indexed, u32 index_offset, const Indirec
                     const float bx0 = std::max(u0, fx0), bx1 = std::min(u1, fx1);
                     const float by0 = std::max(v0, fy0), by1 = std::min(v1, fy1);
                     item_y0 = by0;
+                    if (tall && bx1 > bx0 && by1 > by0) {
+                        tall_move = HudTall::Move(bx0, bx1, by0, by1, 0.025f);
+                    }
                     if (bx1 <= bx0 || by1 <= by0) {
                         place = WideHud::Place::Middle; // off the HUD: as the game drew it
                     } else if (bx0 <= 0.01f && bx1 >= 0.99f && by0 <= 0.01f && by1 >= 0.99f) {
@@ -19368,6 +19398,9 @@ void NativeRenderer::RecordDraw(bool is_indexed, u32 index_offset, const Indirec
                     item_y0 = fy0;
                     place = fx1 > fx0 && fy1 > fy0 ? WideHud::FromScissor(fx0, fx1, fy0, fy1)
                                                    : WideHud::Place::Bar; // outside the HUD
+                    if (tall && fx1 > fx0 && fy1 > fy0) {
+                        tall_move = HudTall::Move(fx0, fx1, fy0, fy1);
+                    }
                 } else if (fs && IsSceneCompositionShader(fs->pgm_hash)) {
                     // WIDE-038: a 3D scene composed in the HUD's pass (the results screen's driver)
                     // covers the whole screen: always a fill, so what is drawn over it stays whole.
@@ -19402,13 +19435,19 @@ void NativeRenderer::RecordDraw(bool is_indexed, u32 index_offset, const Indirec
                     place = WideHud::Place::Middle;
                 }
                 ++hud.counts[u32(place)];
-                const s32 shift = hud_rect.offset.x;
+                // FEAT-SGT-209: on a taller screen nothing moves sideways (no sides); the top
+                // pieces move up and the bottom row down by the band's height instead.
+                const s32 shift = tall ? 0 : hud_rect.offset.x;
+                const s32 lift = tall ? hud_rect.offset.y : 0;
                 if (place == WideHud::Place::Left || place == WideHud::Place::Middle ||
                     place == WideHud::Place::Right) {
                     // Whole, on its side (clipped to the HUD as before).
                     const s32 dx = place == WideHud::Place::Left    ? -shift
                                  : place == WideHud::Place::Right ? shift
                                                                    : 0;
+                    // What is drawn over a whole-screen darkening stays where the game drew it.
+                    const s32 dy = place == WideHud::Place::Middle && hud.overlay ? 0
+                                                                                  : tall_move * lift;
                     auto vps = viewports;
                     auto scs = scissors;
                     bool any = false;
@@ -19424,9 +19463,10 @@ void NativeRenderer::RecordDraw(bool is_indexed, u32 index_offset, const Indirec
                             continue;
                         }
                         any = true;
-                        scs[i] = vk::Rect2D{{std::max<s32>(x0 + dx, 0), y0},
+                        scs[i] = vk::Rect2D{{std::max<s32>(x0 + dx, 0), std::max<s32>(y0 + dy, 0)},
                                             {u32(x1 - x0), u32(y1 - y0)}};
                         vps[i].x += float(dx);
+                        vps[i].y += float(dy);
                     }
                     if (any) {
                         s.cmd.setViewportWithCount(vk::ArrayProxy<const vk::Viewport>(u32(vps.size()), vps.data()));
@@ -19476,7 +19516,18 @@ void NativeRenderer::RecordDraw(bool is_indexed, u32 index_offset, const Indirec
                     } else {
                     auto vps = viewports;
                     auto scs = scissors;
+                    // FEAT-SGT-209: on a taller screen, the HUD's height stretched to the
+                    // output's instead (the pause menu's darkening covers the bands too).
+                    const float kh = float(2 * hud_rect.offset.y + s32(hud_rect.extent.height)) / h;
                     for (size_t i = 0; i < scs.size(); ++i) {
+                        if (tall) {
+                            vps[i].y = (vps[i].y - hy) * kh;
+                            vps[i].height *= kh;
+                            scs[i] = vk::Rect2D{{scs[i].offset.x, 0},
+                                                {scs[i].extent.width,
+                                                 u32(2 * hud_rect.offset.y) + hud_rect.extent.height}};
+                            continue;
+                        }
                         vps[i].x = (vps[i].x - hx) * k;
                         vps[i].width *= k;
                         if (even) {
@@ -19501,13 +19552,15 @@ void NativeRenderer::RecordDraw(bool is_indexed, u32 index_offset, const Indirec
                         slot.keys.push_back(key);
                         slot.issued.push_back(0);
                     }
+                    const auto& zones = WideHud::ActiveZones(); // FEAT-SGT-209: tall ones there
                     for (u32 z = 0; z < WideHud::kZones; ++z) {
-                        const auto& zone = WideHud::Zones[z];
+                        const auto& zone = zones[z];
                         const s32 px0 = hud_rect.offset.x + s32(std::lround(zone.u0 * w));
                         const s32 px1 = hud_rect.offset.x + s32(std::lround(zone.u1 * w));
                         const s32 py0 = hud_rect.offset.y + s32(std::lround(zone.v0 * h));
                         const s32 py1 = hud_rect.offset.y + s32(std::lround(zone.v1 * h));
                         const s32 dx = zone.move * shift;
+                        const s32 dy = zone.move * lift;
                         auto vps = viewports;
                         auto scs = scissors;
                         bool any = false;
@@ -19523,9 +19576,10 @@ void NativeRenderer::RecordDraw(bool is_indexed, u32 index_offset, const Indirec
                                 continue;
                             }
                             any = true;
-                            scs[i] = vk::Rect2D{{std::max<s32>(x0 + dx, 0), y0},
+                            scs[i] = vk::Rect2D{{std::max<s32>(x0 + dx, 0), std::max<s32>(y0 + dy, 0)},
                                                 {u32(x1 - x0), u32(y1 - y0)}};
                             vps[i].x += float(dx);
+                            vps[i].y += float(dy);
                         }
                         if (!any) {
                             continue;

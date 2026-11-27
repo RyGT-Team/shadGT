@@ -195,6 +195,8 @@ public:
     static bool PrepareEnabled();
     /// Whether the prepared draws are used (the recorder takes them, the command thread trusts them).
     static bool PreparedOn();
+    static bool NeedStageBindingEnd();
+    const bool need_stage_binding_end = NeedStageBindingEnd();
     /// PERF-GT7-010 (on by default, PERF-419-GTS): whether the native threads run above normal priority.
     static bool BoostOn();
     /// PERF-GT7-013..016 (SHADGT_NATIVE_NEXT=1, A/B mode C): the draw path's next changes under test.

@@ -1842,6 +1842,11 @@ bool NativeRenderer::RingOn() {
     return g_ring_on.load(std::memory_order_relaxed);
 }
 
+bool NativeRenderer::NeedStageBindingEnd() {
+    const char* value = std::getenv("SHADGT_SKIP_UNUSED_STAGE_END"); // PERF-SGT-214
+    return !value || std::strcmp(value, "1") != 0;
+}
+
 bool NativeRenderer::PreparedOn() {
     return PrepareEnabled();
 }
@@ -10421,7 +10426,6 @@ void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
         }
     }
     b.writes.reserve(total);
-    Shader::Backend::Bindings binding{};
     std::array<StageResourceBindings, Shader::MaxStageTypes> plans{};
     for (u32 i = 0; i < stages.size(); ++i) {
         const auto* stage = stages[i];
@@ -10429,13 +10433,12 @@ void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
             continue;
         }
         // SHD-002: each stage binds in its own set, from its own start.
-        plans[i] = PlanStageResourceBindings(*stage,
-                                             Shader::Backend::StageStart(u32(stage->sw_stage)));
+        plans[i] = PlanStageResourceBindings(*stage, Shader::Backend::StageStart(u32(stage->sw_stage)),
+                                             need_stage_binding_end);
         auto buffer_binding = plans[i].buffers;
         PhaseClock clock{stats.phase_ns[2]};
         PartClock part{compute ? &stats.dispatch_bind_ns[1] : nullptr}; // DIAG-GT7-004
         BindBuffers(*stage, regs, compute, buffer_binding, b);
-        binding = plans[i].next;
     }
     for (u32 i = 0; i < stages.size(); ++i) {
         if (const auto* stage = stages[i]) {
@@ -20960,8 +20963,8 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
         if (!stage) {
             continue;
         }
-        plans[i] = PlanStageResourceBindings(*stage,
-                                             Shader::Backend::StageStart(u32(stage->sw_stage)));
+        plans[i] = PlanStageResourceBindings(*stage, Shader::Backend::StageStart(u32(stage->sw_stage)),
+                                             need_stage_binding_end);
         auto buffer_binding = plans[i].buffers;
         ok = PrepareBuffers(*stage, regs, buffer_binding, *p);
     }

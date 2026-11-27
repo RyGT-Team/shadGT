@@ -805,6 +805,15 @@ void Ryty::RytyLibraryInitialize() {
         g_renderer_ready = true;
     }
     g_window_cv.notify_all();
+    // FIX-SGT-134: the game's first call into the renderer (and any other, behind the library's
+    // initialization) returns once the splash precompile is done. The window, the splash screen
+    // and the precompile run on their own threads meanwhile.
+    const auto gate_start = std::chrono::steady_clock::now();
+    if (Common::GuestClock::WaitStartGate(std::chrono::seconds{900})) {
+        LOG_WARNING(Lib_GnmDriver, "FIX-SGT-134: the game goes on after the splash precompile ({:.1f} s at "
+                    "the start gate)",
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - gate_start).count());
+    }
 }
 
 // Ryty's libkernel maps and unmaps guest memory, so it reports those changes here; shadGT's own

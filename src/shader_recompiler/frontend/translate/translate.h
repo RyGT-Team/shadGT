@@ -68,6 +68,8 @@ public:
     void Translate(IR::Block* block, u32 pc, IR::Condition cond,
                    std::span<const GcnInst> inst_list);
     void TranslateInstruction(const GcnInst& inst);
+    /// PERF-SGT-151: the attributes the program reads with V_INTERP_MOV_F32, before translating.
+    void NoteInterpMovs(std::span<const GcnInst> program);
 
     // Instruction categories
     void EmitPrologue(IR::Block* first_block);
@@ -397,6 +399,8 @@ private:
     u32 next_vgpr_num;
     std::unordered_map<u32, IR::VectorReg> vgpr_map;
     std::array<IR::Attribute, MaxInterpVgpr> vgpr_to_interp{};
+    u64 interp_mov_attrs{}; ///< PERF-SGT-151: bit n: attribute n is read with V_INTERP_MOV_F32
+    bool ManualInterpolation(u32 attr_index) const;
     FetchShaderData fetch_data{};
     bool opcode_missing = false;
     u32 pc{};

@@ -50,13 +50,39 @@ void Translator::EmitVectorInterpolation(const GcnInst& inst) {
     }
 }
 
+// PERF-SGT-151: on AMD's explicit vertex path (AMD-315, RX 6000 and older) a V_INTERP_MOV makes
+// its whole attribute per-vertex, so P1/P2 reads of that attribute must be done by hand. Other
+// attributes keep the hardware's interpolation: doing them all by hand cost 8% of a GT7 frame on
+// a Radeon 610M (27 vertex reads in one pixel shader). The KHR barycentric path (NVIDIA, the
+// single-sample barycentric fix) and RX 7000/9000 (FIX-SGT-145, cause not known there) keep every
+// attribute by hand (Profile::manual_interp_mov_only). SHADGT_MANUAL_INTERP_ALL=1: every
+// attribute by hand on AMD too, as before (part of the shader store key).
+void Translator::NoteInterpMovs(std::span<const GcnInst> program) {
+    interp_mov_attrs = 0;
+    for (const GcnInst& inst : program) {
+        if (inst.opcode == Opcode::V_INTERP_MOV_F32 && inst.control.vintrp.attr < 64) {
+            interp_mov_attrs |= u64{1} << inst.control.vintrp.attr;
+        }
+    }
+}
+
+bool Translator::ManualInterpolation(u32 attr_index) const {
+    if (!profile.needs_manual_interpolation) {
+        return false;
+    }
+    if (!profile.manual_interp_mov_only || !profile.supports_amd_shader_explicit_vertex_parameter) {
+        return true;
+    }
+    return attr_index < 64 && (interp_mov_attrs >> attr_index & 1) != 0;
+}
+
 // VINTRP
 
 void Translator::V_INTERP_P1_F32(const GcnInst& inst) {
-    if (!profile.needs_manual_interpolation) {
+    const u32 attr_index = inst.control.vintrp.attr;
+    if (!ManualInterpolation(attr_index)) {
         return;
     }
-    const u32 attr_index = inst.control.vintrp.attr;
     const auto& attr = runtime_info.hw.fs.inputs[attr_index];
     if (attr.IsDefault()) {
         return;
@@ -81,7 +107,7 @@ void Translator::V_INTERP_P2_F32(const GcnInst& inst) {
         return;
     }
     ASSERT(!attr.is_flat);
-    if (!profile.needs_manual_interpolation) {
+    if (!ManualInterpolation(attr_index)) {
         interp = GetInterpolation(vgpr_to_interp[inst.src[0].code]);
         SetDst(inst.dst[0], ir.GetAttribute(attrib, inst.control.vintrp.chan));
         return;
@@ -102,11 +128,18 @@ void Translator::V_INTERP_MOV_F32(const GcnInst& inst) {
     auto& interp = info.fs_interpolation[attr_index];
     const u32 src_select = inst.src[0].code;
     ASSERT_MSG(src_select < 3, "Invalid V_INTERP_MOV_F32 selector {}", src_select);
-    ASSERT(attr.is_flat || src_select == 2 ||
-           profile.supports_amd_shader_explicit_vertex_parameter ||
-           profile.supports_fragment_shader_barycentric);
-    if (profile.supports_amd_shader_explicit_vertex_parameter ||
-        profile.supports_fragment_shader_barycentric) {
+    const bool per_vertex = profile.supports_amd_shader_explicit_vertex_parameter ||
+                            profile.supports_fragment_shader_barycentric;
+    if (!per_vertex && !attr.is_flat && src_select != 2) {
+        // FIX-SGT-190 (RyGT #124): without either extension (Intel Arc on Windows) a shader
+        // cannot read one vertex's attribute, so the P10/P20 deltas are taken as 0. A shader
+        // that interpolates by hand (P0 + i * P10 + j * P20) then gets the flat P0 value.
+        // This used to be an assertion: the shader failed to translate, its draws were skipped
+        // and it was translated again on every draw (175 GT7 shaders, 3 fps at the menus).
+        SetDst(inst.dst[0], ir.Imm32(0.f));
+        return;
+    }
+    if (per_vertex) {
         // VSRC 0=P10, 1=P20, 2=P0
         interp.primary = Qualifier::PerVertex;
         IR::F32 result = ir.GetAttribute(attrib, inst.control.vintrp.chan, (src_select + 1) % 3);

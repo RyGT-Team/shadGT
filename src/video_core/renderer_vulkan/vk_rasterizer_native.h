@@ -103,6 +103,7 @@ template <class Buffer> class AsyncMirrorBuffer;
 
 class Rasterizer;
 struct GtsSceneImage;
+struct GtsSceneBinding;
 class GraphicsPipeline;
 class ComputePipeline;
 
@@ -125,7 +126,8 @@ public:
         u16 instance_sgpr_offset = 0; ///< where it writes the first instance (0: nowhere)
     };
     /// `indirect` (NAT-161): the draw's counts and offsets are its arguments in memory.
-    void Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect = nullptr);
+    void Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect = nullptr,
+              bool world_hud = false);
     void DispatchDirect();
     void DispatchIndirect(VAddr address, u32 offset, u32 size);
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
@@ -175,6 +177,7 @@ public:
         vk::ImageView hud_white{};
         /// GT7-UW: the frame's HUD is a race's (its moved pieces apply; not to menus).
         bool hud_race = false;
+        bool center_menu = false;
         /// DLSS-GT7-001: the frame's depth, motion vectors and jitter, when the game's temporal
         /// anti-aliasing pass was seen in it (RYGT_DLSS_TEMPORAL=1).
         std::optional<RytyUpscale::TemporalInputs> temporal;
@@ -589,8 +592,11 @@ private:
     void ChunkFlushCheck();
 
     /// Upload memory of the stream's list: (buffer, offset, CPU pointer).
-    std::tuple<vk::Buffer, u64, u8*> Allocate(u64 size, u64 align, bool* backing_proven = nullptr);
-    Chunk TakeChunk(u64 size);
+    /// FIX-SGT-140: may_fail, a null buffer and pointer when device memory has run out.
+    std::tuple<vk::Buffer, u64, u8*> Allocate(u64 size, u64 align, bool* backing_proven = nullptr,
+                                              bool may_fail = false);
+    Chunk TakeChunk(u64 size, bool may_fail = false);
+    bool RelieveDeviceMemory(); // FIX-SGT-140
     void TrimIdleChunks();
     vk::DescriptorBufferInfo UploadFlatData(u32 stage, const u8* source, u32 size, bool* backing_proven = nullptr);
     vk::DescriptorPool TakeDescriptorPool();
@@ -1144,9 +1150,11 @@ private:
     GtsSceneImage TemporalImage(const Native::ImageEntry& entry);
     void CaptureNativeFsr(const GraphicsPipeline& pipeline, const Targets& targets,
                           const DrawBindings& bindings);
-    bool BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& targets,
-                        const DrawBindings& bindings);
-    void FinishNativeFsr(const Targets& targets);
+    bool BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& targets, DrawBindings& bindings,
+                        GtsSceneBinding& scene_binding);
+    bool FinishNativeFsr(const Targets& targets);
+    void RecordDraw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect, bool world_hud,
+                    bool& use_game_taa);
     struct FsrComposition;
     std::unique_ptr<FsrComposition> fsr_composition;
     u64 fsr_display_frame = ~u64{};
@@ -1988,6 +1996,7 @@ private:
     const RecordContext& Ctx() const {
         return main_record_context;
     }
+    bool center_wide_menu = false;
     u64 frame = 0;
     u64 timing_tick = 0; ///< OPT-001
     u64 ui_draws = 0;
@@ -2025,6 +2034,8 @@ private:
     }
 
     std::mutex chunk_mutex;
+    /// FIX-SGT-140: the frame RelieveDeviceMemory last waited in.
+    std::atomic<u64> oom_relief_frame{~u64{0}};
     std::vector<Chunk> free_chunks;
     size_t free_chunks_low = 0; // FIX-GT7-046: the fewest free since the last trim
     Native::RetiredSnapshotPool<Native::Rhi::Buffer> snapshot_pool;

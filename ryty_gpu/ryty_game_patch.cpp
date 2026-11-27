@@ -9,6 +9,9 @@
 // experiments (RVA in GTSport.exe: eboot.bin address + 0x10000).
 
 #include "common/game_title.h"
+#include "ryty_gpu/ryty_pro_mode.h"
+#include "common/scope_exit.h"
+#include "ryty_gpu/gt7_car_sign.h"
 #include <cstdio>
 #include <array>
 #include <algorithm>
@@ -34,6 +37,7 @@
 #include <vector>
 #include <windows.h>
 #include <fmt/format.h>
+#include <xbyak/xbyak.h>
 #include <nlohmann/json.hpp>
 
 #include "common/diagnostics.h"
@@ -53,6 +57,7 @@
 #include "common/thread.h"
 #include "ryty_gpu/prepare_tour.h"
 #include "video_core/renderer_vulkan/shader_capture.h"
+#include "ryty_gpu/ryty_dlss_layout.h"
 #include "core/file_format/psf.h"
 #include "common/ryty_param_sfo.h"
 #include "ryty_gpu/gt7_preset_options.h"
@@ -2606,6 +2611,7 @@ constexpr u8 kGt7OrgRaceStart[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x5
                                    0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x18};
 using OrgRaceFn = void(PS4_SYSV_ABI*)(void*);
 OrgRaceFn g_gt7_org_race = nullptr;
+std::atomic<bool> g_gt7_race_hook_installed{false};
 std::atomic<u64> g_gt7_org_race_ms{0};
 
 // GAME-006: the race runs, from its start countdown (3-2-1, or a rolling start's start) to its
@@ -2822,6 +2828,7 @@ void InstallGt7RaceSignal(u8* base) {
     DWORD ignored = 0;
     VirtualProtect(entry, kMoved, old_protect, &ignored);
     FlushInstructionCache(GetCurrentProcess(), entry, kMoved);
+    g_gt7_race_hook_installed.store(true, std::memory_order_relaxed);
     // The flag falls when the module stops running.
     std::thread([] {
         for (;;) {
@@ -3443,6 +3450,13 @@ bool RytyHudSpread() {
 RytySceneExtent RytySceneSize() {
     static const RytySceneExtent size = [] {
         RytySceneExtent result{};
+        // FEAT-GT7-194: GT7 keeps its 1080p targets and scales its own scene viewports
+        // (InstallGt7SceneScale), so no target here is the scene's size.
+        if (Common::IsGt7()) {
+            return result;
+        }
+        const auto& dlss = RytyUpscale::DlssLayout();
+        if (dlss.Wide() && RytyWideScene()) return RytySceneExtent{dlss.scene.width, dlss.scene.height};
         const char* viewport = std::getenv("SHADGT_EXPERIMENTAL_SCENE_VIEWPORT");
         if (viewport && std::strcmp(viewport, "1") == 0) {
             const char* w = std::getenv("SHADGT_SCENE_WIDTH");
@@ -4214,7 +4228,84 @@ void InstallSceneHistoryOrigins(u8* base) {
     if (!Apply(base, {y_rva, {original_y.begin(),original_y.end()}, y, "scene history Y origin"}))
         Apply(base, {x_rva, x, {original_x.begin(),original_x.end()}, "restore history X origin"});
 }
+// FEAT-GT7-194: GT7's scene render scale. GT7 has its own: a render settings object made once
+// (exe 0x27a2990, kept at 0x6415300) whose float at +0x28 (1.0, never changed by the game) the
+// scene passes read (exe 0x1eef329, 0x20aad4f, 0x371a6e9) and hand to the scene viewport setup
+// (0x27128c0, GT Sport's 0x18d2cb0 with more arguments) as its X and Y scale. The scene is then
+// drawn into that part of the 1080p targets and the game's own passes (TAA, history, the
+// composition) read it from there, so the targets keep their size and nothing else is patched.
+// One scale for both axes: SHADGT_SCENE_HEIGHT / 1080 (the width must be 16:9 of it).
+namespace Gt7SceneScale {
+constexpr u64 kSettingsMake = 0x27a2990; // exe RVA
+constexpr u64 kSettingsSlot = 0x6415300; // exe RVA of the pointer the maker stores
+constexpr u8 kMakePrologue[]{0x55, 0x48, 0x89, 0xe5, 0x53, 0x50}; // push rbp; mov rbp,rsp; push rbx; push rax
+constexpr u8 kMakeStore[]{0x48, 0x89, 0x1d, 0x37, 0x29, 0xc7, 0x03}; // 0x27a29c2: mov [rip+..], rbx
+constexpr u8 kScaleRead[]{0xc5, 0xfa, 0x10, 0x40, 0x28};                // vmovss xmm0, [rax+0x28]
+using MakeFn = void(PS4_SYSV_ABI*)();
+MakeFn g_make{};
+u8* g_base{};
+float g_scale = 1.0f;
+
+void PS4_SYSV_ABI Make() {
+    g_make();
+    u64 settings{};
+    if (Core::RytyMemory::GuardedCopy(&settings, g_base + kSettingsSlot, sizeof(settings)) &&
+        settings) {
+        float original{};
+        auto* field = reinterpret_cast<float*>(settings + 0x28);
+        if (Core::RytyMemory::GuardedCopy(&original, field, sizeof(original)) && original == 1.0f) {
+            *field = g_scale;
+            std::fprintf(stderr, "[patch] FEAT-GT7-194 scene render scale %.4f set\n", g_scale);
+            return;
+        }
+        std::fprintf(stderr, "[patch] FEAT-GT7-194 scene scale field is %f, not 1; left as it is\n",
+                     original);
+    }
+}
+
+void Install(u8* base) {
+    const char* enabled = std::getenv("SHADGT_EXPERIMENTAL_SCENE_VIEWPORT");
+    if (!enabled || std::strcmp(enabled, "1") != 0) {
+        return;
+    }
+    const char* w = std::getenv("SHADGT_SCENE_WIDTH");
+    const char* h = std::getenv("SHADGT_SCENE_HEIGHT");
+    const u32 width = w ? u32(std::strtoul(w, nullptr, 10)) : 960u;
+    const u32 height = h ? u32(std::strtoul(h, nullptr, 10)) : 540u;
+    if (height < 180 || height >= 1080 || width < 320 || width >= 1920 ||
+        std::abs(s64(width) * 9 - s64(height) * 16) > 16 * 9) {
+        std::fprintf(stderr, "[patch] FEAT-GT7-194: scene %ux%u is not a 16:9 size from 320x180 to "
+                             "below 1920x1080; GT7 renders its scene at 1920x1080\n", width, height);
+        return;
+    }
+    const auto matches = [&](u64 rva, std::span<const u8> expected) {
+        return std::memcmp(base + rva, expected.data(), expected.size()) == 0;
+    };
+    if (!matches(kSettingsMake, kMakePrologue) || !matches(0x27a29c2, kMakeStore) ||
+        !matches(0x1eef329, kScaleRead) || !matches(0x20aad4f, kScaleRead) ||
+        !matches(0x371a6e9, kScaleRead)) {
+        std::fprintf(stderr, "[patch] FEAT-GT7-194: render settings code differs (another GT7 "
+                             "version); scene render scale not applied\n");
+        return;
+    }
+    g_base = base;
+    g_scale = float(height) / 1080.0f;
+    Native::NearCode code{base};
+    g_make = reinterpret_cast<MakeFn>(Native::HookEntry(
+        code, base, kSettingsMake - Native::kEbootToExe, kMakePrologue,
+        reinterpret_cast<void*>(&Make), "FEAT-GT7-194 render settings"));
+    if (g_make) {
+        std::fprintf(stderr, "[patch] FEAT-GT7-194 GT7 scene %ux%u (scale %.4f), output and UI "
+                             "1920x1080\n", u32(std::lround(1920 * g_scale)), height, g_scale);
+    }
+}
+} // namespace Gt7SceneScale
+
 void InstallExperimentalSceneViewport(u8* base) {
+    if (Common::IsGt7()) {
+        Gt7SceneScale::Install(base); // FEAT-GT7-194; GT Sport's sites below are not GT7's
+        return;
+    }
     const char* enabled = std::getenv("SHADGT_EXPERIMENTAL_SCENE_VIEWPORT");
     if ((!enabled || std::strcmp(enabled, "1") != 0) && !Vulkan::RytyWideScene()) return;
     if (Vulkan::RytySceneSize().width == 0) return;
@@ -4226,10 +4317,34 @@ void InstallExperimentalSceneViewport(u8* base) {
         reinterpret_cast<void*>(&MatchExperimentalSceneViewport), "experimental scene viewport scale"));
 }
 
+// GTS 1.69 registers a 1080p display on a Pro 1080p TV, but normally allocates a UHD flip
+// buffer. The True wide viewport uses the 1080p display extent to identify its scene draws.
+// Select the visible dimensions for the flip buffer too. The game selects its Pro effects
+// separately, before this pair of conditional moves.
+static void SetWidePro1080Flip(u8* base) {
+    const char* setting = std::getenv("RYGT_GTS_WIDE_PRO_FLIP");
+    if (Ryty::GetProMode() != Ryty::ProMode::Neo1080 || (setting && setting[0] == '0')) {
+        return;
+    }
+    const std::vector<u8> original{
+        0xb8, 0x00, 0x0f, 0x00, 0x00,       // mov eax, 3840
+        0x41, 0xbf, 0x80, 0x07, 0x00, 0x00, // mov r15d, 1920
+        0x41, 0xbc, 0x38, 0x04, 0x00, 0x00, // mov r12d, 1080
+        0x44, 0x0f, 0x44, 0xf8,             // cmovz r15d, eax
+        0xb8, 0x70, 0x08, 0x00, 0x00,       // mov eax, 2160
+        0x44, 0x0f, 0x44, 0xe0,             // cmovz r12d, eax
+    };
+    auto replacement = original;
+    constexpr u32 width = 1920, height = 1080;
+    std::memcpy(replacement.data() + 1, &width, sizeof(width));
+    std::memcpy(replacement.data() + 22, &height, sizeof(height));
+    Apply(base, Patch{0x1c6dee0, original, replacement, "True wide Pro TV 1080p flip 1920x1080"});
+}
+
 // WIDE-001: the scene allocated at the screen's shape. The same three sites the launcher's scene
 // render scale patches (RenderResolution.cs), from the game's bytes or from the launcher's.
 static void InstallWideSceneAllocation(u8* base) {
-    if (!Vulkan::RytyWideScene() || !ConfigFlag("wide_scene_alloc", true)) {
+    if (!Vulkan::RytyWideScene() || (!Vulkan::RytyUpscale::DlssLayout().Wide() && !ConfigFlag("wide_scene_alloc", true))) {
         return;
     }
     const auto [width, height] = Vulkan::RytySceneSize();
@@ -4278,6 +4393,7 @@ static void InstallWideSceneAllocation(u8* base) {
     }
     if (w->original != w->replacement) Apply(base, *w);
     if (h->original != h->replacement) Apply(base, *h);
+    SetWidePro1080Flip(base);
 }
 
 static void ApplyEnvironmentPatches(u8* base) {
@@ -5197,7 +5313,404 @@ void Install(u8* base) {
 
 } // namespace Gt7RaceContextGuard
 
+namespace Gt7CarSign {
+thread_local bool recording = false;
+using Render = void(PS4_SYSV_ABI*)(void*, void*);
+static Render render_original{};
+
+static void PS4_SYSV_ABI RenderLabel(void* widget, void* context) {
+    [[maybe_unused]] static const int seen = std::fputs("[native] GT7 CarSign: rendering a competitor label\n", stderr);
+    const bool previous = std::exchange(recording, true);
+    SCOPE_EXIT { recording = previous; };
+    render_original(widget, context);
+}
+
+static void Install(u8* base) {
+    const char* enabled = std::getenv("RYGT_ULTRAWIDE_CAR_SIGNS");
+    if (!Common::IsGt7() || (enabled && enabled[0] == '0') ||
+        Vulkan::RytyDisplayAspect() <= 16.0f / 9.0f + 0.01f) {
+        return;
+    }
+
+    // GT7's GTEngine::CarSign implements MENU::IRender3D. Its render method draws
+    // the rank, logo and name together using the race camera's projection.
+    static constexpr std::array<u8, 12> adapter{
+        0x48, 0x81, 0xc7, 0x60, 0xff, 0xff, 0xff, 0xe9, 0xf4, 0xe9, 0xff, 0xff};
+    const auto* thunk = base + 0x371b990;
+    if (!ReadableRange(thunk, adapter.size()) || std::memcmp(thunk, adapter.data(), adapter.size()) != 0) {
+        std::fputs("[native] GT7 CarSign: unrecognized render method\n", stderr);
+        return;
+    }
+    static constexpr std::array<u8, 13> prologue{
+        0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53};
+    static Native::NearCode code{base};
+    render_original = reinterpret_cast<Render>(Native::HookEntry(
+        code, base, 0x370a390, prologue, reinterpret_cast<void*>(&RenderLabel), "GT7 CarSign"));
+}
+} // namespace Gt7CarSign
+
+namespace Gt7NativeMenu {
+// GT7 keeps three flip allocations until shutdown. Their pitch, addresses and allocation
+// size stay fixed. GraphicsConfig rebuilds the scene targets when the logical size changes.
+constexpr u32 scene_size = 0x595f610;
+constexpr u32 first_flip_size = 0x62ef29c;
+constexpr u32 projection_aspect = 0x3f5f510;
+u8* game;
+u32 wide_width, menu_width, height, menu_height, output_width;
+bool dlss_layout;
+bool native_dlaa;
+std::atomic<u32> active_extent{};
+using Configure = void(PS4_SYSV_ABI*)();
+using ApplyConfig = void(PS4_SYSV_ABI*)(void*, int);
+Configure configure_original;
+ApplyConfig apply_original;
+std::mutex configure_lock;
+
+namespace Rewards {
+// GT7RewardRootEvent.setSceneFace loads this stage before drawing the driver.
+// The race organizer can still be active. The widget owns the stage; the script
+// also saves and disables race rendering on opening and restores the same
+// StateControl on closing.
+std::atomic<void*> active_stage{};
+void* race_control{};
+std::mutex state_lock;
+using QueueFile = void(PS4_SYSV_ABI*)(void*, u16, const char*, void*, u32);
+using Destroy = void(PS4_SYSV_ABI*)(void*);
+using SetRendering = void(PS4_SYSV_ABI*)(void*, void**);
+QueueFile queue_original;
+Destroy destroy_original;
+SetRendering set_rendering_original;
+
+bool IsRewardFile(std::string_view path) {
+    constexpr std::string_view name = "Reward_Sequence.txt";
+    const auto filename = path.substr(path.find_last_of("/\\") + 1);
+    return filename.size() == name.size() &&
+           _strnicmp(filename.data(), name.data(), name.size()) == 0;
+}
+
+void SetStage(void* next) { // called with state_lock held
+    race_control = nullptr;
+    active_stage.store(next, std::memory_order_release);
+    std::fprintf(stderr, "[native] GT7 Rewards: %s\n",
+                 next ? "request 16:9 before scene load" : "release menu layout");
+}
+
+void PS4_SYSV_ABI QueueStage(void* queue, u16 opcode, const char* path, void* callback, u32 id,
+                             void* stage) {
+    {
+        std::scoped_lock lock{state_lock};
+        void* current = active_stage.load();
+        if (path && IsRewardFile(path)) {
+            if (current != stage)
+                SetStage(stage);
+        } else if (current && current == stage) {
+            SetStage(nullptr);
+        }
+    }
+    queue_original(queue, opcode, path, callback, id);
+}
+
+void PS4_SYSV_ABI DestroyFace(void* widget) {
+    {
+        std::scoped_lock lock{state_lock};
+        void* stage = active_stage.load();
+        if (stage && stage == *reinterpret_cast<void**>(static_cast<u8*>(widget) + 0x10)) {
+            SetStage(nullptr);
+        }
+    }
+    destroy_original(widget);
+}
+
+void PS4_SYSV_ABI SetRaceRendering(void* result, void** args) {
+    set_rendering_original(result, args);
+    std::scoped_lock lock{state_lock};
+    if (!active_stage.load())
+        return;
+    void* control = *static_cast<void**>(args[0]);
+    const bool enabled = *static_cast<const u8*>(args[1]) != 0;
+    if (enabled && control == race_control) {
+        // A cached widget can outlive its page. Release as soon as the same control
+        // resumes the race. If rendering was already disabled, widget teardown owns
+        // exit.
+        SetStage(nullptr);
+    } else if (!enabled && !race_control) {
+        race_control = control;
+    }
+}
+
+void Install(Native::NearCode& code, u8* base) {
+    const char* opt = std::getenv("RYGT_GT7_REWARDS_16_9");
+    if (opt ? std::string_view(opt) != "1" : !(dlss_layout || native_dlaa))
+        return;
+    // SceneFace.loadCommandFile has already acquired a live stage in r14 and
+    // resolved the path in rdx. Observe only its enqueue call, before the worker
+    // can render any commands.
+    const auto matches = [&](u32 rva, std::initializer_list<u8> bytes) {
+        return ReadableRange(base + rva, bytes.size()) &&
+               std::memcmp(base + rva, bytes.begin(), bytes.size()) == 0;
+    };
+    constexpr u32 enqueue = 0xbcfbec, target = 0x2189500, destroy = 0xbb7260, setter = 0x10e1240;
+    if (!matches(0xbbfb78, {0xe8, 0x03, 0x00, 0x01, 0x00}) ||
+        !matches(0xbcfbd1, {0x49, 0x8b, 0xbe, 0x38, 0x02, 0x00, 0x00}) ||
+        !matches(enqueue, {0xe8, 0x0f, 0x99, 0x5b, 0x01}) ||
+        !matches(0xbb7719, {0x48, 0x8b, 0x46, 0x10}) ||
+        !matches(destroy + 6, {0x48, 0x8d, 0x05, 0xc3, 0x41, 0x57, 0x04}) ||
+        !matches(setter + 7,
+                 {0x8a, 0x09, 0x48, 0x8b, 0x00, 0x88, 0x88, 0x74, 0x02, 0x00, 0x00, 0xc3})) {
+        std::fputs("[native] GT7 Rewards: unsupported scene binding\n", stderr);
+        return;
+    }
+    const u8 destroy_entry[]{0x55, 0x48, 0x89, 0xe5, 0x53};
+    const u8 setter_entry[]{0x48, 0x8b, 0x06, 0x48, 0x8b, 0x4e, 0x08};
+    auto* stub = code.Alloc(64);
+    if (!stub)
+        return;
+    Xbyak::CodeGenerator bridge(64, stub);
+    bridge.mov(bridge.r9,
+               bridge.r14); // sixth System V argument, the stage owning the command
+    bridge.mov(bridge.rax, reinterpret_cast<uintptr_t>(&QueueStage));
+    bridge.jmp(bridge.rax);
+    FlushInstructionCache(GetCurrentProcess(), stub, bridge.getSize());
+    destroy_original = reinterpret_cast<Destroy>(
+        Native::HookEntry(code, base, destroy - Native::kEbootToExe, destroy_entry,
+                          reinterpret_cast<void*>(&DestroyFace), "GT7 Rewards scene lifetime"));
+    if (!destroy_original)
+        return;
+    set_rendering_original = reinterpret_cast<SetRendering>(Native::HookEntry(
+        code, base, setter - Native::kEbootToExe, setter_entry,
+        reinterpret_cast<void*>(&SetRaceRendering), "GT7 Rewards race rendering"));
+    if (!set_rendering_original)
+        return;
+    queue_original = reinterpret_cast<QueueFile>(base + target);
+    const s32 rel = static_cast<s32>(stub - (base + enqueue + 5));
+    std::vector<u8> call{0xe8, 0, 0, 0, 0};
+    std::memcpy(call.data() + 1, &rel, sizeof(rel));
+    if (Apply(base, {enqueue, {0xe8, 0x0f, 0x99, 0x5b, 0x01}, call, "GT7 Rewards stage load"})) {
+        std::fputs("[native] GT7 Rewards: scene tracking installed\n", stderr);
+    }
+}
+} // namespace Rewards
+
+u32 PackedExtent(u32 w, u32 h) { return (h << 16) | w; }
+
+bool TrackRequested() {
+    return Vulkan::RytyGtsInRace() && !Rewards::active_stage.load(std::memory_order_acquire);
+}
+
+void PS4_SYSV_ABI ConfigureTargets() {
+    std::scoped_lock lock{configure_lock};
+    const bool track = TrackRequested();
+    const u32 width = track ? wide_width : menu_width;
+    const u32 scene_height = track ? height : menu_height;
+    const u32 extent = PackedExtent(width, scene_height);
+    const bool wide = output_width > menu_width;
+    const float ratio = track ? float(output_width) / menu_height : 16.f / 9.f;
+    auto* aspect = reinterpret_cast<float*>(game + projection_aspect);
+    const bool changed = active_extent.load(std::memory_order_relaxed) != extent;
+    bool applied = false;
+    const bool base_targets = !game[0x62ef250] && !game[0x62ef608] && !game[0x62f5518];
+    if (base_targets && (changed || (wide && std::atomic_ref<float>(*aspect).load(std::memory_order_relaxed) != ratio))) {
+        const u32 race_flip = PackedExtent(output_width, menu_height);
+        const u32 menu_flip = PackedExtent(menu_width, menu_height);
+        bool ready = true;
+        for (u32 i = 0; i < 3; ++i) {
+            const auto flip = *reinterpret_cast<u32*>(game + first_flip_size + i * 0x40);
+            ready &= flip == race_flip || flip == menu_flip;
+        }
+        auto* scene = reinterpret_cast<u32*>(game + scene_size);
+        if (ready && ((scene[0] == wide_width && scene[1] == height) ||
+                      (scene[0] == menu_width && scene[1] == menu_height))) {
+            DWORD old{};
+            if (!wide || VirtualProtect(aspect, sizeof(float), PAGE_READWRITE, &old)) {
+                if (wide) {
+                    std::atomic_ref<float>(*aspect).store(ratio, std::memory_order_relaxed);
+                    DWORD ignored{};
+                    VirtualProtect(aspect, sizeof(float), old, &ignored);
+                    for (u32 i = 0; i < 3; ++i)
+                        *reinterpret_cast<u32*>(game + first_flip_size + i * 0x40) = track ? race_flip : menu_flip;
+                }
+                scene[0] = width;
+                scene[1] = scene_height;
+                applied = true;
+            }
+        }
+    }
+    configure_original();
+    if (applied) {
+        active_extent.store(extent, std::memory_order_release);
+        if (changed) {
+            // The dimensions GT7 accepted, after updating its descriptor under its own lock.
+            auto* targets = *reinterpret_cast<u8**>(game + 0x641c318);
+            const auto* screen = reinterpret_cast<const u32*>(targets + 0x21c);
+            const auto* scene = reinterpret_cast<const u32*>(targets + 0x238);
+            std::fprintf(stderr, "[native] GT7 frame layout: %s, screen %ux%u, scene %ux%u%s\n",
+                         track ? "track" : "menu", screen[0], screen[1], scene[0], scene[1],
+                         !track && Rewards::active_stage.load() ? " (Rewards)" : "");
+        }
+    }
+}
+
+void PS4_SYSV_ABI ApplyGraphicsConfig(void* config, int force) {
+    // This is the game's own render-settings boundary. Let it retire the previous
+    // render targets and rebuild its dependent surfaces once on each transition.
+    const bool track = TrackRequested();
+    const u32 requested = track ? PackedExtent(wide_width, height) : PackedExtent(menu_width, menu_height);
+    const float ratio = track ? float(output_width) / menu_height : 16.f / 9.f;
+    auto* aspect = reinterpret_cast<float*>(game + projection_aspect);
+    // libScePad can initialize its projection constant once after the first menu frame.
+    apply_original(config, force || active_extent.load(std::memory_order_acquire) != requested ||
+                           (output_width > menu_width && std::atomic_ref<float>(*aspect).load(std::memory_order_relaxed) != ratio));
+}
+
+template <typename T>
+std::vector<u8> Bytes(const T& value) {
+    const auto* p = reinterpret_cast<const u8*>(&value);
+    return {p, p + sizeof(T)};
+}
+
+void Install(u8* base) {
+    const char* opt = std::getenv("RYGT_GT7_NATIVE_MENU_16_9");
+    const char* menus = std::getenv("RYGT_ULTRAWIDE_MENUS");
+    const char* guest_output = std::getenv("RYGT_DLSS_GUEST_OUTPUT");
+    const char* native_menus = std::getenv("RYGT_DLSS_NATIVE_MENUS");
+    const bool dlss = guest_output && std::string_view(guest_output) == "1";
+    const bool enabled = dlss ? !(native_menus && native_menus[0] == '0')
+                              : opt && std::string_view(opt) == "1" && !(menus && menus[0] == '0');
+    if (!enabled || !g_gt7_race_hook_installed.load()) return;
+    const char* dlaa = std::getenv("RYGT_NATIVE_DLAA");
+    const auto& layout = Vulkan::RytyUpscale::DlssLayout();
+    if (dlss && !layout.Wide() && dlaa && std::string_view(dlaa) == "1") {
+        // Menus and races already have the same size. Rewards can open before the race ends.
+        native_dlaa = true;
+        Native::NearCode near_code{base};
+        Rewards::Install(near_code, base);
+        return;
+    }
+    constexpr u32 target_config = 0x27cac80, apply_config = 0x1bcc520;
+    constexpr u32 screen_constant = 0x27cadc6;
+    // Read the launcher's scene extent and verify its matching flip allocation.
+    if (!ReadableRange(base + screen_constant, 10) || base[screen_constant] != 0x48 ||
+        base[screen_constant + 1] != 0xb9) return;
+    u32 w{}, h{};
+    std::memcpy(&w, base + screen_constant + 2, 4);
+    std::memcpy(&h, base + screen_constant + 6, 4);
+    if (dlss) {
+        if (layout.scene.width ? (w != layout.scene.width || h != layout.scene.height)
+                               : (w != 1920 || h != 1080)) return;
+    } else if (h < 360 || h > 2160 || w > 7680 || w % 16 || w <= h * 16 / 9 ||
+               u64(w) * h > 3840 * 2160 ||
+               std::abs(Vulkan::RytyDisplayAspect() - float(w) / h) > .01f) return;
+    const u32 display_w = !dlss ? w : layout.output.width ? layout.output.width : 3840;
+    const u32 panel_height = !dlss ? h : layout.output.height ? layout.output.height : 2160;
+    const u32 panel = std::min(display_w, (panel_height * 16 + 4) / 9);
+    const bool wide = display_w > panel;
+    if (!dlss && panel >= w) return;
+    const auto matches = [&](u32 rva, const std::vector<u8>& bytes) {
+        return ReadableRange(base + rva, bytes.size()) &&
+               std::memcmp(base + rva, bytes.data(), bytes.size()) == 0;
+    };
+    const std::vector<u8> prologue{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
+    if (dlss && (display_w != w || panel_height != h) &&
+        (!matches(0x17a7aa5, {0x41,0xb8}) || !matches(0x17a7aa7, Bytes(display_w)) ||
+         !matches(0x17a7aac, {0x41,0xb9}) || !matches(0x17a7aae, Bytes(panel_height)) ||
+         !matches(0x17a7aab, {0x90}) || !matches(0x17a7ab2, {0x90}))) return;
+    if (!matches(target_config, prologue) || !matches(0x17a7417, Bytes(display_w)) ||
+        !matches(0x17a7427, Bytes(w)) || !matches(0x17a7422, Bytes(h)) ||
+        !matches(0x17a741d, Bytes(panel_height)) ||
+        !matches(0x1b4c3f0, {0xc5,0xfa,0x10,0x05,0x18,0x31,0x41,0x02,0xc3}) ||
+        !matches(0x27cad27, {0x80,0x3d,0xea,0xa7,0xb2,0x03,0x00}) ||
+        !matches(0x27cadd0, {0x48,0x89,0x4d,0xb4}) ||
+        !matches(apply_config, {0x85,0xf6,0x75,0x0a,0x80,0xbf,0x66,0x01,0x00,0x00,0x00}) ||
+        !ReadableRange(base + first_flip_size, 0x84) || !ReadableRange(base + scene_size, 8)) return;
+
+    std::vector<Patch> patches;
+    apply_original = reinterpret_cast<ApplyConfig>(base + apply_config);
+    // GTRender::GraphicsConfig and PDIScene::BasicGraphicsConfig share this virtual.
+    for (const u32 slot : {0x539a7d8u, 0x5461a28u}) {
+        patches.push_back({slot, Bytes(apply_original), Bytes(&ApplyGraphicsConfig), "GT7 graphics config"});
+    }
+    // While constructing the base display target, read the active scene width and height.
+    // This replaces only the launch-time immediate. The game compares its descriptor under
+    // its own lock, sets the dirty bit and rebuilds the scene and screen together.
+    std::vector<u8> load{0x48,0x8b,0x0d,0,0,0,0,0x90,0x90,0x90};
+    const s32 delta = s32(scene_size) - s32(screen_constant + 7);
+    std::memcpy(load.data() + 3, &delta, 4);
+    patches.push_back({screen_constant, {base + screen_constant, base + screen_constant + 10},
+                       load, "GT7 active screen extent"});
+
+    if (dlss) {
+        // The title's first frame may precede the first GraphicsConfig.apply.
+        patches.push_back({0x17a7427, Bytes(w), Bytes(panel), "GT7 initial menu width"});
+        patches.push_back({0x17a7422, Bytes(h), Bytes(panel_height), "GT7 initial menu height"});
+    }
+    // The two camera initializers normally embed the same 16:9 float that the game's
+    // projection getter reads. Read the getter's data at both stores, including after
+    // a change of session. xmm0 is overwritten at the following instruction at both sites.
+    Native::NearCode near_code{base};
+    if (wide) {
+        for (const u32 site : {0x1e990ebu, 0x20b7938u}) {
+            const bool race_camera = site == 0x1e990eb;
+            std::vector<u8> store = race_camera ? std::vector<u8>{0xc7,0x83,0x94,0xe8,0x09,0}
+                                                : std::vector<u8>{0xc7,0x47,0x34};
+            if (!matches(site, store)) return;
+            float literal;
+            std::memcpy(&literal, base + site + store.size(), sizeof(literal));
+            if (literal != 16.f / 9.f && literal != float(display_w) / panel_height) return;
+            auto bytes = Bytes(literal);
+            store.insert(store.end(), bytes.begin(), bytes.end());
+            auto* memory = near_code.Alloc(64);
+            if (!memory) return;
+            const auto offset = memory - (base + site + 5);
+            const auto data_offset = (base + projection_aspect) - (memory + 8);
+            if (std::abs(static_cast<s64>(offset)) > INT32_MAX - 64 ||
+                std::abs(static_cast<s64>(data_offset)) > INT32_MAX - 64) return;
+            Xbyak::CodeGenerator code(64, memory);
+            code.vmovss(code.xmm0, code.ptr[code.rip + (base + projection_aspect)]);
+            if (race_camera) code.vmovss(code.ptr[code.rbx + 0x9e894], code.xmm0);
+            else code.vmovss(code.ptr[code.rdi + 0x34], code.xmm0);
+            code.jmp(base + site + store.size(), Xbyak::CodeGenerator::T_NEAR);
+            FlushInstructionCache(GetCurrentProcess(), memory, code.getSize());
+            std::vector<u8> jump(store.size(), 0x90);
+            jump[0] = 0xe9;
+            const auto rel = static_cast<s32>(offset);
+            std::memcpy(jump.data() + 1, &rel, 4);
+            patches.push_back({site, store, jump, "GT7 session camera"});
+        }
+    }
+    for (const auto& p : patches) {
+        if (!matches(static_cast<u32>(p.rva), p.original)) return;
+    }
+    game = base;
+    wide_width = w;
+    output_width = display_w;
+    menu_width = panel;
+    menu_height = panel_height;
+    height = h;
+    // No guest threads are running yet. Restore the previous profile if any write fails.
+    size_t applied = 0;
+    for (; applied < patches.size() && Apply(base, patches[applied]); ++applied) {}
+    if (applied == patches.size()) {
+        configure_original = reinterpret_cast<Configure>(Native::HookEntry(
+            near_code, base, target_config - Native::kEbootToExe, prologue,
+            reinterpret_cast<void*>(&ConfigureTargets), "GT7 scene and screen targets"));
+        if (configure_original) {
+            dlss_layout = dlss;
+            Rewards::Install(near_code, base);
+            std::fprintf(stderr, "[native] GT7 frame layout: installed, menu %ux%u, track %ux%u\n",
+                         menu_width, menu_height, wide_width, height);
+            return;
+        }
+    }
+    while (applied > 0) {
+        auto& p = patches[--applied];
+        std::swap(p.original, p.replacement);
+        Apply(base, p);
+    }
+}
+} // namespace Gt7NativeMenu
+
 void RytyApplyGamePatches() {
+    Gt7CarSign::Install(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallPhotoExport();
     InstallScopedMenuCompiles(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallPhotoCaptureWatch(reinterpret_cast<u8*>(GetModuleHandleA(nullptr))); // FIX-SGT-049
@@ -5241,16 +5754,34 @@ void RytyApplyGamePatches() {
     }
     auto* base = reinterpret_cast<u8*>(GetModuleHandleA(nullptr));
     ApplyEnvironmentPatches(base);
+    Gt7NativeMenu::Install(base);
     InstallWideSceneAllocation(base); // WIDE-001: after the launcher's scene size
 }
 
 namespace Vulkan {
+u32 RytyGt7MenuWidth(u32 registered_width, u32 height) {
+    using namespace Gt7NativeMenu;
+    return active_extent.load(std::memory_order_acquire) && output_width > menu_width &&
+           registered_width == output_width && height == menu_height ? menu_width : 0;
+}
+bool RytyGt7NativeDlssMenu() {
+    using namespace Gt7NativeMenu;
+    if (native_dlaa) return Rewards::active_stage.load(std::memory_order_acquire) != nullptr;
+    return dlss_layout && active_extent.load(std::memory_order_acquire) != PackedExtent(wide_width, height);
+}
+bool RytyGt7MenuActive() {
+    using namespace Gt7NativeMenu;
+    return active_extent.load(std::memory_order_acquire) == PackedExtent(menu_width, menu_height);
+}
 // GAME-006: the race runs (from its start countdown to its finish), and whether a hook reads it.
 bool RytyRaceRunning() {
     return g_race_running.load(std::memory_order_relaxed);
 }
 bool RytyRaceStartSignal() {
     return RaceStartSignalOn() && g_race_signal.load(std::memory_order_relaxed);
+}
+bool RytyGt7RaceHookInstalled() {
+    return g_gt7_race_hook_installed.load(std::memory_order_relaxed);
 }
 // FIX-110: true while a race project runs (see NoteProjectScript).
 bool RytyGtsInRace() {

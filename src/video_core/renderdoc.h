@@ -25,7 +25,7 @@ void FinishDebugFrameDump();
 inline constexpr bool FullFrameDump() { return false; }
 #endif
 
-#ifndef NDEBUG
+#if !defined(NDEBUG) || defined(SHADGT_DIAGNOSTICS)
 
 /// Loads renderdoc dynamic library module.
 void LoadRenderDoc();

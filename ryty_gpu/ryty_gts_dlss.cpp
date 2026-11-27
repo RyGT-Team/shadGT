@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include "ryty_gpu/ryty_dlss_timing.h"
+#include "ryty_gpu/ryty_dlss_layout.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -8,12 +10,35 @@
 #include "core/emulator_settings.h"
 #include "ryty_gpu/ryty_gts_dlss.h"
 #include "ryty_gpu/ryty_dlssg.h"
+#include "video_core/host_shaders/dlss_motion_offset_comp.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Vulkan {
 namespace {
+// FIX-SGT-206: GT7's scene reconstructed below the output got its inputs as GT Sport's are: the
+// motion vectors as the game wrote them, and the depth without a word on its direction. GT7's
+// vectors hold the frame's jitter (drawn position with jitter minus the previous one without)
+// and its depth has near at 1; DLSS-GT7-001 (ryty_dlssg.cpp) hands both right. Each has its
+// switch so a play can tell them apart; GT Sport's inputs are untouched.
+bool SceneMotionFixOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_DLSS_SCENE_MOTION");
+        return Common::IsGt7() && !(env && env[0] == '0');
+    }();
+    return on;
+}
+bool SceneDepthInvertedOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_DLSS_SCENE_DEPTH_INVERTED");
+        return Common::IsGt7() && !(env && env[0] == '0');
+    }();
+    return on;
+}
+
 vk::Extent2D Size(const GtsSceneImage& image) {
     return {image.info.size.width, image.info.size.height};
 }
@@ -115,6 +140,9 @@ void GtsDlssPass::create(Texture& t, vk::Format format, vk::Extent2D size,
     if (aspects == vk::ImageAspectFlagBits::eColor) {
         usage |= vk::ImageUsageFlagBits::eColorAttachment;
         if (format == vk::Format::eR16G16B16A16Sfloat) usage |= vk::ImageUsageFlagBits::eStorage;
+        // FIX-SGT-206: the motion pass writes GT7's vectors.
+        if (&t == &motion && format == vk::Format::eR16G16Sfloat && SceneMotionFixOn())
+            usage |= vk::ImageUsageFlagBits::eStorage;
     }
     t.image.Create({.flags = vk::ImageCreateFlagBits::eMutableFormat,
                     .imageType = vk::ImageType::e2D,
@@ -163,6 +191,100 @@ void GtsDlssPass::copyInput(GtsSceneImage source, Texture& dest) {
         vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
 }
 
+bool GtsDlssPass::fixMotion(GtsSceneImage source, float unit_x, float unit_y) {
+    if (motionFixFailed || motion.format != vk::Format::eR16G16Sfloat ||
+        source.info.pixel_format != vk::Format::eR16G16Sfloat) {
+        return false;
+    }
+    const vk::Device device = instance.GetDevice();
+    if (!motionPipeline) {
+        const auto give_up = [&](const char* what) {
+            motionFixFailed = true;
+            LOG_ERROR(Render_Vulkan, "FIX-SGT-206: {}; the game's motion vectors are used as "
+                                     "they are", what);
+            return false;
+        };
+        const std::array<vk::DescriptorSetLayoutBinding, 2> bindings{{
+            {.binding = 0,
+             .descriptorType = vk::DescriptorType::eSampledImage,
+             .descriptorCount = 1,
+             .stageFlags = vk::ShaderStageFlagBits::eCompute},
+            {.binding = 1,
+             .descriptorType = vk::DescriptorType::eStorageImage,
+             .descriptorCount = 1,
+             .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        }};
+        auto [set_result, set_layout] =
+            device.createDescriptorSetLayoutUnique(vk::DescriptorSetLayoutCreateInfo{
+                .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+                .bindingCount = static_cast<u32>(bindings.size()),
+                .pBindings = bindings.data(),
+            });
+        if (set_result != vk::Result::eSuccess) return give_up("no descriptor layout for the motion pass");
+        motionSetLayout = std::move(set_layout);
+        const vk::PushConstantRange range{
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+            .offset = 0,
+            .size = 2 * sizeof(float),
+        };
+        auto [layout_result, layout] =
+            device.createPipelineLayoutUnique(vk::PipelineLayoutCreateInfo{
+                .setLayoutCount = 1,
+                .pSetLayouts = &motionSetLayout.get(),
+                .pushConstantRangeCount = 1,
+                .pPushConstantRanges = &range,
+            });
+        if (layout_result != vk::Result::eSuccess) return give_up("no pipeline layout for the motion pass");
+        motionLayout = std::move(layout);
+        const vk::ShaderModule module = CompileSPV(DLSS_MOTION_OFFSET_COMP, device);
+        if (!module) return give_up("the motion pass did not compile");
+        auto [pipeline_result, pipeline] =
+            device.createComputePipelineUnique({}, vk::ComputePipelineCreateInfo{
+                                                       .stage{
+                                                           .stage = vk::ShaderStageFlagBits::eCompute,
+                                                           .module = module,
+                                                           .pName = "main",
+                                                       },
+                                                       .layout = motionLayout.get(),
+                                                   });
+        device.destroyShaderModule(module);
+        if (pipeline_result != vk::Result::eSuccess) return give_up("the motion pass could not be built");
+        motionPipeline = std::move(pipeline);
+    }
+    scheduler.EndRendering();
+    transitSource(source, vk::ImageLayout::eShaderReadOnlyOptimal,
+                  vk::PipelineStageFlagBits2::eComputeShader,
+                  vk::AccessFlagBits2::eShaderSampledRead);
+    runtime.FlushBarriers();
+    transit(motion, vk::ImageLayout::eGeneral);
+    const vk::DescriptorImageInfo game{.imageView = source.View(vk::Format::eR16G16Sfloat),
+                                       .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal};
+    const vk::DescriptorImageInfo fixed{.imageView = *motion.view,
+                                        .imageLayout = vk::ImageLayout::eGeneral};
+    const std::array<vk::WriteDescriptorSet, 2> writes{{
+        {.dstBinding = 0,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eSampledImage,
+         .pImageInfo = &game},
+        {.dstBinding = 1,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eStorageImage,
+         .pImageInfo = &fixed},
+    }};
+    const std::array<float, 2> jitter{unit_x, unit_y};
+    const auto cmdbuf = scheduler.CommandBuffer();
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *motionPipeline);
+    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *motionLayout, 0, writes);
+    cmdbuf.pushConstants(*motionLayout, vk::ShaderStageFlagBits::eCompute, 0,
+                         static_cast<u32>(sizeof(jitter)), jitter.data());
+    cmdbuf.dispatch((renderSize.width + 7) / 8, (renderSize.height + 7) / 8, 1);
+    transit(motion, vk::ImageLayout::eShaderReadOnlyOptimal);
+    if (!source.cached) transitSource(source, vk::ImageLayout::eGeneral,
+        vk::PipelineStageFlagBits2::eAllCommands,
+        vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+    return true;
+}
+
 bool GtsDlssPass::Capture(u64 frame, GtsSceneImage color, GtsSceneImage sourceDepth,
                          GtsSceneImage sourceMotion, GtsSceneImage resolved,
                          const std::array<float, 28>& constants) {
@@ -181,6 +303,9 @@ bool GtsDlssPass::Capture(u64 frame, GtsSceneImage color, GtsSceneImage sourceDe
                                             : vk::Extent2D{std::max(requestedSize.width, input.width),
                                                            std::max(requestedSize.height, input.height)}
                         : input;
+    // FEAT-SGT-198: the guest-output layout's output, whichever upscaler rebuilds the scene.
+    if (RytyUpscale::DlssLayout().output.width)
+        output = RytyUpscale::DlssLayout().output;
     // Window resizing changes presentation, not the fixed guest scene resolution.
     // Keep the established DLSS reconstruction extent for an unchanged input;
     // the presenter already scales that image to the current swapchain extent.
@@ -205,6 +330,7 @@ bool GtsDlssPass::Capture(u64 frame, GtsSceneImage color, GtsSceneImage sourceDe
         scheduler.EndRendering();
         runtime.FlushBarriers();
         scheduler.Finish();
+        colorViews.clear();
         renderSize = input;
         outputSize = output;
         create(this->color, color.info.pixel_format, input);
@@ -251,15 +377,37 @@ bool GtsDlssPass::Capture(u64 frame, GtsSceneImage color, GtsSceneImage sourceDe
     sceneUid = resolved.image_uid;
     outputFrame = ~u64{};
     displayUid = 0;
-    jitterX = constants[20] * constants[14];
-    jitterY = constants[21] * constants[15];
+    const float sign = Common::IsGt7() ? -1.f : 1.f;
+    jitterX = sign * constants[20] * constants[14];
+    jitterY = sign * constants[21] * constants[15];
+    motionScaleX = -constants[14];
+    motionScaleY = -constants[15];
     copyInput(sourceDepth, depth);
     {
         if (sourceDepth.info.props.is_depth) copyDepthForFsr();
         else copyInput(sourceDepth, fsrDepth);
     }
-    copyInput(sourceMotion, motion);
+    // FIX-SGT-206: GT7's vectors without the frame's jitter (c20, c21 in their unit).
+    motionFixed = SceneMotionFixOn() && fixMotion(sourceMotion, constants[20], constants[21]);
+    if (!motionFixed) copyInput(sourceMotion, motion);
     copyInput(color, this->color);
+    if (Common::IsGt7()) {
+        // c14/c15 turn the vectors into pixels: half the scene's size when the game follows the
+        // scene (960, -540 at 1920x1080). Anything else scales every moving pixel wrongly.
+        static vk::Extent2D reported{};
+        if (reported != input) {
+            reported = input;
+            const bool follows = std::abs(std::abs(constants[14]) - input.width * .5f) <= .5f &&
+                                 std::abs(std::abs(constants[15]) - input.height * .5f) <= .5f;
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-SGT-206: GT7 scene {}x{}: motion constants c14 {} c15 {} ({}), "
+                        "vectors {}, depth {}",
+                        input.width, input.height, constants[14], constants[15],
+                        follows ? "half the scene, as expected" : "NOT half the scene",
+                        motionFixed ? "without the frame's jitter" : "as the game wrote them",
+                        SceneDepthInvertedOn() ? "declared near = 1" : "not declared inverted");
+        }
+    }
     return true;
 }
 
@@ -399,21 +547,36 @@ bool GtsDlssPass::HasScene(u64 frame, u64 uid) const {
     return !failed && sceneFrame == frame && sceneUid == uid && outputFrame != frame;
 }
 
-void GtsDlssPass::PrepareScene(u64 frame, GtsSceneImage resolved) {
-    if (!HasScene(frame, resolved.image_uid)) return;
-    const auto previous = resolved.State();
-    scheduler.EndRendering();
-    transit(color, vk::ImageLayout::eTransferSrcOptimal);
-    transitSource(resolved, vk::ImageLayout::eTransferDstOptimal,
-                    vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferWrite);
-    runtime.FlushBarriers();
-    const vk::ImageCopy region{.srcSubresource = ColorLayer, .dstSubresource = ColorLayer,
-                              .extent = {renderSize.width, renderSize.height, 1}};
-    scheduler.CommandBuffer().copyImage(color.image, vk::ImageLayout::eTransferSrcOptimal,
-        resolved.GetImage(), vk::ImageLayout::eTransferDstOptimal, region);
-    resolved.MarkGpuModified();
-    transitSource(resolved, previous.layout, previous.pl_stage, previous.access_mask);
-    runtime.FlushBarriers();
+void GtsSceneBinding::Restore() {
+    if (slot) {
+        *slot = original;
+        slot = nullptr;
+    }
+}
+
+bool GtsDlssPass::BindSceneColor(const VideoCore::ImageViewInfo& info, vk::DescriptorImageInfo& slot,
+                                GtsSceneBinding& binding) {
+    if (info.is_storage || info.format != color.format ||
+        info.type != AmdGpu::ImageType::Color2D ||
+        info.range.base.level || info.range.base.layer || !slot.imageView) return false;
+
+    auto view = color.view.get();
+    if (info.mapping != AmdGpu::IdentityMapping) {
+        auto found = std::ranges::find_if(colorViews, [&](const auto& v) { return v.first == info.mapping; });
+        if (found == colorViews.end()) {
+            auto [result, mapped] = instance.GetDevice().createImageViewUnique({
+                .image = color.image, .viewType = vk::ImageViewType::e2D, .format = color.format,
+                .components = LiverpoolToVK::ComponentMapping(info.mapping),
+                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}});
+            if (result != vk::Result::eSuccess) return false;
+            found = colorViews.emplace(colorViews.end(), info.mapping, std::move(mapped));
+        }
+        view = found->second.get();
+    }
+    binding = {&slot, slot};
+    slot.imageView = view;
+    slot.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    return true;
 }
 
 void GtsDlssPass::Resolve(u64 frame, GtsSceneImage display) {
@@ -513,14 +676,26 @@ void GtsDlssPass::Resolve(u64 frame, GtsSceneImage display) {
     desc.output = reconstruction.Descriptor();
     desc.quality = quality;
     desc.flags = reset ? RYGT_DLSS_FRAME_RESET : 0;
+    if (SceneDepthInvertedOn()) desc.flags |= RYGT_DLSS_FRAME_DEPTH_INVERTED; // FIX-SGT-206
     desc.jitter_x = jitterX; desc.jitter_y = jitterY;
-    desc.motion_scale_x = -float(renderSize.width) * .5f;
-    desc.motion_scale_y = float(renderSize.height) * .5f;
+    desc.motion_scale_x = motionScaleX;
+    desc.motion_scale_y = motionScaleY;
     desc.pre_exposure = 1.f; desc.exposure_scale = 1.f;
     desc.frame_time_ms = frameTimeMs;
-    const bool ok = RytyDlss::EvaluateTemporal(scheduler.DirectCommandBuffer(), desc);
+    DlssTiming timing{instance, scheduler};
+    const auto cmd = scheduler.DirectCommandBuffer();
+    const char* preset = quality == RYGT_DLSS_QUALITY_DLAA ? "dlaa" :
+                         quality == RYGT_DLSS_QUALITY_QUALITY ? "quality" :
+                         quality == RYGT_DLSS_QUALITY_BALANCED ? "balanced" :
+                         quality == RYGT_DLSS_QUALITY_ULTRA_PERFORMANCE ? "ultra_performance" : "performance";
+    const bool ok = DlssTiming::Measure(&timing, cmd, renderSize, outputSize,
+        reset ? "reset" : "temporal", preset, [&] { return RytyDlss::EvaluateTemporal(cmd, desc); }, true);
     scheduler.GetDynamicState().Invalidate();
-    if (!ok) { failed = true; return; }
+    if (!ok) {
+        failed = true;
+        LOG_WARNING(Render_Vulkan, "Temporal DLSS: NGX failed on frame {}; returning to game TAA", frame);
+        return;
+    }
     ++evaluatedFrames;
     static u32 loggedFrames = 0;
     if (loggedFrames++ < 8) {

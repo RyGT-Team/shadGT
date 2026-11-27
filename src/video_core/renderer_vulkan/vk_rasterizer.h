@@ -240,7 +240,7 @@ public:
         selected_recycler.Give(std::move(selected));
     }
 
-    void Draw(bool is_indexed, u32 index_offset = 0);
+    void Draw(bool is_indexed, u32 index_offset = 0, bool world_hud = false);
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
                       VAddr count_address, u16 vertex_sgpr_offset, u16 instance_sgpr_offset);
 
@@ -676,7 +676,7 @@ private:
 #ifdef RYTY_GPU
     GtsDlssPass temporalDlss;
     void applyTemporalDlss(const GraphicsPipeline* pipeline, const RenderState& state,
-                           bool beforeDraw = false);
+                           GtsSceneBinding* scene_binding = nullptr);
     void prepareNativeHud(RenderState& state);
 #endif
     bool TemporalOwnsDisplay();

@@ -32,7 +32,7 @@ namespace Vulkan {
 #ifdef RYTY_GPU
 /// GT7-UW: a display buffer's address, for the native renderer (vk_rasterizer_native.cpp, which
 /// only the Ryty renderer library builds).
-void NoteDisplayAddress(VAddr address, u32 width = 0, u32 height = 0);
+void SetDisplaySlot(std::size_t slot, VAddr address, const Libraries::VideoOut::BufferAttribute& view);
 #endif
 
 struct Frame {
@@ -112,10 +112,6 @@ public:
     VideoCore::Image& RegisterVideoOutSurface(
         const Libraries::VideoOut::BufferAttributeGroup& attribute, VAddr cpu_address) {
         vo_buffers_addr.emplace_back(cpu_address);
-#ifdef RYTY_GPU
-        NoteDisplayAddress(cpu_address, attribute.attrib.width,
-                           attribute.attrib.height); // GT7-UW, DLSS-GT7-001
-#endif
         auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
         const auto image_id = texture_cache.FindImage(desc);
         auto& image = texture_cache.GetImage(image_id);
@@ -158,6 +154,7 @@ private:
     float expected_ratio{1920.0 / 1080.0f};
     u32 expected_frame_width{1920};
     u32 expected_frame_height{1080};
+    vk::Extent2D logged_dlss_display_size{};
 
     Frontend::WindowSDL& window;
     Instance instance;

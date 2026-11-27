@@ -173,10 +173,35 @@ void DataBase::Open() {
                 std::string parts;
                 for (const char* name :
                      {"SHADGT_AMD_NAN_RULES", "SHADGT_QUAD_CONTROL", "SHADGT_VERTEX_ORDER",
-                      "SHADGT_FP32_IMAGE_ATOMICS", "SHADGT_MANUAL_INTERP"}) {
+                      "SHADGT_FP32_IMAGE_ATOMICS", "SHADGT_MANUAL_INTERP", "SHADGT_LDS_BARRIERS",
+                      "SHADGT_MANUAL_INTERP_ALL"}) {
                     if (const char* env = std::getenv(name); env && *env) {
                         parts += fmt::format(", {}={}", name, env[0]);
                     }
+                }
+                // FIX-SGT-139: RX 7000/9000 stores made before were translated without the
+                // shared memory barriers that are now on by default there.
+                if (const char* env = std::getenv("SHADGT_LDS_BARRIERS");
+                    !(env && *env) && Vulkan::AmdLdsBarriersByDefault()) {
+                    parts += ", lds barriers";
+                }
+                // PERF-SGT-151: AMD's older compiler interpolates by hand only the attributes
+                // read with V_INTERP_MOV; stores made with every attribute by hand stay apart.
+                if (const char* env = std::getenv("SHADGT_MANUAL_INTERP_ALL");
+                    !(env && env[0] == '1') &&
+                    Vulkan::GetStoreGpuFamily() == Vulkan::StoreGpuFamily::AmdLegacy) {
+                    parts += ", interp by attribute";
+                }
+                // FIX-SGT-145: RX 7000/9000 stores made before were translated without the
+                // hand-made interpolation that is now on by default there.
+                if (const char* env = std::getenv("SHADGT_MANUAL_INTERP");
+                    !(env && *env) && Vulkan::AmdManualInterpByDefault()) {
+                    parts += ", manual interp";
+                }
+                // FIX-SGT-143: hull/domain translations with padding attributes (AMD by default)
+                // are kept apart from those made without.
+                if (const u32 pad = Vulkan::TessAttrPad(); pad != 0) {
+                    parts += fmt::format(", tess attr pad {}", pad);
                 }
                 // DIAG-230 (port): without SHADGT_MANUAL_INTERP, the diagnosis switch changes
                 // NVIDIA's translations (vk_pipeline_cache.cpp); they are kept apart.

@@ -27,6 +27,7 @@
 
 #include "common/logging/log.h"
 #include "ryty_gpu/ryty_dlss.h"
+#include "ryty_gpu/ryty_dlss_layout.h"
 #include "ryty_gpu/ryty_pro_mode.h"
 #include "ryty_gpu/ryty_hdr_ui.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -111,6 +112,9 @@ struct State {
     float scale_y = 0.0f;
     float offset_x = 0.0f;
     float offset_y = 0.0f;
+    /// FEAT-SGT-189: a viewport scissor edge at `from` is widened to `to` before scaling (GT7's
+    /// race HUD clips at its screen times screen / 1920 x 1080; 0 = none).
+    u32 widen_x_from = 0, widen_x_to = 0, widen_y_from = 0, widen_y_to = 0;
     /// Lock-free checks for every draw: the display buffer addresses with a proxy, and how
     /// many proxies hold draws their display buffer has not.
     std::array<std::atomic<VAddr>, 8> addresses{};
@@ -927,6 +931,8 @@ inline std::optional<Shown> TakeFrame(const Instance& instance, vk::CommandBuffe
     if (!Enabled()) {
         return std::nullopt;
     }
+    const bool dlss_wide = Wide() && RytyUpscale::DlssLayout().Wide();
+    if (dlss_wide) output = RytyUpscale::DlssLayout().output;
     auto& state = Get();
     std::scoped_lock lock{state.mutex};
     ++state.frames;
@@ -1045,7 +1051,7 @@ inline std::optional<Shown> TakeFrame(const Instance& instance, vk::CommandBuffe
     const bool same_shape = output.width > native.width && output.height > native.height &&
                             std::abs(s64(output.width) * native.height -
                                      s64(output.height) * native.width) <= s64(native.height);
-    const bool wide = Wide() && output.width >= native.width && output.height >= native.height &&
+    const bool wide = Wide() && (dlss_wide || (output.width >= native.width && output.height >= native.height)) &&
                       s64(output.width) * native.height > s64(output.height) * native.width;
     const bool wanted = same_shape || wide;
     const vk::Extent2D size = wanted ? output : vk::Extent2D{};

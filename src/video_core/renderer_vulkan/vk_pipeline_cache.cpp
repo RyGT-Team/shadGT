@@ -274,6 +274,93 @@ void PipelineCache::ReportKeyTrace() noexcept {
     } catch (...) { /* Diagnostics cannot affect rendering. */ }
 }
 #endif
+// DIAG-SGT-144 (RyGT #86, SHADGT_DIAG_TES_DUMP=<hex domain shader hash>): a host-visible buffer
+// with a device address that the domain shader appends to while word 0 is set (EmitTesDump). A file
+// named tes-dump.now in the RyGT folder turns it on for 2 s; then the counts and records are
+// written to captures\tes-dump-<n>.bin (header: 3 u32 words enabled/vertices/patches, then the
+// raw buffer). Allocated once and never freed (diagnosis only).
+static u64 DiagTesDumpHash() {
+    static const u64 hash = [] {
+        const char* env = Common::DiagEnv("SHADGT_DIAG_TES_DUMP");
+        return env && *env ? u64(std::strtoull(env, nullptr, 16)) : 0ull;
+    }();
+    return hash;
+}
+static u64 DiagTesDumpAddress(const Instance& instance) {
+    static const u64 address = [&]() -> u64 {
+        if (DiagTesDumpHash() == 0)
+            return 0;
+        const vk::Device device = instance.GetDevice();
+        constexpr vk::DeviceSize size = 256 + 512ull * 1024 * 8 * 4 + 16ull * 1024 * (4 + 256) * 4;
+        const auto [buffer_result, buffer] = device.createBuffer(vk::BufferCreateInfo{
+            .size = size,
+            .usage = vk::BufferUsageFlagBits::eStorageBuffer |
+                     vk::BufferUsageFlagBits::eShaderDeviceAddress,
+        });
+        if (buffer_result != vk::Result::eSuccess)
+            return 0;
+        const auto requirements = device.getBufferMemoryRequirements(buffer);
+        const auto properties = instance.GetPhysicalDevice().getMemoryProperties();
+        constexpr auto wanted =
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
+        u32 type = ~0u;
+        for (u32 i = 0; i < properties.memoryTypeCount; ++i) {
+            if ((requirements.memoryTypeBits & (1u << i)) &&
+                (properties.memoryTypes[i].propertyFlags & wanted) == wanted) {
+                type = i;
+                break;
+            }
+        }
+        if (type == ~0u)
+            return 0;
+        const vk::MemoryAllocateFlagsInfo flags{.flags =
+                                                    vk::MemoryAllocateFlagBits::eDeviceAddress};
+        const auto [memory_result, memory] = device.allocateMemory(vk::MemoryAllocateInfo{
+            .pNext = &flags, .allocationSize = requirements.size, .memoryTypeIndex = type});
+        if (memory_result != vk::Result::eSuccess)
+            return 0;
+        if (device.bindBufferMemory(buffer, memory, 0) != vk::Result::eSuccess)
+            return 0;
+        const auto [map_result, mapped] = device.mapMemory(memory, 0, size);
+        if (map_result != vk::Result::eSuccess)
+            return 0;
+        std::memset(mapped, 0, size);
+        auto* words = static_cast<volatile u32*>(mapped);
+        const u64 gpu = device.getBufferAddress(vk::BufferDeviceAddressInfo{.buffer = buffer});
+        const auto root = Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path();
+        static std::jthread watch{[words, size, root](std::stop_token stop) {
+            u32 n = 0;
+            while (!stop.stop_requested()) {
+                std::error_code error;
+                if (std::filesystem::remove(root / "tes-dump.now", error)) {
+                    words[1] = 0;
+                    words[2] = 0;
+                    words[3] = 0; // hull read trace count
+                    words[0] = 1;
+                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                    words[0] = 0;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    std::filesystem::create_directories(root / "captures", error);
+                    const auto path = root / "captures" / fmt::format("tes-dump-{}.bin", n++);
+                    std::ofstream out{path, std::ios::binary};
+                    out.write(reinterpret_cast<const char*>(const_cast<const u32*>(words)),
+                              std::streamsize(size));
+                    LOG_WARNING(Render_Vulkan,
+                                "DIAG-SGT-144: TES dump of {:#x}: {} vertices, {} patches, {} "
+                                "hull reads traced -> {}",
+                                DiagTesDumpHash(), words[1], words[2], words[3], path.string());
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            }
+        }};
+        LOG_WARNING(Render_Vulkan,
+                    "DIAG-SGT-144: TES dump for {:#x} ready at {:#x}; create {} to capture",
+                    DiagTesDumpHash(), gpu, (root / "tes-dump.now").string());
+        return gpu;
+    }();
+    return address;
+}
+
 // DIAG-GTS-459 (SHADGT_DIAG_LDS_READS=1): 64 slots of two u32 counters in host-visible memory
 // with a device address; hull shaders with LDS emulation add their reads to them, and the
 // native report prints them. Allocated once and never freed (diagnosis only).
@@ -323,10 +410,21 @@ u64 DiagLdsReadCountersAddress(const Instance& instance) {
     return address;
 }
 
+// PERF-SGT-155: set by the pipeline cache before any draw: AMD's driver runs without the hull
+// shader LDS emulation by default.
+static std::atomic<bool> g_tess_lds_off_by_default{false};
+
 u32 TessLdsEmulation(const AmdGpu::Regs& regs) {
+    // FIX-227 mode 2 (on elsewhere): a writer pass, a full barrier and scratch reads for every
+    // tessellated draw with several patches a group, for hull shaders that read other patches'
+    // control points. PERF-SGT-155: off by default on AMD's driver. On a Radeon 610M it cost 7.7%
+    // of GT7's GPU time (Tokyo rain replay paused on the chase cam: 176.2 -> 162.7 ms a frame),
+    // and GT7's race-start close-ups, the black car patches it was made for (on NVIDIA), showed
+    // none without it. SHADGT_TESS_LDS_EMULATION=<mode> still decides, on any GPU.
     static const u32 mode = [] {
         const char* env = std::getenv("SHADGT_TESS_LDS_EMULATION");
-        return env && *env ? u32(env[0] - '0') : 2u;
+        if (env && *env) return u32(env[0] - '0');
+        return g_tess_lds_off_by_default.load(std::memory_order_relaxed) ? 0u : 2u;
     }();
     if (mode == 0 || !regs.stage_enable.hs_en || regs.ls_hs_config.hs_input_control_points == 0 ||
         regs.ls_hs_config.num_patches <= 1) return 0;
@@ -1009,9 +1107,51 @@ bool PrecompileHoldsGame() {
 // FEAT-GTS-470: when the hold was taken, for the splash's length in the log.
 static std::atomic<s64> g_precompile_hold_since_ms{};
 
+// FIX-SGT-134: the game waits at the renderer's start gate (Common::GuestClock), before its first
+// call into the renderer returns, until the splash precompile is done; its clock is not held, so
+// none of its threads works through the hold in no time. Holding only the clock (PERF-102), the
+// game ran its start under a 12-15 s splash in no time and GT Sport, past its HDR switch, drew
+// its SDR shader variants into the HDR10 display buffers (cyan sky, burnt whites).
+// The gate makes the start ~5 s longer (the game's own start no longer runs under the hold), so
+// by default it is only where the held clock did harm: GT Sport with an HDR10 output (the
+// launcher's HDR box and a display in HDR). GT Sport in SDR draws its SDR variants anyway, and
+// GT7's HDR was right under the old hold (played 23-11, RTX 4070 only): both keep the old hold.
+// SHADGT_PRECOMPILE_START_GATE=1: the gate for every start; 0: never.
+bool SwapchainOffersHdr10(); // vk_swapchain.cpp, made before the pipeline cache
+
+static bool PrecompileStartGateOn() {
+    static const bool on = [] {
+        if (const char* env = std::getenv("SHADGT_PRECOMPILE_START_GATE"); env && *env) {
+            return env[0] != '0';
+        }
+        return !Common::IsGt7() && SwapchainOffersHdr10();
+    }();
+    return on;
+}
+
+// FIX-SGT-134: whether the hold paused the game's clock (PERF-102 without the start gate).
+static std::atomic<bool> g_precompile_hold_clock{};
+
+// PERF-102: the game waits on the splash screen until the precompile is done (FIX-SGT-134: at the
+// start gate, its clock running; else with its clock held).
+static void TakePrecompileHold(bool hold_clock) {
+    if (!g_precompile_hold.exchange(true)) {
+        g_precompile_hold_since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (hold_clock) {
+            g_precompile_hold_clock = true;
+            Common::GuestClock::TakeHold();
+        }
+        LOG_WARNING(Render_Vulkan, "PERF-102: the game waits on the splash screen for the precompile");
+    }
+}
+
 static void ReleasePrecompileHold() {
+    SCOPE_EXIT { Common::GuestClock::OpenStartGate(); }; // FIX-SGT-134
     if (g_precompile_hold.exchange(false)) {
-        Common::GuestClock::ReleaseHold();
+        if (g_precompile_hold_clock.exchange(false)) {
+            Common::GuestClock::ReleaseHold();
+        }
         const s64 since = g_precompile_hold_since_ms.load();
         const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -1151,6 +1291,92 @@ public:
     bool Prioritize(u64 hash) { return readers.Prioritize(hash); } // FIX-SGT-048
 private:
     ShaderStoreReaders<StoredListing> readers;
+};
+
+// FIX-SGT-146: AMD's shader compiler stops the whole process when an allocation fails ("LLVM
+// ERROR: out of memory", RyGT #101: RX 9070 XT, 32 GB, on the pre-race screen after a race,
+// after the 8-wide backlog had ended). Nothing can catch that, so builds wait for room instead:
+// one always runs, each further one only while the system's free commit (RAM plus page file
+// left) stays above a reserve plus a share per build. SHADGT_COMPILE_RESERVE_MB=<n> sets the
+// reserve (2048 by default, 0 = no check), SHADGT_COMPILE_BUILD_MB=<n> the share (1024).
+class CompileMemoryGate {
+public:
+    void Enter() {
+        if (ReserveMb() == 0) {
+            running.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        std::unique_lock lk{mutex};
+        if (running.load(std::memory_order_relaxed) > 0 && !Fits()) {
+            // A waiting build owns nothing yet (shared libraries are claimed while a build runs,
+            // PERF-GT7-041), so running builds never wait for it. The cap is only a safety net,
+            // and lets one waiter through a second, so a burst of waiters doesn't start at once.
+            constexpr auto MaxWait = std::chrono::seconds{30};
+            const auto start = std::chrono::steady_clock::now();
+            bool fits = false;
+            while (!(fits = running.load(std::memory_order_relaxed) == 0 || Fits())) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now - start >= MaxWait && now - last_forced >= std::chrono::seconds{1}) {
+                    last_forced = now;
+                    break;
+                }
+                cv.wait_for(lk, std::chrono::milliseconds{100});
+            }
+            const double waited = std::chrono::duration<double>(
+                                      std::chrono::steady_clock::now() - start)
+                                      .count();
+            if (const u32 n = ++waits; n <= 10 || n % 200 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-SGT-146: a pipeline build waited {:.2f} s for memory{} ({} "
+                            "running, {} MB free commit, {} MB free RAM; {} waits)",
+                            waited, fits ? "" : ", then went ahead",
+                            running.load(std::memory_order_relaxed), free_commit_mb,
+                            free_phys_mb, n);
+            }
+        }
+        running.fetch_add(1, std::memory_order_relaxed);
+    }
+    void Leave() {
+        running.fetch_sub(1, std::memory_order_relaxed);
+        cv.notify_all();
+    }
+
+private:
+    /// Under the mutex: room for one more build beside those running.
+    bool Fits() {
+#ifdef _WIN32
+        MEMORYSTATUSEX memory{sizeof(memory)};
+        if (!GlobalMemoryStatusEx(&memory)) return true;
+        free_commit_mb = memory.ullAvailPageFile >> 20;
+        free_phys_mb = memory.ullAvailPhys >> 20;
+        const u64 running_now = running.load(std::memory_order_relaxed);
+        return free_commit_mb >= ReserveMb() + (running_now + 1) * BuildMb();
+#else
+        return true;
+#endif
+    }
+    static u64 EnvMb(const char* name, u64 fallback) {
+        if (const char* env = std::getenv(name); env && *env) {
+            return std::strtoull(env, nullptr, 10);
+        }
+        return fallback;
+    }
+    static u64 ReserveMb() {
+        static const u64 mb = EnvMb("SHADGT_COMPILE_RESERVE_MB", 2048);
+        return mb;
+    }
+    static u64 BuildMb() {
+        static const u64 mb = EnvMb("SHADGT_COMPILE_BUILD_MB", 1024);
+        return mb;
+    }
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::atomic<u32> running{};
+    u32 waits{};
+    std::chrono::steady_clock::time_point last_forced{};
+    u64 free_commit_mb{};
+    u64 free_phys_mb{};
 };
 
 class PipelineCache::PipelineBuildWorkers {
@@ -1348,7 +1574,11 @@ private:
                 Common::SetCurrentThreadPriority(want_low ? Common::ThreadPriority::Low
                                                           : Common::ThreadPriority::Normal);
             }
-            job();
+            {
+                memory_gate.Enter(); // FIX-SGT-146
+                SCOPE_EXIT { memory_gate.Leave(); };
+                job();
+            }
             if (background) {
                 queue.FinishedBackground(heavy);
             } else {
@@ -1358,6 +1588,7 @@ private:
     }
 
     BuildQueue queue;
+    CompileMemoryGate memory_gate; // FIX-SGT-146
     std::vector<std::jthread> threads;
     bool catch_up{};
     bool backlog{}; ///< FIX-GT7-106 (port)
@@ -3021,6 +3252,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     if (liverpool) {
         liverpool->on_command_buffer_start = [this] { ReadAheadAtBufferStart(); };
     }
+    g_tess_lds_off_by_default.store(instance.GetDriverID() == vk::DriverId::eAmdProprietary,
+                                    std::memory_order_relaxed); // PERF-SGT-155
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),
@@ -3108,10 +3341,31 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                         instance.GetDriverID() == vk::DriverId::eNvidiaProprietary &&
                         !Common::DiagEnv("SHADGT_DIAG_NO_MANUAL_INTERP")) ||
                        (instance.IsAmdShaderExplicitVertexParameterSupported() &&
-                        instance.IsAmdLegacyShaderCompiler());
+                        instance.IsAmdLegacyShaderCompiler()) ||
+                       AmdManualInterpByDefault(); // FIX-SGT-145
             }(),
-        .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
-                              instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
+        // PERF-SGT-151: only on AMD's older compiler (AMD-315's cause, V_INTERP_MOV making its
+        // attribute per-vertex, is known there). RX 7000/9000 (FIX-SGT-145) keep every attribute.
+        .manual_interp_mov_only =
+            [&] {
+                const char* env = std::getenv("SHADGT_MANUAL_INTERP_ALL");
+                return !(env && env[0] == '1') &&
+                       instance.IsAmdShaderExplicitVertexParameterSupported() &&
+                       instance.IsAmdLegacyShaderCompiler();
+            }(),
+        // FIX-SGT-139: GCN code leaves out the shared memory barriers of a 64-thread workgroup,
+        // one wave there. RX 7000/9000 on AMD's driver (LLPC) need them too, though their compute
+        // runs 64 wide (RyGT #92: GT7 sky flicker on an RX 9050, gone with them).
+        // SHADGT_LDS_BARRIERS=1: on for any GPU, other value: off; part of the store key.
+        .needs_lds_barriers =
+            [&] {
+                if (const char* env = std::getenv("SHADGT_LDS_BARRIERS"); env && *env) {
+                    return env[0] == '1';
+                }
+                return instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
+                       instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp ||
+                       AmdLdsBarriersByDefault();
+            }(),
         .intel_arc_workarounds = instance.IsIntel(),
         .needs_buffer_offsets = instance.StorageMinAlignment() > 4,
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
@@ -3126,6 +3380,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     profile.direct_buffers =
         VideoCore::DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported();
     // PERF-GTS-479: buffers earlier runs never read in place, read before any translation.
+    // FIX-SGT-202: only with SHADGT_LEARNED_DIRECT=1.
+    if (profile.direct_buffers && !Shader::DirectLearning::Enabled()) {
+        LOG_INFO(Render_Vulkan, "FIX-SGT-202: every buffer keeps its direct-memory path; learning "
+                                "from shaders/<serial>.direct-reads is off (SHADGT_LEARNED_DIRECT=1: on)");
+    }
     if (profile.direct_buffers && Shader::DirectLearning::Enabled()) {
         const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
         const auto path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
@@ -3133,10 +3392,21 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         const size_t shaders = Shader::DirectLearning::Load(path);
         LOG_INFO(Render_Vulkan,
                  "PERF-GTS-479: {} shaders in {}; buffers they never read in place are "
-                 "translated without the direct-memory path (SHADGT_LEARNED_DIRECT=0: off)",
+                 "translated without the direct-memory path (SHADGT_LEARNED_DIRECT=1)",
                  shaders, path.string());
     }
+    LOG_INFO(Render_Vulkan, "FIX-SGT-139: shared memory barriers in 64-thread compute: {}",
+             profile.needs_lds_barriers);
     profile.lds_read_counters = DiagLdsReadCountersAddress(instance); // DIAG-GTS-459
+    profile.tess_attr_pad = TessAttrPad();                            // FIX-SGT-143
+    if (profile.tess_attr_pad != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "FIX-SGT-143: hull and domain shaders declare {} more control-point "
+                 "attribute(s) (SHADGT_TESS_ATTR_PAD)",
+                 profile.tess_attr_pad);
+    }
+    profile.tes_dump_address = DiagTesDumpAddress(instance); // DIAG-SGT-144
+    profile.tes_dump_hash = DiagTesDumpHash();
 #ifdef RYTY_GPU
     // FIX-GTS-364 (FIX-GT7-151): an RX 480 drew GT7 right only with the legacy 2D-array cube
     // sampling path, so GCN Radeons take it by default. SHADGT_NATIVE_CUBE=0 picks the legacy
@@ -3316,6 +3586,22 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                                                "vertex input; not available here");
                 } else {
                     prewarm_enabled = true;
+#ifdef RYTY_GPU
+                    // FIX-SGT-134: made while the game's first call into the renderer waits for
+                    // its initialization; that call returns once the hold is released.
+                    if (PrecompileStartGateOn()) {
+                        TakePrecompileHold(false);
+                        Common::GuestClock::CloseStartGate();
+                        LOG_WARNING(Render_Vulkan, "FIX-SGT-134: the game waits at the start gate "
+                                                   "until the splash precompile is done, its clock "
+                                                   "running (SHADGT_PRECOMPILE_START_GATE=0: it runs "
+                                                   "under the hold, as before)");
+                    } else {
+                        LOG_WARNING(Render_Vulkan, "FIX-SGT-134: no start gate ({}): the game runs "
+                                                   "under the splash hold, its clock held",
+                                    Common::IsGt7() ? "GT7" : "GT Sport without an HDR10 output");
+                    }
+#endif
 #ifndef NDEBUG
                     prewarm_stats.since = std::chrono::steady_clock::now();
 #endif
@@ -7725,13 +8011,11 @@ void PipelineCache::PrewarmRead(std::stop_token stop) {
     Common::SetCurrentThreadName("shadGT:PrewarmRead");
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
 #ifdef RYTY_GPU
-    // PERF-102: the game waits on the splash screen until the precompile is done.
-    if (!g_precompile_hold.exchange(true)) {
-        g_precompile_hold_since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-        Common::GuestClock::TakeHold();
-        LOG_WARNING(Render_Vulkan, "PERF-102: the game waits on the splash screen for the precompile");
-    }
+    TakePrecompileHold(true); // PERF-102 (with FIX-SGT-134, already taken by the constructor)
+    // FIX-SGT-134: stopped before it is done (the renderer closes), the game is let go.
+    SCOPE_EXIT {
+        if (stop.stop_requested()) ReleasePrecompileHold();
+    };
 #endif
     auto& store = Storage::DataBase::Instance();
     RebuildFromPrograms(); // PB-1

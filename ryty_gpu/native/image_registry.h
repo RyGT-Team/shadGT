@@ -444,6 +444,9 @@ public:
     /// only, as Evict). The caller names live entries.
     u32 EvictListed(std::span<const ImageEntry* const> listed, u64 before,
                     const std::function<void(ImageEntry&)>& on_evict);
+    /// FIX-SGT-158: frees render targets a new target of another layout replaced at their
+    /// address, each once it has gone unused for a few frames (recorder only, before Evict).
+    u32 EvictSuperseded(u64 frame, const std::function<void(ImageEntry&)>& on_evict);
     /// FIX-157: whether guest memory under a picture the GPU wrote still holds what it held
     /// when the picture was last uploaded from it (its content hash).
     bool MemoryUnchanged(const ImageEntry& entry);
@@ -468,6 +471,10 @@ public:
     /// guest memory the CPU reads after the GPU wrote it.
     bool RecordDownload(Rhi::CommandList& list, ImageEntry& entry, const Rhi::Buffer& out,
                         u64 out_offset = 0, DownloadBatch* batch = nullptr);
+    /// FIX-SGT-140: makes the buffers RecordDownload would make for the picture (its tiling
+    /// parameters, and unbatched its scratch), before anything is recorded. false: device
+    /// memory ran out, and the write-back can be left out with nothing half recorded.
+    bool PrepareDownload(ImageEntry& entry, bool batched);
     // FIX-SGT-072 (review): what RecordPartialVolumeFill needs, checked and made before anything
     // is recorded. Ineligible does not change for the image; OutOfMemory may pass later.
     enum class PartialFill : u8 { Ready, Ineligible, OutOfMemory };
@@ -546,8 +553,20 @@ private:
     std::mutex upload_mutex;
     std::mutex recent_fills_mutex;
     RecentFills recent_fills;
+    struct Superseded {                          ///< FIX-SGT-158
+        VAddr address;
+        const ImageEntry* entry;                 ///< compared only, never read unless found
+        u64 noted;                               ///< frame it was replaced
+    };
+    std::mutex superseded_mutex;                 ///< FIX-SGT-158
+    std::vector<Superseded> superseded;          ///< FIX-SGT-158
+    std::atomic<u64> superseded_frame{0};        ///< FIX-SGT-158: last EvictSuperseded frame
     std::shared_ptr<std::atomic<u64>> remembered_fill_count = std::make_shared<std::atomic<u64>>(0);
     std::vector<ImageEntry*> pending_uploads;
+    /// FIX-SGT-140: uploads left out when device memory ran out, due again from the next frame
+    /// on (upload_mutex, like pending_uploads).
+    std::vector<ImageEntry*> retry_uploads;
+    u64 retry_uploads_frame = 0;
     std::atomic<u64> generation{0}; ///< OPT-002
     /// OPT-010: the ranges of the pictures made or dropped, by the generation they made.
     struct Change {

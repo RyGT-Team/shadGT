@@ -274,6 +274,17 @@ ImageRegistry::ImageRegistry(Rhi::Device& device) : device{device} {
 
 ImageRegistry::~ImageRegistry() = default;
 
+namespace {
+// FIX-SGT-158: SHADGT_FREE_SUPERSEDED_TARGETS=0 turns it off.
+bool FreeSupersededOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_FREE_SUPERSEDED_TARGETS");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+} // namespace
+
 ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_target, u64 frame,
                                 bool create, bool exact_format) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::RegistryFind}; // DIAG-SGT-023
@@ -384,13 +395,27 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                 const char* env = std::getenv("SHADGT_NATIVE_DEPTH_TEXTURES"); // FIX-206 off: =0
                 return !(env && env[0] == '0');
             }();
+            // FEAT-SGT-189: a depth array the game drew with fewer layers than the texture that
+            // samples it describes (GT7's near shadow cascades: 3 drawn, sampled as 4, with a
+            // scene below the output) is still that depth: without it the texture was made from
+            // guest memory (zeros) and the near shadows were wrong up to the cascade's edge.
+            // The view then has the drawn layers; a later layer index clamps to the last.
+            // SHADGT_DEPTH_FEWER_LAYERS=0: as before.
+            static const bool fewer_layers = [] {
+                const char* env = std::getenv("SHADGT_DEPTH_FEWER_LAYERS");
+                return !(env && env[0] == '0');
+            }();
             ImageEntry* depth = nullptr;
             for (auto it = first; it != last; ++it) {
                 const auto& cached = it->second->info;
+                const bool layers_ok =
+                    cached.resources.layers >= info.resources.layers ||
+                    (fewer_layers && cached.resources.layers > 1 && cached.size == info.size &&
+                     cached.pitch == info.pitch && cached.resources.levels == info.resources.levels);
                 if (cached.props.is_depth && cached.num_bits == info.num_bits &&
                     (depth_textures || !info.props.is_depth) &&
                     !it->second->reused.load(std::memory_order_relaxed) &&
-                    cached.resources.layers >= info.resources.layers &&
+                    layers_ok &&
                     CompatibleLayerStrides(cached, info) &&
                     ((cached.size.width == info.size.width &&
                       cached.size.height == info.size.height) ||
@@ -585,6 +610,34 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                 result->remembered_fill_receipt =
                     std::make_shared<RememberedFillReceipt>(remembered_fill_count);
                 remembered = true;
+            }
+        }
+        // FIX-SGT-158 (SHADGT_FREE_SUPERSEDED_TARGETS=0: as before): a render target of a new layout
+        // at an address where older targets of other layouts sit means the game drew over that
+        // memory. GT7 lowers its render resolution a step every frame or two when the GPU is busy
+        // (its License Test "TRY AGAIN" screen: 15 sizes from 3150x1771 down to 2513x1415 in a
+        // second), each step a full new set of targets at the same scratch addresses, and the old
+        // sets stayed until two seconds idle: +1.8 GB in a second on an 8 GB card, over its budget,
+        // a hitch, and a crash waiting to happen on less forgiving drivers. The old targets are
+        // noted here and freed at the end of a frame once unused for a few frames (each set was
+        // still in use the frame before the next size came, so checking only now missed them all).
+        // One the game uses again in that time stays usable (a pool that holds two sizes at one
+        // address in turn keeps both), and after four seconds it is left to the idle eviction.
+        // Uploaded pictures of another layout under a new image go too (the guest memory they
+        // came from is uploaded again if one is wanted; GT7's fail screen made ~40 images a frame
+        // for 23 frames over ~150 of them a frame, ~2 GB kept two seconds). A picture drawn by the
+        // GPU under a new texture stays (only the GPU holds what it drew), unless stale.
+        const bool free_superseded = FreeSupersededOn();
+        if (free_superseded) {
+            for (auto it = first; it != last; ++it) {
+                const ImageEntry& old = *it->second;
+                if (!old.image || SameLayout(old.info, info) ||
+                    (!old.from_cpu && !render_target &&
+                     !old.reused.load(std::memory_order_relaxed))) {
+                    continue;
+                }
+                std::scoped_lock superseded_lock{superseded_mutex};
+                superseded.push_back({info.guest_address, &old, frame});
             }
         }
         shard.images.emplace(info.guest_address, std::move(entry));
@@ -1319,6 +1372,46 @@ u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_
     return RetireTaken(taken, on_evict);
 }
 
+u32 ImageRegistry::EvictSuperseded(u64 frame, const std::function<void(ImageEntry&)>& on_evict) {
+    constexpr u64 IdleFrames = 4;    // unused this long: freed
+    constexpr u64 WatchFrames = 240; // still in use after this long: left to Evict
+    superseded_frame.store(frame, std::memory_order_relaxed);
+    std::vector<Superseded> noted;
+    {
+        std::scoped_lock lock{superseded_mutex};
+        noted.swap(superseded);
+    }
+    if (noted.empty()) {
+        return 0;
+    }
+    std::vector<Superseded> still;
+    std::vector<std::unique_ptr<ImageEntry>> taken;
+    std::unordered_set<const ImageEntry*> seen;
+    for (const Superseded& item : noted) {
+        if (!seen.insert(item.entry).second) {
+            continue;
+        }
+        Shard& shard = ShardOf(item.address);
+        std::unique_lock lock{shard.mutex};
+        const auto [first, last] = shard.images.equal_range(item.address);
+        for (auto it = first; it != last; ++it) {
+            if (it->second.get() != item.entry) continue;
+            if (it->second->last_use.load(std::memory_order_relaxed) + IdleFrames < frame) {
+                taken.push_back(std::move(it->second));
+                shard.images.erase(it);
+            } else if (item.noted + WatchFrames >= frame) {
+                still.push_back(item);
+            }
+            break;
+        }
+    }
+    if (!still.empty()) {
+        std::scoped_lock lock{superseded_mutex};
+        superseded.insert(superseded.end(), still.begin(), still.end());
+    }
+    return taken.empty() ? 0 : RetireTaken(taken, on_evict);
+}
+
 u32 ImageRegistry::EvictListed(std::span<const ImageEntry* const> listed, u64 before,
                                const std::function<void(ImageEntry&)>& on_evict) {
     std::vector<std::unique_ptr<ImageEntry>> taken;
@@ -1356,6 +1449,7 @@ u32 ImageRegistry::RetireTaken(std::vector<std::unique_ptr<ImageEntry>>& taken,
     {
         std::scoped_lock lock{upload_mutex};
         std::erase_if(pending_uploads, [&](ImageEntry* entry) { return gone.contains(entry); });
+        std::erase_if(retry_uploads, [&](ImageEntry* entry) { return gone.contains(entry); }); // FIX-SGT-140
     }
     if (!taken.empty()) {
         std::vector<std::pair<VAddr, VAddr>> ranges;
@@ -1547,6 +1641,13 @@ void ImageRegistry::MarkReused(ImageEntry& entry) {
                                         entry.info.guest_address +
                                             std::max<u64>(entry.info.guest_size, 1)};
     NoteChanges({&range, 1}, 3);
+    // FIX-SGT-158: nothing finds a stale picture any more: freed once unused a few frames, not
+    // kept two seconds.
+    if (FreeSupersededOn() && entry.image) {
+        std::scoped_lock superseded_lock{superseded_mutex};
+        superseded.push_back({entry.info.guest_address, &entry,
+                              superseded_frame.load(std::memory_order_relaxed)});
+    }
 #ifndef NDEBUG
     if (WatchedTexture(entry.info.guest_address, entry.info.guest_address + 1)) {
         LOG_WARNING(Render_Vulkan, "FIX-157 watch: kept {:#x} reused", entry.info.guest_address);
@@ -2163,6 +2264,22 @@ bool ImageRegistry::LazyUploads() {
     return true;
 }
 
+// FIX-SGT-140 (RyGT #103): an upload left out because device memory ran out. Its hash was
+// already taken for the bytes it was to upload, and its upload was no longer due: the texture
+// kept its old pixels until the game wrote it again. Its hash is forgotten and it is due again
+// from the next frame on (RecordUploads; retried at every bind in this one, each try would fail
+// again).
+static void ForgetUploadedHash(ImageEntry& entry) {
+    entry.content_hash = 0;
+    static std::atomic<u32> logged{};
+    if (const u32 n = logged.fetch_add(1, std::memory_order_relaxed); n < 16 || n % 256 == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-SGT-140: upload of texture {:#x}+{:#x} left for its next use: device "
+                    "memory ran out",
+                    entry.info.guest_address, entry.info.guest_size);
+    }
+}
+
 u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* const> bound,
                                  bool trace_slow_calls) {
     SampleGuestHashCalls hash_sampling{trace_slow_calls};
@@ -2175,6 +2292,24 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
         std::scoped_lock lock{upload_mutex};
         pending.swap(pending_uploads);
     }
+    {
+        // FIX-SGT-140: uploads left out in an earlier frame are due again.
+        std::scoped_lock lock{upload_mutex};
+        const u64 now = upload_frame_now.load(std::memory_order_relaxed);
+        if (!retry_uploads.empty() && retry_uploads_frame != now) {
+            for (ImageEntry* entry : retry_uploads) {
+                entry->needs_upload.store(true, std::memory_order_release);
+                pending.push_back(entry);
+            }
+            retry_uploads.clear();
+        }
+    }
+    const auto retry_later = [&](ImageEntry& entry) { // FIX-SGT-140
+        ForgetUploadedHash(entry);
+        std::scoped_lock lock{upload_mutex};
+        retry_uploads.push_back(&entry);
+        retry_uploads_frame = upload_frame_now.load(std::memory_order_relaxed);
+    };
     // PERF-109: the stale textures the work uses (an entry listed twice is uploaded once).
     for (ImageEntry* entry : bound) {
         if (entry && entry->from_cpu && UploadDue(*entry)) {
@@ -2374,6 +2509,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
                                                    Rhi::BufferUsageTransferSrc,
                                           .memory = Rhi::MemoryKind::Upload});
             if (!source || !source->Mapped()) {
+                retry_later(*entry); // FIX-SGT-140
                 continue;
             }
             // A streamed texture can have unmapped leading mips and resident lower mips.
@@ -2447,6 +2583,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
 #endif
             }
             if (!untile || !params_buffer || !out) {
+                if (untile) retry_later(*entry); // FIX-SGT-140: memory ran out
                 continue;
             }
             // WAR dependency: the preceding copy must finish reading shared scratch
@@ -2714,6 +2851,23 @@ bool ImageRegistry::RecordPartialVolumeFill(Rhi::CommandList& list, ImageEntry& 
     // Also orders this fill's reads of the scratch buffers before the next one's writes.
     list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeCompute | Rhi::ScopeTransfer);
     return true;
+}
+
+bool ImageRegistry::PrepareDownload(ImageEntry& entry, bool batched) {
+    const VideoCore::ImageInfo& info = entry.info;
+    if (!info.props.is_tiled && !info.props.is_bgr_packed_float) {
+        return true; // a plain copy: nothing to make
+    }
+    if (!TilingPipeline(info, true)) {
+        return true; // RecordDownload refuses it for that, not for memory
+    }
+    if (!entry.download_params) {
+        entry.download_params = TilingParamsBuffer(info);
+    }
+    if (!entry.download_params) {
+        return false;
+    }
+    return batched || PrepareTilingScratch(entry, true);
 }
 
 bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, const Rhi::Buffer& out,

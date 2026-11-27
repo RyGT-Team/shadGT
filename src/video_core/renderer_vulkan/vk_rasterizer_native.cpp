@@ -1,3 +1,4 @@
+#include "ryty_gpu/ryty_dlss_layout.h"
 #include "ryty_gpu/native/ordered_timing.h"
 #include <exception>
 #include "ryty_gpu/native/cpu_stack_registry.h"
@@ -21,6 +22,7 @@
 #include "ryty_gpu/native/buffer_sizes.h"
 #include "ryty_gpu/native/descriptor_dead_handles.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/videoout/buffer.h"
 #include "ryty_gpu/native/parallel_rotate_segment.h"
 #include "ryty_gpu/native/natural_scope_boundary.h"
 #include "ryty_gpu/native/attachment_alias.h"
@@ -585,6 +587,10 @@ static std::unique_ptr<Native::Rhi::Buffer> scene_indirect_buffer;
 static std::vector<SceneIndirectArgs> scene_indirect_args;
 
 bool RytyGtsInRace();
+bool RytyGt7RaceHookInstalled();
+u32 RytyGt7MenuWidth(u32 registered_width, u32 height);
+bool RytyGt7MenuActive();
+bool RytyGt7NativeDlssMenu();
 bool RytyRaceRunning(); // GAME-006, ryty_game_patch.cpp
 static bool PrepareScope(); // PERF-GTS-450: races, or menus with SHADGT_NATIVE_PREPARE_MENUS=1
 bool RytyGtsRaceSession(); // WIDE-015
@@ -1954,18 +1960,31 @@ GtsSceneImage NativeRenderer::TemporalImage(const Native::ImageEntry& entry) {
             }, [this, &entry] { Written(&entry); }};
 }
 
+static bool IsDisplayAddress(VAddr address);
+static bool IsPrimaryDisplayExtent(vk::Extent2D extent);
+
 void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Targets& targets,
                                      const DrawBindings& bindings) {
-    // Merge (shadGT): GT Sport's temporal pass; GT7 has its own (NoteTemporalDraw).
-    if (Common::IsGt7() || !r.temporalDlss.Enabled()) return;
+    const bool gt7 = Common::IsGt7();
+    if ((gt7 && !RytyUpscale::GuestOutputDlss()) || !r.temporalDlss.Enabled()) return;
     const auto& regs = r.liverpool->DrawRegs();
     const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
-    if (!fs || regs.num_indices > 6 ||
+    // GT7's 4K race captures identify this TAA draw and its four scene-sized resources.
+    if (!fs || (gt7 && fs->pgm_hash != 0xcfa125dd) || regs.num_indices > 6 ||
         regs.num_instances.NumInstances() != 1 || targets.state.num_color_attachments != 2 ||
         bindings.sampled.size() != 4 || !targets.colors[0] || !targets.colors[1]) { NATIVE_DIAGNOSTIC(static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 1, fs {:#x}", fs ? fs->pgm_hash : 0);); return; }
     const auto* history_out = targets.colors[0];
     const auto* resolved = targets.colors[1];
     const vk::Extent2D size{resolved->info.size.width, resolved->info.size.height};
+    if (RytyUpscale::GuestOutputDlss()) {
+        if (RytyGt7NativeDlssMenu()) return;
+        const auto& layout = RytyUpscale::DlssLayout();
+        if (layout.scene.width) {
+            if (size != layout.scene || !RytyGtsInRace()) return;
+        } else if (r.temporalDlss.ActiveQuality() == RYGT_DLSS_QUALITY_DLAA) {
+            if (!RytyGtsInRace() || !IsPrimaryDisplayExtent(size)) return;
+        } else if (size != vk::Extent2D{1920, 1080}) return;
+    }
     if (history_out->info.pixel_format != vk::Format::eR16G16B16A16Sfloat ||
         resolved->info.pixel_format != vk::Format::eB10G11R11UfloatPack32 ||
         history_out->info.size.width != size.width || history_out->info.size.height != size.height)
@@ -1992,16 +2011,17 @@ void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Ta
     for (const auto& buffer : fs->buffers) {
         if (buffer.IsSpecial() || buffer.is_written) continue;
         const auto sharp = buffer.GetSharp(*fs);
-        if (!sharp.base_address || sharp.GetSize() != sizeof(constants)) continue;
+        if (!sharp.base_address || (gt7 ? sharp.GetSize() < sizeof(constants) : sharp.GetSize() != sizeof(constants))) continue;
         if (!Core::RytyMemory::GuardedCopy(constants.data(),
                 reinterpret_cast<const void*>(sharp.base_address), sizeof(constants))) { NATIVE_DIAGNOSTIC(static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 6, fs {:#x}", fs ? fs->pgm_hash : 0);); return; }
-        valid = std::ranges::all_of(constants, [](float v) { return std::isfinite(v); }) &&
-            std::abs(constants[14] - size.width * .5f) <= .01f &&
-            std::abs(constants[15] + size.height * .5f) <= .01f &&
-            ((constants[16] == size.width && constants[17] == size.height) ||
-             // WIDE-062: with the wide scene the game leaves these two at 0 (the half-size pair
-             // above still matches); only that pair and the jitter are used by the capture.
-             (RytyWideScene() && constants[16] == 0.f && constants[17] == 0.f)) &&
+        const bool known_scale = gt7
+            ? constants[14] != 0.f && constants[15] != 0.f &&
+              std::abs(constants[14]) <= size.width && std::abs(constants[15]) <= size.height
+            : std::abs(constants[14] - size.width * .5f) <= .01f &&
+              std::abs(constants[15] + size.height * .5f) <= .01f &&
+              ((constants[16] == size.width && constants[17] == size.height) ||
+               (RytyWideScene() && constants[16] == 0.f && constants[17] == 0.f));
+        valid = known_scale && std::ranges::all_of(constants, [](float v) { return std::isfinite(v); }) &&
             std::abs(constants[20] * constants[14]) <= 1.f &&
             std::abs(constants[21] * constants[15]) <= 1.f;
         break;
@@ -2020,11 +2040,14 @@ void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Ta
 }
 
 bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& targets,
-                                   const DrawBindings& bindings) {
-    if (Common::IsGt7() || !r.temporalDlss.Enabled()) return false; // (as CaptureNativeFsr)
+                                    DrawBindings& bindings, GtsSceneBinding& scene_binding) {
+    const bool gt7 = Common::IsGt7();
+    const bool guest_output = RytyUpscale::GuestOutputDlss();
+    if ((gt7 && !guest_output) || !r.temporalDlss.Enabled() || RytyGt7NativeDlssMenu()) return false;
     const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
     const auto& regs = r.liverpool->DrawRegs();
-    if (!fs || !IsSceneCompositionShader(fs->pgm_hash) || regs.num_indices > 6 ||
+    if (!fs || (gt7 ? fs->pgm_hash != 0xdf75f23b : !IsSceneCompositionShader(fs->pgm_hash)) ||
+        regs.num_indices > 6 ||
         regs.num_instances.NumInstances() != 1 || targets.depth ||
         targets.state.num_color_attachments != 1 || !targets.colors[0] ||
         regs.blend_control[0].enable || regs.color_target_mask.GetMask(0) != 0xf) return false;
@@ -2037,8 +2060,23 @@ bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& t
     const auto scene = std::ranges::find_if(bindings.sampled, [&](const auto* e) {
         return r.temporalDlss.HasScene(now, e->image->NativeHandle());
     });
-    if (scene == bindings.sampled.end()) return false;
+    if (scene == bindings.sampled.end() || bindings.region_writeback || bindings.writes_buffers ||
+        !bindings.stored.empty()) return false; // A failed reconstruction can replay this draw.
     const auto size = r.temporalDlss.RenderSize();
+    if (guest_output) {
+        const vk::Extent2D output{desc.width, desc.height};
+        const auto& layout = RytyUpscale::DlssLayout();
+        // GT Sport's wide UI proxy receives the full reconstruction after composing its display.
+        const bool wide_proxy = !gt7 && layout.Wide() && UiHires::Wide() &&
+                                IsWideRaceComposition(fs->pgm_hash) && IsDisplayAddress(target->info.guest_address);
+        if ((!wide_proxy && r.temporalDlss.OutputSize() != output) ||
+            (gt7 && !IsDisplayAddress(target->info.guest_address))) return false;
+        if (layout.scene.width) {
+            if (size != layout.scene || r.temporalDlss.OutputSize() != layout.output) return false;
+        } else if (r.temporalDlss.ActiveQuality() == RYGT_DLSS_QUALITY_DLAA) {
+            if (size != output || !RytyGtsInRace()) return false;
+        } else if (size != vk::Extent2D{1920, 1080} || output != vk::Extent2D{3840, 2160}) return false;
+    }
     // WIDE-063: the wide race scene is wider than the game's display buffer (3840x1080 against
     // 1920x1080), so the composition cannot be drawn into it at the scene's size. It is drawn
     // into the reconstruction's input image instead (below), and the reconstruction is shown
@@ -2074,13 +2112,39 @@ bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& t
         fsr_composition = std::move(scratch);
         PrepareImages();
     }
+    // Substitute only the descriptor that reads the TAA result in this composition draw.
+    // Leave unusual or ambiguous views to the game.
+    {
+        std::scoped_lock lock{views_mutex};
+        const auto found = views.find(*scene);
+        if (found == views.end()) return false;
+        vk::DescriptorImageInfo* slot{};
+        const VideoCore::ImageViewInfo* info{};
+        for (const auto& record : found->second) {
+            for (auto& descriptor : bindings.images) {
+                if (descriptor.imageView != *record.view) continue;
+                if (slot || record.use != ViewUse::Sampled) return false;
+                slot = &descriptor;
+                info = &record.info;
+            }
+        }
+        if (!slot || !r.temporalDlss.BindSceneColor(*info, *slot, scene_binding)) return false;
+        bindings.key_layout = nullptr;
+    }
     Splice();
-    r.temporalDlss.PrepareScene(now, TemporalImage(**scene));
     Begin();
     UiHires::Get().scale = 0.f;
     fsr_wide_full = IsWideRaceComposition(fs->pgm_hash); // WIDE-001
-    fsr_game_extent = {targets.state.width, targets.state.height};
-    fsr_wide_drawn = wide && (size.width > desc.width || size.height > desc.height);
+    // GT7 can request a scene-sized viewport for this draw on a full-sized display image.
+    // In that case its coordinates already address the DLSS input directly.
+    const auto& vp = regs.viewports[0];
+    const bool scene_viewport = guest_output && vp.xscale == size.width * 0.5f &&
+        std::abs(vp.yscale) == size.height * 0.5f && vp.xoffset == size.width * 0.5f &&
+        vp.yoffset == size.height * 0.5f;
+    fsr_game_extent = scene_viewport ? size : vk::Extent2D{targets.state.width, targets.state.height};
+    // Render the entire tone-mapped scene into the input image. The reconstructed result goes
+    // into the real display before HUD drawing, even when that display is already full-size.
+    fsr_wide_drawn = guest_output || (wide && (size.width > desc.width || size.height > desc.height));
     if (fsr_wide_drawn) {
         // WIDE-063: the composition goes straight into the reconstruction's input, at its size.
         auto& attachment = targets.state.color_attachments[0];
@@ -2089,7 +2153,7 @@ bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& t
         targets.state.width = size.width;
         targets.state.height = size.height;
         static std::atomic<u32> logged{};
-        if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+        if (!guest_output && logged.fetch_add(1, std::memory_order_relaxed) < 4) {
             std::fprintf(stderr, "[wide] WIDE-063 race composition drawn at %ux%u for DLSS "
                                  "(display buffer %ux%u)\n",
                          size.width, size.height, desc.width, desc.height);
@@ -2098,7 +2162,7 @@ bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& t
     return true;
 }
 
-void NativeRenderer::FinishNativeFsr(const Targets& targets) {
+bool NativeRenderer::FinishNativeFsr(const Targets& targets) {
     EndRendering();
     GlobalBarrier();
     auto& s = Begin();
@@ -2136,27 +2200,12 @@ void NativeRenderer::FinishNativeFsr(const Targets& targets) {
                 size.width, size.height, r.temporalDlss.OutputSize().width,
                 r.temporalDlss.OutputSize().height, target->info.size.width, target->info.size.height);
     } else {
-        if (drawn_in_scratch) {
-            static std::atomic<u32> logged{};
-            if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
-                std::fprintf(stderr, "[wide] WIDE-063 DLSS reconstruction of the wide scene "
-                                     "failed; showing the composition scaled\n");
-            }
-        }
-        // Preserve a complete output picture even if the optional provider fails.
-        auto& fallback = Begin();
-        GlobalBarrier();
-        vk::ImageBlit blit{};
-        blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
-        blit.dstSubresource = blit.srcSubresource;
-        blit.srcOffsets[1] = {s32(size.width), s32(size.height), 1};
-        blit.dstOffsets[1] = {s32(target->info.size.width), s32(target->info.size.height), 1};
-        fallback.cmd.blitImage(scratch, vk::ImageLayout::eGeneral, source,
-                               vk::ImageLayout::eGeneral, blit, vk::Filter::eLinear);
-        fallback.list->Barrier(Native::Rhi::ScopeAll, Native::Rhi::ScopeAll);
+        Begin(); // NGX may already have recorded commands before reporting an error.
+        return false;
     }
     Written(target);
     Begin(); // Direct backend commands invalidate cached Native pipeline/dynamic state.
+    return true;
 }
 
 // PERF-GT7-130: whether the range is not imported yet and starts in a guest mapping of at most
@@ -2180,7 +2229,32 @@ static bool InSmallUnimportedMapping(const VideoCore::DirectMemory& direct, VAdd
     return mapping_end > address && mapping_end - mapping <= copy_below;
 }
 
+static void DecideGtsCpuWritebackNow();
+
+// FIX-SGT-140 (diagnosis, SHADGT_DIAG_OOM_EVERY=<n>, diagnostics builds only): every nth upload
+// chunk a caller can do without, and every nth write-back, fails as if device memory had run
+// out, so the recovery paths run without a full card.
+static bool DiagForcedOutOfMemory() {
+    if constexpr (!Common::DiagnosticsBuilt) {
+        return false;
+    } else {
+        static const u64 every = [] {
+            const char* env = Common::DiagEnv("SHADGT_DIAG_OOM_EVERY");
+            return env && *env ? u64{std::strtoull(env, nullptr, 10)} : u64{0};
+        }();
+        static std::atomic<u64> calls{};
+        return every != 0 && calls.fetch_add(1, std::memory_order_relaxed) % every == every - 1;
+    }
+}
+
+// FIX-SGT-140: out-of-memory lines: the first 16, then one in 256.
+static bool OutOfMemoryLogDue(std::atomic<u32>& logged) {
+    const u32 n = logged.fetch_add(1, std::memory_order_relaxed);
+    return n < 16 || n % 256 == 0;
+}
+
 NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
+    DecideGtsCpuWritebackNow(); // FIX-GTS-529: before the game sets up its save memory
     SnapshotLease::BackingProtocol::Initialize(r.instance.GetVendorID());
     sampler_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
     if(PreparedSampledProofRequested())try {prepared_proof_contexts.Register(this);} catch(...) {}
@@ -2242,7 +2316,21 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
                 {"allocate", "mapping", "readable-prefix", "zero-tail", "guarded-copy",
                  "sparse-copy", "wrap-buffer", "local-stage"}};
             detail.Next(0,address,size);
-            const auto [buffer, offset, destination] = Allocate(size, r.instance.StorageMinAlignment());
+            // FIX-SGT-140 (RyGT #103): with device memory gone (an 8 GB card, a track change
+            // while shaders compile) this stopped the renderer (NAT-100). Without upload memory
+            // the registry's own CPU copy is tried, and when that fails too the texture keeps
+            // what it has until its next upload.
+            const auto [buffer, offset, destination] =
+                Allocate(size, r.instance.StorageMinAlignment(), nullptr, true);
+            if (!destination) {
+                static std::atomic<u32> logged{};
+                if (OutOfMemoryLogDue(logged)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-SGT-140: texture {:#x}+{:#x} not staged: upload memory ran out",
+                                address, size);
+                }
+                return staged;
+            }
             detail.Next(1);
             u64 readable = 0;
             if (r.memory->IsValidMapping(address)) {
@@ -2689,34 +2777,41 @@ static bool FaultAheadEnabled() {
     return enabled;
 }
 
-// GT7-UW: the display buffers' addresses (the presenter notes them as the game registers them).
+// VideoOut may register multiple views of the same address, each with its own pitch.
 namespace {
-std::array<std::atomic<VAddr>, 16> g_display_addresses{};
-/// DLSS-GT7-001: the size each was registered with (width << 32 | height; 0 unknown).
-std::array<std::atomic<u64>, 16> g_display_sizes{};
+struct DisplaySlot {
+    std::atomic<VAddr> address{};
+    vk::Extent2D extent{};
+    u32 pitch{};
+};
+std::array<DisplaySlot, Libraries::VideoOut::MaxDisplayBuffers> g_display_slots{};
+std::atomic<std::size_t> g_display_slot_count{};
+std::mutex g_display_slots_mutex;
 } // namespace
 
-void NoteDisplayAddress(VAddr address, u32 width, u32 height) {
-    for (std::size_t i = 0; i < g_display_addresses.size(); ++i) {
-        auto& slot = g_display_addresses[i];
-        VAddr expected = 0;
-        if (slot.load(std::memory_order_relaxed) == address ||
-            slot.compare_exchange_strong(expected, address)) {
-            if (width != 0 && height != 0) {
-                g_display_sizes[i].store((u64{width} << 32) | height, std::memory_order_relaxed);
-            }
-            return;
-        }
+void SetDisplaySlot(std::size_t index, VAddr address, const Libraries::VideoOut::BufferAttribute& view) {
+    std::scoped_lock lock{g_display_slots_mutex};
+    auto& slot = g_display_slots[index];
+    slot.extent = vk::Extent2D{view.width, view.height};
+    slot.pitch = view.pitch_in_pixel;
+    slot.address.store(address, std::memory_order_relaxed);
+    auto count = std::max(index + 1, g_display_slot_count.load(std::memory_order_relaxed));
+    while (count && !g_display_slots[count - 1].address.load(std::memory_order_relaxed)) {
+        --count;
     }
+    g_display_slot_count.store(count, std::memory_order_release);
+}
+
+static bool IsPrimaryDisplayExtent(vk::Extent2D extent) {
+    std::scoped_lock lock{g_display_slots_mutex};
+    return g_display_slots[0].address.load(std::memory_order_relaxed) &&
+           g_display_slots[0].extent == extent;
 }
 
 static bool IsDisplayAddress(VAddr address) {
-    for (const auto& slot : g_display_addresses) {
-        const VAddr value = slot.load(std::memory_order_relaxed);
-        if (value == 0) {
-            return false;
-        }
-        if (value == address) {
+    const auto count = g_display_slot_count.load(std::memory_order_acquire);
+    for (std::size_t i = 0; address && i < count; ++i) {
+        if (g_display_slots[i].address.load(std::memory_order_relaxed) == address) {
             return true;
         }
     }
@@ -2741,22 +2836,25 @@ static bool Gt7TemporalActive() {
 // before a menu's interface) are made that size, so they match what FindDisplay shows. Elsewhere
 // the picture's own size.
 static vk::Extent2D ShownPart(const Native::ImageEntry& picture) {
-    vk::Extent2D size{picture.info.size.width, picture.info.size.height};
-    for (std::size_t i = 0; i < g_display_addresses.size(); ++i) {
-        const VAddr value = g_display_addresses[i].load(std::memory_order_relaxed);
-        if (value == 0) {
-            break;
+    const vk::Extent2D size{picture.info.size.width, picture.info.size.height};
+    std::scoped_lock lock{g_display_slots_mutex};
+    int best_rank = -1;
+    auto shown = size;
+    for (const auto& slot : g_display_slots) {
+        if (slot.address.load(std::memory_order_relaxed) != picture.info.guest_address ||
+            !slot.extent.width || !slot.extent.height) {
+            continue;
         }
-        if (value == picture.info.guest_address) {
-            const u64 shown = g_display_sizes[i].load(std::memory_order_relaxed);
-            if (shown != 0) {
-                size.width = std::min(size.width, static_cast<u32>(shown >> 32));
-                size.height = std::min(size.height, static_cast<u32>(shown & 0xffffffffu));
-            }
-            break;
+        // Prefer the matching row layout. At equal pitch prefer an exact size, then
+        // the first slot (the primary view when a padded Pro target needs cropping).
+        const int rank = 2 * (slot.pitch == picture.info.pitch) + (slot.extent == size);
+        if (rank > best_rank) {
+            best_rank = rank;
+            shown.width = std::min(size.width, slot.extent.width);
+            shown.height = std::min(size.height, slot.extent.height);
         }
     }
-    return size;
+    return shown;
 }
 
 bool NativeRenderer::HudSplitOn() {
@@ -2882,7 +2980,7 @@ void NativeRenderer::SpliceStream(Stream& s, u64 tick) {
 // came out wrong (seen by the user on 2026-11-11).
 bool NativeRenderer::HudSplitNow() const {
     // DLSS-GT7-001: not in a menu frame whose interface goes through DLSS (NoteTemporalDraw).
-    return HudSplitOn() && (RytyDisplayAspect() > 0.0f ||
+    return !center_wide_menu && HudSplitOn() && (RytyDisplayAspect() > 0.0f ||
                             (temporal.frame == frame && temporal.through_frame != frame));
 }
 
@@ -4566,6 +4664,59 @@ void NativeRenderer::PassBarrier(std::source_location where) {
     NATIVE_DIAGNOSTIC(++stats.pass_barriers);
 }
 
+static VAddr InplaceFrom();
+
+// FIX-GTS-528: in a fresh GT Sport game (no save data yet), a small picture in the memory the CPU
+// reads (0xf0'0000'0000 and up, the game's own heap) goes back in this submission, before the
+// fence the CPU waits for, and not at the frame's end. On a fresh game GT Sport makes its first car
+// thumbnails after the intro: it draws a 32x32 float picture into a heap buffer, waits for the GPU,
+// reads it and frees the buffer within the frame; written back at the frame's end, the picture
+// landed in the freed block, over the heap's free-list links, and the next allocation crashed
+// (GTSport.exe+0x1c3a01d, RyGT #53 and #87; 4 of 5 fresh starts). A game with save data
+// (user\savedata\CUSA03220\_sd\sce_sdmemory\<user>\memory.dat) and GT7 keep PERF-GT7-044 as it
+// is. SHADGT_GTS_CPU_WRITEBACK_NOW=0: as before; 1: in every GT Sport session.
+static bool GtsFreshGame() {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path memory = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "savedata" /
+                            std::string(Common::GtSportSerial) / "_sd" / "sce_sdmemory";
+    for (fs::directory_iterator it{memory, ec}, end; !ec && it != end; it.increment(ec)) {
+        if (fs::exists(it->path() / "memory.dat", ec)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// FIX-GTS-529: decided when the native renderer starts, before the game runs. FIX-GTS-528 decided
+// at the first small picture, but GT Sport sets up its save memory (and so creates memory.dat) at
+// boot, before its first auto exposure picture, so a fresh game always looked like one with save
+// data and the fix never came on (2 of 4 fresh starts still crashed).
+static std::atomic<bool> gts_cpu_writeback_now{false};
+
+static void DecideGtsCpuWritebackNow() {
+    if (Common::IsGt7()) {
+        return;
+    }
+    bool on = false;
+    const char* env = std::getenv("SHADGT_GTS_CPU_WRITEBACK_NOW");
+    if (env && (env[0] == '0' || env[0] == '1')) {
+        on = env[0] == '1';
+    } else {
+        on = GtsFreshGame();
+    }
+    gts_cpu_writeback_now.store(on, std::memory_order_relaxed);
+    if (on) {
+        LOG_INFO(Render_Vulkan, "FIX-GTS-528: no GT Sport save data yet, small pictures in "
+                                "CPU-read memory go back before the fence this session");
+    }
+}
+
+static bool GtsCpuWritebackNow(const Native::ImageEntry* entry) {
+    return gts_cpu_writeback_now.load(std::memory_order_relaxed) &&
+           entry->info.guest_address >= InplaceFrom();
+}
+
 // PERF-GT7-044: NAT-112 writes a small picture back to guest memory once a frame, when the frame
 // ends, for the CPU to read (GT Sport's auto exposure), and not after every draw into it. GT7 draws
 // ~100 such pictures a frame: on its pre-race screens ~210 write-backs a frame, nearly all tiled (a
@@ -4576,7 +4727,7 @@ void NativeRenderer::QueueWriteback(const Native::ImageEntry* entry) {
         const char* env = std::getenv("SHADGT_NATIVE_WRITEBACK_EACH");
         return env && env[0] == '1';
     }();
-    if (each || entry->info.guest_size > 64_KB) {
+    if (each || entry->info.guest_size > 64_KB || GtsCpuWritebackNow(entry)) {
         if (std::ranges::find(writebacks, entry) == writebacks.end()) {
             writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
         }
@@ -4870,12 +5021,32 @@ void NativeRenderer::FlushWritebacks() {
                 UNREACHABLE_MSG("native image download import coverage or alignment failed");
                 return;
             }
-            auto out = chunked ? nullptr : direct_output ? device->WrapBuffer(
-                reinterpret_cast<u64>(static_cast<VkBuffer>(parts->front().buffer)), parts->front().view_size)
-                : device->CreateBuffer({.size = size,
+            const auto make_scatter = [&] {
+                return device->CreateBuffer({.size = size,
                     .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageTransferSrc |
                              Native::Rhi::BufferUsageTransferDst,
                     .memory = Native::Rhi::MemoryKind::DeviceLocal, .name = "native image download scatter"});
+            };
+            auto out = chunked ? nullptr : direct_output ? device->WrapBuffer(
+                reinterpret_cast<u64>(static_cast<VkBuffer>(parts->front().buffer)), parts->front().view_size)
+                : make_scatter();
+            if (!out && !chunked && !direct_output) {
+                RelieveDeviceMemory(); // FIX-SGT-140: the submitted work frees what it held
+                out = make_scatter();
+            }
+            if (!out && !chunked && !direct_output) {
+                // FIX-SGT-140 (RyGT #103): device memory ran out. Nothing is recorded for the
+                // picture yet: its write-back is left out (guest memory keeps what it had until
+                // the picture is drawn and goes back again), not the renderer stopped.
+                static std::atomic<u32> logged{};
+                if (OutOfMemoryLogDue(logged)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-SGT-140: write-back of the picture at {:#x}+{:#x} skipped: "
+                                "no device memory for its scatter buffer",
+                                address, size);
+                }
+                continue;
+            }
             if (!out && !chunked) {
                 UNREACHABLE_MSG("native image download wrapper allocation failed");
                 return;
@@ -5118,6 +5289,32 @@ void NativeRenderer::FlushWritebacks() {
             NATIVE_DIAGNOSTIC(++stats.writebacks);
             continue;
         }
+        // FIX-SGT-140 (RyGT #103): what RecordDownload makes (the tiling parameters, a 64 KB
+        // allocation, and unbatched its scratch) is made here, before anything is recorded for
+        // the picture. With device memory gone it stopped the renderer ("native image download
+        // recording failed"); now, after a wait for the submitted work, the write-back is left
+        // out for this time.
+        const auto prepared = [&] {
+            return !DiagForcedOutOfMemory() && registry->PrepareDownload(*entry, use_batch);
+        };
+        bool ready = prepared();
+        if (!ready) {
+            RelieveDeviceMemory();
+            ready = prepared();
+        }
+        if (!ready) {
+            static std::atomic<u32> logged{};
+            if (OutOfMemoryLogDue(logged)) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-SGT-140: write-back of the picture at {:#x}+{:#x} skipped: "
+                            "no device memory for its tiling buffers",
+                            address, size);
+            }
+            Native::Rhi::g_device_memory_pressure.store(true, std::memory_order_relaxed);
+            s.keep.push_back(std::move(plan.out));
+            for (auto& part : plan.imports) s.imported_view_leases.push_back(std::move(part.lease));
+            continue;
+        }
         if (!plan.scatter.empty()) {
             const vk::Buffer scratch{Handle<VkBuffer_T>(plan.out->NativeHandle())};
             for (const auto& part : plan.imports)
@@ -5307,7 +5504,25 @@ static char NativeNoReuse() {
     return mode;
 }
 
-NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
+// FIX-SGT-140 (RyGT #103): device memory ran out with every upload chunk held by work not yet
+// done, and the texture cache's eviction had not freed enough. At most once a frame, wait for the
+// work already submitted (nothing new is submitted here: the stream being recorded stays open),
+// then free what it held: the images, views and buffers retired since. The frame's end then
+// evicts harder (VRAM-PRESSURE-001). false: already done this frame.
+bool NativeRenderer::RelieveDeviceMemory() {
+    Native::Rhi::g_device_memory_pressure.store(true, std::memory_order_relaxed);
+    if (oom_relief_frame.exchange(frame, std::memory_order_relaxed) == frame) {
+        return false;
+    }
+    const u64 current = r.scheduler.CurrentTick();
+    if (current > 1) {
+        r.scheduler.Wait(current - 1); // the last submitted tick: no flush
+    }
+    device->Collect();
+    return true;
+}
+
+NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size, bool may_fail) {
     Native::SlowCallTrace<6> trace{t_timed, "take-upload-chunk",
         {"mutex", "timeline-query", "trim-free", "reclaim-retired", "take-free", "create-buffer"}};
     trace.Next(0, 0, size);
@@ -5346,11 +5561,17 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
         free_chunks_low = std::min(free_chunks_low, free_chunks.size());
         return chunk;
     }
+    // FIX-SGT-140: memory ran out already this frame (and the wait was spent): a caller that can
+    // do without gets none, and what is left goes to those that can't.
+    if (may_fail && oom_relief_frame.load(std::memory_order_relaxed) == frame) {
+        return {};
+    }
     Chunk chunk;
     trace.Next(5);
-    const auto create = [&] {
+    const bool forced_failure = may_fail && DiagForcedOutOfMemory(); // FIX-SGT-140 (diagnosis)
+    const auto create = [&](u64 capacity, bool recycle = true) {
         Chunk result;
-        const u64 capacity = UploadChunkCapacity(size, ChunkSize());
+        if (forced_failure) return result;
         result.buffer = device->CreateBuffer({
         .size = capacity,
         .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageUniform |
@@ -5362,14 +5583,14 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
         // the standard chunk) took 100 to 145 ms to create, and the chunk cache's 128 MB
         // budget freed it again before the next large texture: a long frame each time.
         // Freed, its memory waits in the upload copy pool for the next one of its size.
-        .recycle = capacity > ChunkSize(),
+        .recycle = recycle && capacity > ChunkSize(),
         });
         return result;
     };
-    chunk = create();
-    if (!chunk.buffer || !chunk.buffer->Mapped()) {
-        LOG_WARNING(Render_Vulkan,
-                    "FIX-276: reclaiming completed upload allocations for {} bytes", size);
+    const u64 capacity = UploadChunkCapacity(size, ChunkSize());
+    const auto usable = [](const Chunk& made) { return made.buffer && made.buffer->Mapped(); };
+    chunk = create(capacity);
+    const auto recover = [&] {
         device->DestroyCompletedBuffer(std::move(chunk.buffer)); // Never submitted.
         chunk = RecoverUploadMemory(
             size, r.scheduler.CurrentTick(), true, free_chunks, retiring_chunks,
@@ -5378,20 +5599,55 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
             [&](std::unique_ptr<Native::Rhi::Buffer> buffer) {
                 device->DestroyCompletedBuffer(std::move(buffer));
             },
-            [&] { device->Collect(); return create(); });
+            [&] { device->Collect(); return create(capacity); });
         free_chunks_low = std::min(free_chunks_low, free_chunks.size());
+    };
+    if (!usable(chunk)) {
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-276: reclaiming completed upload allocations for {} bytes", size);
+        recover();
     }
-    ASSERT_MSG(chunk.buffer && chunk.buffer->Mapped(), "NAT-100: no upload memory ({} bytes)",
-               size);
+    if (!usable(chunk)) {
+        // FIX-SGT-140: the work already submitted frees what it holds once done; then a chunk
+        // of just the size asked for (not the standard 4 MB, or the next power of two).
+        const bool relieved = RelieveDeviceMemory();
+        if (relieved) recover();
+        if (!usable(chunk) && capacity > size) {
+            device->DestroyCompletedBuffer(std::move(chunk.buffer)); // Never submitted.
+            // Not recycled: its size class would round it up again.
+            chunk = create(Common::AlignUp(size, u64{64} << 10), false);
+        }
+        static std::atomic<u32> logged{};
+        if (OutOfMemoryLogDue(logged)) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-SGT-140: upload memory ran out ({} bytes): {} after waiting for "
+                        "the submitted work{}{}",
+                        size, usable(chunk) ? "found" : "none", relieved ? "" : " (waited already this frame)",
+                        usable(chunk) || !may_fail ? "" : "; this upload is skipped");
+        }
+    }
+    if (!usable(chunk) && may_fail) {
+        device->DestroyCompletedBuffer(std::move(chunk.buffer)); // Never submitted.
+        return {};
+    }
+    ASSERT_MSG(usable(chunk), "NAT-100: no upload memory ({} bytes)", size);
     return chunk;
 }
 
-std::tuple<vk::Buffer, u64, u8*> NativeRenderer::Allocate(u64 size, u64 align, bool* backing_proven) {
+std::tuple<vk::Buffer, u64, u8*> NativeRenderer::Allocate(u64 size, u64 align, bool* backing_proven,
+                                                          bool may_fail) {
     Stream& s = Ctx().stream;
     align = std::max<u64>(align, 16);
     if (s.chunks.empty() ||
         Common::AlignUp(s.chunk_used, align) + size > s.chunks.back().buffer->Size()) {
-        s.chunks.push_back(TakeChunk(size));
+        // FIX-SGT-140: may_fail, a caller that can do without (it gets no memory) when device
+        // memory has run out.
+        Chunk chunk = TakeChunk(size, may_fail);
+        if (!chunk.buffer) {
+            if (backing_proven) *backing_proven = false;
+            return {vk::Buffer{}, 0, nullptr};
+        }
+        s.chunks.push_back(std::move(chunk));
         s.chunk_used = 0;
     }
     const auto& buffer = *s.chunks.back().buffer;
@@ -8363,6 +8619,110 @@ static bool ListedInPlace(VAddr address, u64 size) {
     return begin != 0 && address < PerFrameEnd() && address + size > begin;
 }
 
+/// FIX-GT7-195 (RyGT #99, SHADGT_PERFRAME_READ_CUT=0: as before): a read that starts in GT7's
+/// per-frame memory and reaches more than 64 MB past its listed end is cut at the per-frame
+/// memory's end. These are GT7's unbounded reads (sized to the end of the mapping): they end where
+/// the per-frame memory does while nothing is mapped after it. After about half an hour of play
+/// the game mapped more memory right after it (to 0x23f800000), the same reads became 1016 MB
+/// (0x200000000+0x3f800000), no span view could alias that ("not all shared views"), and they fell
+/// back to a 1 GiB region refreshed every frame: heavy stutter, then 0 FPS until a restart.
+/// FIX-GT7-122 already refuses such a range as the per-frame memory's end; its binding now stops
+/// there too. Writes keep their size.
+static u64 PerFrameReadCut(VAddr base, u64 size, bool written) {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_PERFRAME_READ_CUT");
+        return !(env && env[0] == '0');
+    }();
+    if (!on || written || size == 0) {
+        return size;
+    }
+    const auto [begin, listed_end] = PerFrameListed();
+    const VAddr end = PerFrameEnd();
+    if (begin == 0 || base < begin || base >= end || base + size <= listed_end + 64_MB) {
+        return size;
+    }
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-GT7-195: read {:#x}+{:#x} cut at the end of GT7's per-frame memory "
+                    "({:#x})",
+                    base, size, end);
+    }
+    return end - base;
+}
+
+/// FIX-SGT-191 (RyGT #120, SHADGT_PERFRAME_WRITE_CUT=0: as before): a written range that starts in
+/// GT7's per-frame memory and reaches more than 64 MB past its listed end is cut where the memory
+/// stops being committed, and at the per-frame memory's end at most. GT7's weather radar in rain
+/// (PS4 Pro mode) binds a 310 MB written buffer (0x13681180 bytes, from 0x2008xxxxx-0x205axxxxx)
+/// over a per-frame memory committed to 0x206000000: no span view could alias it ("not all shared
+/// views", two or three failed tries a draw), and it fell back to a 310-550 MB video-memory region
+/// refreshed every frame: heavy stutter, then the GPU device was lost. FIX-GT7-195 cuts only
+/// reads. The shader's writes past the cut are dropped (robust buffer access), as the GPU could
+/// not write memory that isn't there.
+static u64 PerFrameWriteCut(VAddr base, u64 size, bool written) {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_PERFRAME_WRITE_CUT");
+        return !(env && env[0] == '0');
+    }();
+    if (!on || !written || size == 0) {
+        return size;
+    }
+    const auto [begin, listed_end] = PerFrameListed();
+    const VAddr end = PerFrameEnd();
+    if (begin == 0 || base < begin || base >= end || base + size <= listed_end + 64_MB) {
+        return size;
+    }
+    const u64 cut = Native::ReadablePrefix(reinterpret_cast<const void*>(base), end - base);
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-SGT-191: written range {:#x}+{:#x} cut to {:#x} (GT7's per-frame memory "
+                    "ends at {:#x}, committed to {:#x})",
+                    base, size, cut, end, base + cut);
+    }
+    return cut;
+}
+
+/// FIX-GT7-196 (RyGT #99, SHADGT_LISTED_READ_CUT=0: as before): a read over one of the other listed
+/// in-place ranges (GT7's culling block at 0x1020000000) that reaches more than 64 MB past that
+/// range's end is cut there. It is FIX-GT7-195's read outside the per-frame memory: an unbounded
+/// buffer from 0x1015603260, sized to the end of the mapping, grew from 690 MB to 2.6 GB over a
+/// session of License Test retries as the game mapped more after it. Each growth retired its span
+/// view and imported a bigger one (150-180 ms each), and past 1 GiB (FIX-SGT-041) no span view could
+/// hold it and it fell back to a region: freezes, then 0 FPS until a restart. The 64 MB keeps
+/// FIX-SGT-014's rain read (77-85 MB from 0x101d8d9490, ending about 34 MB past the block) whole.
+/// Writes keep their size.
+static u64 ListedReadCut(VAddr base, u64 size, bool written) {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADGT_LISTED_READ_CUT");
+        return !(env && env[0] == '0');
+    }();
+    if (!on || written || size == 0) {
+        return size;
+    }
+    const VAddr per_frame = PerFrameListed().first;
+    const VAddr per_frame_end = PerFrameEnd();
+    for (const auto& [range_begin, range_end] : InplaceRanges()) {
+        if (per_frame != 0 && range_begin >= per_frame && range_end <= per_frame_end) {
+            continue; // FIX-GT7-195's
+        }
+        const VAddr limit = range_end + 64_MB;
+        if (base >= range_end || base + size <= limit) {
+            continue;
+        }
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-GT7-196: read {:#x}+{:#x} cut 64 MB past the listed range "
+                        "{:#x}-{:#x}",
+                        base, size, range_begin, range_end);
+        }
+        return limit - base;
+    }
+    return size;
+}
+
 void NativeRenderer::NotePerFrameRange(VAddr address, u64 size) {
     // The unbounded reads end where the per-frame memory does: one that starts in it and ends past
     // its end shows how far it goes now.
@@ -8466,7 +8826,11 @@ bool NativeRenderer::WritebackRaceDiag() {
 u64 NativeRenderer::SnapshotBelow() {
     static const u64 below = [] {
         const char* env = std::getenv("SHADGT_NATIVE_SNAPSHOT_BELOW");
-        return env && *env ? std::strtoull(env, nullptr, 0) : u64{1_MB};
+        // FIX-SGT-161: 64 KiB, was 1 MiB. GT Sport's car menus bind read-only buffers of
+        // 0.2-0.6 MiB (the car's data) hundreds of times a frame; each bind was copied again:
+        // 217-255 MB a frame over PCIe (~3 GB/s) and the CPU copying it, menus at ~35 fps.
+        // Above 64 KiB they use their video-memory mirror: 29 MB copied, 60 fps, no glitches.
+        return env && *env ? std::strtoull(env, nullptr, 0) : u64{64_KB};
     }();
     // Race/replay buffers can depend on GPU writes not visible to a CPU snapshot.
     // The native session guard also covers attract replays using cached menu scripts.
@@ -11897,6 +12261,9 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                 [&](u64 a, u64 n) { std::shared_lock lock{buffer_map_mutex}; return RegionOver(a, n) != nullptr; },
                 [&](u64 a, u64 n) { return readable_direct->EnsureImported(a, n); },
                 [&](u64 a, u64 n) { return Native::ReadablePrefix(reinterpret_cast<const void*>(a), n); });
+            if (bindable) size = PerFrameReadCut(base, size, desc.is_written); // FIX-GT7-195
+            if (bindable) size = PerFrameWriteCut(base, size, desc.is_written); // FIX-SGT-191
+            if (bindable) size = ListedReadCut(base, size, desc.is_written); // FIX-GT7-196
             if (bindable && size != 0) {
 #if !defined(NDEBUG)
                 // FIX-174 (diagnosis, SHADGT_NATIVE_WATCH_BUFFER=<hex address>+<hex size>): the
@@ -14154,9 +14521,77 @@ void NativeRenderer::CheckVertexReach(const GraphicsPipeline& pipeline, const Am
     // vertex it can read (its indices read from guest memory, or its vertex count) against each
     // vertex V#'s end and the mirror bound there: draws reading past a mirror's end got zeros
     // (the tunnel explosions went away with mirrors 256 KB longer).
+    // DIAG-SGT-144 (RyGT #86, debug builds): SHADGT_DIAG_VERTEX_INPUTS=<hex vs hash> logs that
+    // draw's vertex attributes and bindings (format, offset, stride, guest base) 8 times.
+    static const u64 inputs_hash = [] {
+        const char* env = Common::DiagEnv("SHADGT_DIAG_VERTEX_INPUTS");
+        return env && *env ? u64(std::strtoull(env, nullptr, 16)) : 0ull;
+    }();
+    static std::atomic<u32> inputs_logged{};
+    if (inputs_hash != 0 && pipeline.GetStage(Shader::SwStage::Vertex).pgm_hash == inputs_hash &&
+        inputs_logged.fetch_add(1) < 8) {
+        VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+        VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+        VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
+        VertexInputs<AmdGpu::Buffer> guest_buffers;
+        pipeline.GetVertexInputs(attributes, bindings, divisors, guest_buffers,
+                                 regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
+        // Restart indices in the index list, and whether restart is on (patch lists: AMD lacks
+        // primitiveTopologyPatchListRestart, so the renderer turns restart off for them).
+        if (is_indexed) {
+            const bool is16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
+            const u32 index_size = is16 ? 2 : 4;
+            const VAddr address =
+                regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size;
+            const u64 bytes = std::min<u64>(u64(regs.num_indices) * index_size, 1_MB);
+            std::vector<u8> indices(bytes);
+            u64 restarts = 0, first_restart = ~0ull, max_index = 0;
+            const u32 restart_index =
+                is16 ? (regs.primitive_restart_index & 0xffff) : regs.primitive_restart_index;
+            if (bytes && Core::RytyMemory::GuardedCopy(
+                             indices.data(), reinterpret_cast<const void*>(address), bytes)) {
+                for (u64 i = 0; i < bytes / index_size; ++i) {
+                    const u32 v = is16 ? u32(reinterpret_cast<const u16*>(indices.data())[i])
+                                       : reinterpret_cast<const u32*>(indices.data())[i];
+                    if (v == restart_index) {
+                        ++restarts;
+                        first_restart = std::min(first_restart, i);
+                    } else {
+                        max_index = std::max<u64>(max_index, v);
+                    }
+                }
+            }
+            LOG_WARNING(
+                Render_Vulkan,
+                "DIAG-SGT-144: indices (vs {:#x}): primitive type {} restart enabled {} index "
+                "{:#x} 16-bit {} count {}: {} restart indices (first at {}), max other {}; "
+                "patch list restart supported {}",
+                inputs_hash, u32(regs.primitive_type), regs.enable_primitive_restart & 1,
+                restart_index, is16, regs.num_indices, restarts,
+                first_restart == ~0ull ? -1ll : static_cast<long long>(first_restart), max_index,
+                r.instance.IsPatchListRestartSupported());
+        }
+        for (const auto& a : attributes) {
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-SGT-144: vertex input (vs {:#x}): location {} binding {} format {} "
+                        "offset {}",
+                        inputs_hash, a.location, a.binding, vk::to_string(a.format), a.offset);
+        }
+        for (u32 i = 0; i < guest_buffers.size(); ++i) {
+            const auto& g = guest_buffers[i];
+            LOG_WARNING(
+                Render_Vulkan,
+                "DIAG-SGT-144: vertex binding {}: stride {} rate {} guest base {:#x} (mod 4 = {}) "
+                "V# stride {} records {} size {} indices {} indexed {}",
+                bindings[i].binding, bindings[i].stride,
+                bindings[i].inputRate == vk::VertexInputRate::eInstance ? "instance" : "vertex",
+                g.base_address, g.base_address % 4, g.GetStride(), g.num_records, g.GetSize(),
+                regs.num_indices, is_indexed);
+        }
+    }
     static const u32 every = [] {
         const char* env = std::getenv("SHADGT_NATIVE_VERTEX_REACH_CHECK");
-        return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 0u;
+        return env && *env ? u32(std::strtoull(env, nullptr, 10)) : 0u;
     }();
     if (every == 0 || ++reach_check_counter % every != 0) {
         return;
@@ -15690,7 +16125,18 @@ void NativeRenderer::YieldToMappingChanges() {
     }
 }
 
-void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect) {
+void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect,
+                          bool world_hud) {
+    bool use_game_taa = false;
+    RecordDraw(is_indexed, index_offset, indirect, world_hud, use_game_taa);
+    if (use_game_taa) {
+        // Record the original composition through the usual display/ultrawide routing.
+        RecordDraw(is_indexed, index_offset, indirect, world_hud, use_game_taa);
+    }
+}
+
+void NativeRenderer::RecordDraw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect,
+                                bool world_hud, bool& use_game_taa) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::DrawTotal}; // DIAG-SGT-023
     YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
@@ -16530,6 +16976,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             const vk::Extent2D size{shown.width * layer.scale, shown.height * layer.scale};
             TemporalPicture(layer.black, *targets.colors[0], size);
             TemporalPicture(layer.white, *targets.colors[0], size);
+        } else if (world_hud) {
+            // The scene fills the ultrawide window. Keep camera-projected signs on that
+            // target so both their glyphs and their screen positions follow the cars.
+            [[maybe_unused]] static const int seen =
+                std::fputs("[native] GT7 CarSign: drawing projected labels with the race scene\n", stderr);
         } else if (layer.black && layer.white) {
             const VideoCore::TextureCache::ImageDesc desc{regs.color_buffers[0],
                                                           r.liverpool->DrawCbExtent(0)};
@@ -16707,7 +17158,28 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     if (!from_prepared) {
         b.Clear();
         b.push = UserData(regs);
+        // FEAT-SGT-189: GT7's final composition (0xdf75f23b) reads an unwritten full-screen
+        // RGBA16F input described at the guest output's size (2560x1440) over memory the game
+        // allocated for the scene (1280x720): it read other resources' data, a dark band across
+        // the screen. Taken at the scene's size there, as the game has it without the output
+        // patch (all zeros). SHADGT_DLSS_COMPOSITION_CLAMP=0: as before.
+        static const bool composition_clamp = [] {
+            const char* env = std::getenv("SHADGT_DLSS_COMPOSITION_CLAMP");
+            return !(env && env[0] == '0');
+        }();
+        auto& clamp = VideoCore::g_texture_extent_clamp;
+        clamp = {};
+        if (composition_clamp && Common::IsGt7() && RytyUpscale::GuestOutputDlss()) {
+            const auto& layout = RytyUpscale::DlssLayout();
+            const Shader::Info* cfs = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+            if (cfs && cfs->pgm_hash == 0xdf75f23b && layout.scene.width &&
+                layout.scene.width < layout.output.width) {
+                clamp = {layout.output.width, layout.output.height, layout.scene.width,
+                         layout.scene.height};
+            }
+        }
         BindStagesStable(pipeline->GetStages(), regs, false, b);
+        clamp = {};
     }
     WritebacksBefore(b); // includes worker-prepared bindings
     if (b.failed) {
@@ -16787,11 +17259,49 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         PhaseClock clock{stats.phase_ns[6]};
         PrepareImages(b); // PERF-109
     }
-    const bool native_fsr_composition = BeginNativeFsr(*pipeline, targets, b);
+    GtsSceneBinding scene_binding;
+    const bool native_fsr_composition = !use_game_taa && !indirect &&
+        BeginNativeFsr(*pipeline, targets, b, scene_binding);
+    SCOPE_EXIT {
+        if (scene_binding.slot) {
+            DrainBinder(); // A queued descriptor bind may still refer to this slot.
+            scene_binding.Restore();
+            b.key_layout = nullptr;
+        }
+    };
     if (native_fsr_composition) scale_composition = false;
     if (!native_fsr_composition && !PrepareUiTarget(targets, *pipeline)) {
         NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
+    }
+    // The race HUD uses scene coordinates. A native menu sub-viewport already
+    // addresses its rectangle inside the UHD display.
+    const auto& guest_vp = regs.viewports[0];
+    const auto& layout = RytyUpscale::DlssLayout();
+    // Older launchers supplied only the 4K Performance flag.
+    const auto hud_scene = layout.scene.width ? layout.scene : vk::Extent2D{1920, 1080};
+    const auto hud_output = layout.output.width ? layout.output : vk::Extent2D{3840, 2160};
+    const bool scale_guest_display = RytyUpscale::GuestOutputDlss() && !native_fsr_composition &&
+        r.temporalDlss.ActiveQuality() != RYGT_DLSS_QUALITY_DLAA && !UiHires::Wide() &&
+        targets.state.num_color_attachments == 1 && targets.colors[0] &&
+        targets.state.width == hud_output.width && targets.state.height == hud_output.height &&
+        std::abs(guest_vp.xscale) <= hud_scene.width * .5f &&
+        std::abs(guest_vp.yscale) <= hud_scene.height * .5f &&
+        IsDisplayAddress(targets.colors[0]->info.guest_address) && !RytyGt7NativeDlssMenu();
+    if (scale_guest_display) {
+        auto& ui = UiHires::Get();
+        ui.scale = float(hud_output.width) / hud_scene.width;
+        ui.scale_y = float(hud_output.height) / hud_scene.height;
+        ui.offset_x = ui.offset_y = 0.f;
+        // GT7 clips its race HUD at screen * screen / 1920x1080 (1499x843 for a 1696x954
+        // scene, DIAG-SGT-188): the panels sliding in on the right were cut at 88%. The clip is
+        // the whole screen at 1920x1080, so it is widened to the scene here.
+        ui.widen_x_from = (hud_scene.width * hud_scene.width + 1919) / 1920;
+        ui.widen_x_to = hud_scene.width;
+        ui.widen_y_from = (hud_scene.height * hud_scene.height + 1079) / 1080;
+        ui.widen_y_to = hud_scene.height;
+    } else {
+        UiHires::Get().widen_x_from = 0;
     }
     for (unsigned attempt = 0; b.region_writeback && !RegionPlanValid(*b.region_writeback) && attempt < 4; ++attempt) {
         b.Clear();
@@ -16809,9 +17319,29 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     const bool sampled_depth = targets.depth &&
         std::ranges::find(b.sampled, targets.depth) != b.sampled.end();
     const auto& db_feedback = targets.state.depth_stencil_attachment;
+    // PERF-SGT-150: the stencil counts as written only when the draw can change it (a write mask
+    // and an op other than Keep), not for every stencil test. GT7's full-screen passes test the
+    // stencil with Keep ops and sample the depth (RDNA2 iGPU, Tokyo rain replay: ~42 a frame);
+    // without the feedback-loop extensions (AMD's Windows driver) each of them copied the whole
+    // 1920x1080 depth-stencil target first. SHADGT_STENCIL_KEEP_READ_ONLY=0: every stencil
+    // test counts as a write, as before.
+    static const bool stencil_keep_read_only = [] {
+        const char* env = std::getenv("SHADGT_STENCIL_KEEP_READ_ONLY");
+        return !(env && env[0] == '0');
+    }();
+    const auto& dc = regs.depth_control;
+    const auto& sc = regs.stencil_control;
+    const bool stencil_writes = db_feedback.has_stencil &&
+        (stencil_keep_read_only
+             ? Native::StencilMayWrite(dc.stencil_enable, dc.backface_enable,
+                   u32(sc.stencil_fail_front), u32(sc.stencil_zpass_front),
+                   u32(sc.stencil_zfail_front), u32(sc.stencil_fail_back),
+                   u32(sc.stencil_zpass_back), u32(sc.stencil_zfail_back),
+                   regs.stencil_ref_front.stencil_write_mask,
+                   regs.stencil_ref_back.stencil_write_mask)
+             : bool(dc.stencil_enable));
     const bool depth_writes = db_feedback.depth_clear || db_feedback.stencil_clear ||
-        (regs.depth_control.depth_enable && regs.depth_control.depth_write_enable) ||
-        (db_feedback.has_stencil && regs.depth_control.stencil_enable);
+        (dc.depth_enable && dc.depth_write_enable) || stencil_writes;
     const auto depth_feedback = Native::DecideDepthFeedback(
         sampled_depth, depth_writes, r.instance.IsAttachmentFeedbackLoopLayoutSupported());
     // NEO-GTS-511: the pixel shader's positions table (the draw's own positions, as given to
@@ -17221,7 +17751,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         parallel_bindings.ordinary_images=worker_result->ordinary_images;
     };
     // NAT-161 indirect draws and GT7-UW HUD draws stay on the serial recorder.
-    if(parallel && !parallel->closing && parallel->applied_mode.Enabled() && !indirect && !hud_black_state) {
+    if(parallel && !parallel->closing && parallel->applied_mode.Enabled() && !indirect && !hud_black_state && !scale_guest_display) {
 #if !defined(NDEBUG)
         static const bool whole_enabled=[] {const char* p=std::getenv("SHADGT_PARALLEL_WHOLE_PREFLIGHT");return p && p[0]=='1' && p[1]=='\0';}();
         const bool whole_sample=whole_enabled && ((++parallel->whole_seq & 127u)==0);
@@ -19348,8 +19878,15 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     }
 
 #endif
-    if (native_fsr_composition) FinishNativeFsr(targets);
-    else CaptureNativeFsr(*pipeline, targets, b);
+    if (native_fsr_composition) {
+        use_game_taa = !FinishNativeFsr(targets);
+    } else if (use_game_taa) {
+        const auto* fs = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        LOG_INFO(Render_Vulkan, "Temporal fallback: composed game TAA with shader {:#x} into {}x{}",
+                 fs->pgm_hash, targets.state.width, targets.state.height);
+    } else {
+        CaptureNativeFsr(*pipeline, targets, b);
+    }
 
     if (scale_composition) {
         EndRendering();
@@ -21000,6 +21537,9 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                 [&](u64 a, u64 n) { std::shared_lock lock{buffer_map_mutex}; return RegionOver(a, n) != nullptr; },
                 [&](u64 a, u64 n) { return readable_direct->EnsureImported(a, n); },
                 [&](u64 a, u64 n) { return Native::ReadablePrefix(reinterpret_cast<const void*>(a), n); });
+            if (bindable) size = PerFrameReadCut(base, size, desc.is_written); // FIX-GT7-195
+            if (bindable) size = PerFrameWriteCut(base, size, desc.is_written); // FIX-SGT-191
+            if (bindable) size = ListedReadCut(base, size, desc.is_written); // FIX-GT7-196
             // A region can appear after a worker's overlap check. Recheck any
             // truncated/empty range on the serialized recorder rather than
             // publishing an untracked truncated descriptor.
@@ -24127,9 +24667,37 @@ void NativeRenderer::EvictImages() {
     // This pass keeps none of them, so the next attempt finds the room.
     const bool pressure = Native::Rhi::g_device_memory_pressure.exchange(false,
                                                                          std::memory_order_relaxed);
-    if (pressure) {
+    // FIX-SGT-140: rate-limited; under lasting pressure this came every frame.
+    static std::atomic<u32> pressure_logged{};
+    if (pressure && OutOfMemoryLogDue(pressure_logged)) {
         LOG_WARNING(Render_Vulkan, "VRAM-PRESSURE-001: device memory ran out; idle textures are "
                                    "released instead of kept");
+    }
+    // FIX-SGT-140 (RyGT #103): that was not enough on an 8 GB card at a track change while
+    // shaders compiled: the pass still retired at most 16 pictures, from 8 of the 64 shards, and
+    // kept per-frame textures in the recycle pool. Under pressure it now goes through every
+    // shard with no cap, lets textures from the CPU go after PressureIdleFrames (they upload
+    // again from guest memory; what the GPU drew keeps KeepFrames) and empties the pool.
+    constexpr u64 PressureIdleFrames = 30;
+    if (pressure && RecycleFrameTextures()) {
+        u32 dropped = 0;
+        std::scoped_lock lock{views_mutex};
+        std::scoped_lock recycle_lock{recycle_mutex};
+        for (auto& [key, pool] : recycle_pool) {
+            for (auto& free : pool) {
+                for (auto& record : free.records) {
+                    retired_views.emplace_back(tick, std::move(record.view));
+                }
+                if (free.image) recycle_keys.erase(free.image->NativeHandle());
+                ++dropped;
+            }
+            pool.clear(); // the images go once the GPU is done with them
+        }
+        recycle_free = 0;
+        if (dropped != 0) {
+            LOG_WARNING(Render_Vulkan, "FIX-SGT-140: {} pooled per-frame textures released",
+                        dropped);
+        }
     }
     if (pressure || texture_budget == 0) {
         kept_textures.clear();
@@ -24245,7 +24813,7 @@ void NativeRenderer::EvictImages() {
                     recycle_views.erase(kept);
                 }
                 if (key != recycle_keys.end() && entry.from_cpu && entry.sources.empty() &&
-                    recycle_free < 96) {
+                    recycle_free < 96 && !pressure) { // FIX-SGT-140
                     RecycledImage free{std::move(entry.image), std::move(waiting),
                                        entry.backend_usage, entry.backend_features};
                     if (const auto it = views.find(&entry); it != views.end()) {
@@ -24283,9 +24851,34 @@ void NativeRenderer::EvictImages() {
             it = owners.empty() ? stencil_owners.erase(it) : std::next(it);
         }
     };
-    registry->Evict(frame - KeepFrames, on_evict, [&](Native::ImageEntry& entry) {
-        return kept_textures.contains(&entry) || keep(entry) || keep_new_texture(entry);
-    }, 16);
+    // FIX-SGT-158: render targets a new target of another layout replaced at their address. Before
+    // the idle eviction below, which could free one of them first (the list names live entries).
+    {
+        const u32 freed = registry->EvictSuperseded(frame, on_evict);
+        static std::atomic<u32> superseded_logged{};
+        if (freed != 0) {
+            if (const u32 n = superseded_logged++; n < 8 || n % 500 == 0) {
+                LOG_INFO(Render_Vulkan,
+                         "FIX-SGT-158: {} render targets replaced at their address freed "
+                         "(unused 4 frames, not kept two seconds)", freed);
+            }
+        }
+    }
+    const u32 evicted = registry->Evict(
+        frame - (pressure ? PressureIdleFrames : KeepFrames), on_evict,
+        [&](Native::ImageEntry& entry) {
+            if (pressure && !entry.from_cpu && // FIX-SGT-140: drawn pictures keep KeepFrames
+                entry.last_use.load(std::memory_order_relaxed) >= frame - KeepFrames) {
+                return true;
+            }
+            return kept_textures.contains(&entry) || keep(entry) || keep_new_texture(entry);
+        },
+        pressure ? ~u32{0} : 16);
+    static std::atomic<u32> evict_logged{};
+    if (pressure && evicted != 0 && OutOfMemoryLogDue(evict_logged)) {
+        LOG_WARNING(Render_Vulkan, "FIX-SGT-140: {} idle pictures released under memory pressure",
+                    evicted);
+    }
     if (RecycleFrameTextures()) {
         // PERF-SGT-021: per-frame textures go after a few idle frames, so a handful of
         // images of each shape go round (not one for each of the last 120 frames).
@@ -24992,6 +25585,16 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         }
     }
     frame_writebacks.clear();
+    // Use one routing decision for all draws and the presentation of the same frame.
+    const bool finished_wide_menu = center_wide_menu;
+    static const bool fit_gt7_menus = [] {
+        const char* setting = std::getenv("RYGT_ULTRAWIDE_MENUS");
+        return Common::IsGt7() && RytyDisplayAspect() > 16.0f / 9.0f + 0.01f &&
+               !(setting && setting[0] == '0');
+    }();
+    const u32 native_panel = RytyGt7MenuWidth(info.size.width, info.size.height);
+    center_wide_menu = native_panel ? RytyGt7MenuActive()
+                                    : fit_gt7_menus && RytyGt7RaceHookInstalled() && !RytyGtsInRace();
     ++frame;
     BufferOrderFrame(); // PERF-SGT-120
     TrimIdleChunks();
@@ -25029,7 +25632,9 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         registry->FindExisting(info.guest_address, [&](const Native::ImageEntry& candidate) {
             if (gt7_display) {
                 return !candidate.from_cpu && !candidate.info.props.is_depth &&
-                       candidate.info.size.width == info.size.width &&
+                       (candidate.info.size.width == info.size.width ||
+                        (native_panel && candidate.info.size.width == native_panel &&
+                         candidate.info.pitch == info.pitch)) &&
                        candidate.info.size.height == info.size.height &&
                        candidate.info.num_bits == info.num_bits;
             }
@@ -25039,7 +25644,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
                    candidate.info.num_bits == info.num_bits && candidate.info.pitch == info.pitch &&
                    candidate.info.num_samples == 1 && candidate.info.resources.levels == 1 &&
                    candidate.info.resources.layers == 1;
-        });
+        }, native_panel != 0); // A flip address can hold either logical width. Show its latest draw.
     // NEO-GT7-006: in the PS4 Pro mode GT7 draws its 3200x1800 picture into the top left corner of
     // a 3840x2160 surface, registered as 3200x1800 with a pitch of 3840: the display shows that
     // corner, copied below into an image of the display's size each frame. A lookup by the
@@ -25091,7 +25696,10 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     // An uncropped display returns the original entry without the crop path's
     // admission step. Refresh a dirty CPU-backed display before presentation too.
     ApplyRewrite(*entry);
-    const auto* source = CropDisplay(*entry, {info.size.width, info.size.height});
+    const bool narrow_flip = native_panel &&
+                             (entry->info.size.width == native_panel || finished_wide_menu);
+    const auto* source = CropDisplay(*entry, {narrow_flip ? native_panel : info.size.width,
+                                             info.size.height});
     if (!source) {
         return std::nullopt;
     }
@@ -25181,6 +25789,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     Splice();
     Display display{vk::Image{Handle<VkImage_T>(source->image->NativeHandle())}, view,
                     source->info.size.width, source->info.size.height};
+    display.center_menu = native_panel ? narrow_flip : finished_wide_menu;
     r.scheduler.EndRendering(); // WIDE-042: TakeFrame may blit
 #ifndef NDEBUG
     display.capture_format = static_cast<vk::Format>(source->image->Desc().format);

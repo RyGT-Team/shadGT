@@ -1,6 +1,7 @@
-// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+﻿// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include "common/assert.h"
 #include "common/diagnostics.h"
 #include "core/emulator_settings.h"
@@ -422,6 +423,74 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
     }
 }
 
+// DIAG-SGT-144 (RyGT #86, SHADGT_DIAG_TES_DUMP=<hull hash>): while the dump is on, invocation 3 of
+// the patches with PrimitiveID % 16 == 14 or 15 appends every input read to the dump buffer at 8
+// MB: 8 words (PrimitiveID, invocation, vertex index, attribute, component, flags (1 = from the
+// scratch path, 2 = valid scratch read), value bits, dword index); count in header word 3.
+void EmitTcsReadTrace(EmitContext& ctx, Id vertex_index, Id attr_index, Id comp_index,
+                      Id from_scratch, Id valid, Id value, Id dword) {
+    constexpr u64 TraceBase = 8ull << 20;
+    constexpr u32 TraceCapacity = 256 * 1024;
+    const u64 base = ctx.profile.tes_dump_address;
+    const Id primitive = ctx.OpLoad(ctx.U32[1], ctx.primitive_id);
+    const Id invocation = ctx.OpLoad(ctx.U32[1], ctx.invocation_id);
+    const Id base_id =
+        ctx.profile.needs_clip_distance_emulation
+            ? ctx.OpIAdd(ctx.U64, ctx.Constant(ctx.U64, base),
+                         ctx.OpUConvert(ctx.U64, ctx.OpShiftRightLogical(ctx.U32[1], primitive,
+                                                                         ctx.ConstU32(31u))))
+            : ctx.Constant(ctx.U64, base);
+    const auto u32_ptr = [&](Id address) {
+        return ctx.OpConvertUToPtr(ctx.physical_pointer_type_u32, address);
+    };
+    const auto offset = [&](Id address, u64 bytes) {
+        return ctx.OpIAdd(ctx.U64, address, ctx.Constant(ctx.U64, bytes));
+    };
+    const Id enabled =
+        ctx.OpLoad(ctx.U32[1], u32_ptr(base_id),
+                   spv::MemoryAccessMask::Aligned | spv::MemoryAccessMask::Volatile, 4u);
+    const Id group_slot = ctx.OpBitwiseAnd(ctx.U32[1], primitive, ctx.ConstU32(15u));
+    const Id wanted = ctx.OpLogicalAnd(
+        ctx.U1[1], ctx.OpINotEqual(ctx.U1[1], enabled, ctx.u32_zero_value),
+        ctx.OpLogicalAnd(ctx.U1[1], ctx.OpIEqual(ctx.U1[1], invocation, ctx.ConstU32(3u)),
+                         ctx.OpUGreaterThanEqual(ctx.U1[1], group_slot, ctx.ConstU32(14u))));
+    const Id on_label = ctx.OpLabel();
+    const Id end_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(end_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(wanted, on_label, end_label);
+    ctx.AddLabel(on_label);
+    const Id index = ctx.OpAtomicIAdd(ctx.U32[1], u32_ptr(offset(base_id, 12)),
+                                      ctx.ConstU32(u32(spv::Scope::Device)), ctx.u32_zero_value,
+                                      ctx.u32_one_value);
+    const Id fits = ctx.OpULessThan(ctx.U1[1], index, ctx.ConstU32(TraceCapacity));
+    const Id store_label = ctx.OpLabel();
+    const Id store_end = ctx.OpLabel();
+    ctx.OpSelectionMerge(store_end, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(fits, store_label, store_end);
+    ctx.AddLabel(store_label);
+    const Id record = ctx.OpIAdd(
+        ctx.U64, offset(base_id, TraceBase),
+        ctx.OpIMul(ctx.U64, ctx.OpUConvert(ctx.U64, index), ctx.Constant(ctx.U64, u64(32))));
+    const Id flags = ctx.OpBitwiseOr(
+        ctx.U32[1], ctx.OpSelect(ctx.U32[1], from_scratch, ctx.u32_one_value, ctx.u32_zero_value),
+        ctx.OpSelect(ctx.U32[1], valid, ctx.ConstU32(2u), ctx.u32_zero_value));
+    const std::array<Id, 8> words{primitive,
+                                  invocation,
+                                  vertex_index,
+                                  attr_index,
+                                  comp_index,
+                                  flags,
+                                  ctx.OpBitcast(ctx.U32[1], value),
+                                  dword};
+    for (u32 i = 0; i < 8; ++i) {
+        ctx.OpStore(u32_ptr(offset(record, i * 4)), words[i], spv::MemoryAccessMask::Aligned, 4u);
+    }
+    ctx.OpBranch(store_end);
+    ctx.AddLabel(store_end);
+    ctx.OpBranch(end_label);
+    ctx.AddLabel(end_label);
+}
+
 Id EmitGetTessGenericAttribute(EmitContext& ctx, Id vertex_index, Id attr_index, Id comp_index) {
     // DIAG-238 (diagnosis, SHADGT_DIAG_TCS_CLAMP_VERTEX=1): hull shader input reads stay inside the
     // patch (an index past gl_PatchVerticesIn reads undefined values in Vulkan).
@@ -441,6 +510,8 @@ Id EmitGetTessGenericAttribute(EmitContext& ctx, Id vertex_index, Id attr_index,
         const Id address = ctx.OpIAdd(ctx.U64, ctx.lds_scratch_base,
             ctx.OpUConvert(ctx.U64, ctx.OpShiftLeftLogical(ctx.U32[1], dword, ctx.ConstU32(2u))));
         const u32 num_cp = std::max(ctx.runtime_info.sw.tcs.num_input_control_points, 1u);
+        const u32 group_vertices_all =
+            std::max<u32>(ctx.runtime_info.sw.tcs.num_patches, 1u) * num_cp; // RyGT #86 trace
         const Id in_range = ctx.OpULessThan(ctx.U1[1], vertex_index, ctx.ConstU32(num_cp));
         const Id attr_valid = ctx.OpLogicalAnd(ctx.U1[1],
             ctx.OpULessThan(ctx.U1[1], attr_index, ctx.ConstU32(num_attrs)),
@@ -498,7 +569,18 @@ Id EmitGetTessGenericAttribute(EmitContext& ctx, Id vertex_index, Id attr_index,
         const Id checked = ctx.OpPhi(ctx.F32[1], scratch_value, valid_label, ctx.ConstF32(0.0f), invalid_label);
         ctx.OpBranch(merge_label);
         ctx.AddLabel(merge_label);
-        return ctx.OpPhi(ctx.F32[1], checked, scratch_merge, own_value, own_label);
+        const Id result = ctx.OpPhi(ctx.F32[1], checked, scratch_merge, own_value, own_label);
+        if (ctx.profile.TesDump(ctx.info.pgm_hash)) {
+            // Recomputed here: `valid` was made in a block that does not dominate the merge.
+            const Id valid_here = ctx.OpLogicalAnd(
+                ctx.U1[1], attr_valid,
+                ctx.OpLogicalAnd(
+                    ctx.U1[1], ctx.lds_enabled,
+                    ctx.OpULessThan(ctx.U1[1], vertex_index, ctx.ConstU32(group_vertices_all))));
+            EmitTcsReadTrace(ctx, vertex_index, attr_index, comp_index, from_scratch, valid_here,
+                             result, dword);
+        }
+        return result;
     }
     const auto attr_comp_ptr = ctx.TypePointer(spv::StorageClass::Input, ctx.F32[1]);
     return ctx.OpLoad(ctx.F32[1],
@@ -688,20 +770,41 @@ Id EmitLoadBufferU16(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     return ctx.OpLoad(ctx.U16, ptr);
 }
 
+// DIAG-SGT-144: in the traced hull, each loaded dword goes to the read trace too (vertex field
+// 0x10000 + buffer handle, attribute field = dword index, component = lane).
+static Id TraceBufferLoad(EmitContext& ctx, u32 handle, Id address, Id result, u32 n) {
+    if (ctx.sw_stage != SwStage::TessellationControl || !ctx.profile.TesDump(ctx.info.pgm_hash) ||
+        !Sirit::ValidId(ctx.lds_vertex_base)) {
+        return result;
+    }
+    const Id no = ctx.ConstantFalse(ctx.U1[1]);
+    for (u32 i = 0; i < n; ++i) {
+        const Id word = n == 1 ? result : ctx.OpCompositeExtract(ctx.U32[1], result, i);
+        const Id index = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
+        EmitTcsReadTrace(ctx, ctx.ConstU32(0x10000u + handle), index, ctx.ConstU32(i), no, no,
+                         ctx.OpBitcast(ctx.F32[1], word), index);
+    }
+    return result;
+}
+
 Id EmitLoadBufferU32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
-    return EmitLoadBufferB32xN<1, PointerType::U32>(ctx, inst, handle, address);
+    return TraceBufferLoad(ctx, handle, address,
+                           EmitLoadBufferB32xN<1, PointerType::U32>(ctx, inst, handle, address), 1);
 }
 
 Id EmitLoadBufferU32x2(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
-    return EmitLoadBufferB32xN<2, PointerType::U32>(ctx, inst, handle, address);
+    return TraceBufferLoad(ctx, handle, address,
+                           EmitLoadBufferB32xN<2, PointerType::U32>(ctx, inst, handle, address), 2);
 }
 
 Id EmitLoadBufferU32x3(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
-    return EmitLoadBufferB32xN<3, PointerType::U32>(ctx, inst, handle, address);
+    return TraceBufferLoad(ctx, handle, address,
+                           EmitLoadBufferB32xN<3, PointerType::U32>(ctx, inst, handle, address), 3);
 }
 
 Id EmitLoadBufferU32x4(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
-    return EmitLoadBufferB32xN<4, PointerType::U32>(ctx, inst, handle, address);
+    return TraceBufferLoad(ctx, handle, address,
+                           EmitLoadBufferB32xN<4, PointerType::U32>(ctx, inst, handle, address), 4);
 }
 
 Id EmitLoadBufferU64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {

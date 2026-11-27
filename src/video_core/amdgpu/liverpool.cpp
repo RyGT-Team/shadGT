@@ -1587,9 +1587,11 @@ void Liverpool::Process(std::stop_token stoken) {
             const auto has_work = [this] { return num_commands || num_tasks || submit_done; };
             // PERF-098: while the splash screen shows, or stored pipelines remain, the idle
             // command thread queues stored pipeline builds every few milliseconds.
+            // FIX-SGT-134: and while the precompile holds the game, which waits at its start
+            // gate until IdlePrewarm releases the hold (also with the splash screen off).
             while (!has_work() && !stoken.stop_requested() && rasterizer &&
                    (Libraries::SystemService::IsSplashVisible() ||
-                    Vulkan::GetPrecompileProgress().active)) {
+                    Vulkan::GetPrecompileProgress().active || Vulkan::PrecompileHoldsGame())) {
                 if (submit_cv.wait_for(lk, stoken, std::chrono::milliseconds{5}, has_work)) {
                     break;
                 }
@@ -1598,7 +1600,11 @@ void Liverpool::Process(std::stop_token stoken) {
                     Libraries::SystemService::IsSplashVisible());
                 lk.lock();
             }
-            Common::CondvarWait(submit_cv, lk, stoken, has_work);
+            // FIX-SGT-134: the game, at its start gate, submits nothing while the precompile holds
+            // it, so the precompile's idle work wakes this wait too (BindRasterizer notifies it).
+            Common::CondvarWait(submit_cv, lk, stoken, [&] {
+                return has_work() || (rasterizer && Vulkan::PrecompileHoldsGame());
+            });
         }
         if (stoken.stop_requested()) {
             break;
@@ -2306,14 +2312,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 staged_index_offset = 0; // MT-005
                 decode_draw_packet = cmd_address; // OPT-012
+                const bool world_hud = PM4CmdNop::FollowsWorldSpaceDraw(lookahead_dcb);
                 RecordDraw(
-                    [this, cmd_address] {
+                    [this, cmd_address, world_hud] {
                         rasterizer->ScopeMarker("gfx:{}:DrawIndex2",
                                                 fmt::make_format_args(cmd_address),
                                                 [&] {
                                                     // NAT-032: shadow checks key by it
                                                     Vulkan::Rasterizer::t_draw_packet = cmd_address;
-                                                    rasterizer->Draw(true);
+                                                    rasterizer->Draw(true, 0, world_hud);
                                                     Vulkan::Rasterizer::t_draw_packet = nullptr;
                                                 });
                     },
@@ -2344,14 +2351,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u32 index_offset = draw_index_off->index_offset;
                 staged_index_offset = index_offset; // MT-005
                 decode_draw_packet = cmd_address; // OPT-012
+                const bool world_hud = PM4CmdNop::FollowsWorldSpaceDraw(lookahead_dcb);
                 RecordDraw(
-                    [this, cmd_address, index_offset] {
+                    [this, cmd_address, index_offset, world_hud] {
                         rasterizer->ScopeMarker("gfx:{}:DrawIndexOffset2",
                                                 fmt::make_format_args(cmd_address),
                                                 [&] {
                                                     // NAT-032: shadow checks key by it
                                                     Vulkan::Rasterizer::t_draw_packet = cmd_address;
-                                                    rasterizer->Draw(true, index_offset);
+                                                    rasterizer->Draw(true, index_offset, world_hud);
                                                     Vulkan::Rasterizer::t_draw_packet = nullptr;
                                                 });
                     },
@@ -2377,14 +2385,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 decode_draw_packet = cmd_address; // OPT-012
+                const bool world_hud = PM4CmdNop::FollowsWorldSpaceDraw(lookahead_dcb);
                 RecordDraw(
-                    [this, cmd_address] {
+                    [this, cmd_address, world_hud] {
                         rasterizer->ScopeMarker("gfx:{}:DrawIndexAuto",
                                                 fmt::make_format_args(cmd_address),
                                                 [&] {
                                                     // NAT-032: shadow checks key by it
                                                     Vulkan::Rasterizer::t_draw_packet = cmd_address;
-                                                    rasterizer->Draw(false);
+                                                    rasterizer->Draw(false, 0, world_hud);
                                                     Vulkan::Rasterizer::t_draw_packet = nullptr;
                                                 });
                     },

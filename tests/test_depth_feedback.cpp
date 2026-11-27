@@ -17,6 +17,17 @@ TEST(DepthFeedback, WritableRequiresBothFeatures) {
     EXPECT_FALSE(Native::DecideDepthFeedback(false, true, false).unsupported);
 }
 
+TEST(DepthFeedback, StencilTestWithKeepOpsDoesNotWrite) {
+    // PERF-SGT-150: GT7's full-screen passes test stencil with Keep ops and sample the depth.
+    EXPECT_FALSE(Native::StencilMayWrite(true, true, 0, 0, 0, 0, 0, 0, 0xff, 0xff));
+    EXPECT_FALSE(Native::StencilMayWrite(true, true, 3, 3, 3, 3, 3, 3, 0, 0));
+    EXPECT_FALSE(Native::StencilMayWrite(false, true, 3, 3, 3, 3, 3, 3, 0xff, 0xff));
+    EXPECT_TRUE(Native::StencilMayWrite(true, false, 0, 3, 0, 0, 0, 0, 0xff, 0));
+    EXPECT_TRUE(Native::StencilMayWrite(true, true, 0, 0, 0, 0, 0, 1, 0, 0x01));
+    // Without backface_enable the back settings are unused.
+    EXPECT_FALSE(Native::StencilMayWrite(true, false, 0, 0, 0, 3, 3, 3, 0xff, 0xff));
+}
+
 TEST(DepthFeedback, TransitionAndSnapshotBothBlockAheadReuse) {
     EXPECT_FALSE(Native::BlocksParallelFeedback(false, false));
     EXPECT_TRUE(Native::BlocksParallelFeedback(true, false));

@@ -112,6 +112,18 @@ void MarkGpuCommandThread();
 void TakeHold();
 void ReleaseHold();
 
+/// FIX-SGT-134: the start gate. The splash-screen precompile closes it when the pipeline cache is
+/// made (in the renderer's initialization, on the game's first call into it), the game waits at it
+/// before that first call returns, and the precompile opens it when it releases its hold, whose
+/// clock then runs. Holding only the game's clock let its threads work through a 15 s splash in
+/// no time, and GT Sport, past its HDR switch, drew its SDR shader variants into the HDR10
+/// display buffers.
+void CloseStartGate();
+void OpenStartGate(); ///< Idempotent; also on shutdown.
+/// Blocks the calling thread while the gate is closed, at most `limit` (then opens it). Returns
+/// true if it had to wait.
+bool WaitStartGate(std::chrono::seconds limit);
+
 /// DIAG-GTS-518: where a hold was taken, for the per-site totals.
 enum class HoldSite : u8 {
     Other,

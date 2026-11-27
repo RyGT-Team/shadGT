@@ -1774,13 +1774,23 @@ bool NativeModeRequested() {
     return requested;
 }
 
+static bool SkipRedundantDescriptorWork() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADGT_DESCRIPTOR_KEY_WORK"); // PERF-SGT-218
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 void NativeRenderer::DrawBindings::PrepareDescriptorKeys(const Pipeline& pipeline) {
     if (!groups_ready) PrepareWriteGroups();
     for (u32 set = 0; set < grouped_writes.size(); ++set) {
         if (grouped_writes[set].empty() || set == pipeline.PushSet()) continue;
         descriptor_keys[set].Build<false>(pipeline.SetLayout(set), grouped_writes[set]);
         auto& key = descriptor_keys[set];
-        if (key.cacheable) key.hash = Native::Parallel::AdaptiveXXH3(key.words.data(), key.words.size() * sizeof(u64));
+        if (key.cacheable && (!SkipRedundantDescriptorWork() || pipeline.DynamicBuffers(set) == 0)) {
+            key.hash = Native::Parallel::AdaptiveXXH3(key.words.data(), key.words.size() * sizeof(u64));
+        }
     }
     key_layout = pipeline.GetLayout();
 }
@@ -13847,7 +13857,8 @@ void NativeRenderer::PushBindingsWith(const Pipeline& pipeline, vk::PipelineBind
     trace.Next(1);
     if (!b.groups_ready) b.PrepareWriteGroups();
     const auto& by_set = b.grouped_writes;
-    if (b.key_layout != pipeline.GetLayout()) b.PrepareDescriptorKeys(pipeline);
+    const bool built_here = b.key_layout != pipeline.GetLayout();
+    if (built_here) b.PrepareDescriptorKeys(pipeline);
     const vk::Device vk_device = r.instance.GetDevice();
     static thread_local boost::container::small_vector<vk::WriteDescriptorSet, 64> updates;
     updates.clear();
@@ -13911,7 +13922,8 @@ void NativeRenderer::PushBindingsWith(const Pipeline& pipeline, vk::PipelineBind
         auto& prepared_key = b.descriptor_keys[index];
         // Preparation hashed the complete key. Commit changes only buffer slots;
         // recompute the same XXH3 hash only when those values actually changed.
-        const bool key_changed = prepared_key.RefreshBuffers<false>();
+        const bool key_changed = (!built_here || parallel_binding_capture || !SkipRedundantDescriptorWork()) &&
+                                 prepared_key.RefreshBuffers<false>();
         const auto& key = prepared_key.words;
         const bool cacheable = prepared_key.cacheable;
         std::span<const u64> descriptor_key{key.data(), key.size()};
@@ -13919,7 +13931,7 @@ void NativeRenderer::PushBindingsWith(const Pipeline& pipeline, vk::PipelineBind
         u64 key_check = 0; // PERF-GTS-376: the other half of a dynamic set's 128-bit hash
         if (dynamic_buffers != 0) {
             // hashed below, without the offsets
-        } else if (cacheable && key_changed) {
+        } else if (cacheable && (key_changed || (SkipRedundantDescriptorWork() && prepared_key.hash == 0))) {
             prepared_key.hash = Native::Parallel::AdaptiveXXH3(key.data(), key.size() * sizeof(u64));
             NATIVE_DIAGNOSTIC(++descriptor_hash_refreshed);
         } else if (cacheable) {

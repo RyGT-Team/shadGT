@@ -17124,7 +17124,28 @@ void NativeRenderer::RecordDraw(bool is_indexed, u32 index_offset, const Indirec
     if (!from_prepared) {
         b.Clear();
         b.push = UserData(regs);
+        // FEAT-SGT-189: GT7's final composition (0xdf75f23b) reads an unwritten full-screen
+        // RGBA16F input described at the guest output's size (2560x1440) over memory the game
+        // allocated for the scene (1280x720): it read other resources' data, a dark band across
+        // the screen. Taken at the scene's size there, as the game has it without the output
+        // patch (all zeros). SHADGT_DLSS_COMPOSITION_CLAMP=0: as before.
+        static const bool composition_clamp = [] {
+            const char* env = std::getenv("SHADGT_DLSS_COMPOSITION_CLAMP");
+            return !(env && env[0] == '0');
+        }();
+        auto& clamp = VideoCore::g_texture_extent_clamp;
+        clamp = {};
+        if (composition_clamp && Common::IsGt7() && RytyUpscale::GuestOutputDlss()) {
+            const auto& layout = RytyUpscale::DlssLayout();
+            const Shader::Info* cfs = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+            if (cfs && cfs->pgm_hash == 0xdf75f23b && layout.scene.width &&
+                layout.scene.width < layout.output.width) {
+                clamp = {layout.output.width, layout.output.height, layout.scene.width,
+                         layout.scene.height};
+            }
+        }
         BindStagesStable(pipeline->GetStages(), regs, false, b);
+        clamp = {};
     }
     WritebacksBefore(b); // includes worker-prepared bindings
     if (b.failed) {
@@ -17238,6 +17259,15 @@ void NativeRenderer::RecordDraw(bool is_indexed, u32 index_offset, const Indirec
         ui.scale = float(hud_output.width) / hud_scene.width;
         ui.scale_y = float(hud_output.height) / hud_scene.height;
         ui.offset_x = ui.offset_y = 0.f;
+        // GT7 clips its race HUD at screen * screen / 1920x1080 (1499x843 for a 1696x954
+        // scene, DIAG-SGT-188): the panels sliding in on the right were cut at 88%. The clip is
+        // the whole screen at 1920x1080, so it is widened to the scene here.
+        ui.widen_x_from = (hud_scene.width * hud_scene.width + 1919) / 1920;
+        ui.widen_x_to = hud_scene.width;
+        ui.widen_y_from = (hud_scene.height * hud_scene.height + 1079) / 1080;
+        ui.widen_y_to = hud_scene.height;
+    } else {
+        UiHires::Get().widen_x_from = 0;
     }
     for (unsigned attempt = 0; b.region_writeback && !RegionPlanValid(*b.region_writeback) && attempt < 4; ++attempt) {
         b.Clear();

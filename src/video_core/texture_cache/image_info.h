@@ -27,6 +27,14 @@ struct ImageResource;
 
 namespace VideoCore {
 
+/// FEAT-SGT-189: while set (one draw, this thread), a texture described at from_w x from_h
+/// with that pitch is taken at to_w x to_h with pitch to_w: GT7's final composition describes an
+/// unwritten full-screen input at the guest output's size over memory allocated for the scene.
+struct TextureExtentClamp {
+    u32 from_w = 0, from_h = 0, to_w = 0, to_h = 0;
+};
+inline thread_local TextureExtentClamp g_texture_extent_clamp{};
+
 struct ImageProperties {
     u32 is_volume : 1;
     u32 is_tiled : 1;

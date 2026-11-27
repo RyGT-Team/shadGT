@@ -2296,6 +2296,8 @@ static bool InPlaceStorageWritesRequested() {
 
 NativeRenderer::NativeRenderer(Rasterizer& rasterizer)
     : r{rasterizer}, in_place_storage_writes{InPlaceStorageWritesRequested()} {
+    const char* dedup = std::getenv("SHADGT_DEDUP_DOWNLOAD_PAGES"); // PERF-SGT-231
+    dedup_download_pages = dedup && dedup[0] == '1' && dedup[1] == '\0';
     DecideGtsCpuWritebackNow(); // FIX-GTS-529: before the game sets up its save memory
     SnapshotLease::BackingProtocol::Initialize(r.instance.GetVendorID());
     sampler_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
@@ -5306,12 +5308,11 @@ void NativeRenderer::FlushWritebacks() {
                         Region& region = it->second;
                         const VAddr begin = std::max(from, region.begin), end = std::min(to, region.end);
                         for (VAddr page = Common::AlignDown(begin, 4096); begin < end && page < end; page += 4096) {
-                            region.dirty_pages.push_back(page);
+                            region.MarkDownloadPage(page, dedup_download_pages);
                             diag_region_marks[3].fetch_add(1, std::memory_order_relaxed); // DIAG-GTS-411
                             Native::AddPageDownloadRange(downloaded_ranges[page], std::max(begin, page),
                                                          std::min(end, page + 4096));
                         }
-                        if (begin < end) region.dirty_sorted = false;
                     }
                 }
               }
@@ -5395,12 +5396,11 @@ void NativeRenderer::FlushWritebacks() {
                     const VAddr from = std::max(address, region.begin);
                     const VAddr to = std::min(address + size, region.end);
                     for (VAddr page = Common::AlignDown(from, 4096); from < to && page < to; page += 4096) {
-                        region.dirty_pages.push_back(page);
+                        region.MarkDownloadPage(page, dedup_download_pages);
                         diag_region_marks[4].fetch_add(1, std::memory_order_relaxed); // DIAG-GTS-411
                         Native::AddPageDownloadRange(downloaded_ranges[page], std::max(from, page),
                                                      std::min(to, page + 4096));
                     }
-                    if (from < to) region.dirty_sorted = false;
                 }
             }
             // NAT-150: so do mirrors.
@@ -7198,6 +7198,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         }
     }
     dirty.erase(first, last);
+    if (dedup_download_pages) region.recent_downloads = {};
     // PERF-104 (port of shadgt7's switch): consecutive pages are watched again in one call.
     // SHADGT_NATIVE_REFRESH_BATCH=0: each page on its own (diagnosis).
     static const bool watch_batch = [] {

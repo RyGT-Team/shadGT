@@ -692,7 +692,28 @@ private:
         /// FIX-GT7-033: of those, the pages the GPU wrote since their last copy.
         std::unique_ptr<std::unordered_set<VAddr>> gpu_pages = std::make_unique<std::unordered_set<VAddr>>(); ///< recently CPU-written pages changed by GPU work
         bool dirty_sorted = true;
+        struct DownloadPageGroup {
+            VAddr number{};
+            u64 bits{};
+        };
+        std::array<DownloadPageGroup, 4> recent_downloads{};
+
+        void MarkDownloadPage(VAddr page, bool deduplicate) {
+            if (deduplicate) {
+                const VAddr number = page >> 18;
+                const u64 bit = u64{1} << ((page >> 12) & 63);
+                auto& group = recent_downloads[number % recent_downloads.size()];
+                if (group.number == number && (group.bits & bit)) return;
+                dirty_pages.push_back(page);
+                if (group.number != number) group = {number, 0};
+                group.bits |= bit;
+            } else {
+                dirty_pages.push_back(page);
+            }
+            dirty_sorted = false;
+        }
     };
+    bool dedup_download_pages{};
     std::map<VAddr, Region> regions; ///< by begin; guarded by mutex
     /// PERF-SGT-046: `regions` as flat sorted arrays for RegionOver (about 230 regions in a GT7
     /// race fit in L1; the tree's nodes are scattered). Rebuilt after every change of `regions`,

@@ -461,8 +461,12 @@ bool Instance::CreateDevice() {
     whole_pipeline_binaries_only =
         properties.vendorID == 0x1002 &&
         (amd_whole_binaries_set ? amd_whole_binaries_env[0] == '1' : IsAmdRdna2());
-    const bool request_pipeline_binaries = (properties.vendorID != 0x1002 &&
-        pipeline_binary_env && pipeline_binary_env[0] == '1' && pipeline_binary_env[1] == '\0') ||
+    // FIX-SGT-192: still opt-in off AMD. On an RTX 4070 (617.42) every pipeline made from stored
+    // binaries kept its own copy of a 2 MB binary the driver gives all of them: GT7 went from
+    // 11.9 to 17.4 GB in four minutes. SHADGT_PIPELINE_CACHE_FILES (below) is the default instead.
+    const bool pipeline_binary_set = pipeline_binary_env && *pipeline_binary_env;
+    const bool request_pipeline_binaries = (properties.vendorID != 0x1002 && pipeline_binary_set &&
+        pipeline_binary_env[0] == '1' && pipeline_binary_env[1] == '\0') ||
         whole_pipeline_binaries_only;
     if (request_pipeline_binaries && maintenance_5) {
         const auto chain = physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
@@ -480,11 +484,50 @@ bool Instance::CreateDevice() {
                         bool(p.pipelineBinaryPrefersInternalCache),
                         bool(p.pipelineBinaryPrecompiledInternalCache),
                         bool(p.pipelineBinaryCompressedData));
+            // FIX-SGT-192: a driver that prefers its internal cache is not asked for binaries
+            // (the spec: such an app should not capture them) unless the switch says 1.
+            if (p.pipelineBinaryPrefersInternalCache && !pipeline_binary_set &&
+                !whole_pipeline_binaries_only) {
+                pipeline_binary = false;
+                LOG_WARNING(Render_Vulkan, "FIX-SGT-192: the driver prefers its internal cache; "
+                                           "pipeline binaries are not stored");
+            }
+            // FIX-SGT-192 (SHADGT_PIPELINE_BINARY_INTERNAL_CACHE=0): the driver's own cache of
+            // binaries off, where the driver lets it be (NVIDIA does).
+            const char* internal_env = std::getenv("SHADGT_PIPELINE_BINARY_INTERNAL_CACHE");
+            pipeline_binary_internal_cache_off = p.pipelineBinaryInternalCacheControl &&
+                                                 internal_env && internal_env[0] == '0';
+            if (pipeline_binary_internal_cache_off) {
+                LOG_WARNING(Render_Vulkan, "FIX-SGT-192: the driver's internal binary cache is off");
+            }
         } else {
             LOG_WARNING(Render_Vulkan, "BIN-001: pipeline binaries not supported by this driver");
         }
     }
     whole_pipeline_binaries_only = whole_pipeline_binaries_only && pipeline_binary;
+    // FIX-SGT-192 (SHADGT_PIPELINE_CACHE_FILES): without pipeline binaries (Intel Arc on Windows
+    // has none), a driver cache file per pipeline instead of one file loaded whole into memory.
+    // On by default off AMD; 0 turns it off, 1 turns it on anywhere. On AMD, unset, the pipeline
+    // cache chooses at its start by the single file's size (SHADGT_PIPELINE_CACHE_FILES_MB): a
+    // small one (the 610M's GT7 file, 89 MB) builds libraries in half the time of the files, but
+    // an RX 9050's GT Sport file reached 935 MB, held whole in memory on 16 GB of RAM (RyGT #104).
+    // With RDNA2 whole binaries (PERF-GTS-482) the files stay off.
+    {
+        const char* files_env = std::getenv("SHADGT_PIPELINE_CACHE_FILES");
+        const bool files_set = files_env && *files_env;
+        pipeline_cache_files = files_set ? files_env[0] == '1' : properties.vendorID != 0x1002;
+        pipeline_cache_files = pipeline_cache_files && !whole_pipeline_binaries_only;
+        pipeline_cache_files_by_size =
+            !files_set && properties.vendorID == 0x1002 && !whole_pipeline_binaries_only;
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-SGT-192: pipelines kept as {}",
+                    pipeline_binary && !whole_pipeline_binaries_only
+                        ? "pipeline binaries, a file each"
+                    : pipeline_cache_files ? "driver cache files, one per pipeline"
+                    : pipeline_cache_files_by_size
+                        ? "one driver cache file, or a file per pipeline once it is big"
+                        : "one driver cache file");
+    }
     if (whole_pipeline_binaries_only) {
         LOG_WARNING(Render_Vulkan, "PERF-GTS-482: whole pipelines are stored as pipeline binaries "
                                    "(libraries are not)");
@@ -1249,6 +1292,9 @@ bool Instance::CreateDevice() {
         vk::PhysicalDevicePipelineBinaryFeaturesKHR{
             .pipelineBinaries = true, // BIN-001
         },
+        vk::DevicePipelineBinaryInternalCacheControlKHR{
+            .disableInternalCache = true, // FIX-SGT-192
+        },
         vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR{
             .shaderMaximalReconvergence = true, // AMD-306
         },
@@ -1274,6 +1320,9 @@ bool Instance::CreateDevice() {
     }
     if (!pipeline_binary) {
         device_chain.unlink<vk::PhysicalDevicePipelineBinaryFeaturesKHR>();
+    }
+    if (!pipeline_binary || !pipeline_binary_internal_cache_off) {
+        device_chain.unlink<vk::DevicePipelineBinaryInternalCacheControlKHR>();
     }
     if (!xess_mutable_descriptor) {
         device_chain.unlink<vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT>();

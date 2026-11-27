@@ -9,6 +9,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <xxhash.h>
+
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/ryty_config.h"
@@ -20,6 +22,9 @@ namespace Vulkan {
 namespace {
 std::mutex code_mutex;
 std::unordered_map<VkDevice, std::unordered_map<VkShaderModule, std::vector<u32>>> module_code;
+// FIX-SGT-192: each module's SPIR-V hash, for keys that stay the same from one run to the next.
+std::mutex hash_mutex;
+std::unordered_map<VkShaderModule, u64> module_hashes;
 
 // FIX-GT7-143: the brightness of GT7's own interface on an HDR output ("paper white").
 //
@@ -174,7 +179,23 @@ std::vector<u32> ModuleCode(vk::ShaderModule module) {
     return {};
 }
 
+void RememberModuleHash(vk::ShaderModule module, std::span<const u32> code) {
+    const u64 hash = XXH3_64bits(code.data(), code.size_bytes()) | 1; // never 0
+    std::scoped_lock lock{hash_mutex};
+    module_hashes.insert_or_assign(static_cast<VkShaderModule>(module), hash);
+}
+
+u64 ModuleHash(vk::ShaderModule module) {
+    std::scoped_lock lock{hash_mutex};
+    const auto it = module_hashes.find(static_cast<VkShaderModule>(module));
+    return it != module_hashes.end() ? it->second : 0;
+}
+
 void ForgetModuleCode(vk::Device device, vk::ShaderModule module) {
+    {
+        std::scoped_lock lock{hash_mutex};
+        module_hashes.erase(static_cast<VkShaderModule>(module));
+    }
     std::scoped_lock lock{code_mutex};
     if (const auto it = module_code.find(static_cast<VkDevice>(device)); it != module_code.end())
         it->second.erase(static_cast<VkShaderModule>(module));
@@ -209,6 +230,7 @@ vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device, bool k
     auto [module_result, module] = device.createShaderModule(shader_info);
     ASSERT_MSG(module_result == vk::Result::eSuccess, "Failed to compile SPIR-V shader: {}",
                vk::to_string(module_result));
+    RememberModuleHash(module, code); // FIX-SGT-192
     if (keep_code) {
         try {
             std::scoped_lock lock{code_mutex};

@@ -163,6 +163,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_native_ui.h"
 #include "shader_recompiler/direct_learning.h"
+#include "video_core/renderer_vulkan/direct_table_scratch.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/image_descriptor.h"
 #include "video_core/texture_cache/sampler.h"
@@ -12153,8 +12154,8 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
         ? r.buffer_cache.GetDirectMemory() : nullptr;
     // D3's table: page table L1 and zero page, then base, size and valid of each buffer read
     // through it.
-    static thread_local std::vector<std::array<u32, 4>> direct_entries;
-    direct_entries.assign(stage.buffers.size(), {});
+    static thread_local DirectTableScratch table_scratch;
+    auto direct_entries = table_scratch.Begin(stage.buffers.size(), direct != nullptr);
     constexpr u64 GpuAddressLimit = 1ULL << 40;
     u32 index = 0;
     for (const auto& desc : stage.buffers) {
@@ -12197,28 +12198,16 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                 }
                 break;
             case Shader::BufferType::DirectTable: {
-                const u32 words = static_cast<u32>(4 + stage.buffers.size() * 4);
-                static thread_local std::vector<u32> table_words;
-                table_words.assign(words, 0);
-                u32* const table = table_words.data();
-                if (auto* memory = r.buffer_cache.GetDirectMemory()) {
-                    const u64 l1 = memory->L1Address();
-                    const u64 zero = memory->ZeroPageAddress();
-                    table[0] = u32(l1);
-                    table[1] = u32(l1 >> 32);
-                    table[2] = u32(zero);
-                    table[3] = u32(zero >> 32);
-                    for (size_t i = 0; i < stage.buffers.size(); ++i) {
-                        std::memcpy(&table[4 + i * 4], direct_entries[i].data(), 16);
-                    }
-                    // PERF-GTS-479: which direct candidates this draw read in place.
-                    Shader::DirectLearning::NoteBind(stage.pgm_hash, direct_entries, [&](u32 slot) {
+                auto* memory = r.buffer_cache.GetDirectMemory();
+                const auto table = table_scratch.Pack(stage.buffers.size(), direct_entries, memory);
+                if (memory) {
+                    Shader::DirectLearning::NoteBind(stage.pgm_hash, table.subspan(1), [&](u32 slot) {
                         return stage.buffers[slot].IsDirectEligible();
                     });
                 }
-                const auto [buffer, offset] = UploadBytes(upload_slot + 2, table,
-                                                          words * sizeof(u32), alignment); // OPT-015
-                info = {buffer, offset, words * sizeof(u32)};
+                const u32 bytes = static_cast<u32>(table.size_bytes());
+                const auto [buffer, offset] = UploadBytes(upload_slot + 2, table.data(), bytes, alignment);
+                info = {buffer, offset, bytes};
                 break;
             }
             case Shader::BufferType::SharedMemory: {
@@ -21453,8 +21442,8 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
 #endif
     auto* direct = stage.uses_direct && !descriptor_composition && !force_descriptor
         ? r.buffer_cache.GetDirectMemory() : nullptr;
-    static thread_local std::vector<std::array<u32, 4>> direct_entries;
-    direct_entries.assign(stage.buffers.size(), {});
+    static thread_local DirectTableScratch table_scratch;
+    auto direct_entries = table_scratch.Begin(stage.buffers.size(), direct != nullptr);
     constexpr u64 GpuAddressLimit = 1ULL << 40;
     const auto upload = [&](const void* data, u32 size) {
         const u32 offset = static_cast<u32>(p.upload_bytes.size());
@@ -21511,25 +21500,15 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                 }
                 break;
             case Shader::BufferType::DirectTable: {
-                const u32 words = static_cast<u32>(4 + stage.buffers.size() * 4);
-                static thread_local std::vector<u32> table;
-                table.assign(words, 0);
-                if (auto* memory = r.buffer_cache.GetDirectMemory()) {
-                    const u64 l1 = memory->L1Address();
-                    const u64 zero = memory->ZeroPageAddress();
-                    table[0] = u32(l1);
-                    table[1] = u32(l1 >> 32);
-                    table[2] = u32(zero);
-                    table[3] = u32(zero >> 32);
-                    for (size_t i = 0; i < stage.buffers.size(); ++i) {
-                        std::memcpy(&table[4 + i * 4], direct_entries[i].data(), 16);
-                    }
-                    // PERF-GTS-479: which direct candidates this draw read in place.
-                    Shader::DirectLearning::NoteBind(stage.pgm_hash, direct_entries, [&](u32 slot) {
+                auto* memory = r.buffer_cache.GetDirectMemory();
+                const auto table = table_scratch.Pack(stage.buffers.size(), direct_entries, memory);
+                if (memory) {
+                    Shader::DirectLearning::NoteBind(stage.pgm_hash, table.subspan(1), [&](u32 slot) {
                         return stage.buffers[slot].IsDirectEligible();
                     });
                 }
-                info = upload(table.data(), words * sizeof(u32));
+                const u32 bytes = static_cast<u32>(table.size_bytes());
+                info = upload(table.data(), bytes);
                 break;
             }
             default:

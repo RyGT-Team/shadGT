@@ -183,6 +183,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_DEPTH_TWIN_HINT|flag|Native recorder & sync|off|0 = off, 1 = on|Skips depth/colour partner lookup until an opposite target of the same dimensions has appeared at that address.",
     "RYGTSW1|SHADGT_DESCRIPTOR_GROUP_RUNS|flag|Native recorder & sync|off|0 = off, 1 = on|Group consecutive descriptor writes by set.",
     "RYGTSW1|SHADGT_DESCRIPTOR_KEY_WORK|flag|Native recorder & sync|off|0 = off, 1 = on|Avoid redundant descriptor key construction.",
+    "RYGTSW1|SHADGT_SINGLE_DIRECT_TABLE|flag|Native recorder & sync|off|0 = off, 1 = on|Reuse scratch storage for a single direct descriptor table.",
     "RYGTSW1|SHADGT_LONG_LIVED_SETS|flag|Native recorder & sync|on|unset or 1 = on, any other value = off (needs SHADGT_DYNAMIC_BUFFER_OFFSETS on)|Keeps descriptor sets across command lists and drops one when an object it uses is destroyed (PERF-GTS-375). Experimental.",
     "RYGTSW1|SHADGT_LISTED_IN_PLACE|flag|Native recorder & sync|on|0 = off|Ranges in the listed in-place ranges (GT7's launcher sets them) are always read and written in guest memory, even under a video-memory copy, so GPU culling reads what it wrote (FIX-SGT-004, FIX-SGT-009)",
     "RYGTSW1|SHADGT_REGION_AVOID_LISTED|flag|Native recorder & sync|on|0 = off|Video-memory copies of guest memory never grow over GT7's listed in-place ranges; fixes the road going dark for single frames in the rain (FIX-SGT-012).",

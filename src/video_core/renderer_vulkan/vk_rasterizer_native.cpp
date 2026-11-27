@@ -19969,6 +19969,13 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
     if (temporal.size_refused) {
         return; // the result's size is not the display's (FindDisplay): left to the game
     }
+    // FIX-SGT-200: a menu shown at 16:9 in a window of another shape (RYGT_ULTRAWIDE_MENUS) does
+    // not split its HUD (HudSplitNow), so the mirror's second HUD draw below has no interface to
+    // lay over the scene: World Circuits' zoomed map came out without its track list, header and
+    // event panel (16:10 and 21:9, with DLSS on). Such a menu's pass is left to the game.
+    if (center_wide_menu) {
+        return;
+    }
     // Only in a race, and only while the interface does not read the display back. The game
     // runs the same pass behind menus that have a 3D scene (the title screen over the world
     // map, the layout cards over the globe, the pre-race page; seen by the user on 2026-11-12),
@@ -25616,9 +25623,12 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     frame_writebacks.clear();
     // Use one routing decision for all draws and the presentation of the same frame.
     const bool finished_wide_menu = center_wide_menu;
+    // FIX-SGT-200: also on a screen taller than 16:9 (16:10, 4:3): the menus' 16:9 picture
+    // goes between bars at the top and bottom instead of being stretched to the window's height
+    // (the race camera's aspect is widened only for races, so menus are drawn for 16:9).
     static const bool fit_gt7_menus = [] {
         const char* setting = std::getenv("RYGT_ULTRAWIDE_MENUS");
-        return Common::IsGt7() && RytyDisplayAspect() > 16.0f / 9.0f + 0.01f &&
+        return Common::IsGt7() && RytyDisplayAspect() > 0.0f &&
                !(setting && setting[0] == '0');
     }();
     const u32 native_panel = RytyGt7MenuWidth(info.size.width, info.size.height);

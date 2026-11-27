@@ -168,12 +168,14 @@ std::vector<HudPiece> DefaultHudPieces() {
         return HudPiece{name, {x / 1920.0f, y / 1080.0f, w / 1920.0f, h / 1080.0f}};
     };
     return {
-        piece("Lap", 10, 20, 170, 115),
+        // FEAT-SGT-201: Lap takes in the whole POSITION / LAP block and Track map the whole map
+        // (1440..1880 wide), so a piece moved on a taller screen isn't split.
+        piece("Lap", 10, 20, 410, 115),
         piece("Lap time", 790, 215, 340, 90),
-        piece("Track map", 1530, 5, 260, 315),
+        piece("Track map", 1420, 5, 500, 300),
         piece("Position", 1670, 310, 250, 200),
         piece("Race time", 5, 990, 250, 90),
-        piece("Dashboard", 235, 920, 1120, 160),
+        piece("Dashboard", 235, 880, 1120, 200), // FEAT-SGT-201: "AUTO DRIVE" above it too
         piece("Course map", 1560, 790, 360, 290),
     };
 }
@@ -233,18 +235,35 @@ void SaveHudLayout(const HudLayoutState& state) {
 }
 
 // Where a piece shows on the output: its place, or where the centred HUD has it.
-std::array<float, 4> HudPieceRect(const HudPiece& piece, float x0, float x1) {
+// Where the centred 16:9 HUD is on an output of this shape (0..1 of it): x0, x1, y0, y1. On a
+// wider screen it spans the height; on a taller one (FIX-SGT-200: 16:10, 4:3) the width.
+std::array<float, 4> HudSpan(float width, float height) {
+    const float across = width > 0.0f ? std::min(1.0f, height * 16.0f / 9.0f / width) : 1.0f;
+    const float down = height > 0.0f ? std::min(1.0f, width * 9.0f / 16.0f / height) : 1.0f;
+    return {0.5f - across / 2.0f, 0.5f + across / 2.0f, 0.5f - down / 2.0f, 0.5f + down / 2.0f};
+}
+
+// Where a part of the 16:9 HUD (src, 0..1 of it) shows inside the centred HUD's span.
+std::array<float, 4> HudAreaRect(const float src[4], const std::array<float, 4>& span) {
+    const float width = span[1] - span[0];
+    const float height = span[3] - span[2];
+    return {span[0] + src[0] * width, span[2] + src[1] * height, src[2] * width,
+            src[3] * height};
+}
+
+std::array<float, 4> HudPieceRect(const HudPiece& piece, const std::array<float, 4>& span) {
     if (piece.placed) {
         return {piece.dst[0], piece.dst[1], piece.dst[2], piece.dst[3]};
     }
-    const float width = x1 - x0;
-    return {x0 + piece.src[0] * width, piece.src[1], piece.src[2] * width, piece.src[3]};
-}
-
-// The horizontal span of the centred 16:9 HUD on an output of this shape.
-std::pair<float, float> HudSpan(float width, float height) {
-    const float hud = width > 0.0f ? std::min(1.0f, height * 16.0f / 9.0f / width) : 1.0f;
-    return {0.5f - hud / 2.0f, 0.5f + hud / 2.0f};
+    auto rect = HudAreaRect(piece.src, span);
+    // FEAT-SGT-201: on a screen taller than 16:9 the race view is taller too (FEAT-GT7-202), so
+    // the pieces go out to the edges: those in the HUD's top half to the top, the rest to the
+    // bottom, at their 16:9 size. What isn't a piece stays in the centred 16:9 band.
+    if (span[2] > 0.0f) {
+        const float centre = piece.src[1] + piece.src[3] / 2.0f;
+        rect[1] += centre < 0.5f ? -span[2] : 1.0f - span[3];
+    }
+    return rect;
 }
 } // namespace
 
@@ -263,22 +282,22 @@ static void DrawHudEditor(ImVec2 origin, ImVec2 size) {
     if (!layout.editing || size.x <= 0.0f || size.y <= 0.0f) {
         return;
     }
-    const auto [x0, x1] = HudSpan(size.x, size.y);
+    const auto span = HudSpan(size.x, size.y);
     auto* draw = ImGui::GetWindowDrawList();
     const ImGuiIO& io = ImGui::GetIO();
     // The centred HUD's outline.
-    draw->AddRect(ImVec2{origin.x + x0 * size.x, origin.y},
-                  ImVec2{origin.x + x1 * size.x, origin.y + size.y}, IM_COL32(255, 255, 255, 60));
+    draw->AddRect(ImVec2{origin.x + span[0] * size.x, origin.y + span[2] * size.y},
+                  ImVec2{origin.x + span[1] * size.x, origin.y + span[3] * size.y},
+                  IM_COL32(255, 255, 255, 60));
     constexpr float handle = 16.0f;
     for (size_t i = 0; i < layout.pieces.size(); ++i) {
         auto& piece = layout.pieces[i];
         // The box: the piece on screen, or (editing areas) its area in the centred HUD.
         std::array<float, 4> rect;
         if (layout.capture_areas) {
-            const float width = x1 - x0;
-            rect = {x0 + piece.src[0] * width, piece.src[1], piece.src[2] * width, piece.src[3]};
+            rect = HudAreaRect(piece.src, span);
         } else {
-            rect = HudPieceRect(piece, x0, x1);
+            rect = HudPieceRect(piece, span);
         }
         const ImVec2 p0{origin.x + rect[0] * size.x, origin.y + rect[1] * size.y};
         const ImVec2 p1{p0.x + rect[2] * size.x, p0.y + rect[3] * size.y};
@@ -304,16 +323,17 @@ static void DrawHudEditor(ImVec2 origin, ImVec2 size) {
             const float dx = io.MouseDelta.x / size.x;
             const float dy = io.MouseDelta.y / size.y;
             if (layout.capture_areas) {
-                const float width = x1 - x0;
+                const float width = span[1] - span[0];
+                const float height = span[3] - span[2]; // FIX-SGT-200
                 if (moving) {
                     piece.src[0] = std::clamp(piece.src[0] + dx / width, 0.0f, 1.0f - piece.src[2]);
-                    piece.src[1] = std::clamp(piece.src[1] + dy, 0.0f, 1.0f - piece.src[3]);
+                    piece.src[1] = std::clamp(piece.src[1] + dy / height, 0.0f, 1.0f - piece.src[3]);
                 } else {
                     // A placed piece keeps its scale: its box on the screen grows with its area.
                     const float scale_x = piece.dst[2] / std::max(piece.src[2], 0.001f);
                     const float scale_y = piece.dst[3] / std::max(piece.src[3], 0.001f);
                     piece.src[2] = std::clamp(piece.src[2] + dx / width, 0.01f, 1.0f - piece.src[0]);
-                    piece.src[3] = std::clamp(piece.src[3] + dy, 0.01f, 1.0f - piece.src[1]);
+                    piece.src[3] = std::clamp(piece.src[3] + dy / height, 0.01f, 1.0f - piece.src[1]);
                     if (piece.placed) {
                         piece.dst[2] = std::min(piece.src[2] * scale_x, 1.0f - piece.dst[0]);
                         piece.dst[3] = std::min(piece.src[3] * scale_y, 1.0f - piece.dst[1]);
@@ -1674,9 +1694,11 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     // GT7-UW: the HUD at 16:9, centred over the stretched picture.
     auto hud_settings = pp_settings;
     if (display->hud_black && display->hud_white && frame->width > 0) {
-        const float hud_width = std::min(1.0f, float(frame->height) * 16.0f / 9.0f / float(frame->width));
-        hud_settings.hud_x0 = 0.5f - hud_width / 2.0f;
-        hud_settings.hud_x1 = 0.5f + hud_width / 2.0f;
+        const auto span = HudSpan(float(frame->width), float(frame->height));
+        hud_settings.hud_x0 = span[0];
+        hud_settings.hud_x1 = span[1];
+        hud_settings.hud_y0 = span[2]; // FIX-SGT-200
+        hud_settings.hud_y1 = span[3];
         const vk::MemoryBarrier2 hud_written{
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
             .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
@@ -1695,7 +1717,8 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
             LoadHudLayout(layout);
         }
         for (const auto& piece : layout.pieces) {
-            const auto rect = HudPieceRect(piece, hud_settings.hud_x0, hud_settings.hud_x1);
+            const auto rect = HudPieceRect(piece, {hud_settings.hud_x0, hud_settings.hud_x1,
+                                                   hud_settings.hud_y0, hud_settings.hud_y1});
             hud_widgets.push_back({{piece.src[0], piece.src[1], piece.src[2], piece.src[3]},
                                    {rect[0], rect[1], rect[2], rect[3]}});
         }

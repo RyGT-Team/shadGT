@@ -830,6 +830,26 @@ static CopyFn volatile g_guarded_copy = &std::memcpy;
 static HashFn volatile g_guarded_hash = &XXH3_64bits;
 static CompareFn volatile g_guarded_compare = &std::memcmp;
 
+static bool MatchWords(const volatile u32* guest, const u32* expected, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        if (guest[i] != expected[i]) return false;
+    }
+    return true;
+}
+
+bool GuardedMatchWords(const u32* guest, const u32* expected, size_t count) {
+    static decltype(&MatchWords) volatile compare = &MatchWords;
+    bool matched;
+    ++g_guarded_reads;
+    __try {
+        matched = compare(guest, expected, count);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        matched = false;
+    }
+    --g_guarded_reads;
+    return matched;
+}
+
 static bool GuardedCopyRaw(void* dest, const void* source, size_t size) {
     __try {
         g_guarded_copy(dest, source, size);

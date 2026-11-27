@@ -37,6 +37,7 @@ RYGT_SWITCH_EXPORT extern const std::size_t RyGT_SwitchDescriptionCount;
 
 RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     // Shader objects & caches
+    "RYGTSW1|SHADGT_REUSE_FETCH_LAYOUT|flag|Shader objects & caches|off|0 = off, 1 = on|Checks the live words of the last vertex fetch program before reusing its decoded attributes.",
     "RYGTSW1|SHADGT_COMPILE_PACK|flag|Shader objects & caches|off|1 = on (needs shader objects and SHADGT_SO_CACHE on)|At start, compiles in the background the compile-pack recipes missing from this driver's cache, e.g. after a driver update. Uses all cores.",
     "RYGTSW1|SHADGT_DEPTH_CLIP_CONTROL|flag|Shader objects & caches|on (VK_EXT_depth_clip_control)|0 = the vertex shader converts -1..1 depth (uses a separate shader store)|0 converts -1..1 depth in the vertex shader instead of the driver; breaks car tessellation (FIX-GTS-443, experimental).",
     "RYGTSW1|SHADGT_DRIVER_CACHE|flag|Shader objects & caches|on|0 = off|Keeps the driver's pipeline cache file between runs; 0 turns it off so every start compiles again.",

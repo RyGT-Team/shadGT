@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // FEAT-SGT-203: the game's 1920x1080 picture placed in outputs of other shapes (UiHires::UiRect,
-// the proxy's shape tests).
+// the proxy's shape tests and the post pass's bands).
 #include <gtest/gtest.h>
 #include "video_core/renderer_vulkan/ui_fit_policy.h"
 
@@ -47,3 +47,16 @@ TEST(UiFitPolicy, Shapes) {
     EXPECT_FALSE(Covers(1280, 800, 1920, 1080));  // Steam Deck: no proxy either
 }
 
+TEST(UiFitPolicy, LetterboxOnlyWhatIsClearlyWider) {
+    ExpectRect(Letterbox(1920, 1200, 1920, 1080), 0, 60, 1920, 1080);
+    ExpectRect(Letterbox(2560, 1600, 1920, 1080), 0, 80, 2560, 1440);
+    // The proxy's own picture, at the output's size: the whole output.
+    ExpectRect(Letterbox(1920, 1200, 1920, 1200), 0, 0, 1920, 1200);
+    // Narrower or about the same shape: the whole output, as before.
+    ExpectRect(Letterbox(1920, 1200, 1440, 1080), 0, 0, 1920, 1200);
+    ExpectRect(Letterbox(1920, 1080, 1920, 1080), 0, 0, 1920, 1080);
+    // Smaller than the picture: no proxy, every frame stretched as before (GTS-009).
+    ExpectRect(Letterbox(1680, 1050, 1920, 1080), 0, 0, 1680, 1050);
+    ExpectRect(Letterbox(1280, 800, 1920, 1080), 0, 0, 1280, 800);
+    ExpectRect(Letterbox(1920, 1200, 0, 0), 0, 0, 1920, 1200);
+}

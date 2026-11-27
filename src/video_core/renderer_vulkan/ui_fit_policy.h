@@ -51,4 +51,20 @@ inline bool Taller(std::uint32_t out_w, std::uint32_t out_h, std::uint32_t from_
     return std::int64_t(out_w) * from_h < std::int64_t(out_h) * from_w;
 }
 
+/// FEAT-SGT-203: where a picture shown without the proxy (boot screens, the intro, a frame the
+/// proxy was given up for) goes on a taller output: between bands when it is clearly wider than
+/// the output (a 16:9 picture on 16:10 or 4:3); otherwise the whole output, as before.
+/// Only on an output the proxy takes (at least the picture's size): on a smaller one (1680x1050)
+/// every frame comes this way, race pictures drawn for the screen's shape included, so they all
+/// keep GTS-009's stretch.
+inline Rect Letterbox(std::uint32_t out_w, std::uint32_t out_h, std::uint32_t from_w,
+                      std::uint32_t from_h) {
+    if (out_w == 0 || out_h == 0 || from_w == 0 || from_h == 0 ||
+        !Covers(out_w, out_h, from_w, from_h) ||
+        double(from_w) / from_h <= double(out_w) / out_h * 1.05) {
+        return Rect{0, 0, out_w, out_h};
+    }
+    return Centred(out_w, out_h, from_w, from_h);
+}
+
 } // namespace Vulkan::UiFit

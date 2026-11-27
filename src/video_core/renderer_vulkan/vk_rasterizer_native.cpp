@@ -588,7 +588,8 @@ static std::vector<SceneIndirectArgs> scene_indirect_args;
 
 bool RytyGtsInRace();
 bool RytyGt7RaceHookInstalled();
-u32 RytyGt7MenuWidth(u32 registered_width, u32 height);
+u32 RytyGt7MenuWidth(u32 registered_width, u32 registered_height);
+u32 RytyGt7MenuHeight(u32 registered_width, u32 registered_height); // FEAT-SGT-243
 bool RytyGt7MenuActive();
 bool RytyGt7NativeDlssMenu();
 bool RytyRaceRunning(); // GAME-006, ryty_game_patch.cpp
@@ -25651,6 +25652,9 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
                !(setting && setting[0] == '0');
     }();
     const u32 native_panel = RytyGt7MenuWidth(info.size.width, info.size.height);
+    // FEAT-SGT-243: on a display taller than 16:9 the menus' panel has the display's width and
+    // fewer rows (1920x1080 in a 1920x1200 buffer); on a wider one, the display's rows.
+    const u32 native_rows = RytyGt7MenuHeight(info.size.width, info.size.height);
     center_wide_menu = native_panel ? RytyGt7MenuActive()
                                     : fit_gt7_menus && RytyGt7RaceHookInstalled() && !RytyGtsInRace();
     ++frame;
@@ -25690,10 +25694,11 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         registry->FindExisting(info.guest_address, [&](const Native::ImageEntry& candidate) {
             if (gt7_display) {
                 return !candidate.from_cpu && !candidate.info.props.is_depth &&
-                       (candidate.info.size.width == info.size.width ||
+                       ((candidate.info.size.width == info.size.width &&
+                         candidate.info.size.height == info.size.height) ||
                         (native_panel && candidate.info.size.width == native_panel &&
+                         candidate.info.size.height == native_rows &&
                          candidate.info.pitch == info.pitch)) &&
-                       candidate.info.size.height == info.size.height &&
                        candidate.info.num_bits == info.num_bits;
             }
             return !candidate.from_cpu && !candidate.info.props.is_depth &&
@@ -25702,7 +25707,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
                    candidate.info.num_bits == info.num_bits && candidate.info.pitch == info.pitch &&
                    candidate.info.num_samples == 1 && candidate.info.resources.levels == 1 &&
                    candidate.info.resources.layers == 1;
-        }, native_panel != 0); // A flip address can hold either logical width. Show its latest draw.
+        }, native_panel != 0); // A flip address can hold either logical size. Show its latest draw.
     // NEO-GT7-006: in the PS4 Pro mode GT7 draws its 3200x1800 picture into the top left corner of
     // a 3840x2160 surface, registered as 3200x1800 with a pitch of 3840: the display shows that
     // corner, copied below into an image of the display's size each frame. A lookup by the
@@ -25755,9 +25760,10 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     // admission step. Refresh a dirty CPU-backed display before presentation too.
     ApplyRewrite(*entry);
     const bool narrow_flip = native_panel &&
-                             (entry->info.size.width == native_panel || finished_wide_menu);
+                             ((entry->info.size.width == native_panel &&
+                               entry->info.size.height == native_rows) || finished_wide_menu);
     const auto* source = CropDisplay(*entry, {narrow_flip ? native_panel : info.size.width,
-                                             info.size.height});
+                                             narrow_flip ? native_rows : info.size.height});
     if (!source) {
         return std::nullopt;
     }

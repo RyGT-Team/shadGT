@@ -52,6 +52,7 @@
 #include "input/telemetry_haptics_output.h"
 #include "input/trigger_feedback.h"
 #include "ryty_gpu/ryty_dlssg.h"
+#include "ryty_gpu/gt7_menu_layout.h"
 #include "ryty_gpu/ryty_dlss_layout.h"
 #include "core/file_format/psf.h"
 #include "common/ryty_param_sfo.h"
@@ -4458,7 +4459,10 @@ constexpr u32 scene_size = 0x595f610;
 constexpr u32 first_flip_size = 0x62ef29c;
 constexpr u32 projection_aspect = 0x3f5f510;
 u8* game;
-u32 wide_width, menu_width, height, menu_height, output_width;
+// The track's scene (wide_width x height), the menus' 16:9 panel (menu_width x menu_height) and
+// the display (output_width x output_height). FEAT-SGT-243: the display can be taller than 16:9
+// too: the menus then keep its width and take fewer rows (1920x1080 in 1920x1200).
+u32 wide_width, menu_width, height, menu_height, output_width, output_height;
 bool dlss_layout;
 bool native_dlaa;
 std::atomic<u32> active_extent{};
@@ -4607,14 +4611,14 @@ void PS4_SYSV_ABI ConfigureTargets() {
     const u32 width = track ? wide_width : menu_width;
     const u32 scene_height = track ? height : menu_height;
     const u32 extent = PackedExtent(width, scene_height);
-    const bool wide = output_width > menu_width;
-    const float ratio = track ? float(output_width) / menu_height : 16.f / 9.f;
+    const bool wide = output_width > menu_width || output_height > menu_height;
+    const float ratio = track ? float(output_width) / output_height : 16.f / 9.f;
     auto* aspect = reinterpret_cast<float*>(game + projection_aspect);
     const bool changed = active_extent.load(std::memory_order_relaxed) != extent;
     bool applied = false;
     const bool base_targets = !game[0x62ef250] && !game[0x62ef608] && !game[0x62f5518];
     if (base_targets && (changed || (wide && std::atomic_ref<float>(*aspect).load(std::memory_order_relaxed) != ratio))) {
-        const u32 race_flip = PackedExtent(output_width, menu_height);
+        const u32 race_flip = PackedExtent(output_width, output_height);
         const u32 menu_flip = PackedExtent(menu_width, menu_height);
         bool ready = true;
         for (u32 i = 0; i < 3; ++i) {
@@ -4659,11 +4663,12 @@ void PS4_SYSV_ABI ApplyGraphicsConfig(void* config, int force) {
     // render targets and rebuild its dependent surfaces once on each transition.
     const bool track = TrackRequested();
     const u32 requested = track ? PackedExtent(wide_width, height) : PackedExtent(menu_width, menu_height);
-    const float ratio = track ? float(output_width) / menu_height : 16.f / 9.f;
+    const float ratio = track ? float(output_width) / output_height : 16.f / 9.f;
     auto* aspect = reinterpret_cast<float*>(game + projection_aspect);
+    const bool shaped = output_width > menu_width || output_height > menu_height;
     // libScePad can initialize its projection constant once after the first menu frame.
     apply_original(config, force || active_extent.load(std::memory_order_acquire) != requested ||
-                           (output_width > menu_width && std::atomic_ref<float>(*aspect).load(std::memory_order_relaxed) != ratio));
+                           (shaped && std::atomic_ref<float>(*aspect).load(std::memory_order_relaxed) != ratio));
 }
 
 template <typename T>
@@ -4705,26 +4710,34 @@ void Install(u8* base) {
     if (dlss) {
         if (layout.scene.width ? (w != layout.scene.width || h != layout.scene.height)
                                : (w != 1920 || h != 1080)) return;
-    } else if (h < 360 || h > 2160 || w > 7680 || w % 16 || w <= h * 16 / 9 ||
-               u64(w) * h > 3840 * 2160 ||
-               std::abs(Vulkan::RytyDisplayAspect() - float(w) / h) > .01f) return;
+    } else {
+        // FEAT-SGT-243: a scene taller than 16:9 (1920x1200 on a 16:10 screen) is laid out the
+        // same way, its menus at the 16:9 of its width. RYGT_GT7_TALL_MENUS=0: wider scenes only,
+        // and the taller scene's finished menu picture is fitted to 16:9 instead.
+        const char* tall_menus = std::getenv("RYGT_GT7_TALL_MENUS");
+        const bool taller = u64(w) * 9 < u64(h) * 16;
+        if (h < 360 || h > 2160 || w > 7680 || w % 16 || !Gt7MenuLayout::Shaped(w, h) ||
+            (taller && tall_menus && tall_menus[0] == '0') || u64(w) * h > 3840 * 2160 ||
+            std::abs(Vulkan::RytyDisplayAspect() - float(w) / h) > .01f) return;
+    }
     const u32 display_w = !dlss ? w : layout.output.width ? layout.output.width : 3840;
-    const u32 panel_height = !dlss ? h : layout.output.height ? layout.output.height : 2160;
-    const u32 panel = std::min(display_w, (panel_height * 16 + 4) / 9);
-    const bool wide = display_w > panel;
-    if (!dlss && panel >= w) return;
+    const u32 display_h = !dlss ? h : layout.output.height ? layout.output.height : 2160;
+    const u32 panel = Gt7MenuLayout::Panel(display_w, display_h).width;
+    const u32 panel_height = Gt7MenuLayout::Panel(display_w, display_h).height;
+    const bool wide = display_w > panel || display_h > panel_height;
+    if (!dlss && !wide) return;
     const auto matches = [&](u32 rva, const std::vector<u8>& bytes) {
         return ReadableRange(base + rva, bytes.size()) &&
                std::memcmp(base + rva, bytes.data(), bytes.size()) == 0;
     };
     const std::vector<u8> prologue{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
-    if (dlss && (display_w != w || panel_height != h) &&
+    if (dlss && (display_w != w || display_h != h) &&
         (!matches(0x17a7aa5, {0x41,0xb8}) || !matches(0x17a7aa7, Bytes(display_w)) ||
-         !matches(0x17a7aac, {0x41,0xb9}) || !matches(0x17a7aae, Bytes(panel_height)) ||
+         !matches(0x17a7aac, {0x41,0xb9}) || !matches(0x17a7aae, Bytes(display_h)) ||
          !matches(0x17a7aab, {0x90}) || !matches(0x17a7ab2, {0x90}))) return;
     if (!matches(target_config, prologue) || !matches(0x17a7417, Bytes(display_w)) ||
         !matches(0x17a7427, Bytes(w)) || !matches(0x17a7422, Bytes(h)) ||
-        !matches(0x17a741d, Bytes(panel_height)) ||
+        !matches(0x17a741d, Bytes(display_h)) ||
         !matches(0x1b4c3f0, {0xc5,0xfa,0x10,0x05,0x18,0x31,0x41,0x02,0xc3}) ||
         !matches(0x27cad27, {0x80,0x3d,0xea,0xa7,0xb2,0x03,0x00}) ||
         !matches(0x27cadd0, {0x48,0x89,0x4d,0xb4}) ||
@@ -4763,7 +4776,7 @@ void Install(u8* base) {
             if (!matches(site, store)) return;
             float literal;
             std::memcpy(&literal, base + site + store.size(), sizeof(literal));
-            if (literal != 16.f / 9.f && literal != float(display_w) / panel_height) return;
+            if (literal != 16.f / 9.f && literal != float(display_w) / display_h) return;
             auto bytes = Bytes(literal);
             store.insert(store.end(), bytes.begin(), bytes.end());
             auto* memory = near_code.Alloc(64);
@@ -4791,6 +4804,7 @@ void Install(u8* base) {
     game = base;
     wide_width = w;
     output_width = display_w;
+    output_height = display_h;
     menu_width = panel;
     menu_height = panel_height;
     height = h;
@@ -4866,10 +4880,17 @@ void RytyApplyGamePatches() {
 }
 
 namespace Vulkan {
-u32 RytyGt7MenuWidth(u32 registered_width, u32 height) {
+// The 16:9 panel GT7's menus are drawn at inside a display buffer registered at this size, or 0
+// when the menus have the display's own size. FEAT-SGT-243: on a display taller than 16:9 the
+// panel has the display's width and fewer rows, so both are returned.
+u32 RytyGt7MenuWidth(u32 registered_width, u32 registered_height) {
     using namespace Gt7NativeMenu;
-    return active_extent.load(std::memory_order_acquire) && output_width > menu_width &&
-           registered_width == output_width && height == menu_height ? menu_width : 0;
+    return active_extent.load(std::memory_order_acquire) &&
+           (output_width > menu_width || output_height > menu_height) &&
+           registered_width == output_width && registered_height == output_height ? menu_width : 0;
+}
+u32 RytyGt7MenuHeight(u32 registered_width, u32 registered_height) {
+    return RytyGt7MenuWidth(registered_width, registered_height) ? Gt7NativeMenu::menu_height : 0;
 }
 bool RytyGt7NativeDlssMenu() {
     using namespace Gt7NativeMenu;

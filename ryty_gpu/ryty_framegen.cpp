@@ -604,26 +604,17 @@ void FrameGen::Prepare(vk::CommandBuffer cmdbuf, vk::SwapchainKHR swapchain, vk:
             ab_seconds[0] = ab_seconds[1] = 0.0;
         }
     }
-    // FIX-104: no generated frames while new shaders compile (and for a second after). With
-    // generation on during heavy compiles the driver deadlocked: FFX's present thread waited in
-    // the driver while pipeline builds and the recorder waited on its locks (October 16, both
-    // renderers; the new one compiles its own shaders at first, so it met it at once).
-    {
-        static std::chrono::steady_clock::time_point last_compile{};
-        if (Common::GuestClock::IsPaused() || Vulkan::CompileSlowMotion() ||
-            Vulkan::PipelineBuildsRunning() > 0) {
-            last_compile = now;
-        }
-        if (last_compile != std::chrono::steady_clock::time_point{} &&
-            now - last_compile < std::chrono::seconds{1}) {
-            enabled = false;
-        }
-    }
-    // With temporal FSR, use only frames carrying matching scene inputs. Intro/UI
-    // frames have no such inputs and should retain normal presentation pacing.
-    // Standalone optical-flow FG keeps its existing fallback when temporal FSR is off.
-    const bool scene_ready = !RytyFsr3::TemporalRequested() || scene_valid;
-    config.frameGenerationEnabled = enabled && fresh_frame && scene_ready;
+    // FIX-104 held generation while new shaders compiled (and for a second after): with it on
+    // during heavy compiles the driver deadlocked on October 16 (FFX's present thread waited in
+    // the driver while pipeline builds and the recorder waited on its locks). FIX-SGT-173 takes
+    // the wait out at the maintainer's request, so that generation never waits; if that
+    // deadlock comes back, this is where it was held off.
+    // FIX-SGT-173: generation no longer waits for scene inputs or a fresh game frame, as DLSS
+    // frame generation (FIX-SGT-172): frames without the scene's inputs (intro, menus, loading,
+    // temporal FSR or not) use the zero motion and flat depth below, and a repeated frame is
+    // generated from as well.
+    const bool scene_ready = true;
+    config.frameGenerationEnabled = enabled;
     config.allowAsyncWorkloads = false;
     const bool hudless_valid = scene_valid && scene->hudless && scene->hudless_size == size &&
                                scene->hudless_format == format;

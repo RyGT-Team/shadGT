@@ -33,6 +33,13 @@ public:
         return valid && (flags & 7) == 1 && now - updated <= std::chrono::milliseconds{250};
     }
 
+    // DIAG-GT7-198: what Ready() looked at, for the line naming why generation waits.
+    bool Valid() const { return valid; }
+    std::uint16_t Flags() const { return flags; }
+    long long AgeMs(Clock::time_point now) const {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(now - updated).count();
+    }
+
 private:
     Clock::time_point updated{};
     std::uint32_t packet{};

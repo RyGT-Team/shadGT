@@ -187,13 +187,23 @@ void main() {
             }
         }
         if (!shown && overlay) {
-            // FEAT-SGT-201: outside the 16:9 band the overlay's nearest edge pixel, so the pause
-            // menu's dimming (or the pre-race header and panel) reaches the screen's edges as at 16:9.
+            // FEAT-SGT-201: outside the 16:9 band the overlay's nearest edge pixel, where it is the
+            // overlay's plain fill (the top-centre spot checked above): the pause menu's dimming
+            // reaches the screen's edges as at 16:9. Things that only touch the band's edge (a
+            // button, a line) are not stretched out.
             const vec2 half_texel = 0.5 / vec2(textureSize(hudBlack, 0));
-            hud_uv = clamp(vec2((uv.x - pp.hud_x0) / (pp.hud_x1 - pp.hud_x0),
-                                (uv.y - pp.hud_y0) / (pp.hud_y1 - pp.hud_y0)),
-                           half_texel, 1.0 - half_texel);
-            shown = true;
+            const vec2 edge = clamp(vec2((uv.x - pp.hud_x0) / (pp.hud_x1 - pp.hud_x0),
+                                         (uv.y - pp.hud_y0) / (pp.hud_y1 - pp.hud_y0)),
+                                    half_texel, 1.0 - half_texel);
+            const vec3 d_black =
+                abs(texture(hudBlack, edge).rgb - texture(hudBlack, vec2(0.5, 0.03)).rgb);
+            const vec3 d_white =
+                abs(texture(hudWhite, edge).rgb - texture(hudWhite, vec2(0.5, 0.03)).rgb);
+            if (max(max(d_black.r, d_black.g), max(d_black.b, max(d_white.r,
+                    max(d_white.g, d_white.b)))) < 0.02) {
+                hud_uv = edge;
+                shown = true;
+            }
         }
         if (shown) {
             // Over black the HUD left its colour times its coverage; over white also

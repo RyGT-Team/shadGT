@@ -713,6 +713,7 @@ private:
             dirty_sorted = false;
         }
     };
+    bool read_clean_sources = false;
     bool dedup_download_pages{};
     std::map<VAddr, Region> regions; ///< by begin; guarded by mutex
     /// PERF-SGT-046: `regions` as flat sorted arrays for RegionOver (about 230 regions in a GT7
@@ -1610,6 +1611,7 @@ private:
     static bool SubVersionsOn();
     /// NAT-104: copies the newer pictures of the render targets a texture is made of into it.
     void RefreshSources(Native::ImageEntry& texture);
+    void CheckAndRefreshSources(Native::ImageEntry& texture);
     /// FIX-212: a depth target and a colour target of its layout at its address (D16/R16,
     /// D32/R32) are one picture: the other's newer one is copied in before either is used
     /// (SHADGT_NATIVE_DEPTH_TWINS=0 off).

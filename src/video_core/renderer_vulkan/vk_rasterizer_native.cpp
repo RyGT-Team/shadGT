@@ -2302,6 +2302,10 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer)
         copy_literal_samplers = value[0] == '1' && value[1] == '\0';
         LOG_INFO(Render_Vulkan, "Literal sampler copies {}", copy_literal_samplers);
     }
+    if (const char* value = std::getenv("SHADGT_READ_CLEAN_SOURCES")) { // PERF-SGT-233
+        read_clean_sources = value[0] == '1' && value[1] == '\0';
+        LOG_INFO(Render_Vulkan, "Texture source refresh: {}", read_clean_sources ? "read first" : "stock");
+    }
     DecideGtsCpuWritebackNow(); // FIX-GTS-529: before the game sets up its save memory
     SnapshotLease::BackingProtocol::Initialize(r.instance.GetVendorID());
     sampler_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
@@ -15351,6 +15355,15 @@ u64 NativeRenderer::WholeVersion(Native::ImageEntry& source) {
 }
 
 void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
+    if (read_clean_sources && !texture.sources_dirty.load(std::memory_order_relaxed) &&
+        !Native::OrderedTiming::Enabled() &&
+        !(Common::DiagnosticsBuilt && Rasterizer::Traced(texture.info.guest_address, texture.info.guest_size))) {
+        return;
+    }
+    CheckAndRefreshSources(texture);
+}
+
+void NativeRenderer::CheckAndRefreshSources(Native::ImageEntry& texture) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::RefreshSources}; // DIAG-SGT-023
     // NAT-111: only when one of its targets was drawn since the last time.
     const bool traced = Rasterizer::Traced(texture.info.guest_address, texture.info.guest_size);

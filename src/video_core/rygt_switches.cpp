@@ -298,6 +298,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_REUSE_FULL_DOWNLOAD|flag|Memory & VRAM|off|0 = off, 1 = on|Skip staging snapshots covered by a full download.",
     "RYGTSW1|SHADGT_READ_EMPTY_IMAGE_QUEUES|flag|Memory & VRAM|off|0 = off, 1 = on|Check published empty image upload and layout initialization queues before taking their mutexes.",
     "RYGTSW1|SHADGT_IMPORT_COVERAGE_SUMMARY|flag|Memory & VRAM|off|0 = off, 1 = on|Check long imported guest-memory ranges using a summary of completely imported page groups.",
+    "RYGTSW1|SHADGT_FLAT_KEPT_TEXTURES|flag|Memory & VRAM|off|0 = off, 1 = on|Uses a flat pointer set for the image retirement keep list.",
     "RYGTSW1|RYGT_BATCH_MAP_MERGE|flag|Memory & VRAM|off|1 = on|Maps a run of the renderer's fixed batch maps as one direct-memory map (PERF-GTS-268); off because it caused 30-80 ms recorder stalls in races. Runtime (libkernel).",
     "RYGTSW1|SHADGT_LISTED_ONE_VIEW|flag|Memory & VRAM|on|0 = off|Imports each listed in-place range (GT7's culling memory) as one view even when the game mapped it in 2 MB pieces, so its buffers are bound in place (FIX-SGT-005).",
     "RYGTSW1|SHADGT_PIPELINE_IDLE_S|int|Memory & VRAM|120|seconds, 1 or more; 5 = as before|Under memory pressure, pipelines unused for this long are freed. Too short and things that leave the view lose theirs and pop back in (FIX-GTS-523).",

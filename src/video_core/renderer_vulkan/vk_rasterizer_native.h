@@ -49,6 +49,7 @@
 #include "ryty_gpu/native/writeback_plan.h"
 #include "ryty_gpu/ryty_upscale.h"
 #include "video_core/renderer_vulkan/pipeline_binding_state.h"
+#include "video_core/renderer_vulkan/kept_texture_set.h"
 #include "video_core/renderer_vulkan/descriptor_set_memo.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/resource.h"
@@ -1529,7 +1530,7 @@ private:
         u64 size;
         VAddr address;
     };
-    std::unordered_set<const Native::ImageEntry*> kept_texture_cache;
+    KeptTextureSet kept_texture_cache;
     std::vector<KeptTextureCandidate> kept_texture_scan;
     u32 kept_texture_shard = 0;
     u64 kept_texture_bytes = 0;

@@ -408,6 +408,18 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             const u32 width = u32(std::lround(frame.height * input_aspect));
             area = vk::Rect2D{{s32((frame.width - width) / 2), 0}, {width, frame.height}};
         }
+#ifdef RYTY_GPU
+        // FEAT-SGT-203: on a screen taller than 16:9 a 16:9 picture shown without the proxy
+        // (boot screens, the intro, a frame it was given up for) goes between bands at the top
+        // and bottom instead of being stretched to the window's height.
+        if (UiHires::Tall()) {
+            const UiFit::Rect fit =
+                UiFit::Letterbox(frame.width, frame.height, input_size.width, input_size.height);
+            if (fit.height < frame.height) { // a narrower picture keeps the bars above
+                area = vk::Rect2D{{fit.x, fit.y}, {fit.width, fit.height}};
+            }
+        }
+#endif
     }
 #ifdef RYTY_GPU
     static thread_local vk::Extent2D logged_extent{};

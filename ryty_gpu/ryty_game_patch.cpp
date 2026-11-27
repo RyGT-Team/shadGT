@@ -53,6 +53,7 @@
 #include "input/trigger_feedback.h"
 #include "ryty_gpu/ryty_dlssg.h"
 #include "ryty_gpu/ryty_dlss_layout.h"
+#include "ryty_gpu/wide_scene_size.h"
 #include "core/file_format/psf.h"
 #include "common/ryty_param_sfo.h"
 #include "ryty_gpu/gt7_preset_options.h"
@@ -65,6 +66,8 @@ struct RytySceneExtent {
 };
 RytySceneExtent RytySceneSize(); // WIDE-001
 bool RytyWideScene();
+bool RytyTallScreen(); // FEAT-SGT-203
+bool RytyTallNativeScene(); // FEAT-SGT-210
 bool RytyWideViews();
 bool RytyGtsInRace();
 float RytyDisplayAspect();
@@ -2510,10 +2513,11 @@ float RytyDisplayAspect() {
 // 16:9, the race picture is composed at the window's full size, and the HUD and menus are drawn
 // 16:9 in its middle (nothing is stretched). Opt-in: GPU.wide_scene=true or SHADGT_WIDE_SCENE=1
 // turns it on; off, a wider screen keeps GTS-009's 16:9 picture.
+// FEAT-SGT-203: also a screen taller than 16:9 (16:10, 4:3), see RytyTallScreen.
 bool RytyWideScene() {
     static const bool wide = [] {
-        if (RytyDisplayAspect() <= 16.0f / 9.0f + 0.01f) {
-            return false; // only wider screens
+        if (RytyDisplayAspect() <= 16.0f / 9.0f + 0.01f && !RytyTallScreen()) {
+            return false; // only wider screens, or taller ones (FEAT-SGT-203)
         }
         if (const char* env = std::getenv("SHADGT_WIDE_SCENE")) {
             return env[0] == '1';
@@ -2522,6 +2526,29 @@ bool RytyWideScene() {
                ConfigFlag("native_renderer", false);
     }();
     return wide;
+}
+
+// FEAT-SGT-203: GT Sport on a screen taller than 16:9 (16:10, 4:3) with WIDE-001's picture: the
+// race picture fills the screen (its camera at the screen's shape, GTS-009 and WIDE-002/004),
+// while the menus and the race HUD keep their 16:9 shape between bands at the top and bottom
+// (UiHires::UiRect centres the game's picture both ways). The scene stays allocated at 16:9
+// unless FEAT-SGT-210 (RYGT_TALL_SCENE=1) allocates it at the screen's shape; the race HUD's
+// pieces go to the top and bottom edges
+// (FEAT-SGT-209, RytyHudSpread) instead of the sides.
+// The game keeps its vertical field of view, so the race view loses a little at the sides.
+// Not GT7 (its taller screens go through its own path). RYGT_TALL_SCREEN=0 keeps GTS-009's
+// stretched picture. Decided once; WIDE-001's own switches (SHADGT_WIDE_SCENE, GPU.wide_scene,
+// ui_hires, native_renderer) still apply.
+bool RytyTallScreen() {
+    static const bool tall = [] {
+        const float aspect = RytyDisplayAspect();
+        if (Common::IsGt7() || aspect <= 0.0f || aspect >= 16.0f / 9.0f - 0.01f) {
+            return false;
+        }
+        const char* env = std::getenv("RYGT_TALL_SCREEN");
+        return !(env && env[0] == '0');
+    }();
+    return tall;
 }
 
 // WIDE-002/004: the game's 3D views widened to the screen's shape (their 16:9 constants patched).
@@ -2537,13 +2564,60 @@ bool RytyWideViews() {
 
 // WIDE-005: the race HUD's left and right parts moved out to the screen's edges.
 // GPU.wide_hud_spread=false or SHADGT_WIDE_HUD_SPREAD=0 keeps the HUD 16:9 in the middle.
+// FEAT-SGT-209: on a taller screen its top pieces move up to the top edge and its bottom row down
+// to the bottom edge instead (HudTall); RYGT_TALL_HUD_EDGES=0 keeps it whole in the middle band
+// there (FEAT-SGT-203's HUD), as the two switches above also do.
 bool RytyHudSpread() {
     static const bool spread = [] {
         if (!RytyWideScene()) return false;
+        if (const char* tall = std::getenv("RYGT_TALL_HUD_EDGES");
+            RytyTallScreen() && tall && tall[0] == '0') {
+            return false;
+        }
         if (const char* env = std::getenv("SHADGT_WIDE_HUD_SPREAD")) return env[0] == '1';
         return ConfigFlag("wide_hud_spread", true);
     }();
     return spread;
+}
+
+// FEAT-SGT-210: on a screen taller than 16:9 (FEAT-SGT-203), the scene allocated at the screen's
+// shape like WIDE-001 does on wider ones: the width kept, the height grown (1920x1200 at 16:10,
+// 1920x1440 at 4:3, or GPU.wide_scene_height), instead of the 16:9 scene enlarged by 11% in
+// height. The menus and the HUD stay 16:9 between bands as with FEAT-SGT-203. Opt-in while it has
+// not been played: RYGT_TALL_SCENE=1. GPU.wide_scene_alloc=false keeps the 16:9 scene. Not yet with
+// PS4 Pro mode, DLSS, FSR or XeSS (their scene sizes are their own): those keep the 16:9 scene, and
+// the log says why.
+bool RytyTallNativeScene() {
+    static const bool native = [] {
+        const char* env = std::getenv("RYGT_TALL_SCENE");
+        if (!RytyTallScreen() || !RytyWideScene() || !(env && env[0] == '1' && env[1] == '\0') ||
+            !ConfigFlag("wide_scene_alloc", true)) {
+            return false;
+        }
+        // An upscaler is on when its override says 1, or with no override when the profile asks for
+        // it (XeSS is chosen under fsr_enabled, GPU.fsr_upscaler).
+        const auto upscaler = [](const char* override_name, const char* config_name) {
+            if (const char* value = std::getenv(override_name); value && (value[0] == '0' || value[0] == '1')) {
+                return value[0] == '1';
+            }
+            return ConfigFlag(config_name, false);
+        };
+        const char* refused = nullptr;
+        if (Ryty::GetProMode() != Ryty::ProMode::Base) {
+            refused = "PS4 Pro mode";
+        } else if (upscaler("SHADGT_DLSS_TEMPORAL", "dlss_enabled")) {
+            refused = "DLSS";
+        } else if (upscaler("SHADGT_FSR_TEMPORAL", "fsr_enabled")) {
+            refused = "FSR or XeSS";
+        }
+        if (refused) {
+            std::fprintf(stderr, "[patch] FEAT-SGT-210: not with %s yet; the scene stays 16:9 "
+                                 "(FEAT-SGT-203)\n", refused);
+            return false;
+        }
+        return true;
+    }();
+    return native;
 }
 
 // The scene's size when it is not the game's own 1920x1080: the launcher's scene render scale
@@ -2568,24 +2642,22 @@ RytySceneExtent RytySceneSize() {
         }
         // GPU.wide_scene_alloc=false keeps the scene's allocation 16:9 (the wide picture is then
         // composed from it at a lower horizontal resolution); for tests.
-        if (RytyWideScene() && ConfigFlag("wide_scene_alloc", true)) {
+        // FEAT-SGT-203: on a taller screen only with FEAT-SGT-210 (RytyTallNativeScene): there the
+        // width is kept and the height grows (the wider screens' rule keeps the height).
+        const bool tall = RytyTallScreen();
+        if (RytyWideScene() && (!tall || RytyTallNativeScene()) &&
+            ConfigFlag("wide_scene_alloc", true)) {
             if (!result.width || !result.height) {
                 result = {1920, 1080};
             }
-            // GPU.wide_scene_height (e.g. 1440 for 5120x1440 on a 32:9 screen) overrides the height.
-            if (const u32 wanted = u32(std::atoi(ConfigValue("wide_scene_height").c_str()));
-                wanted >= 360 && wanted <= 2160) {
-                result.height = wanted;
-            }
+            // GPU.wide_scene_height (e.g. 1440 for 5120x1440 on a 32:9 screen) sets the height.
+            const u32 wanted = u32(std::atoi(ConfigValue("wide_scene_height").c_str()));
             const double aspect = RytyDisplayAspect();
-            constexpr double max_pixels = 3840.0 * 2160.0; // what the scene scale allows at 16:9
-            u32 height = result.height;
-            if (double(height) * height * aspect > max_pixels) {
-                height = u32(std::sqrt(max_pixels / aspect)) & ~7u;
-            }
-            const u32 width = std::min<u32>(u32(std::lround(height * aspect / 16.0)) * 16, 7680);
-            std::fprintf(stderr, "[patch] WIDE-001 scene %ux%u (was %ux%u), camera aspect %.3f\n",
-                         width, height, result.width, result.height, aspect);
+            const auto [width, height] =
+                WideScene::Size({result.width, result.height}, aspect, wanted, tall);
+            std::fprintf(stderr, "[patch] %s scene %ux%u (was %ux%u), camera aspect %.3f\n",
+                         tall ? "FEAT-SGT-210 taller" : "WIDE-001", width, height, result.width,
+                         result.height, aspect);
             result = {width, height};
         }
         if (result.width < 320 || result.width > 7680 || result.height < 180 ||
@@ -2610,9 +2682,12 @@ static void InstallWideCamera(u8* base) {
     std::memcpy(from.data(), &original, 4);
     std::memcpy(to.data(), &aspect, 4);
     if (Apply(base, Patch{0x5f7185, from, to, fmt::format("GTS-009 camera aspect {:.3f}", aspect)})) {
-        std::fprintf(stderr, Vulkan::RytyWideScene()
-                                 ? "[patch] GTS-009: wide picture (WIDE-001), HUD and menus 16:9\n"
-                                 : "[patch] GTS-009: picture stretched to the window\n");
+        std::fprintf(stderr,
+                     !Vulkan::RytyWideScene() ? "[patch] GTS-009: picture stretched to the window\n"
+                     : Vulkan::RytyTallScreen()
+                         ? "[patch] GTS-009: taller screen (FEAT-SGT-203), HUD and menus 16:9 "
+                           "between bands\n"
+                         : "[patch] GTS-009: wide picture (WIDE-001), HUD and menus 16:9\n");
     }
     if (!Vulkan::RytyWideScene()) {
         return;
@@ -3446,7 +3521,9 @@ static void SetWidePro1080Flip(u8* base) {
 // WIDE-001: the scene allocated at the screen's shape. The same three sites the launcher's scene
 // render scale patches (RenderResolution.cs), from the game's bytes or from the launcher's.
 static void InstallWideSceneAllocation(u8* base) {
-    if (!Vulkan::RytyWideScene() || (!Vulkan::RytyUpscale::DlssLayout().Wide() && !ConfigFlag("wide_scene_alloc", true))) {
+    if (!Vulkan::RytyWideScene() ||
+        (Vulkan::RytyTallScreen() && !Vulkan::RytyTallNativeScene()) || // FEAT-SGT-203/210
+        (!Vulkan::RytyUpscale::DlssLayout().Wide() && !ConfigFlag("wide_scene_alloc", true))) {
         return;
     }
     const auto [width, height] = Vulkan::RytySceneSize();

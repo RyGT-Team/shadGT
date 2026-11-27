@@ -149,6 +149,13 @@ ImageInfo::ImageInfo(const AmdGpu::Image& sharp, const Shader::ImageResource& de
     size.height = image.height + 1;
     size.depth = props.is_volume ? image.depth + 1 : 1;
     pitch = image.Pitch();
+    if (const auto& clamp = g_texture_extent_clamp; clamp.from_w && size.width == clamp.from_w &&
+                                                    size.height == clamp.from_h &&
+                                                    pitch == clamp.from_w) {
+        size.width = clamp.to_w; // FEAT-SGT-189
+        size.height = clamp.to_h;
+        pitch = clamp.to_w;
+    }
     resources.levels = image.NumLevels();
     resources.layers = image.NumLayers();
     num_samples = image.NumSamples();

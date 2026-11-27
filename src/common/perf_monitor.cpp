@@ -280,6 +280,15 @@ static WorkSnapshot Difference(const WorkSnapshot& now, const WorkSnapshot& then
     return d;
 }
 
+// DIAG-SGT-197: the presents' time since the last window report (in microseconds).
+static std::atomic<u64> g_present_prepare_us{0}, g_present_queue_us{0}, g_presents{0};
+
+void NotePresentTime(double prepare_ms, double present_ms) {
+    g_present_prepare_us.fetch_add(u64(prepare_ms * 1000.0), std::memory_order_relaxed);
+    g_present_queue_us.fetch_add(u64(present_ms * 1000.0), std::memory_order_relaxed);
+    g_presents.fetch_add(1, std::memory_order_relaxed);
+}
+
 void NoteGameFrame() {
     static const double threshold_ms = [] {
         const char* env = DiagEnv("SHADGT_STALL_MS");
@@ -305,6 +314,24 @@ void NoteGameFrame() {
         static u32 recent_count = 0;
         static auto window_start = now;
         static u32 hitch_lines = 0;
+        // DIAG-SGT-197: where the GPU threads' time went over the window, a frame on average
+        // (draws, dispatches, submits, GPU and command-buffer waits; the rest is not ours).
+        static double w_draw = 0, w_dispatch = 0, w_submit = 0, w_gpu_wait = 0, w_cb_wait = 0;
+        static u64 w_draws = 0, w_protects = 0;
+        if (DiagnosticsBuilt) {
+            const double per_ms = ms > 0 ? double(tsc - last_tsc) / ms : 1.0;
+            const auto part = [&](Phase phase) {
+                return double(ticks[size_t(phase)] - last_ticks[size_t(phase)]) / per_ms;
+            };
+            const auto d = Difference(work, last_work);
+            w_draw += part(Phase::DrawTotal);
+            w_dispatch += part(Phase::DispatchTotal);
+            w_submit += part(Phase::Submit);
+            w_gpu_wait += d.gpu_wait_us / 1000.0;
+            w_cb_wait += d.frontend_wait_us / 1000.0;
+            w_draws += d.draws;
+            w_protects += d.protects;
+        }
         window_ms.push_back(ms);
         std::array<double, 64> sorted_recent = recent;
         const u32 n_recent = std::min<u32>(recent_count, 64);
@@ -360,6 +387,25 @@ void NoteGameFrame() {
                         avg, 1000.0 / avg, sorted[sorted.size() / 2],
                         1000.0 / (slow_total / slow), sorted.back(), over25, over33, over50,
                         over100, hitch_lines);
+            if (DiagnosticsBuilt) {
+                const double n = double(sorted.size());
+                const double ours = (w_draw + w_dispatch + w_submit + w_gpu_wait + w_cb_wait) / n;
+                const u64 presents = g_presents.exchange(0, std::memory_order_relaxed);
+                const u64 prepare_us = g_present_prepare_us.exchange(0, std::memory_order_relaxed);
+                const u64 queue_us = g_present_queue_us.exchange(0, std::memory_order_relaxed);
+                LOG_WARNING(Render_Vulkan,
+                            "DIAG-SGT-197 a frame on average: draws {:.2f} ms, dispatches {:.2f}, "
+                            "submits {:.2f}, GPU waits {:.2f}, command-buffer waits {:.2f}; "
+                            "ours {:.2f} of {:.2f} ms, the rest {:.2f}; {:.0f} draws, {:.0f} "
+                            "protections; {} presents: {:.2f} ms preparing, {:.2f} ms in the "
+                            "queue present on average",
+                            w_draw / n, w_dispatch / n, w_submit / n, w_gpu_wait / n, w_cb_wait / n,
+                            ours, avg, avg - ours, w_draws / n, w_protects / n, presents,
+                            presents ? prepare_us / 1000.0 / presents : 0.0,
+                            presents ? queue_us / 1000.0 / presents : 0.0);
+            }
+            w_draw = w_dispatch = w_submit = w_gpu_wait = w_cb_wait = 0;
+            w_draws = w_protects = 0;
             window_ms.clear();
             window_start = now;
             hitch_lines = 0;

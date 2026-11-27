@@ -303,7 +303,8 @@ bool GtsDlssPass::Capture(u64 frame, GtsSceneImage color, GtsSceneImage sourceDe
                                             : vk::Extent2D{std::max(requestedSize.width, input.width),
                                                            std::max(requestedSize.height, input.height)}
                         : input;
-    if (!useFsr && !useXess && RytyUpscale::DlssLayout().output.width)
+    // FEAT-SGT-198: the guest-output layout's output, whichever upscaler rebuilds the scene.
+    if (RytyUpscale::DlssLayout().output.width)
         output = RytyUpscale::DlssLayout().output;
     // Window resizing changes presentation, not the fixed guest scene resolution.
     // Keep the established DLSS reconstruction extent for an unchanged input;

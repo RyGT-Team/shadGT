@@ -7033,6 +7033,11 @@ void Rasterizer::UpdateViewportScissorState() const {
             vp_scsr.bottom_right_y = std::min(AmdGpu::Scissor::Clamp(vp_scsr.bottom_right_y),
                                               regs.viewport_scissors[i].bottom_right_y);
         }
+        // FEAT-SGT-189: GT7's race HUD clip, made for a 1920x1080 screen, at a smaller one.
+        if (const auto& ui = UiHires::Get(); ui.scale != 0.0f && ui.widen_x_from) {
+            if (u32(vp_scsr.bottom_right_x) == ui.widen_x_from) vp_scsr.bottom_right_x = s16(ui.widen_x_to);
+            if (u32(vp_scsr.bottom_right_y) == ui.widen_y_from) vp_scsr.bottom_right_y = s16(ui.widen_y_to);
+        }
         scissors.push_back({
             .offset = {vp_scsr.top_left_x, vp_scsr.top_left_y},
             .extent = {vp_scsr.GetWidth(), vp_scsr.GetHeight()},

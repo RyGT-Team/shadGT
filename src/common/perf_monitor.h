@@ -137,8 +137,11 @@ GameFrameTotals GetGameFrameTotals();
 /// SHADGT_STALL_MS (default 100) is logged with what the emulator did during it.
 #ifdef SHADGT_DIAGNOSTICS
 void NoteGameFrame();
+/// DIAG-SGT-197: a present's time by step (acquire+imgui+record+submit+flush+lock, queue present).
+void NotePresentTime(double prepare_ms, double present_ms);
 #else
 inline void NoteGameFrame() noexcept {}
+inline void NotePresentTime(double, double) noexcept {}
 #endif
 
 // PERF-026: the draw-step timers run about 14 times per draw, so the counter read and the

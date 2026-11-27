@@ -112,6 +112,9 @@ struct State {
     float scale_y = 0.0f;
     float offset_x = 0.0f;
     float offset_y = 0.0f;
+    /// FEAT-SGT-189: a viewport scissor edge at `from` is widened to `to` before scaling (GT7's
+    /// race HUD clips at its screen times screen / 1920 x 1080; 0 = none).
+    u32 widen_x_from = 0, widen_x_to = 0, widen_y_from = 0, widen_y_to = 0;
     /// Lock-free checks for every draw: the display buffer addresses with a proxy, and how
     /// many proxies hold draws their display buffer has not.
     std::array<std::atomic<VAddr>, 8> addresses{};

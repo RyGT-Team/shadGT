@@ -613,10 +613,13 @@ float UpscaleRatio() {
 
 bool TemporalRequested() {
     static const bool requested = [] {
-        // GT Sport only, like the rest of the in-frame reconstruction (GtsDlssPass): its capture
-        // knows GT Sport's passes, and GT7 (shadgt7) never had it.
+        // GT Sport, like the rest of the in-frame reconstruction (GtsDlssPass): its capture
+        // knows GT Sport's passes. FEAT-SGT-198: GT7 too when the launcher draws its scene below
+        // the output for FSR (RYGT_FSR_GUEST_OUTPUT=1 with the guest-output layout), where the
+        // capture knows GT7's anti-aliasing pass and composition.
         if (Common::IsGt7()) {
-            return false;
+            const char* guest = std::getenv("RYGT_FSR_GUEST_OUTPUT");
+            return RytyUpscale::GuestOutputDlss() && guest && std::string_view(guest) == "1";
         }
         if (const char* env = std::getenv("SHADGT_FSR_TEMPORAL")) {
             return env[0] == '1';

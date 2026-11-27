@@ -395,13 +395,27 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                 const char* env = std::getenv("SHADGT_NATIVE_DEPTH_TEXTURES"); // FIX-206 off: =0
                 return !(env && env[0] == '0');
             }();
+            // FEAT-SGT-189: a depth array the game drew with fewer layers than the texture that
+            // samples it describes (GT7's near shadow cascades: 3 drawn, sampled as 4, with a
+            // scene below the output) is still that depth: without it the texture was made from
+            // guest memory (zeros) and the near shadows were wrong up to the cascade's edge.
+            // The view then has the drawn layers; a later layer index clamps to the last.
+            // SHADGT_DEPTH_FEWER_LAYERS=0: as before.
+            static const bool fewer_layers = [] {
+                const char* env = std::getenv("SHADGT_DEPTH_FEWER_LAYERS");
+                return !(env && env[0] == '0');
+            }();
             ImageEntry* depth = nullptr;
             for (auto it = first; it != last; ++it) {
                 const auto& cached = it->second->info;
+                const bool layers_ok =
+                    cached.resources.layers >= info.resources.layers ||
+                    (fewer_layers && cached.resources.layers > 1 && cached.size == info.size &&
+                     cached.pitch == info.pitch && cached.resources.levels == info.resources.levels);
                 if (cached.props.is_depth && cached.num_bits == info.num_bits &&
                     (depth_textures || !info.props.is_depth) &&
                     !it->second->reused.load(std::memory_order_relaxed) &&
-                    cached.resources.layers >= info.resources.layers &&
+                    layers_ok &&
                     CompatibleLayerStrides(cached, info) &&
                     ((cached.size.width == info.size.width &&
                       cached.size.height == info.size.height) ||

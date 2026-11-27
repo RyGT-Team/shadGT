@@ -17,6 +17,7 @@
 #include <cwchar>
 #endif
 #include "common/adaptive_mutex.h"
+#include "shader_recompiler/resource.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/decoder.h"
@@ -1185,10 +1186,13 @@ struct SignalImpl : public PageManager::Impl {
             // Per thread, so the recorder's faults do not hide the command thread's.
             static thread_local u32 logged = 0;
             if (logged++ < 48) {
-                LOG_WARNING(Render, "DIAG-049 GPU-thread {} fault at {:#x} from {}; stack:{}",
+                LOG_WARNING(Render,
+                            "DIAG-049 GPU-thread {} fault at {:#x} from {}; last compute bind "
+                            "program {:#x} (FIX-SGT-193); stack:{}",
                             Common::IsWriteError(context) ? "write" : "read", addr,
                             Common::SamplingProfiler::DescribeCode(
                                 reinterpret_cast<u64>(Common::GetRip(context))),
+                            Shader::LastComputeBindProgram().load(std::memory_order_relaxed),
                             Common::SamplingProfiler::DescribeStack());
             }
         }

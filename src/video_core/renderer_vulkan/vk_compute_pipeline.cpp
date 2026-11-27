@@ -118,6 +118,10 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
 
 ComputePipeline::~ComputePipeline() = default;
 
+u64 ComputePipeline::KeyHash() const {
+    return std::hash<ComputePipelineKey>{}(compute_key);
+}
+
 u32 ComputePipeline::StageBindings(const Shader::Info& info,
                                    std::vector<vk::DescriptorSetLayoutBinding>& bindings) {
     u32 binding{};

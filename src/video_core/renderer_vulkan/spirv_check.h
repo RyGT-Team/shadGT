@@ -35,6 +35,26 @@ inline bool IsCompleteSpirv(std::span<const u32> words) {
     return last_opcode == OpFunctionEnd;
 }
 
+/// FIX-SGT-193: whether a module has a constant with result id 0: the 64-bit float immediates of a
+/// translation without 64-bit floats (Intel Arc A-series) before FIX-SGT-193, made with a type
+/// the module never declared. Such a module is invalid; a stored one is translated again. Words of
+/// a whole module (IsCompleteSpirv).
+inline bool HasNullConstant(std::span<const u32> words) {
+    constexpr u32 HeaderWords = 5;
+    constexpr u32 OpConstant = 43;
+    for (size_t at = HeaderWords; at < words.size();) {
+        const u32 count = words[at] >> 16;
+        if (count == 0 || at + count > words.size()) {
+            return false;
+        }
+        if ((words[at] & 0xFFFF) == OpConstant && count >= 3 && words[at + 2] == 0) {
+            return true;
+        }
+        at += count;
+    }
+    return false;
+}
+
 /// FIX-GT7-011: how a module makes a float atomic min/max of a buffer from integer atomics
 /// (without VK_EXT_shader_atomic_float2): both atomics, each result bitcast to a float, then an
 /// OpSelect by the value's sign (before FIX-226, or SHADGT_FLOAT_ATOMIC_EXACT=0), or only the one

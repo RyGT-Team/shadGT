@@ -72,7 +72,7 @@ public:
                 bool dlss_scaled = false, float side_x0 = 0.0f, float side_x1 = 1.0f,
                 vk::ImageView hud_black = {}, vk::ImageView hud_white = {},
                 std::span<const HudWidget> hud_widgets = {},
-                std::optional<vk::Rect2D> content_rect = {});
+                std::optional<vk::Rect2D> content_rect = {}, bool hud_overlay_probe = true);
 
 private:
     struct OutputPipeline {

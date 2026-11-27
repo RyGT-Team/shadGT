@@ -4429,9 +4429,13 @@ static void PS4_SYSV_ABI RenderLabel(void* widget, void* context) {
 }
 
 static void Install(u8* base) {
+    // FIX-SGT-236: also on a screen taller than 16:9. There the HUD's picture is laid in the
+    // centred 16:9 band (FIX-SGT-200), so a competitor's label left in it sat off its car, was
+    // flattened with a native taller scene, and was cut where a HUD piece moved to an edge.
     const char* enabled = std::getenv("RYGT_ULTRAWIDE_CAR_SIGNS");
-    if (!Common::IsGt7() || (enabled && enabled[0] == '0') ||
-        Vulkan::RytyDisplayAspect() <= 16.0f / 9.0f + 0.01f) {
+    const float aspect = Vulkan::RytyDisplayAspect();
+    if (!Common::IsGt7() || (enabled && enabled[0] == '0') || aspect <= 0.0f ||
+        std::abs(aspect - 16.0f / 9.0f) <= 0.01f) {
         return;
     }
 

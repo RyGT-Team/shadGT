@@ -124,6 +124,8 @@ bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format for
 
 #ifdef RYTY_GPU
 float RytyDisplayAspect(); // ryty_game_patch.cpp (GTS-009)
+bool RytyRaceRunning();     // GAME-006: from the race's countdown to its finish, not while paused
+bool RytyRaceStartSignal(); // GAME-006: a hook reads that state
 #endif
 
 // GTS-009: with a widened camera (GPU.aspect_ratio) the game's 16:9 picture is stretched over the
@@ -171,11 +173,17 @@ std::vector<HudPiece> DefaultHudPieces() {
         // FEAT-SGT-201: Lap takes in the whole POSITION / LAP block and Track map the whole map
         // (1440..1880 wide), so a piece moved on a taller screen isn't split.
         piece("Lap", 10, 20, 410, 115),
-        piece("Lap time", 790, 215, 340, 90),
+        // FIX-SGT-236: with the row above the lap time (the trophies of the event's targets and
+        // BEST RECORD, 610..1300 at 180..212) and the BEST and gap flags on both sides of it. Moved
+        // to the top edge without that row, the lap time landed on it at 16:10 (the band's 60
+        // lines are the distance between the two) and hid "5th", "8th" and half of BEST RECORD.
+        piece("Lap time", 600, 170, 720, 135),
         piece("Track map", 1420, 5, 500, 300),
         piece("Position", 1670, 310, 250, 200),
         piece("Race time", 5, 990, 250, 90),
-        piece("Dashboard", 235, 880, 1120, 200), // FEAT-SGT-201: "AUTO DRIVE" above it too
+        // FEAT-SGT-201: "AUTO DRIVE" above it too. FIX-SGT-236: and the large gauges of the
+        // bumper view, which start at 710 and reach 1395; a piece from 880 cut them in two.
+        piece("Dashboard", 235, 700, 1185, 380),
         piece("Course map", 1560, 790, 360, 290),
     };
 }
@@ -264,6 +272,30 @@ std::array<float, 4> HudPieceRect(const HudPiece& piece, const std::array<float,
         rect[1] += centre < 0.5f ? -span[2] : 1.0f - span[3];
     }
     return rect;
+}
+// FIX-SGT-236: whether the HUD's pieces are shown apart now (placed with F7, or at the edges of
+// a taller screen). The pause menu draws a whole-screen interface into the same HUD layer, and
+// pieces shown apart took their share of it along; the shader guessed that state from two points
+// of the HUD's picture (FEAT-SGT-201), which the rear-view mirror, a competitor's label or the
+// large gauges can cover too. GT7's race state says it directly: the race runs from its
+// countdown to its finish, and not while paused (GAME-006). Outside it no piece is shown apart
+// and the shader's two spots decide whether the HUD is an overlay (FEAT-SGT-201: the pause
+// menu's dimming reaches the edges, the pre-race page's bar goes to the top). Without that hook
+// (SHADGT_RACE_START_SIGNAL=0) the shader's probe decides alone, as before.
+bool HudPiecesApart() {
+#ifdef RYTY_GPU
+    return !RytyRaceStartSignal() || RytyRaceRunning();
+#else
+    return true;
+#endif
+}
+
+bool HudOverlayProbe() {
+#ifdef RYTY_GPU
+    return !RytyRaceStartSignal();
+#else
+    return true;
+#endif
 }
 } // namespace
 
@@ -1710,7 +1742,8 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     }
     // GT7-UW: the HUD pieces, as placed with the F7 editor.
     std::vector<HostPasses::PostProcessingPass::HudWidget> hud_widgets;
-    if (display->hud_black && display->hud_white && display->hud_race) { // not in menus
+    if (display->hud_black && display->hud_white && display->hud_race && // not in menus
+        HudPiecesApart()) {                                               // FIX-SGT-236
         auto& layout = HudLayout();
         std::scoped_lock lock{layout.mutex};
         if (!layout.loaded) {
@@ -1730,7 +1763,7 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, hud_settings, ui_layer_view,
                    dlss_scaled, display->output_view ? display->side_x0 : 0.0f,
                    display->output_view ? display->side_x1 : 1.0f, display->hud_black,
-                   display->hud_white, hud_widgets, content_rect);
+                   display->hud_white, hud_widgets, content_rect, HudOverlayProbe());
     if (time_passes) {
         g_presenter_times.Mark(pass_cmdbuf, 2);
         g_presenter_times.End();

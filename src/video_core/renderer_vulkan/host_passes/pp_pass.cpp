@@ -400,7 +400,7 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                                 vk::ImageView ui_layer, bool dlss_scaled, float side_x0,
                                 float side_x1, vk::ImageView hud_black, vk::ImageView hud_white,
                                 std::span<const HudWidget> hud_widgets,
-                                std::optional<vk::Rect2D> content_rect) {
+                                std::optional<vk::Rect2D> content_rect, bool hud_overlay_probe) {
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
             .pLabelName = "Host/Post processing",
@@ -457,7 +457,9 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
     if (hud_mapped) {
         u8* data = hud_mapped + slot * HudSlotSize;
         const u32 count = static_cast<u32>(std::min<size_t>(hud_widgets.size(), MaxHudWidgets));
-        const std::array<u32, 4> header{hud ? count : 0u, 0, 0, 0};
+        // FIX-SGT-236: the second word tells the shader that the caller already knows whether a
+        // whole-screen interface is up, so its two probe points are not read.
+        const std::array<u32, 4> header{hud ? count : 0u, hud_overlay_probe ? 0u : 1u, 0, 0};
         std::memcpy(data, header.data(), sizeof(header));
         if (count != 0) {
             std::memcpy(data + sizeof(header), hud_widgets.data(), count * sizeof(HudWidget));

@@ -207,7 +207,12 @@ void main() {
         const float cover_bottom =
             dot(texture(hudWhite, vec2(0.75, 0.95)).rgb - texture(hudBlack, vec2(0.75, 0.95)).rgb,
                 vec3(1.0 / 3.0));
-        const bool overlay = cover_top < 0.9 && cover_bottom < 0.9;
+        // FIX-SGT-236: with the pieces chosen from the race's state (count.y), only while none
+        // is shown apart: in a race the rear-view mirror, a competitor's label or the large gauges
+        // cover these spots too, and the pieces must stay at the edges. Outside the race (the
+        // pre-race page, the pause menu) the two spots decide as before.
+        const bool overlay = (layout_.count.y == 0u || layout_.count.x == 0u) &&
+                             cover_top < 0.9 && cover_bottom < 0.9;
         const uint count = overlay ? 0u : min(layout_.count.x, 16u);
         // FEAT-SGT-235: a HUD that starts with GT7's menu bar on a taller screen (the pre-race
         // page; hud_bar.comp): the bar goes to the screen's top edge and the rest of the HUD to

@@ -4,7 +4,8 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 
-layout (location = 0) in vec2 uv;
+layout (location = 0) in vec2 frag_uv;
+vec2 uv; // FEAT-SGT-201: where in the picture (frag_uv inside the band of a fitted menu)
 layout (location = 0) out vec4 color;
 
 layout (binding = 0) uniform sampler2D texSampler;
@@ -21,6 +22,16 @@ layout (std140, binding = 4) uniform HudLayout {
     uvec4 count;
     HudWidget widgets[16];
 } layout_;
+// FEAT-SGT-235: a fitted menu's top bar (menu_edges.comp): x = 1 while it is moved to the
+// screen's top, yzw = the colour for the rows the move opens.
+layout (std430, binding = 5) readonly buffer MenuEdges {
+    vec4 menu_bar;
+};
+// FEAT-SGT-235: the race HUD's menu bar (hud_bar.comp): x = 1 while it is moved to the
+// screen's top.
+layout (std430, binding = 6) readonly buffer HudBar {
+    vec4 hud_bar;
+};
 
 layout (push_constant) uniform settings {
     // Must match PostProcessingConstants (PostProcessingPass::Settings first) in pp_pass.cpp.
@@ -40,11 +51,17 @@ layout (push_constant) uniform settings {
     uint hud;
     float hud_x0;
     float hud_x1;
+    // FIX-SGT-200: and between hud_y0 and hud_y1 of the height (a screen taller than 16:9).
+    float hud_y0;
+    float hud_y1;
     float dlss_sharpening;
     // ryGT WIDE-042: the ambient sides (outside side_x0..side_x1 of the width) dimmed by side_dim.
     float side_x0;
     float side_x1;
     float side_dim;
+    // FEAT-SGT-201: a menu fitted at 16:9 on a taller screen, between content_y0 and content_y1.
+    float content_y0;
+    float content_y1;
 } pp;
 
 #define A_GPU 1
@@ -134,8 +151,37 @@ bool inside(vec2 p, vec4 rect) {
 }
 
 void main() {
-    vec4 color_linear = texture(texSampler, uv);
-    if (pp.dlss_sharpening > 0.0) {
+    uv = frag_uv;
+    bool bar = false;
+    vec4 bar_color = vec4(0.0, 0.0, 0.0, 1.0);
+    if (pp.content_y1 - pp.content_y0 < 0.9999) {
+        // FEAT-SGT-235: a menu fitted at 16:9 on a taller screen. With GT7's menu bar at its top
+        // (menu_edges.comp), the bar goes to the screen's top edge and the rest of the picture to
+        // the bottom edge, so both keep their place from the edges as at 16:9 (the world map's
+        // Dashboard and News, a page's bottom panel or button bar). The rows between, and the
+        // bar's 12-row shadow, take one colour: the row just past them, averaged over the width.
+        // Without the bar the picture stays in the middle between black bars.
+        const float height = pp.content_y1 - pp.content_y0;
+        const float gap = pp.content_y0 / height; // in the picture's units
+        const float from_top = frag_uv.y / height;
+        if (menu_bar.x != 0.0) {
+            const float cut = 80.0 / 1080.0;
+            const float extra = 2.0 * gap;
+            uv = vec2(frag_uv.x, clamp(from_top - extra, 0.0, 1.0));
+            if (from_top < cut) {
+                uv.y = from_top;
+            } else if (from_top < cut + extra + 12.0 / 1080.0) {
+                bar = true;
+                bar_color = vec4(menu_bar.yzw, 1.0);
+            }
+        } else {
+            const float y = from_top - gap;
+            bar = y < 0.0 || y > 1.0;
+            uv = vec2(frag_uv.x, clamp(y, 0.0, 1.0));
+        }
+    }
+    vec4 color_linear = bar ? bar_color : texture(texSampler, uv);
+    if (!bar && pp.dlss_sharpening > 0.0) {
         ivec2 pixel = clamp(ivec2(uv * textureSize(texSampler, 0)), ivec2(0),
                             textureSize(texSampler, 0) - 1);
         vec3 sharpened;
@@ -146,12 +192,37 @@ void main() {
     if (pp.side_dim < 1.0 && (uv.x < pp.side_x0 || uv.x > pp.side_x1)) {
         color_linear.rgb *= pp.side_dim;
     }
-    if (pp.hud != 0u) {
+    if (pp.hud != 0u && !bar) {
         // Where on the 16:9 HUD this pixel shows: a placed piece's, else the centred HUD's
         // (but not what a piece shows elsewhere).
         bool shown = false;
         vec2 hud_uv = vec2(0.0);
-        const uint count = min(layout_.count.x, 16u);
+        // FEAT-SGT-201: a full-screen overlay (the pause menu's dimming) is part of the HUD too, so
+        // moved pieces would take their share of it along. When two spots a race HUD leaves empty
+        // (top centre, bottom right between the dashboard and the course map) are both covered,
+        // the HUD shows as the plain centred band.
+        const float cover_top =
+            dot(texture(hudWhite, vec2(0.5, 0.03)).rgb - texture(hudBlack, vec2(0.5, 0.03)).rgb,
+                vec3(1.0 / 3.0));
+        const float cover_bottom =
+            dot(texture(hudWhite, vec2(0.75, 0.95)).rgb - texture(hudBlack, vec2(0.75, 0.95)).rgb,
+                vec3(1.0 / 3.0));
+        // FIX-SGT-236: with the pieces chosen from the race's state (count.y), only while none
+        // is shown apart: in a race the rear-view mirror, a competitor's label or the large gauges
+        // cover these spots too, and the pieces must stay at the edges. Outside the race (the
+        // pre-race page, the pause menu) the two spots decide as before.
+        const bool overlay = (layout_.count.y == 0u || layout_.count.x == 0u) &&
+                             cover_top < 0.9 && cover_bottom < 0.9;
+        const uint count = overlay ? 0u : min(layout_.count.x, 16u);
+        // FEAT-SGT-235: a HUD that starts with GT7's menu bar on a taller screen (the pre-race
+        // page; hud_bar.comp): the bar goes to the screen's top edge and the rest of the HUD to
+        // the bottom edge, as both touch the edges at 16:9. The rows between take the HUD's row
+        // just under the bar (the top of what hangs from it, such as the pre-race page's
+        // "World Circuits / Single Race" band), so that stays joined to the bar.
+        const bool menu_bar_hud = overlay && pp.hud_y0 > 0.0 && hud_bar.x != 0.0;
+        // FIX-SGT-244: a placed piece shows where it was placed. FEAT-SGT-235 (b5435f3f9) dropped
+        // this loop: the pieces were still cut out of the centred HUD below and shown nowhere, so
+        // a race at 1920x1200 had lost its position, lap time, maps and dashboard.
         for (uint i = 0u; i < count; ++i) {
             const HudWidget w = layout_.widgets[i];
             if (inside(uv, w.dst)) {
@@ -160,14 +231,52 @@ void main() {
                 break;
             }
         }
-        if (!shown && uv.x >= pp.hud_x0 && uv.x <= pp.hud_x1) {
-            hud_uv = vec2((uv.x - pp.hud_x0) / (pp.hud_x1 - pp.hud_x0), uv.y);
+        if (menu_bar_hud && uv.x >= pp.hud_x0 && uv.x <= pp.hud_x1) {
+            const float band = pp.hud_y1 - pp.hud_y0;
+            const float cut = 80.0 / 1080.0 * band;
+            const float extra = 1.0 - band;
+            const float x = (uv.x - pp.hud_x0) / (pp.hud_x1 - pp.hud_x0);
+            if (uv.y < cut) {
+                hud_uv = vec2(x, uv.y / band);
+                shown = true;
+            } else if (uv.y < cut + extra) {
+                hud_uv = vec2(x, 81.5 / 1080.0);
+                shown = true;
+            } else {
+                hud_uv = vec2(x, (uv.y - extra) / band);
+                shown = true;
+            }
+        } else if (!shown && uv.x >= pp.hud_x0 && uv.x <= pp.hud_x1 && uv.y >= pp.hud_y0 &&
+            uv.y <= pp.hud_y1) {
+            hud_uv = vec2((uv.x - pp.hud_x0) / (pp.hud_x1 - pp.hud_x0),
+                          (uv.y - pp.hud_y0) / (pp.hud_y1 - pp.hud_y0));
             shown = true;
             for (uint i = 0u; i < count; ++i) {
                 if (inside(hud_uv, layout_.widgets[i].src)) {
                     shown = false;
                     break;
                 }
+            }
+        }
+        if (!shown && overlay && !menu_bar_hud) {
+            // FEAT-SGT-201: outside the 16:9 band the overlay's nearest edge pixel, where it is the
+            // overlay's plain black fill (the top-centre spot checked above): the pause menu's
+            // dimming reaches the screen's edges as at 16:9. Coloured or textured UI (a header, a
+            // button, a line) that only touches the band's edge is not stretched out.
+            const vec3 ref_black = texture(hudBlack, vec2(0.5, 0.03)).rgb;
+            const bool black_fill = max(ref_black.r, max(ref_black.g, ref_black.b)) < 0.01;
+            const vec2 half_texel = 0.5 / vec2(textureSize(hudBlack, 0));
+            const vec2 edge = clamp(vec2((uv.x - pp.hud_x0) / (pp.hud_x1 - pp.hud_x0),
+                                         (uv.y - pp.hud_y0) / (pp.hud_y1 - pp.hud_y0)),
+                                    half_texel, 1.0 - half_texel);
+            const vec3 d_black =
+                abs(texture(hudBlack, edge).rgb - texture(hudBlack, vec2(0.5, 0.03)).rgb);
+            const vec3 d_white =
+                abs(texture(hudWhite, edge).rgb - texture(hudWhite, vec2(0.5, 0.03)).rgb);
+            if (black_fill && max(max(d_black.r, d_black.g), max(d_black.b, max(d_white.r,
+                    max(d_white.g, d_white.b)))) < 0.02) {
+                hud_uv = edge;
+                shown = true;
             }
         }
         if (shown) {

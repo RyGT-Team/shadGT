@@ -51,6 +51,10 @@ public:
         u32 hud = 0;
         float hud_x0 = 0.0f;
         float hud_x1 = 1.0f;
+        /// FIX-SGT-200: and between these vertical positions, on a screen taller than 16:9
+        /// (16:10, 4:3), where the HUD keeps its 16:9 shape in the middle.
+        float hud_y0 = 0.0f;
+        float hud_y1 = 1.0f;
     };
 
     /// FIX-GT7-145: the format of a frame shown on an HDR10 output, the swapchain's own 10 bits.
@@ -68,7 +72,7 @@ public:
                 bool dlss_scaled = false, float side_x0 = 0.0f, float side_x1 = 1.0f,
                 vk::ImageView hud_black = {}, vk::ImageView hud_white = {},
                 std::span<const HudWidget> hud_widgets = {},
-                std::optional<vk::Rect2D> content_rect = {});
+                std::optional<vk::Rect2D> content_rect = {}, bool hud_overlay_probe = true);
 
 private:
     struct OutputPipeline {
@@ -91,6 +95,19 @@ private:
     VmaAllocation hud_allocation{};
     u8* hud_mapped = nullptr;
     u32 hud_slot = 0;
+    // FEAT-SGT-235: the top bar of a menu fitted at 16:9 on a taller screen (menu_edges.comp),
+    // found once a frame for post_process.frag.
+    vk::UniqueDescriptorSetLayout edges_set_layout{};
+    vk::UniquePipelineLayout edges_layout{};
+    vk::UniquePipeline edges_pipeline{};
+    vk::Buffer edges_buffer{};
+    VmaAllocation edges_allocation{};
+    // FEAT-SGT-235: the race HUD's menu bar (the pre-race page) on a taller screen (hud_bar.comp).
+    vk::UniqueDescriptorSetLayout hud_bar_set_layout{};
+    vk::UniquePipelineLayout hud_bar_layout{};
+    vk::UniquePipeline hud_bar_pipeline{};
+    vk::Buffer hud_bar_buffer{};
+    VmaAllocation hud_bar_allocation{};
 };
 
 } // namespace Vulkan::HostPasses

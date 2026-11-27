@@ -1,0 +1,54 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// FEAT-SGT-235: whether GT7's HUD on a screen taller than 16:9 starts with its menu bar (the
+// pre-race page: rows 10 and 70 of 1080 covered nearly all along), once a frame, for
+// post_process.frag. The answer changes only after 8 frames in a row agree.
+
+#version 450
+
+layout (local_size_x = 16) in;
+
+layout (binding = 0) uniform sampler2D hudBlack;
+layout (binding = 1) uniform sampler2D hudWhite;
+// result: x = 1 while the bar is moved.
+// state: x = the last frames' answer, y = how many frames in a row gave it.
+layout (std430, binding = 2) buffer HudBar {
+    vec4 result;
+    vec4 state;
+};
+
+shared uint covered;
+
+const float Row = 1.0 / 1080.0;
+
+float Coverage(vec2 p) {
+    return 1.0 - dot(textureLod(hudWhite, p, 0.0).rgb - textureLod(hudBlack, p, 0.0).rgb,
+                     vec3(1.0 / 3.0));
+}
+
+void main() {
+    const uint id = gl_LocalInvocationID.x;
+    if (id == 0u) {
+        covered = 0u;
+    }
+    barrier();
+    const float x = (float(id) + 0.5) / 16.0;
+    if (Coverage(vec2(x, 10.5 * Row)) > 0.9 && Coverage(vec2(x, 70.5 * Row)) > 0.9) {
+        atomicAdd(covered, 1u);
+    }
+    barrier();
+    if (id == 0u) {
+        const float found = covered >= 14u ? 1.0 : 0.0;
+        vec4 s = state;
+        if (s.x == found) {
+            s.y = min(s.y + 1.0, 1000.0);
+        } else {
+            s = vec4(found, 1.0, 0.0, 0.0);
+        }
+        state = s;
+        if (s.y >= 8.0) {
+            result = vec4(s.x, 0.0, 0.0, 0.0);
+        }
+    }
+}

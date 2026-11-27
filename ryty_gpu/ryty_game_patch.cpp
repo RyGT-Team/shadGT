@@ -52,6 +52,8 @@
 #include "input/telemetry_haptics_output.h"
 #include "input/trigger_feedback.h"
 #include "ryty_gpu/ryty_dlssg.h"
+#include "ryty_gpu/gt7_menu_layout.h"
+#include "ryty_gpu/gt7_mirror_size.h"
 #include "ryty_gpu/ryty_dlss_layout.h"
 #include "core/file_format/psf.h"
 #include "common/ryty_param_sfo.h"
@@ -68,6 +70,8 @@ bool RytyWideScene();
 bool RytyWideViews();
 bool RytyGtsInRace();
 float RytyDisplayAspect();
+bool RytyRaceRunning();     // GAME-006
+bool RytyRaceStartSignal(); // GAME-006
 }
 
 namespace {
@@ -1731,6 +1735,8 @@ std::atomic<u64> g_gt7_org_race_ms{0};
 // it (PERF-GTS-494); SHADGT_RACE_START_SIGNAL=0 leaves the play state to the frame-time measure.
 std::atomic<bool> g_race_running{false};
 std::atomic<bool> g_race_signal{false}; ///< GAME-006: a hook reads the start bytes
+/// FIX-SGT-241: for how many of the race module's frames in a row the race has been running.
+std::atomic<u32> g_race_running_frames{0};
 std::atomic<u64> g_race_signal_ms{0};
 
 bool RaceStartSignalOn() {
@@ -1764,7 +1770,13 @@ void StartRaceSignal() {
 
 void NoteRaceRunning(bool running, const char* game) {
     g_race_signal_ms.store(GetTickCount64(), std::memory_order_relaxed);
-    if (g_race_running.exchange(running, std::memory_order_relaxed) == running) {
+    const bool was = g_race_running.exchange(running, std::memory_order_relaxed);
+    // FIX-SGT-241: counted in the module's own frames, so the count means the same at any frame
+    // rate. Only this thread writes it.
+    const u32 frames = g_race_running_frames.load(std::memory_order_relaxed);
+    g_race_running_frames.store(!running ? 0u : !was ? 1u : std::min<u32>(frames + 1, 1u << 20),
+                                std::memory_order_relaxed);
+    if (was == running) {
         return;
     }
     SYSTEMTIME now;
@@ -4428,9 +4440,13 @@ static void PS4_SYSV_ABI RenderLabel(void* widget, void* context) {
 }
 
 static void Install(u8* base) {
+    // FIX-SGT-236: also on a screen taller than 16:9. There the HUD's picture is laid in the
+    // centred 16:9 band (FIX-SGT-200), so a competitor's label left in it sat off its car, was
+    // flattened with a native taller scene, and was cut where a HUD piece moved to an edge.
     const char* enabled = std::getenv("RYGT_ULTRAWIDE_CAR_SIGNS");
-    if (!Common::IsGt7() || (enabled && enabled[0] == '0') ||
-        Vulkan::RytyDisplayAspect() <= 16.0f / 9.0f + 0.01f) {
+    const float aspect = Vulkan::RytyDisplayAspect();
+    if (!Common::IsGt7() || (enabled && enabled[0] == '0') || aspect <= 0.0f ||
+        std::abs(aspect - 16.0f / 9.0f) <= 0.01f) {
         return;
     }
 
@@ -4451,6 +4467,66 @@ static void Install(u8* base) {
 }
 } // namespace Gt7CarSign
 
+namespace Gt7Mirror {
+// FIX-SGT-242: the rear-view mirror of the bumper and bonnet views keeps its 16:9 size in a native
+// wide or tall scene. GT7 sizes it as a share of the scene (800/1920 of the width, 128/1080 of the
+// height) and gives it a camera made for 800:128, so it came out 1600 pixels wide at 3840x1080
+// and 170 lines high at 1920x1440 (the owner's captures of 2026-11-27, RTX 4070), stretched. Its
+// setting is five values the game initialises once (Ghidra, GT7 1.71: the view angle, the width,
+// the height, the centre and a scale, from 0x1463d5620) and reads every frame; they are set for
+// the scene's size at each change of layout (Gt7MirrorSize). Left alone when they are not the
+// values of that version. RYGT_GT7_MIRROR_16_9=0: off.
+constexpr u32 setting = 0x63d5620;
+
+void Apply(u8* game, u32 scene_width, u32 scene_height) {
+    struct Raw {
+        float angle;
+        s32 width, height, centre;
+        float scale;
+    };
+    static_assert(sizeof(Raw) == 20);
+    u8* const at = game + setting;
+    static const bool known = [at] {
+        const char* env = std::getenv("RYGT_GT7_MIRROR_16_9");
+        if (env && env[0] == '0') {
+            return false;
+        }
+        MEMORY_BASIC_INFORMATION info{};
+        Raw raw{};
+        const bool writable = ReadableRange(at, sizeof(Raw)) && VirtualQuery(at, &info, sizeof(info)) &&
+                              (info.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0;
+        if (writable) {
+            std::memcpy(&raw, at, sizeof(raw));
+        }
+        const auto& d = Gt7MirrorSize::Default;
+        const bool ok = writable && raw.angle == d.angle && raw.width == d.width &&
+                        raw.height == d.height && raw.centre == 960 && raw.scale == d.scale;
+        if (!ok) {
+            std::fputs("[native] GT7 mirror: setting not recognized, left as the game has it\n", stderr);
+        }
+        return ok;
+    }();
+    if (!known) {
+        return;
+    }
+    const Gt7MirrorSize::Setting wanted = Gt7MirrorSize::ForScene(scene_width, scene_height);
+    Raw raw{};
+    std::memcpy(&raw, at, sizeof(raw));
+    if (raw.width == wanted.width && raw.height == wanted.height && raw.scale == wanted.scale &&
+        raw.angle == wanted.angle) {
+        return;
+    }
+    raw.angle = wanted.angle;
+    raw.width = wanted.width;
+    raw.height = wanted.height;
+    raw.scale = wanted.scale;
+    std::memcpy(at, &raw, sizeof(raw));
+    std::fprintf(stderr, "[native] GT7 mirror: %d x %d of 1920x1080, scale %.4f, angle %.3f for a "
+                         "%ux%u scene\n", wanted.width, wanted.height, wanted.scale, wanted.angle,
+                 scene_width, scene_height);
+}
+} // namespace Gt7Mirror
+
 namespace Gt7NativeMenu {
 // GT7 keeps three flip allocations until shutdown. Their pitch, addresses and allocation
 // size stay fixed. GraphicsConfig rebuilds the scene targets when the logical size changes.
@@ -4458,7 +4534,10 @@ constexpr u32 scene_size = 0x595f610;
 constexpr u32 first_flip_size = 0x62ef29c;
 constexpr u32 projection_aspect = 0x3f5f510;
 u8* game;
-u32 wide_width, menu_width, height, menu_height, output_width;
+// The track's scene (wide_width x height), the menus' 16:9 panel (menu_width x menu_height) and
+// the display (output_width x output_height). FEAT-SGT-243: the display can be taller than 16:9
+// too: the menus then keep its width and take fewer rows (1920x1080 in 1920x1200).
+u32 wide_width, menu_width, height, menu_height, output_width, output_height;
 bool dlss_layout;
 bool native_dlaa;
 std::atomic<u32> active_extent{};
@@ -4541,8 +4620,10 @@ void PS4_SYSV_ABI SetRaceRendering(void* result, void** args) {
 }
 
 void Install(Native::NearCode& code, u8* base) {
+    // FIX-SGT-208: on with the native menu layout (it was opt-in, and nothing set it, so players
+    // got the squeezed reward driver the layout was written for). RYGT_GT7_REWARDS_16_9=0: off.
     const char* opt = std::getenv("RYGT_GT7_REWARDS_16_9");
-    if (opt ? std::string_view(opt) != "1" : !(dlss_layout || native_dlaa))
+    if (opt && opt[0] == '0')
         return;
     // SceneFace.loadCommandFile has already acquired a live stage in r14 and
     // resolved the path in rdx. Observe only its enqueue call, before the worker
@@ -4595,8 +4676,52 @@ void Install(Native::NearCode& code, u8* base) {
 
 u32 PackedExtent(u32 w, u32 h) { return (h << 16) | w; }
 
+// FIX-SGT-238: a race project's whole-screen interfaces take the menus' layout, as Rewards does:
+// the pre-race screen, the pause menu and the results. In the track's layout their interface is
+// split from the scene and laid back at 16:9, which a menu's pages do not survive (HudSplitNow's
+// note of 2026-11-11): on the owner's plays of 2026-11-27, at 1920x1200 and at 3840x1080, the
+// buttons and translucent panels had wrong colours and flickered. GT7's race state (GAME-006)
+// says when the race itself runs: from its countdown to its finish, and not while paused.
+// Not with the DLSS layout, which has its own handling of these screens (FEAT-SGT-189).
+// Off by default, RYGT_GT7_INTERFACE_16_9=1 turns it on: the owner prefers these screens at the
+// scene's own shape (played both ways at 3840x1080 on 2026-11-27), where FIX-SGT-237 stops the
+// flicker and FEAT-SGT-201 dims the pause to the edges; the buttons' tint is still off there.
+bool InterfaceLayoutOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_GT7_INTERFACE_16_9");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
+// FIX-SGT-241: the track's layout only once the race has run for three of the race module's
+// frames. Leaving the pause menu with Retry or Exit, GT7 clears the pause one frame before it
+// ends the session: the race "ran" for that frame (17 ms on the owner's play of 2026-11-27 at
+// 1920x1200, RTX 4070: "race starts", the track's layout, "not running", the menus' layout, four
+// lines of the journal within 17 ms, at each Retry and Exit), and GT7 rebuilt its render targets
+// twice for it. A real start or Continue takes the track's layout two frames later than before.
+// RYGT_GT7_TRACK_HOLD=0: at once, as before.
+bool TrackHoldOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_GT7_TRACK_HOLD");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
 bool TrackRequested() {
-    return Vulkan::RytyGtsInRace() && !Rewards::active_stage.load(std::memory_order_acquire);
+    if (!Vulkan::RytyGtsInRace() || Rewards::active_stage.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (!dlss_layout && !native_dlaa && InterfaceLayoutOn() && Vulkan::RytyRaceStartSignal()) {
+        if (!Vulkan::RytyRaceRunning()) {
+            return false;
+        }
+        if (TrackHoldOn() && g_race_running_frames.load(std::memory_order_relaxed) < 3) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void PS4_SYSV_ABI ConfigureTargets() {
@@ -4605,14 +4730,14 @@ void PS4_SYSV_ABI ConfigureTargets() {
     const u32 width = track ? wide_width : menu_width;
     const u32 scene_height = track ? height : menu_height;
     const u32 extent = PackedExtent(width, scene_height);
-    const bool wide = output_width > menu_width;
-    const float ratio = track ? float(output_width) / menu_height : 16.f / 9.f;
+    const bool wide = output_width > menu_width || output_height > menu_height;
+    const float ratio = track ? float(output_width) / output_height : 16.f / 9.f;
     auto* aspect = reinterpret_cast<float*>(game + projection_aspect);
     const bool changed = active_extent.load(std::memory_order_relaxed) != extent;
     bool applied = false;
     const bool base_targets = !game[0x62ef250] && !game[0x62ef608] && !game[0x62f5518];
     if (base_targets && (changed || (wide && std::atomic_ref<float>(*aspect).load(std::memory_order_relaxed) != ratio))) {
-        const u32 race_flip = PackedExtent(output_width, menu_height);
+        const u32 race_flip = PackedExtent(output_width, output_height);
         const u32 menu_flip = PackedExtent(menu_width, menu_height);
         bool ready = true;
         for (u32 i = 0; i < 3; ++i) {
@@ -4640,6 +4765,7 @@ void PS4_SYSV_ABI ConfigureTargets() {
     configure_original();
     if (applied) {
         active_extent.store(extent, std::memory_order_release);
+        Gt7Mirror::Apply(game, width, scene_height); // FIX-SGT-242
         if (changed) {
             // The dimensions GT7 accepted, after updating its descriptor under its own lock.
             auto* targets = *reinterpret_cast<u8**>(game + 0x641c318);
@@ -4657,11 +4783,12 @@ void PS4_SYSV_ABI ApplyGraphicsConfig(void* config, int force) {
     // render targets and rebuild its dependent surfaces once on each transition.
     const bool track = TrackRequested();
     const u32 requested = track ? PackedExtent(wide_width, height) : PackedExtent(menu_width, menu_height);
-    const float ratio = track ? float(output_width) / menu_height : 16.f / 9.f;
+    const float ratio = track ? float(output_width) / output_height : 16.f / 9.f;
     auto* aspect = reinterpret_cast<float*>(game + projection_aspect);
+    const bool shaped = output_width > menu_width || output_height > menu_height;
     // libScePad can initialize its projection constant once after the first menu frame.
     apply_original(config, force || active_extent.load(std::memory_order_acquire) != requested ||
-                           (output_width > menu_width && std::atomic_ref<float>(*aspect).load(std::memory_order_relaxed) != ratio));
+                           (shaped && std::atomic_ref<float>(*aspect).load(std::memory_order_relaxed) != ratio));
 }
 
 template <typename T>
@@ -4671,13 +4798,17 @@ std::vector<u8> Bytes(const T& value) {
 }
 
 void Install(u8* base) {
+    // FIX-SGT-208: on by default. GT7 in native ultrawide (the launcher's scene patch, checked
+    // below) renders its menus at 16:9 and switches its targets for the track. It was opt-in and
+    // no launcher set it, so players got the other path (the finished wide menu picture squeezed
+    // into the 16:9 middle) while the tested one stayed off. RYGT_GT7_NATIVE_MENU_16_9=0: off.
     const char* opt = std::getenv("RYGT_GT7_NATIVE_MENU_16_9");
     const char* menus = std::getenv("RYGT_ULTRAWIDE_MENUS");
     const char* guest_output = std::getenv("RYGT_DLSS_GUEST_OUTPUT");
     const char* native_menus = std::getenv("RYGT_DLSS_NATIVE_MENUS");
     const bool dlss = guest_output && std::string_view(guest_output) == "1";
     const bool enabled = dlss ? !(native_menus && native_menus[0] == '0')
-                              : opt && std::string_view(opt) == "1" && !(menus && menus[0] == '0');
+                              : !(opt && opt[0] == '0') && !(menus && menus[0] == '0');
     if (!enabled || !g_gt7_race_hook_installed.load()) return;
     const char* dlaa = std::getenv("RYGT_NATIVE_DLAA");
     const auto& layout = Vulkan::RytyUpscale::DlssLayout();
@@ -4699,26 +4830,34 @@ void Install(u8* base) {
     if (dlss) {
         if (layout.scene.width ? (w != layout.scene.width || h != layout.scene.height)
                                : (w != 1920 || h != 1080)) return;
-    } else if (h < 360 || h > 2160 || w > 7680 || w % 16 || w <= h * 16 / 9 ||
-               u64(w) * h > 3840 * 2160 ||
-               std::abs(Vulkan::RytyDisplayAspect() - float(w) / h) > .01f) return;
+    } else {
+        // FEAT-SGT-243: a scene taller than 16:9 (1920x1200 on a 16:10 screen) is laid out the
+        // same way, its menus at the 16:9 of its width. RYGT_GT7_TALL_MENUS=0: wider scenes only,
+        // and the taller scene's finished menu picture is fitted to 16:9 instead.
+        const char* tall_menus = std::getenv("RYGT_GT7_TALL_MENUS");
+        const bool taller = u64(w) * 9 < u64(h) * 16;
+        if (h < 360 || h > 2160 || w > 7680 || w % 16 || !Gt7MenuLayout::Shaped(w, h) ||
+            (taller && tall_menus && tall_menus[0] == '0') || u64(w) * h > 3840 * 2160 ||
+            std::abs(Vulkan::RytyDisplayAspect() - float(w) / h) > .01f) return;
+    }
     const u32 display_w = !dlss ? w : layout.output.width ? layout.output.width : 3840;
-    const u32 panel_height = !dlss ? h : layout.output.height ? layout.output.height : 2160;
-    const u32 panel = std::min(display_w, (panel_height * 16 + 4) / 9);
-    const bool wide = display_w > panel;
-    if (!dlss && panel >= w) return;
+    const u32 display_h = !dlss ? h : layout.output.height ? layout.output.height : 2160;
+    const u32 panel = Gt7MenuLayout::Panel(display_w, display_h).width;
+    const u32 panel_height = Gt7MenuLayout::Panel(display_w, display_h).height;
+    const bool wide = display_w > panel || display_h > panel_height;
+    if (!dlss && !wide) return;
     const auto matches = [&](u32 rva, const std::vector<u8>& bytes) {
         return ReadableRange(base + rva, bytes.size()) &&
                std::memcmp(base + rva, bytes.data(), bytes.size()) == 0;
     };
     const std::vector<u8> prologue{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
-    if (dlss && (display_w != w || panel_height != h) &&
+    if (dlss && (display_w != w || display_h != h) &&
         (!matches(0x17a7aa5, {0x41,0xb8}) || !matches(0x17a7aa7, Bytes(display_w)) ||
-         !matches(0x17a7aac, {0x41,0xb9}) || !matches(0x17a7aae, Bytes(panel_height)) ||
+         !matches(0x17a7aac, {0x41,0xb9}) || !matches(0x17a7aae, Bytes(display_h)) ||
          !matches(0x17a7aab, {0x90}) || !matches(0x17a7ab2, {0x90}))) return;
     if (!matches(target_config, prologue) || !matches(0x17a7417, Bytes(display_w)) ||
         !matches(0x17a7427, Bytes(w)) || !matches(0x17a7422, Bytes(h)) ||
-        !matches(0x17a741d, Bytes(panel_height)) ||
+        !matches(0x17a741d, Bytes(display_h)) ||
         !matches(0x1b4c3f0, {0xc5,0xfa,0x10,0x05,0x18,0x31,0x41,0x02,0xc3}) ||
         !matches(0x27cad27, {0x80,0x3d,0xea,0xa7,0xb2,0x03,0x00}) ||
         !matches(0x27cadd0, {0x48,0x89,0x4d,0xb4}) ||
@@ -4757,7 +4896,7 @@ void Install(u8* base) {
             if (!matches(site, store)) return;
             float literal;
             std::memcpy(&literal, base + site + store.size(), sizeof(literal));
-            if (literal != 16.f / 9.f && literal != float(display_w) / panel_height) return;
+            if (literal != 16.f / 9.f && literal != float(display_w) / display_h) return;
             auto bytes = Bytes(literal);
             store.insert(store.end(), bytes.begin(), bytes.end());
             auto* memory = near_code.Alloc(64);
@@ -4785,6 +4924,7 @@ void Install(u8* base) {
     game = base;
     wide_width = w;
     output_width = display_w;
+    output_height = display_h;
     menu_width = panel;
     menu_height = panel_height;
     height = h;
@@ -4860,10 +5000,17 @@ void RytyApplyGamePatches() {
 }
 
 namespace Vulkan {
-u32 RytyGt7MenuWidth(u32 registered_width, u32 height) {
+// The 16:9 panel GT7's menus are drawn at inside a display buffer registered at this size, or 0
+// when the menus have the display's own size. FEAT-SGT-243: on a display taller than 16:9 the
+// panel has the display's width and fewer rows, so both are returned.
+u32 RytyGt7MenuWidth(u32 registered_width, u32 registered_height) {
     using namespace Gt7NativeMenu;
-    return active_extent.load(std::memory_order_acquire) && output_width > menu_width &&
-           registered_width == output_width && height == menu_height ? menu_width : 0;
+    return active_extent.load(std::memory_order_acquire) &&
+           (output_width > menu_width || output_height > menu_height) &&
+           registered_width == output_width && registered_height == output_height ? menu_width : 0;
+}
+u32 RytyGt7MenuHeight(u32 registered_width, u32 registered_height) {
+    return RytyGt7MenuWidth(registered_width, registered_height) ? Gt7NativeMenu::menu_height : 0;
 }
 bool RytyGt7NativeDlssMenu() {
     using namespace Gt7NativeMenu;

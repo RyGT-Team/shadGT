@@ -1,0 +1,76 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// FEAT-SGT-235: whether a GT7 menu fitted at 16:9 on a screen taller than 16:9 has GT7's menu
+// bar at its top (80 rows of 1080: plain for its first 8 rows, ending in a step across most of
+// the width), once a frame, for post_process.frag. The answer changes only after 8 frames in a
+// row agree, so a fade or a dialog does not move the menu. With the bar, the colour of the
+// row just past the bar and its shadow (averaged over the width) fills the rows the move opens.
+
+#version 450
+
+layout (local_size_x = 32) in;
+
+layout (binding = 0) uniform sampler2D picture;
+// result: x = 1 while the bar is moved, yzw = the fill colour.
+// state: x = the last frames' answer, y = how many frames in a row gave it.
+layout (std430, binding = 1) buffer Edges {
+    vec4 result;
+    vec4 state;
+};
+
+shared uint steps;
+shared uint plain_rows;
+shared vec3 fill[32];
+
+const float Row = 1.0 / 1080.0;
+
+void main() {
+    const uint id = gl_LocalInvocationID.x;
+    if (id == 0u) {
+        steps = 0u;
+        plain_rows = 0u;
+    }
+    barrier();
+    const float x = (float(id) + 0.5) / 32.0;
+    // Plain: the bar's first 8 rows are the same.
+    const vec3 d0 = abs(textureLod(picture, vec2(x, 0.5 * Row), 0.0).rgb -
+                        textureLod(picture, vec2(x, 8.5 * Row), 0.0).rgb);
+    if (max(d0.r, max(d0.g, d0.b)) < 0.05) {
+        atomicAdd(plain_rows, 1u);
+    }
+    // The bar's border: a step between rows 76..84, held from 4 rows before to 8 rows past it.
+    float best = 0.0;
+    for (int n = 76; n <= 84; ++n) {
+        const float v = (float(n) + 0.5) * Row;
+        const vec3 d = abs(textureLod(picture, vec2(x, v), 0.0).rgb -
+                           textureLod(picture, vec2(x, v + 2.0 * Row), 0.0).rgb);
+        const vec3 held = abs(textureLod(picture, vec2(x, v - 4.0 * Row), 0.0).rgb -
+                              textureLod(picture, vec2(x, v + 8.0 * Row), 0.0).rgb);
+        best = max(best, min(max(d.r, max(d.g, d.b)), max(held.r, max(held.g, held.b))));
+    }
+    if (best > 0.06) {
+        atomicAdd(steps, 1u);
+    }
+    fill[id] = textureLod(picture, vec2(x, (80.0 + 12.0 + 1.5) * Row), 0.0).rgb;
+    barrier();
+    if (id == 0u) {
+        const float found = (steps >= 20u && plain_rows >= 28u) ? 1.0 : 0.0;
+        vec4 s = state;
+        if (s.x == found) {
+            s.y = min(s.y + 1.0, 1000.0);
+        } else {
+            s = vec4(found, 1.0, 0.0, 0.0);
+        }
+        state = s;
+        vec3 sum = vec3(0.0);
+        for (int i = 0; i < 32; ++i) {
+            sum += fill[i];
+        }
+        float moved = result.x;
+        if (s.y >= 8.0) {
+            moved = s.x;
+        }
+        result = vec4(moved, sum / 32.0);
+    }
+}

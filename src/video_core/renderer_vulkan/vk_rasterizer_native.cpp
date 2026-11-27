@@ -588,10 +588,12 @@ static std::vector<SceneIndirectArgs> scene_indirect_args;
 
 bool RytyGtsInRace();
 bool RytyGt7RaceHookInstalled();
-u32 RytyGt7MenuWidth(u32 registered_width, u32 height);
+u32 RytyGt7MenuWidth(u32 registered_width, u32 registered_height);
+u32 RytyGt7MenuHeight(u32 registered_width, u32 registered_height); // FEAT-SGT-243
 bool RytyGt7MenuActive();
 bool RytyGt7NativeDlssMenu();
 bool RytyRaceRunning(); // GAME-006, ryty_game_patch.cpp
+bool RytyRaceStartSignal(); // GAME-006: a hook reads the race's state
 static bool PrepareScope(); // PERF-GTS-450: races, or menus with SHADGT_NATIVE_PREPARE_MENUS=1
 bool RytyGtsRaceSession(); // WIDE-015
 int RytyGtsMenuScreen();   // WIDE-020
@@ -17037,6 +17039,24 @@ void NativeRenderer::RecordDraw(bool is_indexed, u32 index_offset, const Indirec
         // seen by the user on 2026-11-12; my reading of the cause, not measured).
         second_inline = true;
     }
+    // FIX-SGT-237: the same without DLSS for every interface drawn into the HUD's pictures while
+    // the race is not running (GT7's race state, GAME-006): the menus on a screen taller than
+    // 16:9, the pre-race screen, the pause menu. Their pages are drawn through that scratch
+    // picture; with the record over white left to the HUD's own list the two pictures disagreed
+    // from one frame to the next. Seen both ways on the owner's plays of 2026-11-27 (RTX 4070,
+    // 1920x1200 and 1920x1440): with this, steady menus; in a build without it, the menus'
+    // backgrounds went black every other frame from the title screen on (his videos), the look of
+    // a white record equal to the black one. Why the taller menus are split at all while the
+    // ultrawide ones are not is not known. The DLSS path keeps its own rule above, as merged.
+    // RYGT_GT7_INTERFACE_INLINE=0: off.
+    static const bool interface_inline = [] {
+        const char* env = std::getenv("RYGT_GT7_INTERFACE_INLINE");
+        return Common::IsGt7() && !Gt7TemporalRequested() && !(env && env[0] == '0');
+    }();
+    if (interface_inline && hud_black_state && hud_layer && RytyRaceStartSignal() &&
+        !RytyRaceRunning()) {
+        second_inline = true;
+    }
     if (r.FrameDumpActive() || Rasterizer::ExposureLogOn()) {
         if (r.FrameDumpCollecting()) {
             SnapPass(targets); // DIAG-226 (diagnosis)
@@ -19968,6 +19988,13 @@ void NativeRenderer::NoteTemporalDraw(const GraphicsPipeline& pipeline, const Ta
     temporal.mirror = false;
     if (temporal.size_refused) {
         return; // the result's size is not the display's (FindDisplay): left to the game
+    }
+    // FIX-SGT-200: a menu shown at 16:9 in a window of another shape (RYGT_ULTRAWIDE_MENUS) does
+    // not split its HUD (HudSplitNow), so the mirror's second HUD draw below has no interface to
+    // lay over the scene: World Circuits' zoomed map came out without its track list, header and
+    // event panel (16:10 and 21:9, with DLSS on). Such a menu's pass is left to the game.
+    if (center_wide_menu) {
+        return;
     }
     // Only in a race, and only while the interface does not read the display back. The game
     // runs the same pass behind menus that have a 3D scene (the title screen over the world
@@ -25616,12 +25643,18 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     frame_writebacks.clear();
     // Use one routing decision for all draws and the presentation of the same frame.
     const bool finished_wide_menu = center_wide_menu;
+    // FIX-SGT-200: also on a screen taller than 16:9 (16:10, 4:3): the menus' 16:9 picture
+    // goes between bars at the top and bottom instead of being stretched to the window's height
+    // (the race camera's aspect is widened only for races, so menus are drawn for 16:9).
     static const bool fit_gt7_menus = [] {
         const char* setting = std::getenv("RYGT_ULTRAWIDE_MENUS");
-        return Common::IsGt7() && RytyDisplayAspect() > 16.0f / 9.0f + 0.01f &&
+        return Common::IsGt7() && RytyDisplayAspect() > 0.0f &&
                !(setting && setting[0] == '0');
     }();
     const u32 native_panel = RytyGt7MenuWidth(info.size.width, info.size.height);
+    // FEAT-SGT-243: on a display taller than 16:9 the menus' panel has the display's width and
+    // fewer rows (1920x1080 in a 1920x1200 buffer); on a wider one, the display's rows.
+    const u32 native_rows = RytyGt7MenuHeight(info.size.width, info.size.height);
     center_wide_menu = native_panel ? RytyGt7MenuActive()
                                     : fit_gt7_menus && RytyGt7RaceHookInstalled() && !RytyGtsInRace();
     ++frame;
@@ -25661,10 +25694,11 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         registry->FindExisting(info.guest_address, [&](const Native::ImageEntry& candidate) {
             if (gt7_display) {
                 return !candidate.from_cpu && !candidate.info.props.is_depth &&
-                       (candidate.info.size.width == info.size.width ||
+                       ((candidate.info.size.width == info.size.width &&
+                         candidate.info.size.height == info.size.height) ||
                         (native_panel && candidate.info.size.width == native_panel &&
+                         candidate.info.size.height == native_rows &&
                          candidate.info.pitch == info.pitch)) &&
-                       candidate.info.size.height == info.size.height &&
                        candidate.info.num_bits == info.num_bits;
             }
             return !candidate.from_cpu && !candidate.info.props.is_depth &&
@@ -25673,7 +25707,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
                    candidate.info.num_bits == info.num_bits && candidate.info.pitch == info.pitch &&
                    candidate.info.num_samples == 1 && candidate.info.resources.levels == 1 &&
                    candidate.info.resources.layers == 1;
-        }, native_panel != 0); // A flip address can hold either logical width. Show its latest draw.
+        }, native_panel != 0); // A flip address can hold either logical size. Show its latest draw.
     // NEO-GT7-006: in the PS4 Pro mode GT7 draws its 3200x1800 picture into the top left corner of
     // a 3840x2160 surface, registered as 3200x1800 with a pitch of 3840: the display shows that
     // corner, copied below into an image of the display's size each frame. A lookup by the
@@ -25726,9 +25760,10 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     // admission step. Refresh a dirty CPU-backed display before presentation too.
     ApplyRewrite(*entry);
     const bool narrow_flip = native_panel &&
-                             (entry->info.size.width == native_panel || finished_wide_menu);
+                             ((entry->info.size.width == native_panel &&
+                               entry->info.size.height == native_rows) || finished_wide_menu);
     const auto* source = CropDisplay(*entry, {narrow_flip ? native_panel : info.size.width,
-                                             info.size.height});
+                                             narrow_flip ? native_rows : info.size.height});
     if (!source) {
         return std::nullopt;
     }

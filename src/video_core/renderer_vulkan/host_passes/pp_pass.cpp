@@ -6,6 +6,8 @@
 #include "common/assert.h"
 #include "core/emulator_settings.h"
 #include "video_core/host_shaders/fs_tri_vert.h"
+#include "video_core/host_shaders/hud_bar_comp.h"
+#include "video_core/host_shaders/menu_edges_comp.h"
 #include "video_core/host_shaders/post_process_frag.h"
 #include "video_core/renderer_vulkan/hdr_rolloff_policy.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -40,15 +42,19 @@ struct PostProcessingConstants {
     float side_x0 = 0.0f;
     float side_x1 = 1.0f;
     float side_dim = 1.0f;
+    // FEAT-SGT-235: a menu fitted at 16:9 on a taller screen is drawn between content_y0 and
+    // content_y1 of the height; the shader places the picture and its top bar in the window.
+    float content_y0 = 0.0f;
+    float content_y1 = 1.0f;
 };
 // Must match the push-constant block in post_process.frag.
-static_assert(sizeof(PostProcessingPass::Settings) == 56);
-static_assert(offsetof(PostProcessingConstants, dlss_sharpening) == 56);
-static_assert(sizeof(PostProcessingConstants) == 72);
+static_assert(sizeof(PostProcessingPass::Settings) == 64);
+static_assert(offsetof(PostProcessingConstants, dlss_sharpening) == 64);
+static_assert(sizeof(PostProcessingConstants) == 88);
 } // namespace
 
 void PostProcessingPass::Create(vk::Device device, vk::PhysicalDevice physical_device) {
-    boost::container::static_vector<vk::DescriptorSetLayoutBinding, 5> bindings{
+    boost::container::static_vector<vk::DescriptorSetLayoutBinding, 7> bindings{
         {
             .binding = 0,
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
@@ -76,6 +82,18 @@ void PostProcessingPass::Create(vk::Device device, vk::PhysicalDevice physical_d
         { // GT7-UW: the HUD layout
             .binding = 4,
             .descriptorType = vk::DescriptorType::eUniformBuffer,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eFragment,
+        },
+        { // FEAT-SGT-235: a fitted menu's top bar (menu_edges.comp)
+            .binding = 5,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eFragment,
+        },
+        { // FEAT-SGT-235: the race HUD's menu bar (hud_bar.comp)
+            .binding = 6,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
             .descriptorCount = 1,
             .stageFlags = vk::ShaderStageFlagBits::eFragment,
         },
@@ -236,6 +254,94 @@ void PostProcessingPass::Create(vk::Device device, vk::PhysicalDevice physical_d
         .addressModeV = vk::SamplerAddressMode::eClampToEdge,
     };
     sampler = Check<"create pp sampler">(device.createSamplerUnique(sampler_ci));
+
+    // FEAT-SGT-235: the pass that looks for a fitted menu's top bar.
+    const std::array edges_bindings{
+        vk::DescriptorSetLayoutBinding{
+            .binding = 0,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+        vk::DescriptorSetLayoutBinding{
+            .binding = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+    };
+    edges_set_layout = Check<"create menu edges set layout">(
+        device.createDescriptorSetLayoutUnique(vk::DescriptorSetLayoutCreateInfo{
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+            .bindingCount = static_cast<u32>(edges_bindings.size()),
+            .pBindings = edges_bindings.data(),
+        }));
+    edges_layout = Check<"create menu edges layout">(
+        device.createPipelineLayoutUnique(vk::PipelineLayoutCreateInfo{
+            .setLayoutCount = 1U,
+            .pSetLayouts = &*edges_set_layout,
+        }));
+    const auto& edges_module = CompileSPV(MENU_EDGES_COMP, device);
+    ASSERT(edges_module);
+    SetObjectName(device, edges_module, "menu_edges.comp");
+    edges_pipeline = Check<"create menu edges pipeline">(
+        device.createComputePipelineUnique({}, vk::ComputePipelineCreateInfo{
+            .stage =
+                vk::PipelineShaderStageCreateInfo{
+                    .stage = vk::ShaderStageFlagBits::eCompute,
+                    .module = edges_module,
+                    .pName = "main",
+                },
+            .layout = *edges_layout,
+        }));
+    device.destroyShaderModule(edges_module);
+
+    // FEAT-SGT-235: the pass that looks for the race HUD's menu bar.
+    const std::array hud_bar_bindings{
+        vk::DescriptorSetLayoutBinding{
+            .binding = 0,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+        vk::DescriptorSetLayoutBinding{
+            .binding = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+        vk::DescriptorSetLayoutBinding{
+            .binding = 2,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+    };
+    hud_bar_set_layout = Check<"create hud bar set layout">(
+        device.createDescriptorSetLayoutUnique(vk::DescriptorSetLayoutCreateInfo{
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+            .bindingCount = static_cast<u32>(hud_bar_bindings.size()),
+            .pBindings = hud_bar_bindings.data(),
+        }));
+    hud_bar_layout = Check<"create hud bar layout">(
+        device.createPipelineLayoutUnique(vk::PipelineLayoutCreateInfo{
+            .setLayoutCount = 1U,
+            .pSetLayouts = &*hud_bar_set_layout,
+        }));
+    const auto& hud_bar_module = CompileSPV(HUD_BAR_COMP, device);
+    ASSERT(hud_bar_module);
+    SetObjectName(device, hud_bar_module, "hud_bar.comp");
+    hud_bar_pipeline = Check<"create hud bar pipeline">(
+        device.createComputePipelineUnique({}, vk::ComputePipelineCreateInfo{
+            .stage =
+                vk::PipelineShaderStageCreateInfo{
+                    .stage = vk::ShaderStageFlagBits::eCompute,
+                    .module = hud_bar_module,
+                    .pName = "main",
+                },
+            .layout = *hud_bar_layout,
+        }));
+    device.destroyShaderModule(hud_bar_module);
 }
 
 void PostProcessingPass::CreateHudBuffer(VmaAllocator allocator) {
@@ -258,6 +364,35 @@ void PostProcessingPass::CreateHudBuffer(VmaAllocator allocator) {
         hud_mapped = static_cast<u8*>(info.pMappedData);
         std::memset(hud_mapped, 0, HudSlots * HudSlotSize);
     }
+    // FEAT-SGT-235: a fitted menu's top bar (menu_edges.comp): its result and the state it
+    // keeps from frame to frame, zeroed here once and then only touched on the GPU.
+    const VkBufferCreateInfo edges_ci{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = 32,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    };
+    const VmaAllocationCreateInfo edges_alloc_ci{
+        .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                 VMA_ALLOCATION_CREATE_MAPPED_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO,
+    };
+    VkBuffer edges{};
+    VmaAllocationInfo edges_info{};
+    if (vmaCreateBuffer(allocator, &edges_ci, &edges_alloc_ci, &edges, &edges_allocation,
+                        &edges_info) == VK_SUCCESS) {
+        edges_buffer = edges;
+        std::memset(edges_info.pMappedData, 0, 32);
+        vmaFlushAllocation(allocator, edges_allocation, 0, 32);
+    }
+    // FEAT-SGT-235: the race HUD's menu bar (hud_bar.comp), likewise.
+    VkBuffer hud_bar{};
+    VmaAllocationInfo hud_bar_info{};
+    if (vmaCreateBuffer(allocator, &edges_ci, &edges_alloc_ci, &hud_bar, &hud_bar_allocation,
+                        &hud_bar_info) == VK_SUCCESS) {
+        hud_bar_buffer = hud_bar;
+        std::memset(hud_bar_info.pMappedData, 0, 32);
+        vmaFlushAllocation(allocator, hud_bar_allocation, 0, 32);
+    }
 }
 
 void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
@@ -265,7 +400,7 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                                 vk::ImageView ui_layer, bool dlss_scaled, float side_x0,
                                 float side_x1, vk::ImageView hud_black, vk::ImageView hud_white,
                                 std::span<const HudWidget> hud_widgets,
-                                std::optional<vk::Rect2D> content_rect) {
+                                std::optional<vk::Rect2D> content_rect, bool hud_overlay_probe) {
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
             .pLabelName = "Host/Post processing",
@@ -322,7 +457,9 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
     if (hud_mapped) {
         u8* data = hud_mapped + slot * HudSlotSize;
         const u32 count = static_cast<u32>(std::min<size_t>(hud_widgets.size(), MaxHudWidgets));
-        const std::array<u32, 4> header{hud ? count : 0u, 0, 0, 0};
+        // FIX-SGT-236: the second word tells the shader that the caller already knows whether a
+        // whole-screen interface is up, so its two probe points are not read.
+        const std::array<u32, 4> header{hud ? count : 0u, hud_overlay_probe ? 0u : 1u, 0, 0};
         std::memcpy(data, header.data(), sizeof(header));
         if (count != 0) {
             std::memcpy(data + sizeof(header), hud_widgets.data(), count * sizeof(HudWidget));
@@ -335,6 +472,16 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         .range = 16 + MaxHudWidgets * sizeof(HudWidget),
     };
 
+    const vk::DescriptorBufferInfo edges_info{
+        .buffer = edges_buffer,
+        .offset = 0,
+        .range = 32,
+    };
+    const vk::DescriptorBufferInfo hud_bar_info{
+        .buffer = hud_bar_buffer,
+        .offset = 0,
+        .range = 32,
+    };
     vk::DescriptorImageInfo ui_info{
         .sampler = *sampler,
         .imageView = ui_layer ? ui_layer : input,
@@ -382,7 +529,120 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             .descriptorType = vk::DescriptorType::eUniformBuffer,
             .pBufferInfo = &hud_layout_info,
         },
+        vk::WriteDescriptorSet{
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 5,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &edges_info,
+        },
+        vk::WriteDescriptorSet{
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 6,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &hud_bar_info,
+        },
     };
+
+    // FEAT-SGT-235: a menu fitted at 16:9 on a taller screen: look for its top bar first.
+    const bool fitted_tall = content_rect && frame.height &&
+                             content_rect->extent.width == frame.width &&
+                             content_rect->extent.height < frame.height && edges_buffer;
+    // FEAT-SGT-235: the race HUD on a taller screen: look for its menu bar first.
+    const bool hud_tall = hud && settings.hud_y0 > 0.0f && hud_bar_buffer;
+    if (hud_tall) {
+        const vk::MemoryBarrier2 before_hud_bar{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderSampledRead |
+                             vk::AccessFlagBits2::eShaderStorageRead |
+                             vk::AccessFlagBits2::eShaderStorageWrite,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &before_hud_bar,
+        });
+        const std::array hud_bar_writes{
+            vk::WriteDescriptorSet{
+                .dstBinding = 0,
+                .descriptorCount = 1,
+                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                .pImageInfo = &hud_black_info,
+            },
+            vk::WriteDescriptorSet{
+                .dstBinding = 1,
+                .descriptorCount = 1,
+                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                .pImageInfo = &hud_white_info,
+            },
+            vk::WriteDescriptorSet{
+                .dstBinding = 2,
+                .descriptorCount = 1,
+                .descriptorType = vk::DescriptorType::eStorageBuffer,
+                .pBufferInfo = &hud_bar_info,
+            },
+        };
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *hud_bar_pipeline);
+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *hud_bar_layout, 0,
+                                    hud_bar_writes);
+        cmdbuf.dispatch(1, 1, 1);
+        const vk::MemoryBarrier2 after_hud_bar{
+            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &after_hud_bar,
+        });
+    }
+    if (fitted_tall) {
+        const vk::MemoryBarrier2 before_edges{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderSampledRead |
+                             vk::AccessFlagBits2::eShaderStorageRead |
+                             vk::AccessFlagBits2::eShaderStorageWrite,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &before_edges,
+        });
+        const std::array edges_writes{
+            vk::WriteDescriptorSet{
+                .dstBinding = 0,
+                .descriptorCount = 1,
+                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                .pImageInfo = &image_info,
+            },
+            vk::WriteDescriptorSet{
+                .dstBinding = 1,
+                .descriptorCount = 1,
+                .descriptorType = vk::DescriptorType::eStorageBuffer,
+                .pBufferInfo = &edges_info,
+            },
+        };
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *edges_pipeline);
+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *edges_layout, 0,
+                                    edges_writes);
+        cmdbuf.dispatch(1, 1, 1);
+        const vk::MemoryBarrier2 after_edges{
+            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &after_edges,
+        });
+    }
 
     const auto output = std::ranges::find(output_pipelines, frame.image_view_format,
                                           &OutputPipeline::format);
@@ -395,6 +655,14 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
     // With a widened camera the guest can still submit a 16:9 buffer. Its projection
     // expects the full window. GT Sport's True wide compositor fits its boot screens.
     vk::Rect2D area = content_rect.value_or(vk::Rect2D{{0, 0}, {frame.width, frame.height}});
+    float content_y0 = 0.0f, content_y1 = 1.0f;
+    if (fitted_tall) {
+        // FEAT-SGT-235: the whole window is drawn; the shader places the picture in it.
+        content_y0 = float(content_rect->offset.y) / float(frame.height);
+        content_y1 = float(content_rect->offset.y + s32(content_rect->extent.height)) /
+                     float(frame.height);
+        area = vk::Rect2D{{0, 0}, {frame.width, frame.height}};
+    }
 #ifdef RYTY_GPU
     static const bool fit_narrow_input =
         RytyDisplayAspect() == 0.0f || (!Common::IsGt7() && UiHires::Wide());
@@ -488,7 +756,9 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         side_dim = brightness;
     }
 #endif
-    const PostProcessingConstants constants{settings, dlss_sharpening, side_x0, side_x1, side_dim};
+    const PostProcessingConstants constants{settings,   dlss_sharpening, side_x0,
+                                            side_x1,    side_dim,        content_y0,
+                                            content_y1};
     cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0,
                          sizeof(constants), &constants);
 

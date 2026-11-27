@@ -592,6 +592,7 @@ u32 RytyGt7MenuWidth(u32 registered_width, u32 height);
 bool RytyGt7MenuActive();
 bool RytyGt7NativeDlssMenu();
 bool RytyRaceRunning(); // GAME-006, ryty_game_patch.cpp
+bool RytyRaceStartSignal(); // GAME-006: a hook reads the race's state
 static bool PrepareScope(); // PERF-GTS-450: races, or menus with SHADGT_NATIVE_PREPARE_MENUS=1
 bool RytyGtsRaceSession(); // WIDE-015
 int RytyGtsMenuScreen();   // WIDE-020
@@ -17035,6 +17036,24 @@ void NativeRenderer::RecordDraw(bool is_indexed, u32 index_offset, const Indirec
         // each piece: the record over white must run where it stands, not later in the HUD's
         // own list, or it samples the scratch as a later piece left it (colours off in menus,
         // seen by the user on 2026-11-12; my reading of the cause, not measured).
+        second_inline = true;
+    }
+    // FIX-SGT-237: the same without DLSS for every interface drawn into the HUD's pictures while
+    // the race is not running (GT7's race state, GAME-006): the menus on a screen taller than
+    // 16:9, the pre-race screen, the pause menu. Their pages are drawn through that scratch
+    // picture; with the record over white left to the HUD's own list the two pictures disagreed
+    // from one frame to the next. Seen both ways on the owner's plays of 2026-11-27 (RTX 4070,
+    // 1920x1200 and 1920x1440): with this, steady menus; in a build without it, the menus'
+    // backgrounds went black every other frame from the title screen on (his videos), the look of
+    // a white record equal to the black one. Why the taller menus are split at all while the
+    // ultrawide ones are not is not known. The DLSS path keeps its own rule above, as merged.
+    // RYGT_GT7_INTERFACE_INLINE=0: off.
+    static const bool interface_inline = [] {
+        const char* env = std::getenv("RYGT_GT7_INTERFACE_INLINE");
+        return Common::IsGt7() && !Gt7TemporalRequested() && !(env && env[0] == '0');
+    }();
+    if (interface_inline && hud_black_state && hud_layer && RytyRaceStartSignal() &&
+        !RytyRaceRunning()) {
         second_inline = true;
     }
     if (r.FrameDumpActive() || Rasterizer::ExposureLogOn()) {

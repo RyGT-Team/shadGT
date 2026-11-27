@@ -735,8 +735,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         } else if (!remembered && info.num_samples == 1) {
             result->needs_upload.store(true, std::memory_order_relaxed);
             result->force_upload.store(true, std::memory_order_relaxed);
-            std::scoped_lock lock{upload_mutex};
-            pending_uploads.push_back(result);
+            QueueUpload(result);
         }
     } else {
 #ifndef NDEBUG
@@ -744,8 +743,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
 #endif
         LinkTexture(*result);
         result->needs_upload.store(true, std::memory_order_relaxed);
-        std::scoped_lock lock{upload_mutex};
-        pending_uploads.push_back(result);
+        QueueUpload(result);
     }
     return result;
 }
@@ -1481,6 +1479,7 @@ u32 ImageRegistry::RetireTaken(std::vector<std::unique_ptr<ImageEntry>>& taken,
     {
         std::scoped_lock lock{upload_mutex};
         std::erase_if(pending_uploads, [&](ImageEntry* entry) { return gone.contains(entry); });
+        upload_work.Publish(!pending_uploads.empty());
         std::erase_if(retry_uploads, [&](ImageEntry* entry) { return gone.contains(entry); }); // FIX-SGT-140
     }
     if (!taken.empty()) {
@@ -1564,8 +1563,7 @@ void ImageRegistry::MarkStale(ImageEntry& entry, Stale why) {
     // Explicit RequestUpload separately admits its required rewrite immediately.
     const bool defer = entry.from_cpu;
     if (!already_dirty && !defer) {
-        std::scoped_lock upload_lock{upload_mutex};
-        pending_uploads.push_back(&entry);
+        QueueUpload(&entry);
     }
 }
 
@@ -2323,6 +2321,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
     {
         std::scoped_lock lock{upload_mutex};
         pending.swap(pending_uploads);
+        upload_work.Publish(false);
     }
     {
         // FIX-SGT-140: uploads left out in an earlier frame are due again.

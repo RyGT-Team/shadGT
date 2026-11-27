@@ -10,6 +10,7 @@
 
 #pragma once
 #include "ryty_gpu/native/layer_hash.h"
+#include "ryty_gpu/native/pending_image_work.h"
 
 #include <array>
 #include <atomic>
@@ -333,8 +334,7 @@ public:
 
     /// NAT-100: whether uploads are queued (RecordUploads has work).
     bool HasPendingUploads() {
-        std::scoped_lock lock{upload_mutex};
-        return !pending_uploads.empty();
+        return upload_work.Any(upload_mutex, pending_uploads);
     }
     /// NAT-100: whether any image starts at the address.
     bool HasImageAt(VAddr address);
@@ -411,8 +411,7 @@ public:
     std::atomic<u64> upload_frame_now{0};
     void QueueUploadForUse(ImageEntry& entry) {
         if (entry.from_cpu && UploadDue(entry)) {
-            std::scoped_lock lock{upload_mutex};
-            pending_uploads.push_back(&entry);
+            QueueUpload(&entry);
         }
     }
     void RequestUpload(ImageEntry& entry) {
@@ -563,6 +562,12 @@ private:
     std::vector<Superseded> superseded;          ///< FIX-SGT-158
     std::atomic<u64> superseded_frame{0};        ///< FIX-SGT-158: last EvictSuperseded frame
     std::shared_ptr<std::atomic<u64>> remembered_fill_count = std::make_shared<std::atomic<u64>>(0);
+    void QueueUpload(ImageEntry* entry) {
+        std::scoped_lock lock{upload_mutex};
+        pending_uploads.push_back(entry);
+        upload_work.Publish(true);
+    }
+    PendingImageWork upload_work;
     std::vector<ImageEntry*> pending_uploads;
     /// FIX-SGT-140: uploads left out when device memory ran out, due again from the next frame
     /// on (upload_mutex, like pending_uploads).

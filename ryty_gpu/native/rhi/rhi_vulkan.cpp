@@ -1,4 +1,5 @@
 #include "ryty_gpu/native/rhi/completed_owner_release.h"
+#include "ryty_gpu/native/pending_image_work.h"
 #include "ryty_gpu/native/descriptor_dead_handles.h"
 #include "ryty_gpu/native/descriptor_update_batch.h"
 #include "ryty_gpu/native/rhi/descriptor_batch_test_spv.h"
@@ -550,8 +551,7 @@ public:
     void UseExternalTimeline(Fence* fence, std::function<u64()> current) override;
     void RecordPendingImageInit(CommandList& list) override;
     bool PendingImageInit() override {
-        std::scoped_lock lock{init_mutex};
-        return !pending_init.empty();
+        return init_work.Any(init_mutex, pending_init);
     }
 
     /// Destroys GPU objects once the GPU has run the lists recorded so far. Those are submitted
@@ -656,6 +656,7 @@ public:
     std::mutex pools_mutex;
     std::unordered_map<std::thread::id, std::unique_ptr<ThreadPool>> pools;
     // New images go from UNDEFINED to GENERAL in a command buffer submitted before the next list.
+    PendingImageWork init_work;
     std::mutex init_mutex;
     vk::CommandPool init_pool;
     std::deque<std::pair<u64, vk::CommandBuffer>> init_used; // (tick, buffer)
@@ -1342,6 +1343,7 @@ std::unique_ptr<Buffer> VulkanDevice::ImportHostMemory(void* memory, u64 size, u
 void VulkanDevice::InitImageLayout(vk::Image image, vk::ImageAspectFlags aspect) {
     std::scoped_lock lock{init_mutex};
     pending_init.emplace_back(image, aspect);
+    init_work.Publish(true);
 }
 
 void VulkanDevice::RecordImageInit(Vulkan::CmdBuf cmd,
@@ -1381,6 +1383,7 @@ void VulkanDevice::RecordPendingImageInit(CommandList& list) {
     {
         std::scoped_lock lock{init_mutex};
         images.swap(pending_init);
+        init_work.Publish(false);
     }
     RecordImageInit(static_cast<VulkanCommandList&>(list).C(), images);
 }
@@ -2124,6 +2127,7 @@ void VulkanQueue::Submit(std::span<CommandList* const> lists, std::span<const Fe
     const u64 tick = device.submitted.fetch_add(1, std::memory_order_relaxed) + 1;
     if (init_cmd) {
         device.init_used.emplace_back(tick, init_cmd);
+        device.init_work.Publish(false);
     }
     init_lock.unlock();
     std::array<vk::Semaphore, 2> signal_semaphores{device.timeline};

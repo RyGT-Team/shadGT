@@ -220,6 +220,17 @@ void main() {
         // just under the bar (the top of what hangs from it, such as the pre-race page's
         // "World Circuits / Single Race" band), so that stays joined to the bar.
         const bool menu_bar_hud = overlay && pp.hud_y0 > 0.0 && hud_bar.x != 0.0;
+        // FIX-SGT-244: a placed piece shows where it was placed. FEAT-SGT-235 (b5435f3f9) dropped
+        // this loop: the pieces were still cut out of the centred HUD below and shown nowhere, so
+        // a race at 1920x1200 had lost its position, lap time, maps and dashboard.
+        for (uint i = 0u; i < count; ++i) {
+            const HudWidget w = layout_.widgets[i];
+            if (inside(uv, w.dst)) {
+                hud_uv = w.src.xy + (uv - w.dst.xy) / w.dst.zw * w.src.zw;
+                shown = true;
+                break;
+            }
+        }
         if (menu_bar_hud && uv.x >= pp.hud_x0 && uv.x <= pp.hud_x1) {
             const float band = pp.hud_y1 - pp.hud_y0;
             const float cut = 80.0 / 1080.0 * band;

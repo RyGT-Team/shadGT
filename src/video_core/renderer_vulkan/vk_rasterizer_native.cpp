@@ -162,6 +162,7 @@
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_native_ui.h"
+#include "ryty_gpu/native/writeback_run.h"
 #include "shader_recompiler/direct_learning.h"
 #include "video_core/renderer_vulkan/direct_table_scratch.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -6970,21 +6971,36 @@ void NativeRenderer::RecordRegionWriteback(const std::shared_ptr<WritebackPlan>&
         if (found == regions.end()) UNREACHABLE_MSG("native writeback region changed after preflight");
         found->second.gpu_pages->insert(std::move(mark.node));
     }
-    for (auto& part : plan.parts) {
-        SnapshotLease::MarkUnsafe(part.page, 4096, 16);
-        auto found = regions.find(part.region_begin);
-        if (found == regions.end() || found->second.buffer.get() != part.region_buffer)
-            UNREACHABLE_MSG("native writeback region changed after preflight");
+    static const bool combine_pages = [] {
+        const char* env = std::getenv("SHADGT_COMBINE_WRITEBACK_PAGES"); // PERF-SGT-226
+        return env && env[0] == '1';
+    }();
+    for (size_t i = 0; i < plan.parts.size();) {
+        auto& part = plan.parts[i];
+        u64 bytes = part.size;
+        size_t end = i + 1;
+        if (combine_pages && plan.shader) {
+            while (end < plan.parts.size() && Native::ExtendShaderWriteback(part, bytes, plan.parts[end])) {
+                bytes += plan.parts[end++].size;
+            }
+        }
+        for (; i < end; ++i) {
+            const auto& page = plan.parts[i];
+            SnapshotLease::MarkUnsafe(page.page, 4096, 16);
+            auto found = regions.find(page.region_begin);
+            if (found == regions.end() || found->second.buffer.get() != page.region_buffer)
+                UNREACHABLE_MSG("native writeback region changed after preflight");
+        }
         if (plan.shader) {
             auto* snapshot = plan.before[part.before_index].recorded_copy;
             const std::array<Native::Rhi::Binding, 3> inputs{{
                 {.slot = 0, .type = Native::Rhi::BindingType::StorageBuffer, .buffer = part.region_buffer,
-                 .offset = part.region_offset, .size = part.size},
+                 .offset = part.region_offset, .size = bytes},
                 {.slot = 1, .type = Native::Rhi::BindingType::StorageBuffer, .buffer = snapshot,
-                 .offset = part.before_offset, .size = part.size},
+                 .offset = part.before_offset, .size = bytes},
                 {.slot = 2, .type = Native::Rhi::BindingType::StorageBuffer, .buffer = part.guest.get(),
-                 .offset = part.guest_offset, .size = part.size}}};
-            const u32 count = static_cast<u32>(part.size / 16);
+                 .offset = part.guest_offset, .size = bytes}}};
+            const u32 count = static_cast<u32>(bytes / 16);
             s.list->BindPipeline(writeback_pipeline.get());
             s.list->PushBindings(inputs);
             s.list->PushConstants(0, std::span<const u8>{reinterpret_cast<const u8*>(&count), sizeof(count)});

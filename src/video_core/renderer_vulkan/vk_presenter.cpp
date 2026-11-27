@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "ryty_gpu/ryty_dlss_timing.h"
 #include "common/diagnostics.h"
 #include "common/debug.h"
 #include "common/frame_queue_trace.h"
@@ -1538,7 +1539,14 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     bool dlss_scaled = false;
     vk::ImageView ui_layer_view{};
     std::string upscaler = display->upscaler; // actual Native scene reconstruction
-    const vk::Extent2D game_size = image_size;
+    const bool guest_dlss = RytyUpscale::GuestOutputDlss() && upscaler == "DLSS";
+    if (guest_dlss && logged_dlss_display_size != image_size) {
+        LOG_INFO(Render_Vulkan, "DLSS guest display after HUD: {}x{}",
+                 image_size.width, image_size.height);
+        logged_dlss_display_size = image_size;
+    }
+    const vk::Extent2D game_size = guest_dlss
+                                      ? rasterizer->GetTemporalDlss().RenderSize() : image_size;
     if (display->output_view) {
         image_view = display->output_view;
         image_size = display->output_size;
@@ -1610,12 +1618,13 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         g_presenter_times.Begin(pass_cmdbuf, display->temporal.has_value() &&
                                                  RytyUpscale::TemporalActive());
     }
+    DlssTiming dlss_timing{instance, draw_scheduler};
     // GT Sport: `scaled` is its in-frame reconstruction (GtsDlssPass), already at the output size.
     if (const auto dlss_view =
             scaled ? image_view
                    : dlss_pass.Render(pass_cmdbuf, display->image, image_view, view_format,
                                       image_size, upscale_target,
-                                      display->temporal ? &*display->temporal : nullptr);
+                                      display->temporal ? &*display->temporal : nullptr, &dlss_timing);
         dlss_view != image_view) {
         image_view = dlss_view;
         scaled = true;
@@ -1642,9 +1651,15 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
                                      {frame->width, frame->height}, fsr_settings, frame->is_hdr);
         if (image_view != before) upscaler = "FSR 1";
     }
-    RytyUpscalerStatus::ReportResolution(frame->width, frame->height,
-                                          game_size.width, game_size.height, upscaler,
-                                          RytyFrameGen::Working());
+    if (guest_dlss) {
+        const auto output = rasterizer->GetTemporalDlss().OutputSize();
+        RytyUpscalerStatus::Report(game_size == output ? "DLAA" :
+            "DLSS " + RytyUpscalerStatus::QualityMode(output.width, output.height, game_size.width, game_size.height));
+    } else {
+        RytyUpscalerStatus::ReportResolution(frame->width, frame->height,
+                                              game_size.width, game_size.height, upscaler,
+                                              RytyFrameGen::Working());
+    }
     if (time_passes) {
         g_presenter_times.Mark(pass_cmdbuf, 1);
     }

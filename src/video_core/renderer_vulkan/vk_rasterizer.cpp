@@ -2137,7 +2137,7 @@ bool Rasterizer::TemporalOwnsDisplay() {
 bool RytyGtsInRace();
 
 void Rasterizer::applyTemporalDlss(const GraphicsPipeline* pipeline, const RenderState& state,
-                                 bool beforeDraw) {
+                                 GtsSceneBinding* scene_binding) {
     if (!RytyGtsInRace() || Scheduler::ThreadRing() || ctx->dlssNativeDraw) return;
     const u64 frame = g_prepared_frames.load(std::memory_order_relaxed);
     const auto& regs = liverpool->DrawRegs();
@@ -2164,7 +2164,7 @@ void Rasterizer::applyTemporalDlss(const GraphicsPipeline* pipeline, const Rende
     const auto size = vk::Extent2D{target->info.size.width, target->info.size.height};
     if (state.num_color_attachments == 2 && ctx->bound_textures.size() == 4 &&
         target->info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
-        if (beforeDraw) return;
+        if (scene_binding) return;
         auto* resolved = imageAt(1);
         if (!resolved || resolved->info.pixel_format != vk::Format::eB10G11R11UfloatPack32 ||
             resolved->info.size.width != size.width || resolved->info.size.height != size.height) return;
@@ -2197,24 +2197,20 @@ void Rasterizer::applyTemporalDlss(const GraphicsPipeline* pipeline, const Rende
         return;
     }
 
-    // FSR-203: the race's display buffers are not always marked vo_surface by the time the game
-    // draws the scene into them (seen on an RX 7600 with 0062); a draw that reads this frame's
-    // captured scene at the scene's size is the display draw.
-    const bool readsScene = std::ranges::any_of(ctx->bound_textures, [&](const auto& binding) {
-        return temporalDlss.HasScene(frame, texture_cache.GetImage(binding.image_id).image_uid);
-    });
-    const bool display = target->usage.vo_surface || readsScene;
-    if (state.num_color_attachments != 1 || !display ||
-        ctx->db_desc.first || regs.blend_control[0].enable ||
+    if (!scene_binding || size != temporalDlss.RenderSize() ||
+        state.num_color_attachments != 1 || ctx->db_desc.first ||
+        regs.blend_control[0].enable ||
         target->info.pixel_format != vk::Format::eA2B10G10R10UnormPack32 ||
         (!parameterAddress(304) && !parameterAddress(288))) return;
+    const BoundTexture* scene{};
     for (const auto& binding : ctx->bound_textures) {
-        auto& image = texture_cache.GetImage(binding.image_id);
-        if (temporalDlss.HasScene(frame, image.image_uid)) {
-            if (beforeDraw) temporalDlss.PrepareScene(frame, image);
-            else temporalDlss.Resolve(frame, *target);
-            return;
-        }
+        if (!temporalDlss.HasScene(frame, texture_cache.GetImage(binding.image_id).image_uid)) continue;
+        if (scene) return;
+        scene = &binding;
+    }
+    if (scene) {
+        temporalDlss.BindSceneColor(scene->desc->view_info, ctx->image_infos[scene->descriptor_index],
+                                    *scene_binding);
     }
 }
 #endif
@@ -2455,6 +2451,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, bool world_hud) {
         NoteDrawKey(std::make_pair(vs ? vs->pgm_hash : 0, fs ? fs->pgm_hash : 0), 0);
     }
     RenderState state;
+#ifdef RYTY_GPU
+    GtsSceneBinding scene_binding;
+#endif
     {
         PhaseTimer t{Phase::BeginRendering};
         // UI-HIRES: draws into a display buffer after the scene composite go to its proxy.
@@ -2474,7 +2473,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, bool world_hud) {
             FrameDumpPass(regs, state, pipeline); // NAT-117
         }
 #ifdef RYTY_GPU
-        if (temporalDlss.Enabled()) applyTemporalDlss(pipeline, state, true);
+        if (!ui_hires.proxy && temporalDlss.Enabled()) {
+            applyTemporalDlss(pipeline, state, &scene_binding);
+        }
         prepareNativeHud(state);
 #endif
 
@@ -2484,44 +2485,61 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, bool world_hud) {
         UiHires::Apply(ui_hires, *ctx, state, instance);
     }
 
-    {
-        PhaseTimer t{Phase::Descriptors};
-        pipeline->BindResources(ctx->set_writes, ctx->set_write_sets, ctx->push_data);
-    }
-    {
-        PhaseTimer t{Phase::DynamicState};
-        UpdateDynamicState(pipeline, is_indexed, quad_triangles);
-        scheduler.BeginRendering(state);
-    }
-    PhaseTimer record_timer{Phase::Record};
-
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
 
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
-    if (pipeline->SampleLocationSamples() != 0) {
-        DynState().ResendSampleLocations(cmdbuf); // NEO-GTS-508
-    }
-
-    if (quad_triangles) {
-        // Non-indexed quads index from 0 with the first vertex as the vertex offset, which
-        // gives the vertex shader the same vertex indices as the original draw.
-        if (num_quad_indices != 0) {
-            cmdbuf.drawIndexed(num_quad_indices, regs.num_instances.NumInstances(), 0,
-                               s32(vertex_offset), instance_offset);
+    const auto record_draw = [&] {
+        {
+            PhaseTimer t{Phase::Descriptors};
+            pipeline->BindResources(ctx->set_writes, ctx->set_write_sets, ctx->push_data);
         }
-    } else if (is_indexed) {
-        cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
-                           s32(vertex_offset), instance_offset);
-    } else {
-        cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
-                    instance_offset);
-    }
+        {
+            PhaseTimer t{Phase::DynamicState};
+            UpdateDynamicState(pipeline, is_indexed, quad_triangles);
+            scheduler.BeginRendering(state);
+        }
+        PhaseTimer record_timer{Phase::Record};
+
+        const auto cmdbuf = scheduler.CommandBuffer();
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+        if (pipeline->SampleLocationSamples() != 0) {
+            DynState().ResendSampleLocations(cmdbuf); // NEO-GTS-508
+        }
+
+        if (quad_triangles) {
+            // Non-indexed quads index from 0 with the first vertex as the vertex offset, which
+            // gives the vertex shader the same vertex indices as the original draw.
+            if (num_quad_indices != 0) {
+                cmdbuf.drawIndexed(num_quad_indices, regs.num_instances.NumInstances(), 0,
+                                   s32(vertex_offset), instance_offset);
+            }
+        } else if (is_indexed) {
+            cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
+                               s32(vertex_offset), instance_offset);
+        } else {
+            cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
+                        instance_offset);
+        }
+    };
+    record_draw();
     DebugState.IncDrawCall();
 #ifdef RYTY_GPU
-    if (temporalDlss.Enabled()) applyTemporalDlss(pipeline, state);
+    if (scene_binding.slot) {
+        scene_binding.Restore();
+        auto& display = texture_cache.GetImage(ctx->cb_descs[0].image_id);
+        const auto frame = g_prepared_frames.load(std::memory_order_relaxed);
+        temporalDlss.Resolve(frame, display);
+        if (!temporalDlss.HasDisplay(frame, display.image_uid)) {
+            // The resolve sampled this target. Restore its attachment layout before drawing again.
+            state = BeginRendering(pipeline);
+            FinalizeTextureLayouts(&state);
+            runtime.FlushBarriers();
+            record_draw();
+        }
+    } else if (temporalDlss.Enabled()) {
+        applyTemporalDlss(pipeline, state);
+    }
 #endif
 
 #ifndef NDEBUG

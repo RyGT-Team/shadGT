@@ -154,6 +154,7 @@ private:
     float expected_ratio{1920.0 / 1080.0f};
     u32 expected_frame_width{1920};
     u32 expected_frame_height{1080};
+    vk::Extent2D logged_dlss_display_size{};
 
     Frontend::WindowSDL& window;
     Instance instance;

@@ -676,7 +676,7 @@ private:
 #ifdef RYTY_GPU
     GtsDlssPass temporalDlss;
     void applyTemporalDlss(const GraphicsPipeline* pipeline, const RenderState& state,
-                           bool beforeDraw = false);
+                           GtsSceneBinding* scene_binding = nullptr);
     void prepareNativeHud(RenderState& state);
 #endif
     bool TemporalOwnsDisplay();

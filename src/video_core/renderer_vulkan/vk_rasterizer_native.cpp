@@ -1,3 +1,4 @@
+#include "ryty_gpu/ryty_dlss_layout.h"
 #include "ryty_gpu/native/ordered_timing.h"
 #include <exception>
 #include "ryty_gpu/native/cpu_stack_registry.h"
@@ -589,6 +590,7 @@ bool RytyGtsInRace();
 bool RytyGt7RaceHookInstalled();
 u32 RytyGt7MenuWidth(u32 registered_width, u32 height);
 bool RytyGt7MenuActive();
+bool RytyGt7NativeDlssMenu();
 bool RytyRaceRunning(); // GAME-006, ryty_game_patch.cpp
 static bool PrepareScope(); // PERF-GTS-450: races, or menus with SHADGT_NATIVE_PREPARE_MENUS=1
 bool RytyGtsRaceSession(); // WIDE-015
@@ -1958,18 +1960,31 @@ GtsSceneImage NativeRenderer::TemporalImage(const Native::ImageEntry& entry) {
             }, [this, &entry] { Written(&entry); }};
 }
 
+static bool IsDisplayAddress(VAddr address);
+static bool IsPrimaryDisplayExtent(vk::Extent2D extent);
+
 void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Targets& targets,
                                      const DrawBindings& bindings) {
-    // Merge (shadGT): GT Sport's temporal pass; GT7 has its own (NoteTemporalDraw).
-    if (Common::IsGt7() || !r.temporalDlss.Enabled()) return;
+    const bool gt7 = Common::IsGt7();
+    if ((gt7 && !RytyUpscale::GuestOutputDlss()) || !r.temporalDlss.Enabled()) return;
     const auto& regs = r.liverpool->DrawRegs();
     const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
-    if (!fs || regs.num_indices > 6 ||
+    // GT7's 4K race captures identify this TAA draw and its four scene-sized resources.
+    if (!fs || (gt7 && fs->pgm_hash != 0xcfa125dd) || regs.num_indices > 6 ||
         regs.num_instances.NumInstances() != 1 || targets.state.num_color_attachments != 2 ||
         bindings.sampled.size() != 4 || !targets.colors[0] || !targets.colors[1]) { NATIVE_DIAGNOSTIC(static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 1, fs {:#x}", fs ? fs->pgm_hash : 0);); return; }
     const auto* history_out = targets.colors[0];
     const auto* resolved = targets.colors[1];
     const vk::Extent2D size{resolved->info.size.width, resolved->info.size.height};
+    if (RytyUpscale::GuestOutputDlss()) {
+        if (RytyGt7NativeDlssMenu()) return;
+        const auto& layout = RytyUpscale::DlssLayout();
+        if (layout.scene.width) {
+            if (size != layout.scene || !RytyGtsInRace()) return;
+        } else if (r.temporalDlss.ActiveQuality() == RYGT_DLSS_QUALITY_DLAA) {
+            if (!RytyGtsInRace() || !IsPrimaryDisplayExtent(size)) return;
+        } else if (size != vk::Extent2D{1920, 1080}) return;
+    }
     if (history_out->info.pixel_format != vk::Format::eR16G16B16A16Sfloat ||
         resolved->info.pixel_format != vk::Format::eB10G11R11UfloatPack32 ||
         history_out->info.size.width != size.width || history_out->info.size.height != size.height)
@@ -1996,16 +2011,17 @@ void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Ta
     for (const auto& buffer : fs->buffers) {
         if (buffer.IsSpecial() || buffer.is_written) continue;
         const auto sharp = buffer.GetSharp(*fs);
-        if (!sharp.base_address || sharp.GetSize() != sizeof(constants)) continue;
+        if (!sharp.base_address || (gt7 ? sharp.GetSize() < sizeof(constants) : sharp.GetSize() != sizeof(constants))) continue;
         if (!Core::RytyMemory::GuardedCopy(constants.data(),
                 reinterpret_cast<const void*>(sharp.base_address), sizeof(constants))) { NATIVE_DIAGNOSTIC(static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 6, fs {:#x}", fs ? fs->pgm_hash : 0);); return; }
-        valid = std::ranges::all_of(constants, [](float v) { return std::isfinite(v); }) &&
-            std::abs(constants[14] - size.width * .5f) <= .01f &&
-            std::abs(constants[15] + size.height * .5f) <= .01f &&
-            ((constants[16] == size.width && constants[17] == size.height) ||
-             // WIDE-062: with the wide scene the game leaves these two at 0 (the half-size pair
-             // above still matches); only that pair and the jitter are used by the capture.
-             (RytyWideScene() && constants[16] == 0.f && constants[17] == 0.f)) &&
+        const bool known_scale = gt7
+            ? constants[14] != 0.f && constants[15] != 0.f &&
+              std::abs(constants[14]) <= size.width && std::abs(constants[15]) <= size.height
+            : std::abs(constants[14] - size.width * .5f) <= .01f &&
+              std::abs(constants[15] + size.height * .5f) <= .01f &&
+              ((constants[16] == size.width && constants[17] == size.height) ||
+               (RytyWideScene() && constants[16] == 0.f && constants[17] == 0.f));
+        valid = known_scale && std::ranges::all_of(constants, [](float v) { return std::isfinite(v); }) &&
             std::abs(constants[20] * constants[14]) <= 1.f &&
             std::abs(constants[21] * constants[15]) <= 1.f;
         break;
@@ -2024,11 +2040,14 @@ void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Ta
 }
 
 bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& targets,
-                                   const DrawBindings& bindings) {
-    if (Common::IsGt7() || !r.temporalDlss.Enabled()) return false; // (as CaptureNativeFsr)
+                                    DrawBindings& bindings, GtsSceneBinding& scene_binding) {
+    const bool gt7 = Common::IsGt7();
+    const bool guest_output = RytyUpscale::GuestOutputDlss();
+    if ((gt7 && !guest_output) || !r.temporalDlss.Enabled() || RytyGt7NativeDlssMenu()) return false;
     const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
     const auto& regs = r.liverpool->DrawRegs();
-    if (!fs || !IsSceneCompositionShader(fs->pgm_hash) || regs.num_indices > 6 ||
+    if (!fs || (gt7 ? fs->pgm_hash != 0xdf75f23b : !IsSceneCompositionShader(fs->pgm_hash)) ||
+        regs.num_indices > 6 ||
         regs.num_instances.NumInstances() != 1 || targets.depth ||
         targets.state.num_color_attachments != 1 || !targets.colors[0] ||
         regs.blend_control[0].enable || regs.color_target_mask.GetMask(0) != 0xf) return false;
@@ -2041,8 +2060,23 @@ bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& t
     const auto scene = std::ranges::find_if(bindings.sampled, [&](const auto* e) {
         return r.temporalDlss.HasScene(now, e->image->NativeHandle());
     });
-    if (scene == bindings.sampled.end()) return false;
+    if (scene == bindings.sampled.end() || bindings.region_writeback || bindings.writes_buffers ||
+        !bindings.stored.empty()) return false; // A failed reconstruction can replay this draw.
     const auto size = r.temporalDlss.RenderSize();
+    if (guest_output) {
+        const vk::Extent2D output{desc.width, desc.height};
+        const auto& layout = RytyUpscale::DlssLayout();
+        // GT Sport's wide UI proxy receives the full reconstruction after composing its display.
+        const bool wide_proxy = !gt7 && layout.Wide() && UiHires::Wide() &&
+                                IsWideRaceComposition(fs->pgm_hash) && IsDisplayAddress(target->info.guest_address);
+        if ((!wide_proxy && r.temporalDlss.OutputSize() != output) ||
+            (gt7 && !IsDisplayAddress(target->info.guest_address))) return false;
+        if (layout.scene.width) {
+            if (size != layout.scene || r.temporalDlss.OutputSize() != layout.output) return false;
+        } else if (r.temporalDlss.ActiveQuality() == RYGT_DLSS_QUALITY_DLAA) {
+            if (size != output || !RytyGtsInRace()) return false;
+        } else if (size != vk::Extent2D{1920, 1080} || output != vk::Extent2D{3840, 2160}) return false;
+    }
     // WIDE-063: the wide race scene is wider than the game's display buffer (3840x1080 against
     // 1920x1080), so the composition cannot be drawn into it at the scene's size. It is drawn
     // into the reconstruction's input image instead (below), and the reconstruction is shown
@@ -2078,13 +2112,39 @@ bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& t
         fsr_composition = std::move(scratch);
         PrepareImages();
     }
+    // Substitute only the descriptor that reads the TAA result in this composition draw.
+    // Leave unusual or ambiguous views to the game.
+    {
+        std::scoped_lock lock{views_mutex};
+        const auto found = views.find(*scene);
+        if (found == views.end()) return false;
+        vk::DescriptorImageInfo* slot{};
+        const VideoCore::ImageViewInfo* info{};
+        for (const auto& record : found->second) {
+            for (auto& descriptor : bindings.images) {
+                if (descriptor.imageView != *record.view) continue;
+                if (slot || record.use != ViewUse::Sampled) return false;
+                slot = &descriptor;
+                info = &record.info;
+            }
+        }
+        if (!slot || !r.temporalDlss.BindSceneColor(*info, *slot, scene_binding)) return false;
+        bindings.key_layout = nullptr;
+    }
     Splice();
-    r.temporalDlss.PrepareScene(now, TemporalImage(**scene));
     Begin();
     UiHires::Get().scale = 0.f;
     fsr_wide_full = IsWideRaceComposition(fs->pgm_hash); // WIDE-001
-    fsr_game_extent = {targets.state.width, targets.state.height};
-    fsr_wide_drawn = wide && (size.width > desc.width || size.height > desc.height);
+    // GT7 can request a scene-sized viewport for this draw on a full-sized display image.
+    // In that case its coordinates already address the DLSS input directly.
+    const auto& vp = regs.viewports[0];
+    const bool scene_viewport = guest_output && vp.xscale == size.width * 0.5f &&
+        std::abs(vp.yscale) == size.height * 0.5f && vp.xoffset == size.width * 0.5f &&
+        vp.yoffset == size.height * 0.5f;
+    fsr_game_extent = scene_viewport ? size : vk::Extent2D{targets.state.width, targets.state.height};
+    // Render the entire tone-mapped scene into the input image. The reconstructed result goes
+    // into the real display before HUD drawing, even when that display is already full-size.
+    fsr_wide_drawn = guest_output || (wide && (size.width > desc.width || size.height > desc.height));
     if (fsr_wide_drawn) {
         // WIDE-063: the composition goes straight into the reconstruction's input, at its size.
         auto& attachment = targets.state.color_attachments[0];
@@ -2093,7 +2153,7 @@ bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& t
         targets.state.width = size.width;
         targets.state.height = size.height;
         static std::atomic<u32> logged{};
-        if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+        if (!guest_output && logged.fetch_add(1, std::memory_order_relaxed) < 4) {
             std::fprintf(stderr, "[wide] WIDE-063 race composition drawn at %ux%u for DLSS "
                                  "(display buffer %ux%u)\n",
                          size.width, size.height, desc.width, desc.height);
@@ -2102,7 +2162,7 @@ bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& t
     return true;
 }
 
-void NativeRenderer::FinishNativeFsr(const Targets& targets) {
+bool NativeRenderer::FinishNativeFsr(const Targets& targets) {
     EndRendering();
     GlobalBarrier();
     auto& s = Begin();
@@ -2140,27 +2200,12 @@ void NativeRenderer::FinishNativeFsr(const Targets& targets) {
                 size.width, size.height, r.temporalDlss.OutputSize().width,
                 r.temporalDlss.OutputSize().height, target->info.size.width, target->info.size.height);
     } else {
-        if (drawn_in_scratch) {
-            static std::atomic<u32> logged{};
-            if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
-                std::fprintf(stderr, "[wide] WIDE-063 DLSS reconstruction of the wide scene "
-                                     "failed; showing the composition scaled\n");
-            }
-        }
-        // Preserve a complete output picture even if the optional provider fails.
-        auto& fallback = Begin();
-        GlobalBarrier();
-        vk::ImageBlit blit{};
-        blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
-        blit.dstSubresource = blit.srcSubresource;
-        blit.srcOffsets[1] = {s32(size.width), s32(size.height), 1};
-        blit.dstOffsets[1] = {s32(target->info.size.width), s32(target->info.size.height), 1};
-        fallback.cmd.blitImage(scratch, vk::ImageLayout::eGeneral, source,
-                               vk::ImageLayout::eGeneral, blit, vk::Filter::eLinear);
-        fallback.list->Barrier(Native::Rhi::ScopeAll, Native::Rhi::ScopeAll);
+        Begin(); // NGX may already have recorded commands before reporting an error.
+        return false;
     }
     Written(target);
     Begin(); // Direct backend commands invalidate cached Native pipeline/dynamic state.
+    return true;
 }
 
 // PERF-GT7-130: whether the range is not imported yet and starts in a guest mapping of at most
@@ -2755,6 +2800,12 @@ void SetDisplaySlot(std::size_t index, VAddr address, const Libraries::VideoOut:
         --count;
     }
     g_display_slot_count.store(count, std::memory_order_release);
+}
+
+static bool IsPrimaryDisplayExtent(vk::Extent2D extent) {
+    std::scoped_lock lock{g_display_slots_mutex};
+    return g_display_slots[0].address.load(std::memory_order_relaxed) &&
+           g_display_slots[0].extent == extent;
 }
 
 static bool IsDisplayAddress(VAddr address) {
@@ -16076,6 +16127,16 @@ void NativeRenderer::YieldToMappingChanges() {
 
 void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect,
                           bool world_hud) {
+    bool use_game_taa = false;
+    RecordDraw(is_indexed, index_offset, indirect, world_hud, use_game_taa);
+    if (use_game_taa) {
+        // Record the original composition through the usual display/ultrawide routing.
+        RecordDraw(is_indexed, index_offset, indirect, world_hud, use_game_taa);
+    }
+}
+
+void NativeRenderer::RecordDraw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect,
+                                bool world_hud, bool& use_game_taa) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::DrawTotal}; // DIAG-SGT-023
     YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
@@ -17177,11 +17238,40 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         PhaseClock clock{stats.phase_ns[6]};
         PrepareImages(b); // PERF-109
     }
-    const bool native_fsr_composition = BeginNativeFsr(*pipeline, targets, b);
+    GtsSceneBinding scene_binding;
+    const bool native_fsr_composition = !use_game_taa && !indirect &&
+        BeginNativeFsr(*pipeline, targets, b, scene_binding);
+    SCOPE_EXIT {
+        if (scene_binding.slot) {
+            DrainBinder(); // A queued descriptor bind may still refer to this slot.
+            scene_binding.Restore();
+            b.key_layout = nullptr;
+        }
+    };
     if (native_fsr_composition) scale_composition = false;
     if (!native_fsr_composition && !PrepareUiTarget(targets, *pipeline)) {
         NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
+    }
+    // The race HUD uses scene coordinates. A native menu sub-viewport already
+    // addresses its rectangle inside the UHD display.
+    const auto& guest_vp = regs.viewports[0];
+    const auto& layout = RytyUpscale::DlssLayout();
+    // Older launchers supplied only the 4K Performance flag.
+    const auto hud_scene = layout.scene.width ? layout.scene : vk::Extent2D{1920, 1080};
+    const auto hud_output = layout.output.width ? layout.output : vk::Extent2D{3840, 2160};
+    const bool scale_guest_display = RytyUpscale::GuestOutputDlss() && !native_fsr_composition &&
+        r.temporalDlss.ActiveQuality() != RYGT_DLSS_QUALITY_DLAA && !UiHires::Wide() &&
+        targets.state.num_color_attachments == 1 && targets.colors[0] &&
+        targets.state.width == hud_output.width && targets.state.height == hud_output.height &&
+        std::abs(guest_vp.xscale) <= hud_scene.width * .5f &&
+        std::abs(guest_vp.yscale) <= hud_scene.height * .5f &&
+        IsDisplayAddress(targets.colors[0]->info.guest_address) && !RytyGt7NativeDlssMenu();
+    if (scale_guest_display) {
+        auto& ui = UiHires::Get();
+        ui.scale = float(hud_output.width) / hud_scene.width;
+        ui.scale_y = float(hud_output.height) / hud_scene.height;
+        ui.offset_x = ui.offset_y = 0.f;
     }
     for (unsigned attempt = 0; b.region_writeback && !RegionPlanValid(*b.region_writeback) && attempt < 4; ++attempt) {
         b.Clear();
@@ -17631,7 +17721,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         parallel_bindings.ordinary_images=worker_result->ordinary_images;
     };
     // NAT-161 indirect draws and GT7-UW HUD draws stay on the serial recorder.
-    if(parallel && !parallel->closing && parallel->applied_mode.Enabled() && !indirect && !hud_black_state) {
+    if(parallel && !parallel->closing && parallel->applied_mode.Enabled() && !indirect && !hud_black_state && !scale_guest_display) {
 #if !defined(NDEBUG)
         static const bool whole_enabled=[] {const char* p=std::getenv("SHADGT_PARALLEL_WHOLE_PREFLIGHT");return p && p[0]=='1' && p[1]=='\0';}();
         const bool whole_sample=whole_enabled && ((++parallel->whole_seq & 127u)==0);
@@ -19758,8 +19848,15 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     }
 
 #endif
-    if (native_fsr_composition) FinishNativeFsr(targets);
-    else CaptureNativeFsr(*pipeline, targets, b);
+    if (native_fsr_composition) {
+        use_game_taa = !FinishNativeFsr(targets);
+    } else if (use_game_taa) {
+        const auto* fs = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        LOG_INFO(Render_Vulkan, "Temporal fallback: composed game TAA with shader {:#x} into {}x{}",
+                 fs->pgm_hash, targets.state.width, targets.state.height);
+    } else {
+        CaptureNativeFsr(*pipeline, targets, b);
+    }
 
     if (scale_composition) {
         EndRendering();

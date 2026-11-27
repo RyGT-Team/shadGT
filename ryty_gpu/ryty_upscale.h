@@ -30,6 +30,14 @@ bool UpscaleRequested(); // ryty_dlssg.h: GPU.dlss_enabled and Streamline's DLSS
 
 namespace Vulkan::RytyUpscale {
 
+inline bool GuestOutputDlss() {
+    static const bool on = [] {
+        const char* value = std::getenv("RYGT_DLSS_GUEST_OUTPUT");
+        return value && std::string_view(value) == "1";
+    }();
+    return on;
+}
+
 enum class Quality { Auto, Native, Quality, Balanced, Performance, UltraPerformance };
 
 inline Quality GetQuality() {
@@ -156,6 +164,7 @@ struct TemporalInputs {
 /// never tried with it, so it keeps DLSS on single frames. RYGT_DLSS_TEMPORAL=0 turns it off, =1
 /// asks for it whatever the settings (the test launchers). Seen on an RTX 4070 only.
 inline bool TemporalWanted() {
+    if (GuestOutputDlss()) return false; // Full-size guest output reconstructs before the HUD.
     static const bool on = [] {
         const char* env = std::getenv("SHADGT_DLSS_TEMPORAL");
         if (env && (env[0] == '0' || env[0] == '1')) {

@@ -21,7 +21,7 @@
 
 namespace VideoCore {
 
-#ifndef NDEBUG
+#if !defined(NDEBUG) || defined(SHADGT_DIAGNOSTICS)
 enum class CaptureState {
     Idle,
     Triggered,
@@ -76,7 +76,7 @@ static std::atomic<u32> screenshot_with_overlays_count{0};
 static std::mutex requested_screenshot_paths_mutex;
 static std::vector<std::filesystem::path> requested_game_paths, requested_overlay_paths;
 
-#ifndef NDEBUG
+#if !defined(NDEBUG) || defined(SHADGT_DIAGNOSTICS)
 RENDERDOC_API_1_6_0* rdoc_api{};
 
 void LoadRenderDoc() {

@@ -7059,7 +7059,13 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         u64 upload_offset{};
         u8* mapped{};
         bool remapped{};
+        bool download_only{};
     };
+    static const bool reuse_full_download = [] {
+        const char* env = std::getenv("SHADGT_REUSE_FULL_DOWNLOAD"); // PERF-SGT-221
+        const bool enabled = env && std::strcmp(env, "1") == 0;
+        return enabled;
+    }();
     std::vector<RefreshPagePlan> refresh(pages.size());
     {
         std::scoped_lock lock{region_dirty_mutex};
@@ -7082,13 +7088,19 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
             UNREACHABLE_MSG("native region refresh page import or alignment failed");
             return;
         }
-        auto whole = direct->PlanLeasedParts(page, page_bytes, 4, 4);
-        if (!whole) {
-            UNREACHABLE_MSG("native region refresh page preflight failed");
-            return;
+        auto& plan = refresh[i];
+        plan.download_only = reuse_full_download && !plan.remapped && plan.downloads.size() == 1 &&
+                             plan.downloads.front().first == page &&
+                             plan.downloads.front().second == page + page_bytes;
+        if (!plan.download_only) {
+            auto whole = direct->PlanLeasedParts(page, page_bytes, 4, 4);
+            if (!whole) {
+                UNREACHABLE_MSG("native region refresh page preflight failed");
+                return;
+            }
+            plan.whole = std::move(*whole);
+            lease_count += plan.whole.size();
         }
-        refresh[i].whole = std::move(*whole);
-        lease_count += refresh[i].whole.size();
         for (const auto [from, to] : refresh[i].downloads) {
             if (from < page || to > page + page_bytes || from >= to ||
                 (from - region.begin) % 4 || (to - from) % 4 ||
@@ -7109,7 +7121,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
     try {
         Native::ReserveAdditional(s.imported_view_leases, lease_count);
         for (size_t i = 0; i < pages.size(); ++i) {
-            if (refresh[i].remapped) continue;
+            if (refresh[i].remapped || refresh[i].download_only) continue;
             bool valid = false;
             std::tie(refresh[i].upload, refresh[i].upload_offset, refresh[i].mapped) =
                 Allocate(std::min<u64>(4096, region.end - pages[i]), 4, &valid);
@@ -7191,7 +7203,8 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
             UNREACHABLE_MSG("native region refresh cannot safely read guest page");
             return;
         }
-        std::memcpy(refresh[i].mapped, cpu_copy.get() + i * 4096, bytes); // PERF-GTS-390
+        if (!refresh[i].download_only)
+            std::memcpy(refresh[i].mapped, cpu_copy.get() + i * 4096, bytes); // PERF-GTS-390
     }
     for (auto& page : refresh) {
         for (auto& part : page.whole) s.imported_view_leases.push_back(part.lease);
@@ -7210,6 +7223,9 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
                                .size = part.size});
     };
     const auto copy_snapshot = [&](size_t index, VAddr from, u64 bytes) {
+        if (refresh[index].download_only) {
+            return;
+        }
         // The CPU can rewrite/reuse the imported guest pages before a queued
         // copy executes. Upload exactly the bytes compared below from storage
         // retained by this stream until GPU completion, not from the live pages.

@@ -100,6 +100,9 @@ private:
     void transitSource(GtsSceneImage& source, vk::ImageLayout layout,
                        vk::PipelineStageFlags2 stage, vk::AccessFlags2 access);
     void copyBack(GtsSceneImage display);
+    /// FIX-SGT-206: GT7's motion vectors into `motion` with the frame's jitter (unit_x, unit_y: its
+    /// constants c20, c21, in the vectors' unit) taken out. False: copy them as they are.
+    bool fixMotion(GtsSceneImage source, float unit_x, float unit_y);
     void copyDepthForFsr();
     bool isActive(u64 frame, u64 uid) const;
 
@@ -125,6 +128,11 @@ private:
     RytyFsr3::Temporal fsr;
     bool useXess{}; // XESS-200: the scene goes to Intel XeSS
     RytyXess::Temporal xess;
+    // FIX-SGT-206: the pass that writes GT7's motion vectors without the frame's jitter.
+    vk::UniqueDescriptorSetLayout motionSetLayout;
+    vk::UniquePipelineLayout motionLayout;
+    vk::UniquePipeline motionPipeline;
+    bool motionFixFailed{}, motionFixed{};
     u64 evaluatedFrames{}, nativePresentations{}, guestSyncs{}, nativeHudDraws{}, fallbacks{};
     std::chrono::steady_clock::time_point lastScene{};
 };

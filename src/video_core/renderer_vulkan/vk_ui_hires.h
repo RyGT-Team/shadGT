@@ -30,6 +30,7 @@
 #include "ryty_gpu/ryty_dlss_layout.h"
 #include "ryty_gpu/ryty_pro_mode.h"
 #include "ryty_gpu/ryty_hdr_ui.h"
+#include "video_core/renderer_vulkan/ui_fit_policy.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -44,6 +45,7 @@ struct RytySceneExtent {
 };
 RytySceneExtent RytySceneSize();
 bool RytyWideScene();
+bool RytyTallScreen(); // FEAT-SGT-203: the wide scene on a screen taller than 16:9
 bool RytyWideViews();  // WIDE-002/004: the game's 3D views are widened
 bool RytyHudSpread();  // WIDE-005: race HUD sides moved to the screen's edges
 bool RytyGtsRaceSession(); // WIDE-015: from a race project until the menus proper
@@ -185,6 +187,17 @@ inline bool Wide() {
 #endif
 }
 
+/// FEAT-SGT-203: Wide() on a screen taller than 16:9: the game's picture between bands at the
+/// top and bottom, the race picture over the whole output.
+inline bool Tall() {
+#ifdef RYTY_GPU
+    static const bool tall = Wide() && RytyTallScreen();
+    return tall;
+#else
+    return false;
+#endif
+}
+
 
 /// The part of the proxy that holds the game's display buffer: all of it, or (wide output) the
 /// rectangle of the display buffer's shape in its middle.
@@ -192,16 +205,10 @@ inline vk::Rect2D UiRect(const Proxy& proxy) {
     if (!Wide() || proxy.native.width == 0 || proxy.native.height == 0) {
         return vk::Rect2D{{0, 0}, proxy.size};
     }
-    u32 width = u32(std::lround(double(proxy.size.height) * proxy.native.width /
-                                proxy.native.height));
-    u32 height = proxy.size.height;
-    if (width > proxy.size.width) {
-        width = proxy.size.width;
-        height = u32(std::lround(double(proxy.size.width) * proxy.native.height /
-                                 proxy.native.width));
-    }
-    return vk::Rect2D{{s32((proxy.size.width - width) / 2), s32((proxy.size.height - height) / 2)},
-                      {width, height}};
+    // Centred both ways: bars at the sides (wider), bands at the top and bottom (FEAT-SGT-203).
+    const UiFit::Rect rect = UiFit::Centred(proxy.size.width, proxy.size.height,
+                                            proxy.native.width, proxy.native.height);
+    return vk::Rect2D{{rect.x, rect.y}, {rect.width, rect.height}};
 }
 
 /// The viewport and scissor mapping of draws into the proxy: game coordinates (the display
@@ -1051,9 +1058,15 @@ inline std::optional<Shown> TakeFrame(const Instance& instance, vk::CommandBuffe
     const bool same_shape = output.width > native.width && output.height > native.height &&
                             std::abs(s64(output.width) * native.height -
                                      s64(output.height) * native.width) <= s64(native.height);
-    const bool wide = Wide() && (dlss_wide || (output.width >= native.width && output.height >= native.height)) &&
-                      s64(output.width) * native.height > s64(output.height) * native.width;
-    const bool wanted = same_shape || wide;
+    // FEAT-SGT-203: or a taller output, the game's picture between bands at the top and bottom.
+    // Not an output smaller than the display buffer (1280x800, 1680x1050): no proxy there.
+    // (FEAT-SGT-189's guest-output DLSS layout is only for wider outputs.)
+    const bool covers = UiFit::Covers(output.width, output.height, native.width, native.height);
+    const bool wide = Wide() && (dlss_wide || covers) &&
+                      UiFit::Wider(output.width, output.height, native.width, native.height);
+    const bool tall =
+        Tall() && covers && UiFit::Taller(output.width, output.height, native.width, native.height);
+    const bool wanted = same_shape || wide || tall;
     const vk::Extent2D size = wanted ? output : vk::Extent2D{};
     Ryty::g_ui_layer_ready.store(wanted, std::memory_order_relaxed); // HDR-UI
     if (proxy.size != size || proxy.native != native) {

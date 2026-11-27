@@ -4541,8 +4541,10 @@ void PS4_SYSV_ABI SetRaceRendering(void* result, void** args) {
 }
 
 void Install(Native::NearCode& code, u8* base) {
+    // FIX-SGT-208: on with the native menu layout (it was opt-in, and nothing set it, so players
+    // got the squeezed reward driver the layout was written for). RYGT_GT7_REWARDS_16_9=0: off.
     const char* opt = std::getenv("RYGT_GT7_REWARDS_16_9");
-    if (opt ? std::string_view(opt) != "1" : !(dlss_layout || native_dlaa))
+    if (opt && opt[0] == '0')
         return;
     // SceneFace.loadCommandFile has already acquired a live stage in r14 and
     // resolved the path in rdx. Observe only its enqueue call, before the worker
@@ -4671,13 +4673,17 @@ std::vector<u8> Bytes(const T& value) {
 }
 
 void Install(u8* base) {
+    // FIX-SGT-208: on by default. GT7 in native ultrawide (the launcher's scene patch, checked
+    // below) renders its menus at 16:9 and switches its targets for the track. It was opt-in and
+    // no launcher set it, so players got the other path (the finished wide menu picture squeezed
+    // into the 16:9 middle) while the tested one stayed off. RYGT_GT7_NATIVE_MENU_16_9=0: off.
     const char* opt = std::getenv("RYGT_GT7_NATIVE_MENU_16_9");
     const char* menus = std::getenv("RYGT_ULTRAWIDE_MENUS");
     const char* guest_output = std::getenv("RYGT_DLSS_GUEST_OUTPUT");
     const char* native_menus = std::getenv("RYGT_DLSS_NATIVE_MENUS");
     const bool dlss = guest_output && std::string_view(guest_output) == "1";
     const bool enabled = dlss ? !(native_menus && native_menus[0] == '0')
-                              : opt && std::string_view(opt) == "1" && !(menus && menus[0] == '0');
+                              : !(opt && opt[0] == '0') && !(menus && menus[0] == '0');
     if (!enabled || !g_gt7_race_hook_installed.load()) return;
     const char* dlaa = std::getenv("RYGT_NATIVE_DLAA");
     const auto& layout = Vulkan::RytyUpscale::DlssLayout();

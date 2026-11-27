@@ -69,6 +69,8 @@ bool RytyWideScene();
 bool RytyWideViews();
 bool RytyGtsInRace();
 float RytyDisplayAspect();
+bool RytyRaceRunning();     // GAME-006
+bool RytyRaceStartSignal(); // GAME-006
 }
 
 namespace {
@@ -4605,8 +4607,33 @@ void Install(Native::NearCode& code, u8* base) {
 
 u32 PackedExtent(u32 w, u32 h) { return (h << 16) | w; }
 
+// FIX-SGT-238: a race project's whole-screen interfaces take the menus' layout, as Rewards does:
+// the pre-race screen, the pause menu and the results. In the track's layout their interface is
+// split from the scene and laid back at 16:9, which a menu's pages do not survive (HudSplitNow's
+// note of 2026-11-11): on the owner's plays of 2026-11-27, at 1920x1200 and at 3840x1080, the
+// buttons and translucent panels had wrong colours and flickered. GT7's race state (GAME-006)
+// says when the race itself runs: from its countdown to its finish, and not while paused.
+// Not with the DLSS layout, which has its own handling of these screens (FEAT-SGT-189).
+// Off by default, RYGT_GT7_INTERFACE_16_9=1 turns it on: the owner prefers these screens at the
+// scene's own shape (played both ways at 3840x1080 on 2026-11-27), where FIX-SGT-237 stops the
+// flicker and FEAT-SGT-201 dims the pause to the edges; the buttons' tint is still off there.
+bool InterfaceLayoutOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_GT7_INTERFACE_16_9");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
 bool TrackRequested() {
-    return Vulkan::RytyGtsInRace() && !Rewards::active_stage.load(std::memory_order_acquire);
+    if (!Vulkan::RytyGtsInRace() || Rewards::active_stage.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (!dlss_layout && !native_dlaa && InterfaceLayoutOn() && Vulkan::RytyRaceStartSignal() &&
+        !Vulkan::RytyRaceRunning()) {
+        return false;
+    }
+    return true;
 }
 
 void PS4_SYSV_ABI ConfigureTargets() {

@@ -6189,10 +6189,28 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     return PipelineForCurrentKey(params);
 }
 
+namespace {
+// NAT-031: a job thread's own copies of the infos it matches (MatchInfo).
+struct JobInfoCopy {
+    u64 identity{};
+    std::unique_ptr<Shader::Info> info;
+};
+thread_local std::unordered_map<const Shader::Info*, JobInfoCopy> t_job_info_copies;
+} // namespace
+
 const GraphicsPipeline* PipelineCache::LookupBuiltPipeline(const DrawIndirectParams params) {
     // NAT-031: the key is computed in this thread's own scratch; the cache's own (the threads
     // above's last selection) is not touched.
     static thread_local KeyScratch scratch;
+    // FIX-SGT-148 (RyGT #72): programs come and go, so the copies are not kept forever; they are
+    // dropped here, before any stage is matched. MatchInfo dropped them itself once there were
+    // 8192, in the middle of a lookup: the stages bound before it (the pixel shader first)
+    // pointed at freed infos, and PrepareJobDraw's StageHash read their user data through a
+    // null pointer (GT Sport, Prepare0, read of 0x0 at a race start). The last lookup's infos
+    // are valid only until the next one (JobInfos), so nothing still in use is dropped.
+    if (t_job_info_copies.size() > 8192) {
+        t_job_info_copies.clear();
+    }
     KeyScratch* const saved = std::exchange(t_scratch, &scratch);
     t_lookup_only = true;
     scratch.draw_indirect_params = params;
@@ -6219,15 +6237,8 @@ const GraphicsPipeline* PipelineCache::LookupBuiltPipeline(const DrawIndirectPar
 }
 
 Shader::Info& PipelineCache::MatchInfo(const Shader::Info& cached) {
-    struct Copy {
-        u64 identity{};
-        std::unique_ptr<Shader::Info> info;
-    };
-    static thread_local std::unordered_map<const Shader::Info*, Copy> copies;
-    if (copies.size() > 8192) {
-        copies.clear(); // programs come and go: don't keep copies of retired ones forever
-    }
-    auto& copy = copies[&cached];
+    // FIX-SGT-148: trimmed at the start of LookupBuiltPipeline, never during a lookup.
+    auto& copy = t_job_info_copies[&cached];
     if (!copy.info || copy.identity != cached.identity) {
         copy.info = std::make_unique<Shader::Info>(cached);
         copy.identity = cached.identity;

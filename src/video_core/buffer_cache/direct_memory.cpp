@@ -98,7 +98,10 @@ bool ParallelDirectViewCoherent(const DirectMemory* owner, std::uint64_t base, s
 }
 
 DirectMemory::DirectMemory(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_)
-    : instance{instance_}, scheduler{scheduler_} {
+    : instance{instance_}, scheduler{scheduler_}, imported_coverage{[] {
+          const char* flag = std::getenv("SHADGT_IMPORT_COVERAGE_SUMMARY"); // PERF-SGT-224
+          return flag && std::strcmp(flag, "1") == 0;
+      }()} {
     imported_view_epoch.fetch_add(1, std::memory_order_acq_rel);
     l1 = std::make_unique<Buffer>(instance, 0, L1Entries * sizeof(u64), MemoryType::Stream,
                                   "D1 page table L1");

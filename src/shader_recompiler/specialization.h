@@ -131,33 +131,7 @@ struct StageSpecialization {
             // Specialize shader on VS input number types to follow spec.
             ForEachSharp(vs_attribs, fetch_shader_data.attributes,
                          [this](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
-                             using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
-                             if (const auto step_rate = desc.GetStepRate();
-                                 step_rate != InstanceIdType::None) {
-                                 spec.divisor = step_rate == InstanceIdType::OverStepRate0
-                                                    ? runtime_info.sw.vs.step_rate_0
-                                                    : (step_rate == InstanceIdType::OverStepRate1
-                                                           ? runtime_info.sw.vs.step_rate_1
-                                                           : 1);
-                             }
-                             // FIX-060: a V# of a gigabyte or more is garbage. GT Sport's race
-                             // summary quads read float vertex data as their V#s, different
-                             // every frame; specializing on them made a new variant and pipeline
-                             // nearly every frame, and those draws were skipped while each built
-                             // (the flickering driver figure). Such an attribute counts as plain
-                             // floats. -DisablePerf 83 specializes on it.
-                             if (Gcn::VertexAttribute::IsGarbage(sharp)) {
-                                 spec.num_class = AmdGpu::NumberClass::Float;
-                                 spec.dst_select = AmdGpu::CompMapping{
-                                     .r = AmdGpu::CompSwizzle::Red,
-                                     .g = AmdGpu::CompSwizzle::Green,
-                                     .b = AmdGpu::CompSwizzle::Blue,
-                                     .a = AmdGpu::CompSwizzle::Alpha,
-                                 };
-                                 return;
-                             }
-                             spec.num_class = AmdGpu::GetNumberClass(sharp.GetNumberFmt());
-                             spec.dst_select = sharp.DstSelect();
+                             SetVertexAttributeSpec(spec, desc, sharp, runtime_info);
                          });
         }
         // FIX-043: with the resource usage of the translation known, the key holds only the
@@ -166,14 +140,12 @@ struct StageSpecialization {
         // V# translation saw instead of zeros. Thread-id addressing and coherence, which the
         // code also reads from the V#, are added to the key.
         const bool usage_known = info->resource_usage_known;
-        // FIX-GT7-024: -DisablePerf 172 compares buffers bound empty as any other.
-        static const bool empty_without_addressing = Common::PerfFeatureEnabled(172);
         u32 binding{};
         ForEachSharp(
             binding, buffers, info->buffers,
-            [this, usage_known, &binding](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
+            [this, &binding](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
                 const size_t index = &desc - info->buffers.data();
-                if (empty_without_addressing && !desc.IsSpecial() && IsBoundEmpty(sharp)) {
+                if (BoundEmptyForMatch(desc, sharp)) {
                     bound_empty[binding - 1] = true; // ForEachSharp counted it already
                 }
                 // FIX-SGT-008: a V# whose last word has reserved bits or a type set is no buffer (an unused slot holding
@@ -182,40 +154,10 @@ struct StageSpecialization {
                 // time, so GT7 translated and compiled the same shaders again all session and their
                 // draws were skipped (endless popping). Such a slot is specialized as a default
                 // buffer. SHADGT_BUFFER_JUNK_FILTER=0: as before.
-                static const bool junk_filter = [] {
-                    const char* env = std::getenv("SHADGT_BUFFER_JUNK_FILTER");
-                    return !(env && env[0] == '0');
-                }();
                 // Only the last word's reserved bits and type count: GT7 keeps other data in the
                 // address's upper byte (_padding0) of buffers it really reads (fs 0x7e5778be:
                 // 11288000 00407010 00000001 18027204), which the hardware ignores.
-                if (junk_filter && !desc.IsSpecial() && (sharp._padding1 != 0 || sharp.type != 0)) {
-                    spec.stride = 0;
-                    spec.is_formatted = desc.is_formatted;
-                    spec.swizzle_enable = 0;
-                    spec.add_tid_enable = 0;
-                    spec.coherent = desc.buffer_type == BufferType::SharedMemory;
-                    return;
-                }
-                spec.stride =
-                    !usage_known || info->buffer_stride_used[index] ? sharp.GetStride() : 0;
-                if (usage_known) {
-                    spec.add_tid_enable = sharp.add_tid_enable;
-                    spec.coherent =
-                        desc.buffer_type == BufferType::SharedMemory || sharp.mtype == 3;
-                }
-                spec.is_formatted = desc.is_formatted;
-                spec.swizzle_enable = sharp.swizzle_enable;
-                if (spec.is_formatted) {
-                    spec.data_format = static_cast<u32>(sharp.GetDataFmt());
-                    spec.num_format = static_cast<u32>(sharp.GetNumberFmt());
-                    spec.dst_select = sharp.DstSelect();
-                    spec.num_conversion = sharp.GetNumberConversion();
-                }
-                if (spec.swizzle_enable) {
-                    spec.index_stride = sharp.index_stride;
-                    spec.element_size = sharp.element_size;
-                }
+                SetBufferSpec(spec, *info, index, sharp);
             },
             usage_known);
         ForEachSharp(
@@ -278,6 +220,112 @@ struct StageSpecialization {
             info->ReadTessConstantBuffer(tess_constants);
             runtime_info.InitFromTessConstants(tess_constants);
         }
+    }
+
+    static void SetVertexAttributeSpec(VsAttribSpecialization& spec, const Gcn::VertexAttribute& desc,
+                                       AmdGpu::Buffer sharp, const RuntimeInfo& runtime_info) {
+        using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
+        if (const auto step_rate = desc.GetStepRate();
+            step_rate != InstanceIdType::None) {
+            spec.divisor = step_rate == InstanceIdType::OverStepRate0
+                               ? runtime_info.sw.vs.step_rate_0
+                               : (step_rate == InstanceIdType::OverStepRate1
+                                      ? runtime_info.sw.vs.step_rate_1
+                                      : 1);
+        }
+        // FIX-060: a V# of a gigabyte or more is garbage. GT Sport's race
+        // summary quads read float vertex data as their V#s, different
+        // every frame; specializing on them made a new variant and pipeline
+        // nearly every frame, and those draws were skipped while each built
+        // (the flickering driver figure). Such an attribute counts as plain
+        // floats. -DisablePerf 83 specializes on it.
+        if (Gcn::VertexAttribute::IsGarbage(sharp)) {
+            spec.num_class = AmdGpu::NumberClass::Float;
+            spec.dst_select = AmdGpu::CompMapping{
+                .r = AmdGpu::CompSwizzle::Red,
+                .g = AmdGpu::CompSwizzle::Green,
+                .b = AmdGpu::CompSwizzle::Blue,
+                .a = AmdGpu::CompSwizzle::Alpha,
+            };
+            return;
+        }
+        spec.num_class = AmdGpu::GetNumberClass(sharp.GetNumberFmt());
+        spec.dst_select = sharp.DstSelect();
+    }
+
+    static void SetBufferSpec(BufferSpecialization& spec, const Info& info, size_t index,
+                              AmdGpu::Buffer sharp) {
+        const auto& desc = info.buffers[index];
+        const bool usage_known = info.resource_usage_known;
+        static const bool junk_filter = [] {
+            const char* env = std::getenv("SHADGT_BUFFER_JUNK_FILTER");
+            return !(env && env[0] == '0');
+        }();
+        if (junk_filter && !desc.IsSpecial() && (sharp._padding1 != 0 || sharp.type != 0)) {
+            spec.stride = 0;
+            spec.is_formatted = desc.is_formatted;
+            spec.swizzle_enable = 0;
+            spec.add_tid_enable = 0;
+            spec.coherent = desc.buffer_type == BufferType::SharedMemory;
+            return;
+        }
+        spec.stride =
+            !usage_known || info.buffer_stride_used[index] ? sharp.GetStride() : 0;
+        if (usage_known) {
+            spec.add_tid_enable = sharp.add_tid_enable;
+            spec.coherent =
+                desc.buffer_type == BufferType::SharedMemory || sharp.mtype == 3;
+        }
+        spec.is_formatted = desc.is_formatted;
+        spec.swizzle_enable = sharp.swizzle_enable;
+        if (spec.is_formatted) {
+            spec.data_format = static_cast<u32>(sharp.GetDataFmt());
+            spec.num_format = static_cast<u32>(sharp.GetNumberFmt());
+            spec.dst_select = sharp.DstSelect();
+            spec.num_conversion = sharp.GetNumberConversion();
+        }
+        if (spec.swizzle_enable) {
+            spec.index_stride = sharp.index_stride;
+            spec.element_size = sharp.element_size;
+        }
+    }
+
+    static bool BoundEmptyForMatch(const BufferResource& desc, AmdGpu::Buffer sharp) {
+        static const bool enabled = Common::PerfFeatureEnabled(172);
+        return enabled && !desc.IsSpecial() && IsBoundEmpty(sharp);
+    }
+
+    bool MatchesBufferVertex(const Info& current, const RuntimeInfo& runtime,
+                             Backend::Bindings binding) const {
+        Gcn::FetchShaderData fetch;
+        const bool parsed = Gcn::ParseFetchShader(current, fetch);
+        bool equal = Valid() && buffers.size() == current.buffers.size() &&
+                     images.empty() && fmasks.empty() && samplers.empty() &&
+                     vs_attribs.size() == (parsed ? fetch.attributes.size() : 0) &&
+                     runtime_info == runtime && fetch_shader_data == fetch &&
+                     (buffers.empty() || start == binding);
+        if (parsed) {
+            for (size_t i = 0; i < fetch.attributes.size(); ++i) {
+                const auto& desc = fetch.attributes[i];
+                const auto sharp = desc.GetSharp(current);
+                if (equal) {
+                    VsAttribSpecialization spec{};
+                    if (sharp) SetVertexAttributeSpec(spec, desc, sharp, runtime);
+                    equal = vs_attribs[i] == spec;
+                }
+            }
+        }
+        for (size_t i = 0; equal && i < current.buffers.size(); ++i) {
+            const auto& desc = current.buffers[i];
+            const auto sharp = desc.GetSharp(current);
+            if (sharp) {
+                BufferSpecialization spec{};
+                SetBufferSpec(spec, current, i, sharp);
+                equal = BoundEmptyForMatch(desc, sharp) ? buffers[i].SameButAddressing(spec)
+                                                       : buffers[i] == spec;
+            }
+        }
+        return equal;
     }
 
     /// PERF-GT7-058: whether PackInputs may stand for a new specialization of this stage. Not

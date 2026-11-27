@@ -10319,6 +10319,17 @@ PipelineCache::Result PipelineCache::GetProgramForJob(HwStage hw_stage,
     return none();
 }
 
+static void ReportRejectedSpecialization(const Shader::Info& info,
+                                         const Common::RecoverableFailure& error) {
+    static thread_local std::unordered_set<u64> reported;
+    if (reported.insert(info.pgm_hash).second) {
+        LOG_WARNING(Render_Vulkan,
+                    "SHADER-CANDIDATE-REJECT: shader {:#x}: {}; trying other cached "
+                    "permutations or a fresh translation",
+                    info.pgm_hash, error.what());
+    }
+}
+
 // A cached permutation can describe a different fetch-shader layout from the current draw.
 // Reject only that candidate; a later permutation or a fresh translation can still be valid.
 static std::optional<Shader::StageSpecialization> TryMatchingSpecialization(
@@ -10328,15 +10339,29 @@ static std::optional<Shader::StageSpecialization> TryMatchingSpecialization(
         return std::optional<Shader::StageSpecialization>{std::in_place, info, runtime_info,
                                                           profile, binding};
     } catch (const Common::RecoverableFailure& error) {
-        static thread_local std::unordered_set<u64> reported;
-        if (reported.insert(info.pgm_hash).second) {
-            LOG_WARNING(Render_Vulkan,
-                        "SHADER-CANDIDATE-REJECT: shader {:#x}: {}; trying other cached "
-                        "permutations or a fresh translation",
-                        info.pgm_hash, error.what());
-        }
+        ReportRejectedSpecialization(info, error);
         return std::nullopt;
     }
+}
+
+static bool MatchesLastSpecialization(const Shader::StageSpecialization& stored,
+                                      const Shader::Info& info, const Shader::RuntimeInfo& runtime,
+                                      const Shader::Profile& profile, Shader::Backend::Bindings binding) {
+    static const bool direct = [] {
+        const char* value = std::getenv("SHADGT_VERTEX_MATCH"); // PERF-SGT-230
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    if (direct && info.sw_stage == Shader::SwStage::Vertex && info.has_fetch_shader && info.images.empty() &&
+        info.fmasks.empty() && info.samplers.empty()) {
+        try {
+            return stored.MatchesBufferVertex(info, runtime, binding);
+        } catch (const Common::RecoverableFailure& error) {
+            ReportRejectedSpecialization(info, error);
+            return false;
+        }
+    }
+    const auto spec = TryMatchingSpecialization(info, runtime, profile, binding);
+    return spec && stored == *spec;
 }
 
 namespace {
@@ -10689,8 +10714,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
             if (matched) NoteSearch(hw_stage, SearchLastPacked); // DIAG-SGT-024
             if (!matched) {
                 Common::PhaseTimer spec_timer{Common::Phase::SelSpec};
-                const auto current_spec = TryMatchingSpecialization(info, runtime_info, profile, binding);
-                matched = current_spec && permutation.spec == *current_spec;
+                matched = MatchesLastSpecialization(permutation.spec, info, runtime_info, profile, binding);
                 if (matched) NoteSearch(hw_stage, SearchLastSpec); // DIAG-SGT-024
                 if (packed_match && !matched) {
                     LOG_ERROR(Render_Vulkan, "PERF-GT7-058 packed specialization mismatch: {:#x}", params.hash);

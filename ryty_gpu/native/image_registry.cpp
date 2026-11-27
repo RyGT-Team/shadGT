@@ -764,26 +764,42 @@ bool ImageRegistry::Untouched(u64 since, std::span<const std::pair<VAddr, VAddr>
         return true;
     }
     std::scoped_lock lock{changes_mutex};
-    const u64 kept = std::min<u64>(change_count, changes.size());
-    for (u64 i = 0; i < kept; ++i) {
-        const Change& change = changes[(change_count - 1 - i) % changes.size()];
-        if (change.generation <= since) {
-            return true;
-        }
-        for (const auto& [begin, end] : ranges) {
-            if (change.begin < end && change.end > begin) {
+    const auto scan = [&](auto overlaps) {
+        const u64 kept = std::min<u64>(change_count, changes.size());
+        for (u64 i = 0; i < kept; ++i) {
+            const Change& change = changes[(change_count - 1 - i) % changes.size()];
+            if (change.generation <= since) {
+                return true;
+            }
+            if (overlaps(change)) {
                 untouched_no[change.kind >= 1 && change.kind <= 3 ? change.kind : 1].fetch_add(
                     1, std::memory_order_relaxed); // DIAG-GTS-401
                 untouched_no_begin.store(change.begin, std::memory_order_relaxed); // DIAG-GTS-402
                 return false;
             }
         }
+        // Every change kept is newer: the log reaches back far enough only if none was lost.
+        if (change_count > changes.size()) {
+            untouched_no[0].fetch_add(1, std::memory_order_relaxed); // DIAG-GTS-401
+        }
+        return change_count <= changes.size();
+    };
+    static const bool single_range = [] {
+        const char* value = std::getenv("SHADGT_SINGLE_IMAGE_HISTORY"); // PERF-SGT-222
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    if (single_range && ranges.size() == 1) {
+        const auto [begin, end] = ranges.front();
+        return scan([begin, end](const Change& change) {
+            return change.begin < end && change.end > begin;
+        });
     }
-    // Every change kept is newer: the log reaches back far enough only if none was lost.
-    if (change_count > changes.size()) {
-        untouched_no[0].fetch_add(1, std::memory_order_relaxed); // DIAG-GTS-401
-    }
-    return change_count <= changes.size();
+    return scan([ranges](const Change& change) {
+        for (const auto& [begin, end] : ranges) {
+            if (change.begin < end && change.end > begin) return true;
+        }
+        return false;
+    });
 }
 
 bool ImageRegistry::UntouchedHolding(u64 since, std::span<const std::pair<VAddr, VAddr>> ranges,

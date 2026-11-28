@@ -5231,7 +5231,18 @@ void NativeRenderer::FlushWritebacks() {
         vk::Buffer out;
         std::vector<DownloadCopy> scatter;
         std::vector<DownloadCopy> copies;
+        /// PERF-SGT-179: where the same bytes lie in video memory (the batch's scratch buffer),
+        /// and the offset to add to a copy's source offset there.
+        vk::Buffer video{};
+        u64 video_delta = 0;
     };
+    // PERF-SGT-179 (SHADGT_WRITEBACK_REGION_FROM_VIDEO=1, off by default): the regions over a
+    // re-tiled picture get its bytes from the batch's scratch buffer in video memory, where the
+    // re-tiling left them, not from guest memory right after they were written there.
+    static const bool from_video = [] {
+        const char* env = std::getenv("SHADGT_WRITEBACK_REGION_FROM_VIDEO");
+        return env && env[0] == '1' && env[1] == 0;
+    }();
     std::vector<DeferredCopies> deferred;
     std::vector<std::pair<VAddr, VAddr>> deferred_ranges;
     const auto flush_deferred = [&] {
@@ -5260,10 +5271,11 @@ void NativeRenderer::FlushWritebacks() {
                 s.cmd.copyBuffer(d.out, copy.destination,
                                  vk::BufferCopy{.srcOffset = copy.source_offset,
                                                 .dstOffset = copy.destination_offset, .size = copy.size});
-            for (const auto& copy : d.copies)
-                s.cmd.copyBuffer(d.out, copy.destination,
-                                 vk::BufferCopy{.srcOffset = copy.source_offset,
+            for (const auto& copy : d.copies) {
+                s.cmd.copyBuffer(d.video ? d.video : d.out, copy.destination,
+                                 vk::BufferCopy{.srcOffset = copy.source_offset + (d.video ? d.video_delta : 0),
                                                 .dstOffset = copy.destination_offset, .size = copy.size});
+            }
         }
         deferred.clear();
         deferred_ranges.clear();
@@ -5392,8 +5404,18 @@ void NativeRenderer::FlushWritebacks() {
                 .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite};
             s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &copied});
         }
+        const size_t tilings_before = batch.tilings.size();
         if (registry->RecordDownload(*s.list, *entry, *plan.out, plan.offset,
                                      use_batch ? &batch : nullptr)) {
+            // PERF-SGT-179: re-tiled in the batch's scratch buffer: its bytes are there too.
+            vk::Buffer in_video{};
+            u64 in_video_delta = 0;
+            if (from_video && use_batch && batch.scratch && batch.tilings.size() == tilings_before + 1 &&
+                batch.tilings.back().out == plan.out.get() &&
+                batch.tilings.back().out_offset == plan.offset) {
+                in_video = vk::Buffer{Handle<VkBuffer_T>(batch.scratch->NativeHandle())};
+                in_video_delta = batch.tilings.back().tiled_offset - plan.offset;
+            }
             batch_ranges.emplace_back(address, address + size);
             NATIVE_DIAGNOSTIC(++stats.writebacks);
             if (!plan.scatter.empty() || !plan.copies.empty()) {
@@ -5401,7 +5423,8 @@ void NativeRenderer::FlushWritebacks() {
                 // once the batch is finished (PERF-GTS-462: for the whole batch at once).
                 try {
                     deferred.push_back({vk::Buffer{Handle<VkBuffer_T>(plan.out->NativeHandle())},
-                                        std::move(plan.scatter), std::move(plan.copies)});
+                                        std::move(plan.scatter), std::move(plan.copies), in_video,
+                                        in_video_delta});
                     deferred_ranges.emplace_back(address, address + size);
                 } catch (...) {
                     std::terminate(); // the command stream is already mutated

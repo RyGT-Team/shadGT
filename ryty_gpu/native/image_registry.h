@@ -99,6 +99,9 @@ public:
     std::unique_ptr<Rhi::Buffer> download_linear;
     std::unique_ptr<Rhi::Buffer> download_tiled;
     std::unique_ptr<Rhi::Buffer> download_params;
+    /// PERF-SGT-178: what guest memory held over this picture at its first batched write-back,
+    /// in video memory: the bytes the re-tiling leaves unwritten (padding) come from here.
+    std::unique_ptr<Rhi::Buffer> download_padding;
     u32 backend_usage = 0;    ///< from the image factory
     u64 backend_features = 0; ///< from the image factory
     /// NAT-104: when the renderer last wrote the picture (its own clock; 0: never).

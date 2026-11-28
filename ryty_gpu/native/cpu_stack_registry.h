@@ -147,7 +147,7 @@ private:
 inline CpuStackRegistry& CpuStacks() {
     static CpuStackRegistry registry{[] {
         const char* value = std::getenv("SHADGT_STACK_GAP_MEMO"); // PERF-SGT-228
-        return value && value[0] == '1';
+        return value && value[0] == '1' && value[1] == '\0';
     }()};
     return registry;
 }

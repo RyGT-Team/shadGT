@@ -46,7 +46,7 @@ public:
 private:
     static bool Enabled() {
         const char* env = std::getenv("SHADGT_SINGLE_DIRECT_TABLE"); // PERF-SGT-219
-        return env && env[0] == '1';
+        return env && env[0] == '1' && env[1] == '\0';
     }
 
     const bool single = Enabled();

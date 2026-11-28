@@ -17,7 +17,7 @@ std::array<std::span<const Write>, Count> GroupDescriptorWrites(
     std::array<Scratch, Count>& scratch) {
     static const bool group_runs = [] {
         const char* option = std::getenv("SHADGT_DESCRIPTOR_GROUP_RUNS"); // PERF-SGT-217
-        return option && option[0] == '1';
+        return option && option[0] == '1' && option[1] == '\0';
     }();
     if (group_runs) {
         std::array<std::span<const Write>, Count> groups{};

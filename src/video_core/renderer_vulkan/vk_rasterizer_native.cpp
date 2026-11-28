@@ -1855,11 +1855,6 @@ bool NativeRenderer::RingOn() {
     return g_ring_on.load(std::memory_order_relaxed);
 }
 
-bool NativeRenderer::NeedStageBindingEnd() {
-    const char* value = std::getenv("SHADGT_SKIP_UNUSED_STAGE_END"); // PERF-SGT-214
-    return !value || std::strcmp(value, "1") != 0;
-}
-
 bool NativeRenderer::PreparedOn() {
     return PrepareEnabled();
 }
@@ -6999,7 +6994,7 @@ void NativeRenderer::RecordRegionWriteback(const std::shared_ptr<WritebackPlan>&
     }
     static const bool combine_pages = [] {
         const char* env = std::getenv("SHADGT_COMBINE_WRITEBACK_PAGES"); // PERF-SGT-226
-        return env && env[0] == '1';
+        return env && env[0] == '1' && env[1] == '\0';
     }();
     for (size_t i = 0; i < plan.parts.size();) {
         auto& part = plan.parts[i];
@@ -10507,7 +10502,7 @@ void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
         }
         // SHD-002: each stage binds in its own set, from its own start.
         plans[i] = PlanStageResourceBindings(*stage, Shader::Backend::StageStart(u32(stage->sw_stage)),
-                                             need_stage_binding_end);
+                                             false); // PERF-SGT-214: the end is not read here
         auto buffer_binding = plans[i].buffers;
         PhaseClock clock{stats.phase_ns[2]};
         PartClock part{compute ? &stats.dispatch_bind_ns[1] : nullptr}; // DIAG-GT7-004
@@ -13822,8 +13817,6 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     if (!binder && RecorderBinderWanted() != 0 && s.cmd.Ring()) {
         binder = std::make_unique<Native::RecorderBinder<BindJob>>(this, &RunBindJob);
         binder_mode = RecorderBinderWanted();
-        LOG_WARNING(Render_Vulkan, "Descriptor binder publication: {}",
-                    binder->Ring().PublishesAtJobEnd() ? "per job" : "per command");
         LOG_WARNING(Render_Vulkan, "FEAT-SGT-022: descriptor binds are made on a binder thread{}",
                     binder_mode == 2 ? ", one at a time (SHADGT_RECORDER_BINDER=2)" : "");
     }
@@ -15331,7 +15324,7 @@ void NativeRenderer::WrittenSubresources(const Native::ImageEntry* entry, u64 at
         } else if (!subs.empty()) {
             std::fill(subs.begin(), subs.end(), version);
         }
-        if (keep_dependent_snapshot) {
+        if (WholeSourcesOn()) { // PERF-SGT-212: `dependents` is read only then
             for (auto* texture : written->dependents) {
                 texture->sources_dirty.store(true, std::memory_order_relaxed);
                 dependents.push_back(texture);
@@ -15351,11 +15344,6 @@ void NativeRenderer::WrittenSubresources(const Native::ImageEntry* entry, u64 at
             }
         }
     }
-}
-
-bool NativeRenderer::KeepDependentSnapshot() {
-    const char* value = std::getenv("SHADGT_SKIP_UNUSED_DEPENDENT_COPY"); // PERF-SGT-212
-    return !value || std::strcmp(value, "1") != 0 || WholeSourcesOn();
 }
 
 bool NativeRenderer::WholeSourcesOn() {
@@ -21063,7 +21051,7 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
             continue;
         }
         plans[i] = PlanStageResourceBindings(*stage, Shader::Backend::StageStart(u32(stage->sw_stage)),
-                                             need_stage_binding_end);
+                                             false); // PERF-SGT-214: the end is not read here
         auto buffer_binding = plans[i].buffers;
         ok = PrepareBuffers(*stage, regs, buffer_binding, *p);
     }

@@ -180,9 +180,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_DIAG_SPEC_MISS|flag|Diagnostics & tracing|off|1 = on|Logs why stored shader translations (also another GPU's manifest) did not match when the game has to translate a shader again.",
     // Native recorder & sync
     "RYGTSW1|SHADGT_IN_PLACE_STORAGE_WRITES|flag|Native recorder & sync|off|0 = off, 1 = on|Constructs storage-buffer descriptor writes directly in the output vector.",
-    "RYGTSW1|SHADGT_SKIP_UNUSED_DEPENDENT_COPY|flag|Native recorder & sync|off|0 = off, 1 = on|Skips copying dependent image pointers when second-level invalidation is disabled.",
     "RYGTSW1|SHADGT_GROUP_VERTEX_SHARPS|flag|Native recorder & sync|off|0 = off, 1 = on|Read consecutive vertex buffer descriptors within one guest page together.",
-    "RYGTSW1|SHADGT_SKIP_UNUSED_STAGE_END|flag|Native recorder & sync|off|0 = off, 1 = on|Skip the unused end of each stage binding plan in the native recorder and prepared draws.",
     "RYGTSW1|SHADGT_BINDER_BATCH_PUBLISH|flag|Native recorder & sync|off|0 = off, 1 = on|Publishes the descriptor binder's commands once per completed job.",
     "RYGTSW1|SHADGT_DEPTH_TWIN_HINT|flag|Native recorder & sync|off|0 = off, 1 = on|Skips depth/colour partner lookup until an opposite target of the same dimensions has appeared at that address.",
     "RYGTSW1|SHADGT_DESCRIPTOR_GROUP_RUNS|flag|Native recorder & sync|off|0 = off, 1 = on|Group consecutive descriptor writes by set.",

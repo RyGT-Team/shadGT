@@ -640,6 +640,22 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                 superseded.push_back({info.guest_address, &old, frame});
             }
         }
+        static const bool depth_twin_hint = [] {
+            const char* value = std::getenv("SHADGT_DEPTH_TWIN_HINT"); // PERF-SGT-216
+            return value && value[0] == '1' && value[1] == '\0';
+        }();
+        if (depth_twin_hint && render_target) {
+            bool possible = false;
+            for (auto it = first; it != last; ++it) {
+                auto& other = *it->second;
+                if (!other.from_cpu && other.info.props.is_depth != info.props.is_depth &&
+                    other.info.size.width == info.size.width && other.info.size.height == info.size.height) {
+                    other.possible_depth_twin.store(true, std::memory_order_release);
+                    possible = true;
+                }
+            }
+            result->possible_depth_twin.store(possible, std::memory_order_relaxed);
+        }
         shard.images.emplace(info.guest_address, std::move(entry));
         IndexEntry(*result);
         const std::pair<VAddr, VAddr> range{info.guest_address,
@@ -719,8 +735,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         } else if (!remembered && info.num_samples == 1) {
             result->needs_upload.store(true, std::memory_order_relaxed);
             result->force_upload.store(true, std::memory_order_relaxed);
-            std::scoped_lock lock{upload_mutex};
-            pending_uploads.push_back(result);
+            QueueUpload(result);
         }
     } else {
 #ifndef NDEBUG
@@ -728,8 +743,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
 #endif
         LinkTexture(*result);
         result->needs_upload.store(true, std::memory_order_relaxed);
-        std::scoped_lock lock{upload_mutex};
-        pending_uploads.push_back(result);
+        QueueUpload(result);
     }
     return result;
 }
@@ -748,26 +762,42 @@ bool ImageRegistry::Untouched(u64 since, std::span<const std::pair<VAddr, VAddr>
         return true;
     }
     std::scoped_lock lock{changes_mutex};
-    const u64 kept = std::min<u64>(change_count, changes.size());
-    for (u64 i = 0; i < kept; ++i) {
-        const Change& change = changes[(change_count - 1 - i) % changes.size()];
-        if (change.generation <= since) {
-            return true;
-        }
-        for (const auto& [begin, end] : ranges) {
-            if (change.begin < end && change.end > begin) {
+    const auto scan = [&](auto overlaps) {
+        const u64 kept = std::min<u64>(change_count, changes.size());
+        for (u64 i = 0; i < kept; ++i) {
+            const Change& change = changes[(change_count - 1 - i) % changes.size()];
+            if (change.generation <= since) {
+                return true;
+            }
+            if (overlaps(change)) {
                 untouched_no[change.kind >= 1 && change.kind <= 3 ? change.kind : 1].fetch_add(
                     1, std::memory_order_relaxed); // DIAG-GTS-401
                 untouched_no_begin.store(change.begin, std::memory_order_relaxed); // DIAG-GTS-402
                 return false;
             }
         }
+        // Every change kept is newer: the log reaches back far enough only if none was lost.
+        if (change_count > changes.size()) {
+            untouched_no[0].fetch_add(1, std::memory_order_relaxed); // DIAG-GTS-401
+        }
+        return change_count <= changes.size();
+    };
+    static const bool single_range = [] {
+        const char* value = std::getenv("SHADGT_SINGLE_IMAGE_HISTORY"); // PERF-SGT-222
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    if (single_range && ranges.size() == 1) {
+        const auto [begin, end] = ranges.front();
+        return scan([begin, end](const Change& change) {
+            return change.begin < end && change.end > begin;
+        });
     }
-    // Every change kept is newer: the log reaches back far enough only if none was lost.
-    if (change_count > changes.size()) {
-        untouched_no[0].fetch_add(1, std::memory_order_relaxed); // DIAG-GTS-401
-    }
-    return change_count <= changes.size();
+    return scan([ranges](const Change& change) {
+        for (const auto& [begin, end] : ranges) {
+            if (change.begin < end && change.end > begin) return true;
+        }
+        return false;
+    });
 }
 
 bool ImageRegistry::UntouchedHolding(u64 since, std::span<const std::pair<VAddr, VAddr>> ranges,
@@ -1449,6 +1479,7 @@ u32 ImageRegistry::RetireTaken(std::vector<std::unique_ptr<ImageEntry>>& taken,
     {
         std::scoped_lock lock{upload_mutex};
         std::erase_if(pending_uploads, [&](ImageEntry* entry) { return gone.contains(entry); });
+        upload_work.Publish(!pending_uploads.empty());
         std::erase_if(retry_uploads, [&](ImageEntry* entry) { return gone.contains(entry); }); // FIX-SGT-140
     }
     if (!taken.empty()) {
@@ -1532,8 +1563,7 @@ void ImageRegistry::MarkStale(ImageEntry& entry, Stale why) {
     // Explicit RequestUpload separately admits its required rewrite immediately.
     const bool defer = entry.from_cpu;
     if (!already_dirty && !defer) {
-        std::scoped_lock upload_lock{upload_mutex};
-        pending_uploads.push_back(&entry);
+        QueueUpload(&entry);
     }
 }
 
@@ -2291,6 +2321,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
     {
         std::scoped_lock lock{upload_mutex};
         pending.swap(pending_uploads);
+        upload_work.Publish(false);
     }
     {
         // FIX-SGT-140: uploads left out in an earlier frame are due again.
@@ -2910,7 +2941,29 @@ bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, co
             copy.buffer_offset += linear_offset;
         }
         list.CopyImageToBuffer(entry.image.get(), batch->scratch.get(), copies);
-        list.CopyBuffer(&out, out_offset, batch->scratch.get(), tiled_offset, size);
+        // PERF-SGT-178 (SHADGT_WRITEBACK_KEEP_PADDING=1, off by default): the padding the
+        // re-tiling leaves unwritten comes from a copy in video memory, made at the picture's
+        // first write-back, instead of being read from guest memory before every write-back.
+        // Those bytes are inside the picture's own memory, which the write-back overwrites anyway.
+        static const bool keep = [] {
+            const char* env = std::getenv("SHADGT_WRITEBACK_KEEP_PADDING");
+            return env && env[0] == '1' && env[1] == 0;
+        }();
+        if (keep && entry.download_padding && entry.download_padding->Size() >= size) {
+            list.CopyBuffer(entry.download_padding.get(), 0, batch->scratch.get(), tiled_offset, size);
+        } else {
+            list.CopyBuffer(&out, out_offset, batch->scratch.get(), tiled_offset, size);
+            if (keep &&
+                (!entry.download_padding || entry.download_padding->Size() < size)) {
+                auto made = device.CreateBuffer({.size = size,
+                    .usage = Rhi::BufferUsageTransferSrc | Rhi::BufferUsageTransferDst,
+                    .memory = Rhi::MemoryKind::DeviceLocal, .name = "native write-back padding"});
+                if (made) {
+                    list.CopyBuffer(&out, out_offset, made.get(), 0, size);
+                    entry.download_padding = std::move(made);
+                }
+            }
+        }
         batch->tilings.push_back({.pipeline = tile,
                                   .params = batch_params,
                                   .out = &out,

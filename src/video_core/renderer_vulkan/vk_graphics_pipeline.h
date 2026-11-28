@@ -274,6 +274,7 @@ private:
     u32 lds_group_patches{};
     u32 lds_vertex_bytes{};
     Shader::Gcn::FetchShaderData fetch_shader{};
+    bool group_vertex_sharps{};
     ParallelStageSummary parallel_stage_summary;
 };
 

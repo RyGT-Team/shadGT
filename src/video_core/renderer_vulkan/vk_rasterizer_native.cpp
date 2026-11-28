@@ -74,6 +74,7 @@
 
 #include "video_core/renderer_vulkan/build_queue.h"
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
+#include "video_core/amdgpu/guest_dispatch.h"
 #include "common/geometry_trace.h"
 #include "video_core/renderer_vulkan/pipeline_owner.h"
 #include "video_core/buffer_cache/proto_import.h"
@@ -162,7 +163,9 @@
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_native_ui.h"
+#include "ryty_gpu/native/writeback_run.h"
 #include "shader_recompiler/direct_learning.h"
+#include "video_core/renderer_vulkan/direct_table_scratch.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/image_descriptor.h"
 #include "video_core/texture_cache/sampler.h"
@@ -1774,15 +1777,44 @@ bool NativeModeRequested() {
     return requested;
 }
 
+static bool SkipRedundantDescriptorWork() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADGT_DESCRIPTOR_KEY_WORK"); // PERF-SGT-218
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 void NativeRenderer::DrawBindings::PrepareDescriptorKeys(const Pipeline& pipeline) {
     if (!groups_ready) PrepareWriteGroups();
     for (u32 set = 0; set < grouped_writes.size(); ++set) {
         if (grouped_writes[set].empty() || set == pipeline.PushSet()) continue;
         descriptor_keys[set].Build<false>(pipeline.SetLayout(set), grouped_writes[set]);
         auto& key = descriptor_keys[set];
-        if (key.cacheable) key.hash = Native::Parallel::AdaptiveXXH3(key.words.data(), key.words.size() * sizeof(u64));
+        if (key.cacheable && (!SkipRedundantDescriptorWork() || pipeline.DynamicBuffers(set) == 0)) {
+            key.hash = Native::Parallel::AdaptiveXXH3(key.words.data(), key.words.size() * sizeof(u64));
+        }
     }
     key_layout = pipeline.GetLayout();
+}
+
+void NativeRenderer::DrawBindings::AppendStorageWrite(u32 slot, bool in_place) {
+    if (in_place) {
+        auto& write = writes.emplace_back();
+        write.dstBinding = slot;
+        write.descriptorCount = 1;
+        write.descriptorType = vk::DescriptorType::eStorageBuffer;
+        write.pBufferInfo = &buffers.back();
+        return;
+    }
+    writes.push_back(vk::WriteDescriptorSet{
+        .dstSet = VK_NULL_HANDLE,
+        .dstBinding = slot,
+        .dstArrayElement = 0,
+        .descriptorCount = 1,
+        .descriptorType = vk::DescriptorType::eStorageBuffer,
+        .pBufferInfo = &buffers.back(),
+    });
 }
 
 void NativeRenderer::DrawBindings::PrepareWriteGroups() {
@@ -2253,7 +2285,25 @@ static bool OutOfMemoryLogDue(std::atomic<u32>& logged) {
     return n < 16 || n % 256 == 0;
 }
 
-NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
+static bool InPlaceStorageWritesRequested() {
+    const char* value = std::getenv("SHADGT_IN_PLACE_STORAGE_WRITES"); // PERF-SGT-211
+    return value && std::strcmp(value, "1") == 0;
+}
+
+NativeRenderer::NativeRenderer(Rasterizer& rasterizer)
+    : r{rasterizer}, in_place_storage_writes{InPlaceStorageWritesRequested()} {
+    const char* dedup = std::getenv("SHADGT_DEDUP_DOWNLOAD_PAGES"); // PERF-SGT-231
+    dedup_download_pages = dedup && dedup[0] == '1' && dedup[1] == '\0';
+    if (const char* value = std::getenv("SHADGT_COPY_LITERAL_SAMPLERS")) { // PERF-SGT-232
+        copy_literal_samplers = value[0] == '1' && value[1] == '\0';
+        LOG_INFO(Render_Vulkan, "Literal sampler copies {}", copy_literal_samplers);
+    }
+    if (const char* value = std::getenv("SHADGT_READ_CLEAN_SOURCES")) { // PERF-SGT-233
+        read_clean_sources = value[0] == '1' && value[1] == '\0';
+        LOG_INFO(Render_Vulkan, "Texture source refresh: {}", read_clean_sources ? "read first" : "stock");
+    }
+    const char* skip_upkeep = std::getenv("SHADGT_SKIP_EMPTY_DESCRIPTOR_UPKEEP"); // PERF-SGT-234
+    skip_empty_long_sets_upkeep = skip_upkeep && std::strcmp(skip_upkeep, "1") == 0;
     DecideGtsCpuWritebackNow(); // FIX-GTS-529: before the game sets up its save memory
     SnapshotLease::BackingProtocol::Initialize(r.instance.GetVendorID());
     sampler_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
@@ -2891,6 +2941,7 @@ void NativeRenderer::BeginHudStream() {
     s.vertex_state_known = false;
     s.commands = 0;
     s.run_program = 0; // PERF-GT7-043
+    s.run_queue = ~0u; // PERF-SGT-245
     s.run_texels.Clear(); // PERF-GT7-057
     ++s.serial;        // OPT-015
     ForgetBindings(s); // OPT-014
@@ -3398,6 +3449,19 @@ u64 MemoHash(const u64* words, size_t count, u64 seed) {
     h *= 0xC4CEB9FE1A85EC53ULL;
     return h ^ (h >> 29);
 }
+static AmdGpu::Sampler ReadBindingSampler(const Shader::SamplerResource& resource,
+                                          const Shader::Info& stage, bool copy_literals) {
+    const auto& fetch = resource.sharp_fetch;
+    using Summary = Shader::SharpFetch<AmdGpu::Sampler>::Summary;
+    if (copy_literals && fetch.summary == Summary::MultiLoad && fetch.load_mask == 0 &&
+        resource.post_op == Shader::SharpFetchPostOp::None && !resource.is_cube) {
+        AmdGpu::Sampler result;
+        std::memcpy(&result, fetch.immediates.data(), sizeof(result));
+        return result;
+    }
+    return resource.GetSharp(stage);
+}
+
 } // namespace
 
 // DLSS-GT7-002: the bias temporal DLSS adds to a guest sampler (ryty_upscale.h), zero for those
@@ -3997,6 +4061,7 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     s.vertex_state_known = false; // OPT-005
     s.commands = 0;
     s.run_program = 0; // PERF-GT7-043
+    s.run_queue = ~0u; // PERF-SGT-245
     s.run_texels.Clear(); // PERF-GT7-057
     GpuTimeBegin(s); // DIAG-GT7-001: the first segment is the wait for earlier GPU work
     ++s.serial;        // OPT-015
@@ -5166,7 +5231,18 @@ void NativeRenderer::FlushWritebacks() {
         vk::Buffer out;
         std::vector<DownloadCopy> scatter;
         std::vector<DownloadCopy> copies;
+        /// PERF-SGT-179: where the same bytes lie in video memory (the batch's scratch buffer),
+        /// and the offset to add to a copy's source offset there.
+        vk::Buffer video{};
+        u64 video_delta = 0;
     };
+    // PERF-SGT-179 (SHADGT_WRITEBACK_REGION_FROM_VIDEO=1, off by default): the regions over a
+    // re-tiled picture get its bytes from the batch's scratch buffer in video memory, where the
+    // re-tiling left them, not from guest memory right after they were written there.
+    static const bool from_video = [] {
+        const char* env = std::getenv("SHADGT_WRITEBACK_REGION_FROM_VIDEO");
+        return env && env[0] == '1' && env[1] == 0;
+    }();
     std::vector<DeferredCopies> deferred;
     std::vector<std::pair<VAddr, VAddr>> deferred_ranges;
     const auto flush_deferred = [&] {
@@ -5195,10 +5271,11 @@ void NativeRenderer::FlushWritebacks() {
                 s.cmd.copyBuffer(d.out, copy.destination,
                                  vk::BufferCopy{.srcOffset = copy.source_offset,
                                                 .dstOffset = copy.destination_offset, .size = copy.size});
-            for (const auto& copy : d.copies)
-                s.cmd.copyBuffer(d.out, copy.destination,
-                                 vk::BufferCopy{.srcOffset = copy.source_offset,
+            for (const auto& copy : d.copies) {
+                s.cmd.copyBuffer(d.video ? d.video : d.out, copy.destination,
+                                 vk::BufferCopy{.srcOffset = copy.source_offset + (d.video ? d.video_delta : 0),
                                                 .dstOffset = copy.destination_offset, .size = copy.size});
+            }
         }
         deferred.clear();
         deferred_ranges.clear();
@@ -5264,12 +5341,11 @@ void NativeRenderer::FlushWritebacks() {
                         Region& region = it->second;
                         const VAddr begin = std::max(from, region.begin), end = std::min(to, region.end);
                         for (VAddr page = Common::AlignDown(begin, 4096); begin < end && page < end; page += 4096) {
-                            region.dirty_pages.push_back(page);
+                            region.MarkDownloadPage(page, dedup_download_pages);
                             diag_region_marks[3].fetch_add(1, std::memory_order_relaxed); // DIAG-GTS-411
                             Native::AddPageDownloadRange(downloaded_ranges[page], std::max(begin, page),
                                                          std::min(end, page + 4096));
                         }
-                        if (begin < end) region.dirty_sorted = false;
                     }
                 }
               }
@@ -5328,8 +5404,18 @@ void NativeRenderer::FlushWritebacks() {
                 .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite};
             s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &copied});
         }
+        const size_t tilings_before = batch.tilings.size();
         if (registry->RecordDownload(*s.list, *entry, *plan.out, plan.offset,
                                      use_batch ? &batch : nullptr)) {
+            // PERF-SGT-179: re-tiled in the batch's scratch buffer: its bytes are there too.
+            vk::Buffer in_video{};
+            u64 in_video_delta = 0;
+            if (from_video && use_batch && batch.scratch && batch.tilings.size() == tilings_before + 1 &&
+                batch.tilings.back().out == plan.out.get() &&
+                batch.tilings.back().out_offset == plan.offset) {
+                in_video = vk::Buffer{Handle<VkBuffer_T>(batch.scratch->NativeHandle())};
+                in_video_delta = batch.tilings.back().tiled_offset - plan.offset;
+            }
             batch_ranges.emplace_back(address, address + size);
             NATIVE_DIAGNOSTIC(++stats.writebacks);
             if (!plan.scatter.empty() || !plan.copies.empty()) {
@@ -5337,7 +5423,8 @@ void NativeRenderer::FlushWritebacks() {
                 // once the batch is finished (PERF-GTS-462: for the whole batch at once).
                 try {
                     deferred.push_back({vk::Buffer{Handle<VkBuffer_T>(plan.out->NativeHandle())},
-                                        std::move(plan.scatter), std::move(plan.copies)});
+                                        std::move(plan.scatter), std::move(plan.copies), in_video,
+                                        in_video_delta});
                     deferred_ranges.emplace_back(address, address + size);
                 } catch (...) {
                     std::terminate(); // the command stream is already mutated
@@ -5353,12 +5440,11 @@ void NativeRenderer::FlushWritebacks() {
                     const VAddr from = std::max(address, region.begin);
                     const VAddr to = std::min(address + size, region.end);
                     for (VAddr page = Common::AlignDown(from, 4096); from < to && page < to; page += 4096) {
-                        region.dirty_pages.push_back(page);
+                        region.MarkDownloadPage(page, dedup_download_pages);
                         diag_region_marks[4].fetch_add(1, std::memory_order_relaxed); // DIAG-GTS-411
                         Native::AddPageDownloadRange(downloaded_ranges[page], std::max(from, page),
                                                      std::min(to, page + 4096));
                     }
-                    if (from < to) region.dirty_sorted = false;
                 }
             }
             // NAT-150: so do mirrors.
@@ -6929,21 +7015,36 @@ void NativeRenderer::RecordRegionWriteback(const std::shared_ptr<WritebackPlan>&
         if (found == regions.end()) UNREACHABLE_MSG("native writeback region changed after preflight");
         found->second.gpu_pages->insert(std::move(mark.node));
     }
-    for (auto& part : plan.parts) {
-        SnapshotLease::MarkUnsafe(part.page, 4096, 16);
-        auto found = regions.find(part.region_begin);
-        if (found == regions.end() || found->second.buffer.get() != part.region_buffer)
-            UNREACHABLE_MSG("native writeback region changed after preflight");
+    static const bool combine_pages = [] {
+        const char* env = std::getenv("SHADGT_COMBINE_WRITEBACK_PAGES"); // PERF-SGT-226
+        return env && env[0] == '1' && env[1] == '\0';
+    }();
+    for (size_t i = 0; i < plan.parts.size();) {
+        auto& part = plan.parts[i];
+        u64 bytes = part.size;
+        size_t end = i + 1;
+        if (combine_pages && plan.shader) {
+            while (end < plan.parts.size() && Native::ExtendShaderWriteback(part, bytes, plan.parts[end])) {
+                bytes += plan.parts[end++].size;
+            }
+        }
+        for (; i < end; ++i) {
+            const auto& page = plan.parts[i];
+            SnapshotLease::MarkUnsafe(page.page, 4096, 16);
+            auto found = regions.find(page.region_begin);
+            if (found == regions.end() || found->second.buffer.get() != page.region_buffer)
+                UNREACHABLE_MSG("native writeback region changed after preflight");
+        }
         if (plan.shader) {
             auto* snapshot = plan.before[part.before_index].recorded_copy;
             const std::array<Native::Rhi::Binding, 3> inputs{{
                 {.slot = 0, .type = Native::Rhi::BindingType::StorageBuffer, .buffer = part.region_buffer,
-                 .offset = part.region_offset, .size = part.size},
+                 .offset = part.region_offset, .size = bytes},
                 {.slot = 1, .type = Native::Rhi::BindingType::StorageBuffer, .buffer = snapshot,
-                 .offset = part.before_offset, .size = part.size},
+                 .offset = part.before_offset, .size = bytes},
                 {.slot = 2, .type = Native::Rhi::BindingType::StorageBuffer, .buffer = part.guest.get(),
-                 .offset = part.guest_offset, .size = part.size}}};
-            const u32 count = static_cast<u32>(part.size / 16);
+                 .offset = part.guest_offset, .size = bytes}}};
+            const u32 count = static_cast<u32>(bytes / 16);
             s.list->BindPipeline(writeback_pipeline.get());
             s.list->PushBindings(inputs);
             s.list->PushConstants(0, std::span<const u8>{reinterpret_cast<const u8*>(&count), sizeof(count)});
@@ -7018,7 +7119,13 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         u64 upload_offset{};
         u8* mapped{};
         bool remapped{};
+        bool download_only{};
     };
+    static const bool reuse_full_download = [] {
+        const char* env = std::getenv("SHADGT_REUSE_FULL_DOWNLOAD"); // PERF-SGT-221
+        const bool enabled = env && std::strcmp(env, "1") == 0;
+        return enabled;
+    }();
     std::vector<RefreshPagePlan> refresh(pages.size());
     {
         std::scoped_lock lock{region_dirty_mutex};
@@ -7041,13 +7148,19 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
             UNREACHABLE_MSG("native region refresh page import or alignment failed");
             return;
         }
-        auto whole = direct->PlanLeasedParts(page, page_bytes, 4, 4);
-        if (!whole) {
-            UNREACHABLE_MSG("native region refresh page preflight failed");
-            return;
+        auto& plan = refresh[i];
+        plan.download_only = reuse_full_download && !plan.remapped && plan.downloads.size() == 1 &&
+                             plan.downloads.front().first == page &&
+                             plan.downloads.front().second == page + page_bytes;
+        if (!plan.download_only) {
+            auto whole = direct->PlanLeasedParts(page, page_bytes, 4, 4);
+            if (!whole) {
+                UNREACHABLE_MSG("native region refresh page preflight failed");
+                return;
+            }
+            plan.whole = std::move(*whole);
+            lease_count += plan.whole.size();
         }
-        refresh[i].whole = std::move(*whole);
-        lease_count += refresh[i].whole.size();
         for (const auto [from, to] : refresh[i].downloads) {
             if (from < page || to > page + page_bytes || from >= to ||
                 (from - region.begin) % 4 || (to - from) % 4 ||
@@ -7068,7 +7181,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
     try {
         Native::ReserveAdditional(s.imported_view_leases, lease_count);
         for (size_t i = 0; i < pages.size(); ++i) {
-            if (refresh[i].remapped) continue;
+            if (refresh[i].remapped || refresh[i].download_only) continue;
             bool valid = false;
             std::tie(refresh[i].upload, refresh[i].upload_offset, refresh[i].mapped) =
                 Allocate(std::min<u64>(4096, region.end - pages[i]), 4, &valid);
@@ -7129,6 +7242,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         }
     }
     dirty.erase(first, last);
+    if (dedup_download_pages) region.recent_downloads = {};
     // PERF-104 (port of shadgt7's switch): consecutive pages are watched again in one call.
     // SHADGT_NATIVE_REFRESH_BATCH=0: each page on its own (diagnosis).
     static const bool watch_batch = [] {
@@ -7150,7 +7264,8 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
             UNREACHABLE_MSG("native region refresh cannot safely read guest page");
             return;
         }
-        std::memcpy(refresh[i].mapped, cpu_copy.get() + i * 4096, bytes); // PERF-GTS-390
+        if (!refresh[i].download_only)
+            std::memcpy(refresh[i].mapped, cpu_copy.get() + i * 4096, bytes); // PERF-GTS-390
     }
     for (auto& page : refresh) {
         for (auto& part : page.whole) s.imported_view_leases.push_back(part.lease);
@@ -7169,6 +7284,9 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
                                .size = part.size});
     };
     const auto copy_snapshot = [&](size_t index, VAddr from, u64 bytes) {
+        if (refresh[index].download_only) {
+            return;
+        }
         // The CPU can rewrite/reuse the imported guest pages before a queued
         // copy executes. Upload exactly the bytes compared below from storage
         // retained by this stream until GPU completion, not from the live pages.
@@ -8995,6 +9113,11 @@ static void NoteBoundBytes(VAddr address, u64 size, bool write, int kind, u64 fr
     since = now;
 }
 
+static bool MirrorOutsideCpuStacks(VAddr begin, VAddr end) {
+    static thread_local Native::CpuStackRegistry::PointQuery query{Native::CpuStacks()};
+    return query.Allowed(begin, end);
+}
+
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr address, u64 size,
                                                                       bool write, bool mirror) {
     if (size == 0) {
@@ -9070,10 +9193,8 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
         if (memo_r || memo_m) {
             SortRegionWrites(); // CPU writes since: pages to copy in (may drop a mirror)
         }
-        const bool mirror_allowed = memo.generation == buffer_generation && (!memo_m || [&] {
-            Native::CpuStackRegistry::Lease lease{Native::CpuStacks()};
-            return lease.Allowed(memo_m->begin, memo_m->end);
-        }());
+        const bool mirror_allowed = memo.generation == buffer_generation &&
+            (!memo_m || MirrorOutsideCpuStacks(memo_m->begin, memo_m->end));
         const bool fresh =
             mirror_allowed && memo.generation == buffer_generation &&
             (!memo_r || memo_r->dirty_pages.empty()) &&
@@ -10396,7 +10517,6 @@ void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
         }
     }
     b.writes.reserve(total);
-    Shader::Backend::Bindings binding{};
     std::array<StageResourceBindings, Shader::MaxStageTypes> plans{};
     for (u32 i = 0; i < stages.size(); ++i) {
         const auto* stage = stages[i];
@@ -10404,13 +10524,12 @@ void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
             continue;
         }
         // SHD-002: each stage binds in its own set, from its own start.
-        plans[i] = PlanStageResourceBindings(*stage,
-                                             Shader::Backend::StageStart(u32(stage->sw_stage)));
+        plans[i] = PlanStageResourceBindings(*stage, Shader::Backend::StageStart(u32(stage->sw_stage)),
+                                             false); // PERF-SGT-214: the end is not read here
         auto buffer_binding = plans[i].buffers;
         PhaseClock clock{stats.phase_ns[2]};
         PartClock part{compute ? &stats.dispatch_bind_ns[1] : nullptr}; // DIAG-GT7-004
         BindBuffers(*stage, regs, compute, buffer_binding, b);
-        binding = plans[i].next;
     }
     for (u32 i = 0; i < stages.size(); ++i) {
         if (const auto* stage = stages[i]) {
@@ -12115,8 +12234,8 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
         ? r.buffer_cache.GetDirectMemory() : nullptr;
     // D3's table: page table L1 and zero page, then base, size and valid of each buffer read
     // through it.
-    static thread_local std::vector<std::array<u32, 4>> direct_entries;
-    direct_entries.assign(stage.buffers.size(), {});
+    static thread_local DirectTableScratch table_scratch;
+    auto direct_entries = table_scratch.Begin(stage.buffers.size(), direct != nullptr);
     constexpr u64 GpuAddressLimit = 1ULL << 40;
     u32 index = 0;
     for (const auto& desc : stage.buffers) {
@@ -12159,28 +12278,16 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                 }
                 break;
             case Shader::BufferType::DirectTable: {
-                const u32 words = static_cast<u32>(4 + stage.buffers.size() * 4);
-                static thread_local std::vector<u32> table_words;
-                table_words.assign(words, 0);
-                u32* const table = table_words.data();
-                if (auto* memory = r.buffer_cache.GetDirectMemory()) {
-                    const u64 l1 = memory->L1Address();
-                    const u64 zero = memory->ZeroPageAddress();
-                    table[0] = u32(l1);
-                    table[1] = u32(l1 >> 32);
-                    table[2] = u32(zero);
-                    table[3] = u32(zero >> 32);
-                    for (size_t i = 0; i < stage.buffers.size(); ++i) {
-                        std::memcpy(&table[4 + i * 4], direct_entries[i].data(), 16);
-                    }
-                    // PERF-GTS-479: which direct candidates this draw read in place.
-                    Shader::DirectLearning::NoteBind(stage.pgm_hash, direct_entries, [&](u32 slot) {
+                auto* memory = r.buffer_cache.GetDirectMemory();
+                const auto table = table_scratch.Pack(stage.buffers.size(), direct_entries, memory);
+                if (memory) {
+                    Shader::DirectLearning::NoteBind(stage.pgm_hash, table.subspan(1), [&](u32 slot) {
                         return stage.buffers[slot].IsDirectEligible();
                     });
                 }
-                const auto [buffer, offset] = UploadBytes(upload_slot + 2, table,
-                                                          words * sizeof(u32), alignment); // OPT-015
-                info = {buffer, offset, words * sizeof(u32)};
+                const u32 bytes = static_cast<u32>(table.size_bytes());
+                const auto [buffer, offset] = UploadBytes(upload_slot + 2, table.data(), bytes, alignment);
+                info = {buffer, offset, bytes};
                 break;
             }
             case Shader::BufferType::SharedMemory: {
@@ -12513,14 +12620,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
         if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-buffer id={} stage={} program={:#x} binding={} descriptor={} special={} written={} handle={:#x} offset={} range={} direct={}",SceneTrace::Id(),u32(stage.sw_stage),stage.pgm_hash,binding.unified,buffer_index,desc.IsSpecial(),desc.is_written,reinterpret_cast<u64>(static_cast<VkBuffer>(info.buffer)),info.offset,info.range,stage.uses_direct));
         b.buffers.push_back(info);
         b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
-        b.writes.push_back(vk::WriteDescriptorSet{
-            .dstSet = VK_NULL_HANDLE,
-            .dstBinding = binding.unified++,
-            .dstArrayElement = 0,
-            .descriptorCount = 1,
-            .descriptorType = vk::DescriptorType::eStorageBuffer,
-            .pBufferInfo = &b.buffers.back(),
-        });
+        b.AppendStorageWrite(binding.unified++, in_place_storage_writes);
         ++binding.buffer;
     }
     (void)compute;
@@ -13116,7 +13216,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         add_write();
     }
     for (const auto& sampler : stage.samplers) {
-        auto ssharp = sampler.GetSharp(stage);
+        auto ssharp = ReadBindingSampler(sampler, stage, copy_literal_samplers);
         if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
                                 regs.ta_bc_base.Address() == 0)) {
             ssharp = AmdGpu::Sampler{};
@@ -13395,10 +13495,14 @@ void NativeRenderer::LongSetsUpkeep() {
     static thread_local std::vector<u64> dead;
     const bool some = Native::DeadHandles::Take(dead);
     if (some) g_buffer_size_epoch.fetch_add(1, std::memory_order_release); // PERF-SGT-020
+    if (skip_empty_long_sets_upkeep && !some && !long_sets_over_limit.load(std::memory_order_acquire)) {
+        return;
+    }
     std::unique_lock<std::mutex> lock{long_sets_mutex, std::defer_lock};
     if (ParallelRecordingRequested() || binder) lock.lock(); // FEAT-SGT-022: the binder's too
     if (some) DropLongSets(dead);
-    if (long_sets.entries.Size() > 200000 || long_sets.unused_sets > 20000) FlushLongSets();
+    if (long_sets.entries.Size() > LongSetLimit || long_sets.unused_sets > 20000) FlushLongSets();
+    if (skip_empty_long_sets_upkeep) long_sets_over_limit.store(false, std::memory_order_release);
 }
 
 bool NativeRenderer::CanBindLate(const Pipeline& pipeline, DrawBindings& b) {
@@ -13605,6 +13709,9 @@ bool NativeRenderer::StoreLongSet(u64 hash, u64 check, vk::DescriptorSetLayout l
         return false;
     }
     long_sets.entries.Insert(hash, check, u64(VkDescriptorSetLayout(layout)), set);
+    if (skip_empty_long_sets_upkeep && long_sets.entries.Size() == LongSetLimit + 1) {
+        long_sets_over_limit.store(true, std::memory_order_release);
+    }
     // PERF-GTS-378: a list per handle (a multimap walked a handle they all hold at each insert).
     // FIX-SGT-044: the set goes once into each distinct handle's list, and a list is thinned by
     // ids and serials (Native::KeptSetUsers), so a pass always removes more than half of it.
@@ -13824,7 +13931,8 @@ void NativeRenderer::PushBindingsWith(const Pipeline& pipeline, vk::PipelineBind
     trace.Next(1);
     if (!b.groups_ready) b.PrepareWriteGroups();
     const auto& by_set = b.grouped_writes;
-    if (b.key_layout != pipeline.GetLayout()) b.PrepareDescriptorKeys(pipeline);
+    const bool built_here = b.key_layout != pipeline.GetLayout();
+    if (built_here) b.PrepareDescriptorKeys(pipeline);
     const vk::Device vk_device = r.instance.GetDevice();
     static thread_local boost::container::small_vector<vk::WriteDescriptorSet, 64> updates;
     updates.clear();
@@ -13888,7 +13996,8 @@ void NativeRenderer::PushBindingsWith(const Pipeline& pipeline, vk::PipelineBind
         auto& prepared_key = b.descriptor_keys[index];
         // Preparation hashed the complete key. Commit changes only buffer slots;
         // recompute the same XXH3 hash only when those values actually changed.
-        const bool key_changed = prepared_key.RefreshBuffers<false>();
+        const bool key_changed = (!built_here || parallel_binding_capture || !SkipRedundantDescriptorWork()) &&
+                                 prepared_key.RefreshBuffers<false>();
         const auto& key = prepared_key.words;
         const bool cacheable = prepared_key.cacheable;
         std::span<const u64> descriptor_key{key.data(), key.size()};
@@ -13896,7 +14005,7 @@ void NativeRenderer::PushBindingsWith(const Pipeline& pipeline, vk::PipelineBind
         u64 key_check = 0; // PERF-GTS-376: the other half of a dynamic set's 128-bit hash
         if (dynamic_buffers != 0) {
             // hashed below, without the offsets
-        } else if (cacheable && key_changed) {
+        } else if (cacheable && (key_changed || (SkipRedundantDescriptorWork() && prepared_key.hash == 0))) {
             prepared_key.hash = Native::Parallel::AdaptiveXXH3(key.data(), key.size() * sizeof(u64));
             NATIVE_DIAGNOSTIC(++descriptor_hash_refreshed);
         } else if (cacheable) {
@@ -14421,10 +14530,8 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
             const char* env = std::getenv("SHADGT_NATIVE_VERTEX_NEAR");
             return !(env && env[0] == '0');
         }();
-        const bool near_allowed = near && near_generation == buffer_generation && [&] {
-            Native::CpuStackRegistry::Lease lease{Native::CpuStacks()};
-            return lease.Allowed(near->begin, near->end);
-        }();
+        const bool near_allowed = near && near_generation == buffer_generation &&
+                                  MirrorOutsideCpuStacks(near->begin, near->end);
         bool via_near = false; // DIAG-170
         if (near_on && near_allowed && !sampled && base != 0 && sharp_size > 0 &&
             near_generation == buffer_generation && base >= near->begin &&
@@ -14895,6 +15002,25 @@ void NativeRenderer::RecordVertexIndex(const VertexIndexState& v) {
 // other parts of the same picture in a run, which the check of stored pictures would stop.
 bool NativeRenderer::RunNeedsBarrier(const Stream& s, const DrawBindings& b, const Shader::Info& cs,
                                      bool recorded, std::optional<u64> texel) const {
+    // PERF-SGT-245: no barrier between two dispatches of one guest queue when the game sent
+    // nothing that orders work between them (AmdGpu::GuestDispatch) and the renderer recorded
+    // nothing of its own since the first: the PS4 may run such dispatches at once, so the game does
+    // not depend on their order. GT7 sends about half its dispatches like that; the barrier before
+    // each was most of the GPU's wait-for-idle time (Tokyo replay, broadcast cameras: frame time
+    // -5.2%, frames over 25 ms -45%, in-run A/B). On in GT7; GT Sport is not checked yet.
+    // SHADGT_GUEST_SYNC_BARRIERS=1: on in every game; 0: off.
+    static const bool guest_sync = [] {
+        const char* env = std::getenv("SHADGT_GUEST_SYNC_BARRIERS");
+        if (env && env[0] == '0') return false;
+        if (env && env[0] == '1') return true;
+        return Common::IsGt7();
+    }();
+    if (const auto& guest = AmdGpu::t_guest_dispatch;
+        guest_sync && guest.unsynced && guest.queue != ~0u && guest.queue == s.run_queue &&
+        s.run_commands == s.commands && s.run_serial == s.resource_recording_serial && !recorded &&
+        writebacks.empty() && !s.buffers_written.foreign && s.attach_dirty.empty()) {
+        return false;
+    }
     const u64 program = cs.pgm_hash;
     static const std::vector<u64> listed = [] {
         std::vector<u64> list;
@@ -15221,9 +15347,15 @@ void NativeRenderer::WrittenSubresources(const Native::ImageEntry* entry, u64 at
         } else if (!subs.empty()) {
             std::fill(subs.begin(), subs.end(), version);
         }
-        for (auto* texture : written->dependents) {
-            texture->sources_dirty.store(true, std::memory_order_relaxed);
-            dependents.push_back(texture);
+        if (WholeSourcesOn()) { // PERF-SGT-212: `dependents` is read only then
+            for (auto* texture : written->dependents) {
+                texture->sources_dirty.store(true, std::memory_order_relaxed);
+                dependents.push_back(texture);
+            }
+        } else {
+            for (auto* texture : written->dependents) {
+                texture->sources_dirty.store(true, std::memory_order_relaxed);
+            }
         }
     }
     // FIX-207: and the textures made of those (see RefreshSources).
@@ -15265,6 +15397,15 @@ u64 NativeRenderer::WholeVersion(Native::ImageEntry& source) {
 }
 
 void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
+    if (read_clean_sources && !texture.sources_dirty.load(std::memory_order_relaxed) &&
+        !Native::OrderedTiming::Enabled() &&
+        !(Common::DiagnosticsBuilt && Rasterizer::Traced(texture.info.guest_address, texture.info.guest_size))) {
+        return;
+    }
+    CheckAndRefreshSources(texture);
+}
+
+void NativeRenderer::CheckAndRefreshSources(Native::ImageEntry& texture) {
     Native::OrderedTiming::Scope ordered_timing{Native::OrderedTiming::RefreshSources}; // DIAG-SGT-023
     // NAT-111: only when one of its targets was drawn since the last time.
     const bool traced = Rasterizer::Traced(texture.info.guest_address, texture.info.guest_size);
@@ -15594,7 +15735,8 @@ void NativeRenderer::SyncDepthTwin(Native::ImageEntry& entry) {
     const auto& info = entry.info;
     if (!on || entry.from_cpu || !entry.image || info.num_samples != 1 ||
         info.props.has_stencil ||
-        (!info.props.is_depth && !LiverpoolToVK::IsFormatDepthCompatible(info.pixel_format))) {
+        (!info.props.is_depth && !LiverpoolToVK::IsFormatDepthCompatible(info.pixel_format)) ||
+        !entry.possible_depth_twin.load(std::memory_order_acquire)) {
         return;
     }
     Native::ImageEntry* twin =
@@ -20931,8 +21073,8 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
         if (!stage) {
             continue;
         }
-        plans[i] = PlanStageResourceBindings(*stage,
-                                             Shader::Backend::StageStart(u32(stage->sw_stage)));
+        plans[i] = PlanStageResourceBindings(*stage, Shader::Backend::StageStart(u32(stage->sw_stage)),
+                                             false); // PERF-SGT-214: the end is not read here
         auto buffer_binding = plans[i].buffers;
         ok = PrepareBuffers(*stage, regs, buffer_binding, *p);
     }
@@ -21406,8 +21548,8 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
 #endif
     auto* direct = stage.uses_direct && !descriptor_composition && !force_descriptor
         ? r.buffer_cache.GetDirectMemory() : nullptr;
-    static thread_local std::vector<std::array<u32, 4>> direct_entries;
-    direct_entries.assign(stage.buffers.size(), {});
+    static thread_local DirectTableScratch table_scratch;
+    auto direct_entries = table_scratch.Begin(stage.buffers.size(), direct != nullptr);
     constexpr u64 GpuAddressLimit = 1ULL << 40;
     const auto upload = [&](const void* data, u32 size) {
         const u32 offset = static_cast<u32>(p.upload_bytes.size());
@@ -21464,25 +21606,15 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                 }
                 break;
             case Shader::BufferType::DirectTable: {
-                const u32 words = static_cast<u32>(4 + stage.buffers.size() * 4);
-                static thread_local std::vector<u32> table;
-                table.assign(words, 0);
-                if (auto* memory = r.buffer_cache.GetDirectMemory()) {
-                    const u64 l1 = memory->L1Address();
-                    const u64 zero = memory->ZeroPageAddress();
-                    table[0] = u32(l1);
-                    table[1] = u32(l1 >> 32);
-                    table[2] = u32(zero);
-                    table[3] = u32(zero >> 32);
-                    for (size_t i = 0; i < stage.buffers.size(); ++i) {
-                        std::memcpy(&table[4 + i * 4], direct_entries[i].data(), 16);
-                    }
-                    // PERF-GTS-479: which direct candidates this draw read in place.
-                    Shader::DirectLearning::NoteBind(stage.pgm_hash, direct_entries, [&](u32 slot) {
+                auto* memory = r.buffer_cache.GetDirectMemory();
+                const auto table = table_scratch.Pack(stage.buffers.size(), direct_entries, memory);
+                if (memory) {
+                    Shader::DirectLearning::NoteBind(stage.pgm_hash, table.subspan(1), [&](u32 slot) {
                         return stage.buffers[slot].IsDirectEligible();
                     });
                 }
-                info = upload(table.data(), words * sizeof(u32));
+                const u32 bytes = static_cast<u32>(table.size_bytes());
+                info = upload(table.data(), bytes);
                 break;
             }
             default:
@@ -21580,14 +21712,7 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
         }
         b.buffers.push_back(info);
         b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
-        b.writes.push_back(vk::WriteDescriptorSet{
-            .dstSet = VK_NULL_HANDLE,
-            .dstBinding = binding.unified++,
-            .dstArrayElement = 0,
-            .descriptorCount = 1,
-            .descriptorType = vk::DescriptorType::eStorageBuffer,
-            .pBufferInfo = &b.buffers.back(),
-        });
+        b.AppendStorageWrite(binding.unified++, in_place_storage_writes);
         ++binding.buffer;
     }
     return true;
@@ -21883,7 +22008,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
         add_write();
     }
     for (const auto& sampler : stage.samplers) {
-        auto ssharp = sampler.GetSharp(stage);
+        auto ssharp = ReadBindingSampler(sampler, stage, copy_literal_samplers);
         if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
                                 regs.ta_bc_base.Address() == 0)) {
             ssharp = AmdGpu::Sampler{};
@@ -23326,6 +23451,8 @@ void NativeRenderer::DispatchDirect() {
     ++s.commands;
     s.run_program = program;
     s.run_commands = s.commands;
+    s.run_queue = AmdGpu::t_guest_dispatch.queue; // PERF-SGT-245
+    s.run_serial = s.resource_recording_serial;
     ChunkFlushCheck();
     Report();
 }

@@ -677,6 +677,9 @@ private:
     };
     static bool DirectNestedResume();
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
+    /// PERF-SGT-245: per queue (0 = graphics, vqid + 1 = compute), whether it sent a packet that
+    /// orders work since its last dispatch (see OrdersDispatches in liverpool.cpp).
+    std::array<bool, 64> guest_synced{};
     std::atomic<u32> num_mapped_queues{1u}; // GFX is always available.
     bool ComputeQueueRunnable() const {
         const u32 count = num_mapped_queues.load(std::memory_order_acquire);

@@ -1172,6 +1172,7 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/rygt_switches.cpp
                src/video_core/amdgpu/draw_pipe.cpp
                src/video_core/amdgpu/draw_pipe.h
+               src/video_core/amdgpu/guest_dispatch.h
                src/video_core/amdgpu/liverpool.cpp
                src/video_core/amdgpu/liverpool.h
                src/video_core/amdgpu/pixel_format.cpp

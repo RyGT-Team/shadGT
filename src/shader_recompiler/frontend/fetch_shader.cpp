@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 #include <fmt/format.h>
@@ -82,19 +84,19 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
 
 thread_local const FetchOverride* t_fetch_override = nullptr; // PERF-GT7-111 (TEST)
 
-bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data) {
-    if (!info.has_fetch_shader) {
-        return false;
-    }
+struct LastFetch {
+    static constexpr size_t MaxWords = 64;
+    const u32* address{};
+    size_t user_words{};
+    size_t count{};
+    std::array<u32, MaxWords> words;
+    FetchShaderData layout;
+};
 
-    if (t_replay && t_replay->fetch) { // PB-1: the fetch shader parsed in the game
-        out_fetch_data = *static_cast<const FetchShaderData*>(t_replay->fetch);
-        return true;
-    }
-    if (const FetchOverride* o = t_fetch_override) [[unlikely]] {
-        out_fetch_data = o->data;
-        return o->ok;
-    }
+template <bool Remember>
+static bool DecodeFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data,
+                              const u32* code, LastFetch* memo) {
+    std::array<u32, LastFetch::MaxWords> observed;
     // Commit a parse only after its return instruction. Failed parses must not leave a
     // partially filled attribute layout that another draw could reuse.
     FetchShaderData parsed;
@@ -106,7 +108,6 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
     };
     std::array<VsharpLoad, 104> loads{};
 
-    const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
     const u32* ptr = code;
     constexpr size_t MaxFetchDwords = 1024;
     // FIX-211: what the user data points at is not always a fetch shader when the command
@@ -151,6 +152,10 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
 #else
         word = *ptr;
 #endif
+        if constexpr (Remember) {
+            const size_t index = ptr - code;
+            if (index < observed.size()) observed[index] = word;
+        }
         ++ptr;
         return word;
     };
@@ -255,6 +260,7 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
             if (opcode != OpcodeVOP1::V_MOV_B32 || src0 != 242) {
                 return reject("unsupported vector move", word0);
             }
+            if constexpr (Remember) memo = nullptr;
             LOG_WARNING(Render_Recompiler, "Fetch shader has V{} = 1.0 which is ignored", vdst);
         } else {
             return reject("unexpected instruction encoding", word0);
@@ -262,8 +268,52 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
     }
 
     parsed.size = (ptr - code) * sizeof(u32);
+    if constexpr (Remember) {
+        const size_t count = ptr - code;
+        if (memo && count <= observed.size()) {
+            memo->count = 0;
+            memo->layout = parsed;
+            std::copy_n(observed.begin(), count, memo->words.begin());
+            memo->address = code;
+            memo->user_words = info.user_data.size();
+            memo->count = count;
+        }
+    }
     out_fetch_data = std::move(parsed);
     return true;
+}
+
+bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data) {
+    if (!info.has_fetch_shader) {
+        return false;
+    }
+
+    if (t_replay && t_replay->fetch) { // PB-1: the fetch shader parsed in the game
+        out_fetch_data = *static_cast<const FetchShaderData*>(t_replay->fetch);
+        return true;
+    }
+    if (const FetchOverride* o = t_fetch_override) [[unlikely]] {
+        out_fetch_data = o->data;
+        return o->ok;
+    }
+    const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
+#ifdef RYTY_GPU
+    static const bool reuse = [] {
+        const char* value = std::getenv("SHADGT_REUSE_FETCH_LAYOUT"); // PERF-SGT-220
+        const bool enabled = value && std::strcmp(value, "1") == 0;
+        return enabled;
+    }();
+    if (reuse && !t_fetch_code_snapshots && !t_replay && !Common::t_guest_read_log) {
+        static thread_local LastFetch last{};
+        if (last.count && last.address == code && last.user_words == info.user_data.size() &&
+            Core::RytyMemory::GuardedMatchWords(code, last.words.data(), last.count)) {
+            out_fetch_data = last.layout;
+            return true;
+        }
+        return DecodeFetchShader<true>(info, out_fetch_data, code, &last);
+    }
+#endif
+    return DecodeFetchShader<false>(info, out_fetch_data, code, nullptr);
 }
 
 } // namespace Shader::Gcn

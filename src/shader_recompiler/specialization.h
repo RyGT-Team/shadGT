@@ -3,7 +3,11 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <bitset>
+#include <span>
+#include <type_traits>
 
 #include "common/perf_monitor.h"
 #include "common/types.h"
@@ -127,33 +131,7 @@ struct StageSpecialization {
             // Specialize shader on VS input number types to follow spec.
             ForEachSharp(vs_attribs, fetch_shader_data.attributes,
                          [this](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
-                             using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
-                             if (const auto step_rate = desc.GetStepRate();
-                                 step_rate != InstanceIdType::None) {
-                                 spec.divisor = step_rate == InstanceIdType::OverStepRate0
-                                                    ? runtime_info.sw.vs.step_rate_0
-                                                    : (step_rate == InstanceIdType::OverStepRate1
-                                                           ? runtime_info.sw.vs.step_rate_1
-                                                           : 1);
-                             }
-                             // FIX-060: a V# of a gigabyte or more is garbage. GT Sport's race
-                             // summary quads read float vertex data as their V#s, different
-                             // every frame; specializing on them made a new variant and pipeline
-                             // nearly every frame, and those draws were skipped while each built
-                             // (the flickering driver figure). Such an attribute counts as plain
-                             // floats. -DisablePerf 83 specializes on it.
-                             if (Gcn::VertexAttribute::IsGarbage(sharp)) {
-                                 spec.num_class = AmdGpu::NumberClass::Float;
-                                 spec.dst_select = AmdGpu::CompMapping{
-                                     .r = AmdGpu::CompSwizzle::Red,
-                                     .g = AmdGpu::CompSwizzle::Green,
-                                     .b = AmdGpu::CompSwizzle::Blue,
-                                     .a = AmdGpu::CompSwizzle::Alpha,
-                                 };
-                                 return;
-                             }
-                             spec.num_class = AmdGpu::GetNumberClass(sharp.GetNumberFmt());
-                             spec.dst_select = sharp.DstSelect();
+                             SetVertexAttributeSpec(spec, desc, sharp, runtime_info);
                          });
         }
         // FIX-043: with the resource usage of the translation known, the key holds only the
@@ -162,14 +140,12 @@ struct StageSpecialization {
         // V# translation saw instead of zeros. Thread-id addressing and coherence, which the
         // code also reads from the V#, are added to the key.
         const bool usage_known = info->resource_usage_known;
-        // FIX-GT7-024: -DisablePerf 172 compares buffers bound empty as any other.
-        static const bool empty_without_addressing = Common::PerfFeatureEnabled(172);
         u32 binding{};
         ForEachSharp(
             binding, buffers, info->buffers,
-            [this, usage_known, &binding](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
+            [this, &binding](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
                 const size_t index = &desc - info->buffers.data();
-                if (empty_without_addressing && !desc.IsSpecial() && IsBoundEmpty(sharp)) {
+                if (BoundEmptyForMatch(desc, sharp)) {
                     bound_empty[binding - 1] = true; // ForEachSharp counted it already
                 }
                 // FIX-SGT-008: a V# whose last word has reserved bits or a type set is no buffer (an unused slot holding
@@ -178,40 +154,10 @@ struct StageSpecialization {
                 // time, so GT7 translated and compiled the same shaders again all session and their
                 // draws were skipped (endless popping). Such a slot is specialized as a default
                 // buffer. SHADGT_BUFFER_JUNK_FILTER=0: as before.
-                static const bool junk_filter = [] {
-                    const char* env = std::getenv("SHADGT_BUFFER_JUNK_FILTER");
-                    return !(env && env[0] == '0');
-                }();
                 // Only the last word's reserved bits and type count: GT7 keeps other data in the
                 // address's upper byte (_padding0) of buffers it really reads (fs 0x7e5778be:
                 // 11288000 00407010 00000001 18027204), which the hardware ignores.
-                if (junk_filter && !desc.IsSpecial() && (sharp._padding1 != 0 || sharp.type != 0)) {
-                    spec.stride = 0;
-                    spec.is_formatted = desc.is_formatted;
-                    spec.swizzle_enable = 0;
-                    spec.add_tid_enable = 0;
-                    spec.coherent = desc.buffer_type == BufferType::SharedMemory;
-                    return;
-                }
-                spec.stride =
-                    !usage_known || info->buffer_stride_used[index] ? sharp.GetStride() : 0;
-                if (usage_known) {
-                    spec.add_tid_enable = sharp.add_tid_enable;
-                    spec.coherent =
-                        desc.buffer_type == BufferType::SharedMemory || sharp.mtype == 3;
-                }
-                spec.is_formatted = desc.is_formatted;
-                spec.swizzle_enable = sharp.swizzle_enable;
-                if (spec.is_formatted) {
-                    spec.data_format = static_cast<u32>(sharp.GetDataFmt());
-                    spec.num_format = static_cast<u32>(sharp.GetNumberFmt());
-                    spec.dst_select = sharp.DstSelect();
-                    spec.num_conversion = sharp.GetNumberConversion();
-                }
-                if (spec.swizzle_enable) {
-                    spec.index_stride = sharp.index_stride;
-                    spec.element_size = sharp.element_size;
-                }
+                SetBufferSpec(spec, *info, index, sharp);
             },
             usage_known);
         ForEachSharp(
@@ -276,6 +222,112 @@ struct StageSpecialization {
         }
     }
 
+    static void SetVertexAttributeSpec(VsAttribSpecialization& spec, const Gcn::VertexAttribute& desc,
+                                       AmdGpu::Buffer sharp, const RuntimeInfo& runtime_info) {
+        using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
+        if (const auto step_rate = desc.GetStepRate();
+            step_rate != InstanceIdType::None) {
+            spec.divisor = step_rate == InstanceIdType::OverStepRate0
+                               ? runtime_info.sw.vs.step_rate_0
+                               : (step_rate == InstanceIdType::OverStepRate1
+                                      ? runtime_info.sw.vs.step_rate_1
+                                      : 1);
+        }
+        // FIX-060: a V# of a gigabyte or more is garbage. GT Sport's race
+        // summary quads read float vertex data as their V#s, different
+        // every frame; specializing on them made a new variant and pipeline
+        // nearly every frame, and those draws were skipped while each built
+        // (the flickering driver figure). Such an attribute counts as plain
+        // floats. -DisablePerf 83 specializes on it.
+        if (Gcn::VertexAttribute::IsGarbage(sharp)) {
+            spec.num_class = AmdGpu::NumberClass::Float;
+            spec.dst_select = AmdGpu::CompMapping{
+                .r = AmdGpu::CompSwizzle::Red,
+                .g = AmdGpu::CompSwizzle::Green,
+                .b = AmdGpu::CompSwizzle::Blue,
+                .a = AmdGpu::CompSwizzle::Alpha,
+            };
+            return;
+        }
+        spec.num_class = AmdGpu::GetNumberClass(sharp.GetNumberFmt());
+        spec.dst_select = sharp.DstSelect();
+    }
+
+    static void SetBufferSpec(BufferSpecialization& spec, const Info& info, size_t index,
+                              AmdGpu::Buffer sharp) {
+        const auto& desc = info.buffers[index];
+        const bool usage_known = info.resource_usage_known;
+        static const bool junk_filter = [] {
+            const char* env = std::getenv("SHADGT_BUFFER_JUNK_FILTER");
+            return !(env && env[0] == '0');
+        }();
+        if (junk_filter && !desc.IsSpecial() && (sharp._padding1 != 0 || sharp.type != 0)) {
+            spec.stride = 0;
+            spec.is_formatted = desc.is_formatted;
+            spec.swizzle_enable = 0;
+            spec.add_tid_enable = 0;
+            spec.coherent = desc.buffer_type == BufferType::SharedMemory;
+            return;
+        }
+        spec.stride =
+            !usage_known || info.buffer_stride_used[index] ? sharp.GetStride() : 0;
+        if (usage_known) {
+            spec.add_tid_enable = sharp.add_tid_enable;
+            spec.coherent =
+                desc.buffer_type == BufferType::SharedMemory || sharp.mtype == 3;
+        }
+        spec.is_formatted = desc.is_formatted;
+        spec.swizzle_enable = sharp.swizzle_enable;
+        if (spec.is_formatted) {
+            spec.data_format = static_cast<u32>(sharp.GetDataFmt());
+            spec.num_format = static_cast<u32>(sharp.GetNumberFmt());
+            spec.dst_select = sharp.DstSelect();
+            spec.num_conversion = sharp.GetNumberConversion();
+        }
+        if (spec.swizzle_enable) {
+            spec.index_stride = sharp.index_stride;
+            spec.element_size = sharp.element_size;
+        }
+    }
+
+    static bool BoundEmptyForMatch(const BufferResource& desc, AmdGpu::Buffer sharp) {
+        static const bool enabled = Common::PerfFeatureEnabled(172);
+        return enabled && !desc.IsSpecial() && IsBoundEmpty(sharp);
+    }
+
+    bool MatchesBufferVertex(const Info& current, const RuntimeInfo& runtime,
+                             Backend::Bindings binding) const {
+        Gcn::FetchShaderData fetch;
+        const bool parsed = Gcn::ParseFetchShader(current, fetch);
+        bool equal = Valid() && buffers.size() == current.buffers.size() &&
+                     images.empty() && fmasks.empty() && samplers.empty() &&
+                     vs_attribs.size() == (parsed ? fetch.attributes.size() : 0) &&
+                     runtime_info == runtime && fetch_shader_data == fetch &&
+                     (buffers.empty() || start == binding);
+        if (parsed) {
+            for (size_t i = 0; i < fetch.attributes.size(); ++i) {
+                const auto& desc = fetch.attributes[i];
+                const auto sharp = desc.GetSharp(current);
+                if (equal) {
+                    VsAttribSpecialization spec{};
+                    if (sharp) SetVertexAttributeSpec(spec, desc, sharp, runtime);
+                    equal = vs_attribs[i] == spec;
+                }
+            }
+        }
+        for (size_t i = 0; equal && i < current.buffers.size(); ++i) {
+            const auto& desc = current.buffers[i];
+            const auto sharp = desc.GetSharp(current);
+            if (sharp) {
+                BufferSpecialization spec{};
+                SetBufferSpec(spec, current, i, sharp);
+                equal = BoundEmptyForMatch(desc, sharp) ? buffers[i].SameButAddressing(spec)
+                                                       : buffers[i] == spec;
+            }
+        }
+        return equal;
+    }
+
     /// PERF-GT7-058: whether PackInputs may stand for a new specialization of this stage. Not
     /// tessellation stages (their runtime info comes from memory).
     /// FIX-GT7-082: nor a vertex stage with a fetch shader. Its attributes' V#s are read from guest
@@ -290,27 +342,76 @@ struct StageSpecialization {
                !(info.sw_stage == SwStage::Vertex && info.has_fetch_shader);
     }
 
+private:
+    struct FragmentWords {
+        std::array<u64, 4 + 2 * NUM_BUFFERS + 2 * NUM_IMAGES + NUM_FMASKS + NUM_SAMPLERS> words;
+        u64* next = words.data();
+
+        void push_back(u64 word) {
+            DEBUG_ASSERT(next < words.data() + words.size());
+            *next++ = word;
+        }
+    };
+
+    struct ImageFormat {
+        u8 number;
+        u8 conversion;
+    };
+
+    static ImageFormat FragmentImageFormat(const AmdGpu::Image& sharp) {
+        static constexpr auto table = [] {
+            std::array<ImageFormat, 1024> result{};
+            for (u32 i = 0; i < result.size(); ++i) {
+                const auto data = static_cast<AmdGpu::DataFormat>(i & 63);
+                const auto number = static_cast<AmdGpu::NumberFormat>(i >> 6);
+                result[i] = {u8(AmdGpu::RemapNumberFormat(number, data)),
+                             u8(AmdGpu::MapNumberConversion(number, data))};
+            }
+            return result;
+        }();
+        return table[sharp.data_format | (sharp.num_format << 6)];
+    }
+
+public:
     /// PERF-GT7-058: what the constructor above reads of the sharps and of the fetch shader, as the
     /// values it derives from them, packed into words without making a specialization. A stage
     /// with equal words, an equal runtime info, start bindings and fetch shader data, and the same
     /// info makes an equal specialization, for a stage Packable allows. Keep in step with the
     /// constructor.
     static void PackInputs(const Info& info, std::vector<u64>& out, Gcn::FetchShaderData& fetch) {
+        WritePackedInputs(info, out, &fetch);
+    }
+
+    static bool MatchesFragmentInputs(const Info& info, std::span<const u64> expected,
+                                      const Gcn::FetchShaderData& saved_fetch) {
+        DEBUG_ASSERT(info.sw_stage == SwStage::Fragment);
+        FragmentWords out;
+        WritePackedInputs(info, out, nullptr);
+        return std::equal(out.words.data(), out.next, expected.begin(), expected.end()) &&
+               Gcn::FetchShaderData{} == saved_fetch;
+    }
+
+private:
+    template <typename Words>
+    static void WritePackedInputs(const Info& info, Words& out, Gcn::FetchShaderData* fetch) {
         const auto mapping = [](const AmdGpu::CompMapping& m) {
             return u64(m.array[0]) | u64(m.array[1]) << 8 | u64(m.array[2]) << 16 |
                    u64(m.array[3]) << 24;
         };
-        fetch = {};
-        if (info.sw_stage == SwStage::Vertex && Gcn::ParseFetchShader(info, fetch)) {
-            for (const auto& desc : fetch.attributes) {
-                const auto sharp = desc.GetSharp(info);
-                if (!sharp) {
-                    out.push_back(0);
-                } else if (Gcn::VertexAttribute::IsGarbage(sharp)) {
-                    out.push_back(1);
-                } else {
-                    out.push_back(2 | u64(AmdGpu::GetNumberClass(sharp.GetNumberFmt())) << 8 |
-                                  mapping(sharp.DstSelect()) << 16);
+        constexpr bool fragment_key = std::is_same_v<Words, FragmentWords>;
+        if constexpr (!fragment_key) {
+            *fetch = {};
+            if (info.sw_stage == SwStage::Vertex && Gcn::ParseFetchShader(info, *fetch)) {
+                for (const auto& desc : fetch->attributes) {
+                    const auto sharp = desc.GetSharp(info);
+                    if (!sharp) {
+                        out.push_back(0);
+                    } else if (Gcn::VertexAttribute::IsGarbage(sharp)) {
+                        out.push_back(1);
+                    } else {
+                        out.push_back(2 | u64(AmdGpu::GetNumberClass(sharp.GetNumberFmt())) << 8 |
+                                      mapping(sharp.DstSelect()) << 16);
+                    }
                 }
             }
         }
@@ -361,16 +462,27 @@ struct StageSpecialization {
                                   ? AmdGpu::ImageType::Invalid
                                   : sharp.GetViewType(desc.is_array);
             w |= u64(type) << 1;
-            w |= u64(AmdGpu::IsInteger(sharp.GetNumberFmt())) << 8;
+            const auto number = [&] {
+                if constexpr (fragment_key) {
+                    return AmdGpu::NumberFormat(FragmentImageFormat(sharp).number);
+                } else {
+                    return sharp.GetNumberFmt();
+                }
+            }();
+            w |= u64(AmdGpu::IsInteger(number)) << 8;
             w |= u64(desc.is_written) << 9;
             if (desc.is_written) {
                 w |= mapping(sharp.DstSelect()) << 16;
             } else if (!usage_known || info.image_srgb_used[i]) {
-                w |= u64(sharp.GetNumberFmt() == AmdGpu::NumberFormat::Srgb) << 10;
+                w |= u64(number == AmdGpu::NumberFormat::Srgb) << 10;
             }
             w |= u64(desc.NumBindings(info)) << 48;
             out.push_back(w);
-            out.push_back(u64(sharp.GetNumberConversion()));
+            if constexpr (fragment_key) {
+                out.push_back(FragmentImageFormat(sharp).conversion);
+            } else {
+                out.push_back(u64(sharp.GetNumberConversion()));
+            }
         }
         out.push_back(0xf3a5);
         for (const auto& desc : info.fmasks) {
@@ -400,6 +512,7 @@ struct StageSpecialization {
         }
     }
 
+public:
     void ForEachSharp(auto& spec_list, auto& desc_list, auto&& func) {
         for (const auto& desc : desc_list) {
             auto& spec = spec_list.emplace_back();

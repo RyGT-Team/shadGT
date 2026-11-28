@@ -15,11 +15,14 @@ struct StageResourceBindings {
 };
 
 inline StageResourceBindings PlanStageResourceBindings(const Shader::Info& stage,
-                                                       Shader::Backend::Bindings start) {
+                                                       Shader::Backend::Bindings start,
+                                                       bool need_next = true) {
     StageResourceBindings result{start, start, start};
     result.textures.buffer += stage.buffers.size();
     result.textures.unified += stage.buffers.size();
-    stage.AddBindings(result.next);
+    if (need_next) {
+        stage.AddBindings(result.next);
+    }
     return result;
 }
 

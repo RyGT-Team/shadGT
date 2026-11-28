@@ -37,6 +37,7 @@ bool IsWritableTarget(VAddr virtual_addr, u64 size);
 bool GuardedCopy(void* dest, const void* source, size_t size);
 /// False means a read fault; on success `equal` reports full-byte equality.
 bool GuardedEqual(const void* guest, const void* stable, size_t size, bool& equal);
+bool GuardedMatchWords(const u32* guest, const u32* expected, size_t count);
 bool IsValidMapping(VAddr virtual_addr, u64 size);
 /// PERF-GTS-359: maps the alias view a later TryWriteBacking of a small range writes through, so
 /// the caller can do Ryty's map call before taking a lock others wait for. Optional.

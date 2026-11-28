@@ -49,6 +49,7 @@
 #include "ryty_gpu/native/writeback_plan.h"
 #include "ryty_gpu/ryty_upscale.h"
 #include "video_core/renderer_vulkan/pipeline_binding_state.h"
+#include "video_core/renderer_vulkan/kept_texture_set.h"
 #include "video_core/renderer_vulkan/descriptor_set_memo.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/resource.h"
@@ -263,6 +264,7 @@ private:
         std::array<std::vector<vk::WriteDescriptorSet>, Shader::Backend::MaxDescriptorSets> grouped_storage;
         std::array<std::span<const vk::WriteDescriptorSet>, Shader::Backend::MaxDescriptorSets> grouped_writes{};
         bool groups_ready = false;
+        void AppendStorageWrite(u32 slot, bool in_place);
         void PrepareWriteGroups();
         std::array<PreparedDescriptorKey, Shader::Backend::MaxDescriptorSets> descriptor_keys;
         vk::PipelineLayout key_layout{};
@@ -383,6 +385,10 @@ private:
         /// PERF-GT7-043: the program of the last dispatch, if it is the last command so far.
         u64 run_program = 0;
         u32 run_commands = 0;
+        /// PERF-SGT-245: the guest queue of the last dispatch, and the recording serial right
+        /// after it (~0u: no dispatch in this list yet).
+        u32 run_queue = ~0u;
+        u64 run_serial = 0;
         /// PERF-GT7-057: what the run's same-texel dispatches stored since the last barrier:
         /// (picture, mip << 32 | layer), what they sampled elsewhere (FIX-GT7-087), or that one
         /// stored without a key (FIX-GT7-081).
@@ -632,9 +638,12 @@ private:
         u64 late_hits = 0, late_made = 0, late_not_kept = 0;
     };
     LongSets long_sets;
+    static constexpr size_t LongSetLimit = 200000;
+    alignas(64) std::atomic<bool> long_sets_over_limit{false};
+    bool skip_empty_long_sets_upkeep = false;
     /// PERF-GTS-398: with parallel recording the pass workers look sets up and make them too:
     /// then everything of `long_sets` is read and changed under this.
-    std::mutex long_sets_mutex;
+    alignas(64) std::mutex long_sets_mutex;
     /// The recorder: dead handles' sets dropped, the table flushed when it is too large.
     void LongSetsUpkeep();
     /// PERF-GTS-377: upload memory the job threads copy a prepared draw's constants into, so
@@ -688,7 +697,29 @@ private:
         /// FIX-GT7-033: of those, the pages the GPU wrote since their last copy.
         std::unique_ptr<std::unordered_set<VAddr>> gpu_pages = std::make_unique<std::unordered_set<VAddr>>(); ///< recently CPU-written pages changed by GPU work
         bool dirty_sorted = true;
+        struct DownloadPageGroup {
+            VAddr number{};
+            u64 bits{};
+        };
+        std::array<DownloadPageGroup, 4> recent_downloads{};
+
+        void MarkDownloadPage(VAddr page, bool deduplicate) {
+            if (deduplicate) {
+                const VAddr number = page >> 18;
+                const u64 bit = u64{1} << ((page >> 12) & 63);
+                auto& group = recent_downloads[number % recent_downloads.size()];
+                if (group.number == number && (group.bits & bit)) return;
+                dirty_pages.push_back(page);
+                if (group.number != number) group = {number, 0};
+                group.bits |= bit;
+            } else {
+                dirty_pages.push_back(page);
+            }
+            dirty_sorted = false;
+        }
     };
+    bool read_clean_sources = false;
+    bool dedup_download_pages{};
     std::map<VAddr, Region> regions; ///< by begin; guarded by mutex
     /// PERF-SGT-046: `regions` as flat sorted arrays for RegionOver (about 230 regions in a GT7
     /// race fit in L1; the tree's nodes are scattered). Rebuilt after every change of `regions`,
@@ -1526,7 +1557,7 @@ private:
         u64 size;
         VAddr address;
     };
-    std::unordered_set<const Native::ImageEntry*> kept_texture_cache;
+    KeptTextureSet kept_texture_cache;
     std::vector<KeptTextureCandidate> kept_texture_scan;
     u32 kept_texture_shard = 0;
     u64 kept_texture_bytes = 0;
@@ -1585,6 +1616,7 @@ private:
     static bool SubVersionsOn();
     /// NAT-104: copies the newer pictures of the render targets a texture is made of into it.
     void RefreshSources(Native::ImageEntry& texture);
+    void CheckAndRefreshSources(Native::ImageEntry& texture);
     /// FIX-212: a depth target and a colour target of its layout at its address (D16/R16,
     /// D32/R32) are one picture: the other's newer one is copied in before either is used
     /// (SHADGT_NATIVE_DEPTH_TWINS=0 off).
@@ -1895,6 +1927,7 @@ private:
     } prepare_stats;
 
     Rasterizer& r;
+    const bool in_place_storage_writes;
     std::unique_ptr<Native::Rhi::Device> device;
     std::shared_ptr<OneOffObserver> one_off_observer;
     std::unique_ptr<AsyncMirrorBuffer<Native::Rhi::Buffer>> mirror_preparation;
@@ -2305,6 +2338,7 @@ private:
 #else
     std::chrono::steady_clock::time_point last_report{};
 #endif
+    bool copy_literal_samplers = false;
 };
 
 } // namespace Vulkan

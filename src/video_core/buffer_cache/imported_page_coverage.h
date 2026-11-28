@@ -22,7 +22,10 @@ public:
     static constexpr U PageSize=U{1}<<PageBits;
     static constexpr U WordCount=U{1}<<(AddressBits-PageBits-6);
     static constexpr U StorageBytes=WordCount*sizeof(U);
-    ImportedPageCoverage():words{std::make_unique<std::atomic<U>[]>(WordCount)}{}
+    explicit ImportedPageCoverage(bool summarize = false)
+        : words{std::make_unique<std::atomic<U>[]>(WordCount)},
+          full_words{summarize ? std::make_unique<std::atomic<U>[]>((WordCount + 63) / 64)
+                               : nullptr} {}
     class Invalidation {
     public:
         explicit Invalidation(ImportedPageCoverage& owner):owner{owner} {
@@ -43,9 +46,18 @@ public:
         const auto before=epoch.load(std::memory_order_acquire);
         if(before&1)return false;
         const U first=address>>PageBits,last=(address+size-1)>>PageBits;
-        for(U word=first>>6;word<=last>>6;++word){
-            const U mask=Mask(word,first,last);
-            if((words[word].load(std::memory_order_acquire)&mask)!=mask)return false;
+        if (size / (64 * PageSize) < 8 || !full_words) {
+            for (U word = first >> 6; word <= (last >> 6); ++word) {
+                if (!AllSet(words[word], Mask(word, first, last))) return false;
+            }
+        } else {
+            const U first_word = first >> 6, last_word = last >> 6;
+            if (!AllSet(words[first_word], ~U{0} << (first & 63)) ||
+                !AllSet(words[last_word], ~U{0} >> (63 - (last & 63)))) return false;
+            const U begin = first_word + 1, end = last_word - 1;
+            for (U i = begin >> 6; i <= (end >> 6); ++i) {
+                if (!AllSet(full_words[i], Mask(i, begin, end))) return false;
+            }
         }
         std::atomic_thread_fence(std::memory_order_acquire);
         return epoch.load(std::memory_order_relaxed)==before;
@@ -71,6 +83,9 @@ public:
         return result;
     }
 private:
+    static bool AllSet(const std::atomic<U>& word, U mask) {
+        return (word.load(std::memory_order_acquire) & mask) == mask;
+    }
     static U Mask(U word,U first,U last){
         U mask=~U{0};
         if(word==(first>>6))mask&=~U{0}<<(first&63);
@@ -86,8 +101,21 @@ private:
             if constexpr(Add)words[word].fetch_or(mask,std::memory_order_release);
             else words[word].fetch_and(~mask,std::memory_order_release);
         }
+        if (!full_words) return;
+        U lo = first >> 6, hi = (last >> 6) + 1;
+        if constexpr (Add) {
+            if (words[lo].load(std::memory_order_relaxed) != ~U{0}) ++lo;
+            if (lo < hi && words[hi - 1].load(std::memory_order_relaxed) != ~U{0}) --hi;
+        }
+        if (lo == hi) return;
+        for (U i = lo >> 6; i <= ((hi - 1) >> 6); ++i) {
+            const U mask = Mask(i, lo, hi - 1);
+            if constexpr (Add) full_words[i].fetch_or(mask, std::memory_order_release);
+            else full_words[i].fetch_and(~mask, std::memory_order_release);
+        }
     }
     std::unique_ptr<std::atomic<U>[]> words;
+    std::unique_ptr<std::atomic<U>[]> full_words;
     std::atomic<U> epoch{};
 };
 }

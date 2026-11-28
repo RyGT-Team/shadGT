@@ -21,6 +21,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <stop_token>
 #include <thread>
 
@@ -155,7 +156,7 @@ private:
                 continue;
             }
             run(owner, jobs[next % Slots], ring);
-            ends[next % EndSlots] = ring.Recorded();
+            ends[next % EndSlots] = ring.FinishJob();
             done.store(next, std::memory_order_release);
             ++next;
         }
@@ -165,7 +166,13 @@ private:
     RunFn run;
     std::array<Job, Slots> jobs{};
     std::array<std::uint64_t, EndSlots> ends{};
-    Vulkan::CommandRing ring;
+    Vulkan::CommandRing ring{[] {
+        using Publication = Vulkan::CommandRing::Publication;
+        const char* setting = std::getenv("SHADGT_BINDER_BATCH_PUBLISH"); // PERF-SGT-215
+        return setting && setting[0] == '1' && setting[1] == '\0'
+                   ? Publication::AtJobEnd
+                   : Publication::PerCommand;
+    }()};
     std::atomic<std::uint64_t> made{0}; ///< written by the recorder only
     alignas(64) std::atomic<std::uint64_t> published{0};
     alignas(64) std::atomic<std::uint64_t> done{0};

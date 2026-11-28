@@ -10338,6 +10338,17 @@ PipelineCache::Result PipelineCache::GetProgramForJob(HwStage hw_stage,
     return none();
 }
 
+static void ReportRejectedSpecialization(const Shader::Info& info,
+                                         const Common::RecoverableFailure& error) {
+    static thread_local std::unordered_set<u64> reported;
+    if (reported.insert(info.pgm_hash).second) {
+        LOG_WARNING(Render_Vulkan,
+                    "SHADER-CANDIDATE-REJECT: shader {:#x}: {}; trying other cached "
+                    "permutations or a fresh translation",
+                    info.pgm_hash, error.what());
+    }
+}
+
 // A cached permutation can describe a different fetch-shader layout from the current draw.
 // Reject only that candidate; a later permutation or a fresh translation can still be valid.
 static std::optional<Shader::StageSpecialization> TryMatchingSpecialization(
@@ -10347,15 +10358,29 @@ static std::optional<Shader::StageSpecialization> TryMatchingSpecialization(
         return std::optional<Shader::StageSpecialization>{std::in_place, info, runtime_info,
                                                           profile, binding};
     } catch (const Common::RecoverableFailure& error) {
-        static thread_local std::unordered_set<u64> reported;
-        if (reported.insert(info.pgm_hash).second) {
-            LOG_WARNING(Render_Vulkan,
-                        "SHADER-CANDIDATE-REJECT: shader {:#x}: {}; trying other cached "
-                        "permutations or a fresh translation",
-                        info.pgm_hash, error.what());
-        }
+        ReportRejectedSpecialization(info, error);
         return std::nullopt;
     }
+}
+
+static bool MatchesLastSpecialization(const Shader::StageSpecialization& stored,
+                                      const Shader::Info& info, const Shader::RuntimeInfo& runtime,
+                                      const Shader::Profile& profile, Shader::Backend::Bindings binding) {
+    static const bool direct = [] {
+        const char* value = std::getenv("SHADGT_VERTEX_MATCH"); // PERF-SGT-230
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    if (direct && info.sw_stage == Shader::SwStage::Vertex && info.has_fetch_shader && info.images.empty() &&
+        info.fmasks.empty() && info.samplers.empty()) {
+        try {
+            return stored.MatchesBufferVertex(info, runtime, binding);
+        } catch (const Common::RecoverableFailure& error) {
+            ReportRejectedSpecialization(info, error);
+            return false;
+        }
+    }
+    const auto spec = TryMatchingSpecialization(info, runtime, profile, binding);
+    return spec && stored == *spec;
 }
 
 namespace {
@@ -10476,7 +10501,16 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
     // FIX-018: stored permutations of a program with an else after an empty if were translated
     // with the else running for every invocation. Translate those programs again, once; the new
     // permutations start after the stored ones, so their pipelines are new as well.
-    const bool first_use = else_scope_checked.insert(params.hash).second;
+    static const bool reuse_fix_checks = [] {
+        const char* setting = std::getenv("SHADGT_REUSE_SHADER_FIX_CHECKS"); // PERF-SGT-227
+        return setting && std::string_view(setting) == "1";
+    }();
+    const bool first_use = [&] {
+        if (reuse_fix_checks && it_pgm.value()->use_checked) return false;
+        const bool first = else_scope_checked.insert(params.hash).second;
+        if (reuse_fix_checks) it_pgm.value()->use_checked = true;
+        return first;
+    }();
 #ifndef NDEBUG
     if (first_use && IsWatchedShader(params.hash)) {
         // DIAG-031: the guest code of watched shaders, raw and as a listing, in the log folder.
@@ -10561,10 +10595,13 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
                         use.dpp, use.mimg_g16, use.mimg_a16, use.mimg_d16);
         }
     }
-    const auto known = else_scope_fixed.find(params.hash);
-    const auto session = session_fix_marks.find(params.hash);
-    const u32 applied_fixes = (known != else_scope_fixed.end() ? known->second.fixes : 0u) |
-                              (session != session_fix_marks.end() ? session->second : 0u);
+    const u32 applied_fixes = [&] {
+        if (reuse_fix_checks && needed_fixes == 0) return 0u;
+        const auto known = else_scope_fixed.find(params.hash);
+        const auto session = session_fix_marks.find(params.hash);
+        return (known != else_scope_fixed.end() ? known->second.fixes : 0u) |
+               (session != session_fix_marks.end() ? session->second : 0u);
+    }();
     if ((needed_fixes & ~applied_fixes) != 0) {
         auto& boundary = stored_perm_end[params.hash];
         boundary = std::max(boundary, it_pgm.value()->modules.size());
@@ -10676,19 +10713,27 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
             if (fast_mode && permutation.inputs.valid &&
                 Shader::StageSpecialization::Packable(info) &&
                 permutation.inputs.start == binding && permutation.inputs.runtime_info == runtime_info) {
-                thread_local std::vector<u64> words;
-                thread_local Shader::Gcn::FetchShaderData fetch;
-                words.clear();
-                Shader::StageSpecialization::PackInputs(info, words, fetch);
-                packed_match = words == permutation.inputs.words &&
-                               fetch == permutation.spec.fetch_shader_data;
+                static const bool compare_fragment_inputs = [] {
+                    const char* setting = std::getenv("SHADGT_COMPARE_FRAGMENT_INPUTS"); // PERF-SGT-229
+                    return setting && std::string_view(setting) == "1";
+                }();
+                if (compare_fragment_inputs && info.sw_stage == SwStage::Fragment) {
+                    packed_match = Shader::StageSpecialization::MatchesFragmentInputs(
+                        info, permutation.inputs.words, permutation.spec.fetch_shader_data);
+                } else {
+                    thread_local std::vector<u64> words;
+                    thread_local Shader::Gcn::FetchShaderData fetch;
+                    words.clear();
+                    Shader::StageSpecialization::PackInputs(info, words, fetch);
+                    packed_match = words == permutation.inputs.words &&
+                                   fetch == permutation.spec.fetch_shader_data;
+                }
             }
             bool matched = packed_match && fast_mode == 1;
             if (matched) NoteSearch(hw_stage, SearchLastPacked); // DIAG-SGT-024
             if (!matched) {
                 Common::PhaseTimer spec_timer{Common::Phase::SelSpec};
-                const auto current_spec = TryMatchingSpecialization(info, runtime_info, profile, binding);
-                matched = current_spec && permutation.spec == *current_spec;
+                matched = MatchesLastSpecialization(permutation.spec, info, runtime_info, profile, binding);
                 if (matched) NoteSearch(hw_stage, SearchLastSpec); // DIAG-SGT-024
                 if (packed_match && !matched) {
                     LOG_ERROR(Render_Vulkan, "PERF-GT7-058 packed specialization mismatch: {:#x}", params.hash);

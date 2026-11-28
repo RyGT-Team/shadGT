@@ -74,6 +74,7 @@
 
 #include "video_core/renderer_vulkan/build_queue.h"
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
+#include "video_core/amdgpu/guest_dispatch.h"
 #include "common/geometry_trace.h"
 #include "video_core/renderer_vulkan/pipeline_owner.h"
 #include "video_core/buffer_cache/proto_import.h"
@@ -2945,6 +2946,7 @@ void NativeRenderer::BeginHudStream() {
     s.vertex_state_known = false;
     s.commands = 0;
     s.run_program = 0; // PERF-GT7-043
+    s.run_queue = ~0u; // PERF-SGT-245
     s.run_texels.Clear(); // PERF-GT7-057
     ++s.serial;        // OPT-015
     ForgetBindings(s); // OPT-014
@@ -4064,6 +4066,7 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     s.vertex_state_known = false; // OPT-005
     s.commands = 0;
     s.run_program = 0; // PERF-GT7-043
+    s.run_queue = ~0u; // PERF-SGT-245
     s.run_texels.Clear(); // PERF-GT7-057
     GpuTimeBegin(s); // DIAG-GT7-001: the first segment is the wait for earlier GPU work
     ++s.serial;        // OPT-015
@@ -14983,6 +14986,25 @@ void NativeRenderer::RecordVertexIndex(const VertexIndexState& v) {
 // other parts of the same picture in a run, which the check of stored pictures would stop.
 bool NativeRenderer::RunNeedsBarrier(const Stream& s, const DrawBindings& b, const Shader::Info& cs,
                                      bool recorded, std::optional<u64> texel) const {
+    // PERF-SGT-245: no barrier between two dispatches of one guest queue when the game sent
+    // nothing that orders work between them (AmdGpu::GuestDispatch) and the renderer recorded
+    // nothing of its own since the first: the PS4 may run such dispatches at once, so the game does
+    // not depend on their order. GT7 sends about half its dispatches like that; the barrier before
+    // each was most of the GPU's wait-for-idle time (Tokyo replay, broadcast cameras: frame time
+    // -5.2%, frames over 25 ms -45%, in-run A/B). On in GT7; GT Sport is not checked yet.
+    // SHADGT_GUEST_SYNC_BARRIERS=1: on in every game; 0: off.
+    static const bool guest_sync = [] {
+        const char* env = std::getenv("SHADGT_GUEST_SYNC_BARRIERS");
+        if (env && env[0] == '0') return false;
+        if (env && env[0] == '1') return true;
+        return Common::IsGt7();
+    }();
+    if (const auto& guest = AmdGpu::t_guest_dispatch;
+        guest_sync && guest.unsynced && guest.queue != ~0u && guest.queue == s.run_queue &&
+        s.run_commands == s.commands && s.run_serial == s.resource_recording_serial && !recorded &&
+        writebacks.empty() && !s.buffers_written.foreign && s.attach_dirty.empty()) {
+        return false;
+    }
     const u64 program = cs.pgm_hash;
     static const std::vector<u64> listed = [] {
         std::vector<u64> list;
@@ -23389,6 +23411,8 @@ void NativeRenderer::DispatchDirect() {
     ++s.commands;
     s.run_program = program;
     s.run_commands = s.commands;
+    s.run_queue = AmdGpu::t_guest_dispatch.queue; // PERF-SGT-245
+    s.run_serial = s.resource_recording_serial;
     ChunkFlushCheck();
     Report();
 }

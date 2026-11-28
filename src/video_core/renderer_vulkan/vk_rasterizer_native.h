@@ -387,6 +387,10 @@ private:
         /// PERF-GT7-043: the program of the last dispatch, if it is the last command so far.
         u64 run_program = 0;
         u32 run_commands = 0;
+        /// PERF-SGT-245: the guest queue of the last dispatch, and the recording serial right
+        /// after it (~0u: no dispatch in this list yet).
+        u32 run_queue = ~0u;
+        u64 run_serial = 0;
         /// PERF-GT7-057: what the run's same-texel dispatches stored since the last barrier:
         /// (picture, mip << 32 | layer), what they sampled elsewhere (FIX-GT7-087), or that one
         /// stored without a key (FIX-GT7-081).

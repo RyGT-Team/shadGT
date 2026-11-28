@@ -42,6 +42,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include <xxhash.h>
 
+#include "video_core/amdgpu/guest_dispatch.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/amdgpu/pm4_rewind.h"
@@ -1931,6 +1932,43 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
+// PERF-SGT-245: whether a packet can order a queue's later dispatch after its earlier work. Only
+// register writes, NOPs, buffer chaining, draws and dispatches can't; every other packet (events,
+// waits, releases, acquires, memory writes and copies, anything unknown) counts as ordering. Two
+// dispatches of one queue with nothing ordering between them may run at once on the PS4, so the
+// game cannot depend on their order, and the renderer needs no barrier between them for the game.
+static bool OrdersDispatches(PM4ItOpcode opcode) {
+    switch (opcode) {
+    case PM4ItOpcode::Nop:
+    case PM4ItOpcode::SetBase:
+    case PM4ItOpcode::IndexBufferSize:
+    case PM4ItOpcode::IndexBase:
+    case PM4ItOpcode::IndexType:
+    case PM4ItOpcode::NumInstances:
+    case PM4ItOpcode::ContextControl:
+    case PM4ItOpcode::SetConfigReg:
+    case PM4ItOpcode::SetContextReg:
+    case PM4ItOpcode::SetShReg:
+    case PM4ItOpcode::SetQueueReg:
+    case PM4ItOpcode::SetUconfigReg:
+    case PM4ItOpcode::IndirectBuffer:
+    case PM4ItOpcode::IndirectBufferConst:
+    case PM4ItOpcode::DrawIndirect:
+    case PM4ItOpcode::DrawIndexIndirect:
+    case PM4ItOpcode::DrawIndex2:
+    case PM4ItOpcode::DrawIndirectMulti:
+    case PM4ItOpcode::DrawIndexAuto:
+    case PM4ItOpcode::DrawIndexMultiAuto:
+    case PM4ItOpcode::DrawIndexOffset2:
+    case PM4ItOpcode::DrawIndexIndirectMulti:
+    case PM4ItOpcode::DispatchDirect:
+    case PM4ItOpcode::DispatchIndirect:
+        return false;
+    default:
+        return true;
+    }
+}
+
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
                                            std::span<const u32> original_dcb) {
     FIBER_ENTER(dcb_task_name);
@@ -2101,6 +2139,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             ++Common::GetWorkCounters().pm4_packets;
             lookahead_dcb =
                 dcb.size() > count + 1 ? dcb.subspan(count + 1) : std::span<const u32>{};
+            if (OrdersDispatches(opcode)) guest_synced[0] = true; // PERF-SGT-245
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -2561,8 +2600,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
+                const bool unsynced = !std::exchange(guest_synced[0], false); // PERF-SGT-245
                 RecordDraw(
-                    [this, cmd_address] {
+                    [this, cmd_address, unsynced] {
+                        GuestDispatchScope guest{0, unsynced};
                         rasterizer->ScopeMarker("gfx:{}:DispatchDirect",
                                                 fmt::make_format_args(cmd_address),
                                                 [&] { rasterizer->DispatchDirect(); });
@@ -3537,6 +3578,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
         const PM4ItOpcode opcode = header->type3.opcode;
         ++Common::GetWorkCounters().pm4_packets;
+        if (OrdersDispatches(opcode)) guest_synced[(vqid + 1) & 63] = true; // PERF-SGT-245
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
@@ -3701,8 +3743,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 break;
             }
             const auto cmd_address = reinterpret_cast<const void*>(header);
+            const bool unsynced = !std::exchange(guest_synced[(vqid + 1) & 63], false); // PERF-SGT-245
             RecordDraw(
-                [this, vqid, cmd_address] {
+                [this, vqid, cmd_address, unsynced] {
+                    GuestDispatchScope guest{vqid + 1, unsynced};
                     rasterizer->ScopeMarker("asc[{}]:{}:DispatchDirect",
                                             fmt::make_format_args(vqid, cmd_address),
                                             [&] { rasterizer->DispatchDirect(); });
